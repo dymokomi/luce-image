@@ -1,0 +1,15 @@
+## Compiler reproducer, intentionally NOT part of the package's passing tests.
+## Expected exit 0. Pinned native backend: 0; pinned C backend: 1.
+struct Cursor:
+    var calls: usize
+
+    mutating func next() -> const u8[]!:
+        self.calls += 1
+        return b"AB"
+
+pub func main(arguments: str[]) -> i32!:
+    var cursor = Cursor()
+    let value = (try cursor.next())[0]
+    if value != 'A' or cursor.calls != 1:
+        return 1
+    return 0

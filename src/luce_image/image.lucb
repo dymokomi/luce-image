@@ -1,0 +1,454 @@
+## Public, owning Pillow-style image API. Codec code is entirely Luce Base.
+import c as c_api
+import files
+import interop
+import memory
+import math
+import strings
+import luce_image.model as model
+import luce_image.png as png
+import luce_image.jpeg as jpeg
+import luce_image.tiff as tiff
+import luce_image.exr as exr
+import luce_image.parallel as parallel
+from luce_image.binary import Buffer
+from luce_image.errors import invalid, unsupported
+
+pub type SampleType = model.SampleType
+
+pub struct Pixel:
+    pub let r: f64 = 0.0
+    pub let g: f64 = 0.0
+    pub let b: f64 = 0.0
+    pub let a: f64 = 255.0
+
+func check_path(path: str) -> !:
+    if path.length == 0 or strings.contains(path, "\0"):
+        error(invalid, "path is empty or contains a NUL byte")
+
+func probe(raster: model.Raster*) -> !:
+    if raster.encoded.length < 4:
+        error(invalid, "image signature is truncated")
+    let data = raster.encoded
+    if data[0] == 137:
+        if raster.frame != 0:
+            error(invalid, "PNG has one frame")
+        try png.probe(raster)
+    elif data[0] == 255 and data[1] == 216:
+        if raster.frame != 0:
+            error(invalid, "JPEG has one frame")
+        try jpeg.probe(raster)
+    elif data[0] == 118 and data[1] == 47:
+        try exr.probe(raster)
+    elif (data[0] == 'I' and data[1] == 'I') or (data[0] == 'M' and data[1] == 'M'):
+        try tiff.probe(raster)
+    else:
+        error(unsupported, "unrecognized image signature")
+
+func configure_mode(raster: model.Raster*, mode: str) -> !:
+    let nc: usize = 3 if mode == "RGB" or mode == "RGBF" else 4 if mode == "RGBA" or mode == "RGBAF" else 2 if mode == "LA" else 1
+    if mode != "L" and mode != "LA" and mode != "RGB" and mode != "RGBA" and mode != "I;16" and mode != "I" and mode != "F" and mode != "RGBF" and mode != "RGBAF":
+        error(invalid, "unsupported image mode")
+    let kind = SampleType.uint16 if mode == "I;16" else SampleType.uint32 if mode == "I" else SampleType.float32 if mode == "F" or mode == "RGBF" or mode == "RGBAF" else SampleType.uint8
+    try raster.standard(nc, kind)
+
+pub struct Image:
+    var raster: model.Raster
+    var threads: usize = 4
+    var active_workers: usize
+    var closed: bool
+
+    func init():
+        self.raster = model.Raster()
+        self.threads = 4
+        self.active_workers = 0
+        self.closed = false
+
+    static func own(raster: model.Raster, threads: usize = 4) -> interop.Reference[Image]!:
+        var reservation = try interop.Reservation[Image](image_type)
+        errdefer reservation.cancel()
+        let native = try new Image() in memory.heap
+        native.raster = raster
+        native.threads = threads
+        return reservation.publish(native, memory.heap)
+
+    func ensure_open() -> !:
+        if self.closed:
+            error(invalid, "image is closed")
+
+    ## Snapshot the encoded file now; decode pixels lazily on load/access/save.
+    pub static func open(path: str, threads: usize = 4, frame: usize = 0, max_bytes: usize = 1073741824, max_pixels: usize = 268435456) -> interop.Reference[Image]!:
+        try check_path(path)
+        if threads < 1 or threads > 64:
+            error(invalid, "thread count must be in 1-64")
+        var raster = model.Raster(max_bytes = max_bytes, max_pixels = max_pixels, frame = frame)
+        errdefer raster.close()
+        with memory.heap:
+            raster.path = try strings.copy(path)
+            raster.encoded = try files.read_limit((c_api.str)raster.path, max_bytes)
+        try probe(&raster)
+        return try Image.own(raster, threads)
+
+    pub static func open_bytes(data: const u8[], threads: usize = 4, frame: usize = 0, max_bytes: usize = 1073741824, max_pixels: usize = 268435456) -> interop.Reference[Image]!:
+        if threads < 1 or threads > 64 or data.length > max_bytes:
+            error(invalid, "invalid threads or encoded byte limit")
+        var raster = model.Raster(max_bytes = max_bytes, max_pixels = max_pixels, frame = frame)
+        errdefer raster.close()
+        raster.encoded = try alloc u8[data.length] in memory.heap
+        memory.copy(raster.encoded, data, data.length)
+        try probe(&raster)
+        return try Image.own(raster, threads)
+
+    pub static func create(mode: str, width: usize, height: usize, color: Pixel? = none, max_bytes: usize = 1073741824) -> interop.Reference[Image]!:
+        var raster = model.Raster(width = width, height = height, max_bytes = max_bytes)
+        errdefer raster.close()
+        try configure_mode(&raster, mode)
+        try raster.allocate()
+        let pixel = color else Pixel(a = model.maximum(raster.channels[0].kind))
+        for i in 0..<width * height:
+            for c in 0..<raster.channels.length:
+                let name = raster.channels[c].name
+                raster.pixels[i * raster.channels.length + c] = pixel.a if name == "A" else pixel.g if name == "G" else pixel.b if name == "B" else pixel.r
+        return try Image.own(raster)
+
+    ## Named channels are used for AOVs and Cryptomatte; default storage is FLOAT.
+    pub static func create_channels(width: usize, height: usize, names: const str[], kind: SampleType = .float32, max_bytes: usize = 1073741824) -> interop.Reference[Image]!:
+        var raster = model.Raster(width = width, height = height, max_bytes = max_bytes)
+        errdefer raster.close()
+        for name in names:
+            try raster.channel(name, kind)
+        try raster.allocate()
+        return try Image.own(raster)
+
+    pub func width() -> usize!:
+        try self.ensure_open()
+        return self.raster.width
+
+    pub func height() -> usize!:
+        try self.ensure_open()
+        return self.raster.height
+
+    pub func size() -> (usize, usize)!:
+        try self.ensure_open()
+        return (self.raster.width, self.raster.height)
+
+    pub func origin() -> (i64, i64)!:
+        try self.ensure_open()
+        return (self.raster.xmin, self.raster.ymin)
+
+    pub func file_format() -> str!:
+        try self.ensure_open()
+        return self.raster.file_format
+
+    pub func n_frames() -> usize!:
+        try self.ensure_open()
+        return self.raster.frames
+
+    pub func tell() -> usize!:
+        try self.ensure_open()
+        return self.raster.frame
+
+    pub func channel_count() -> usize!:
+        try self.ensure_open()
+        return self.raster.channels.length
+
+    pub func channel_name(index: usize) -> str!:
+        try self.ensure_open()
+        if index >= self.raster.channels.length:
+            error(invalid, "channel index out of range")
+        return self.raster.channels[index].name
+
+    pub func channel_type(index: usize) -> SampleType!:
+        try self.ensure_open()
+        if index >= self.raster.channels.length:
+            error(invalid, "channel index out of range")
+        return self.raster.channels[index].kind
+
+    pub func channel_index(name: str) -> usize!:
+        try self.ensure_open()
+        return try self.raster.find_channel(name)
+
+    pub func mode() -> str!:
+        try self.ensure_open()
+        let channels = self.raster.channels
+        let kind = channels[0].kind
+        for channel in channels:
+            if channel.kind != kind:
+                return "MULTI"
+        if channels.length == 1:
+            return "L" if kind == .uint8 else "I;16" if kind == .uint16 else "I" if kind == .uint32 else "F"
+        if channels.length == 2 and channels[0].name == "Y" and kind == .uint8:
+            return "LA"
+        if channels.length == 3 and channels[0].name == "R" and channels[1].name == "G" and channels[2].name == "B":
+            return "RGB" if kind == .uint8 else "RGBF" if kind == .float32 else "MULTI"
+        if channels.length == 4 and channels[0].name == "R" and channels[3].name == "A":
+            return "RGBA" if kind == .uint8 else "RGBAF" if kind == .float32 else "MULTI"
+        return "MULTI"
+
+    pub func is_loaded() -> bool:
+        return not self.closed and self.raster.pixels.length > 0
+
+    pub func workers_used() -> usize:
+        return self.active_workers
+
+    pub mutating func load() -> !:
+        try self.ensure_open()
+        if self.is_loaded():
+            return
+        try self.raster.allocate()
+        errdefer self.discard_pixels()
+        if self.raster.file_format == "PNG":
+            try png.decode(&self.raster)
+            self.active_workers = 1
+        elif self.raster.file_format == "JPEG":
+            try jpeg.decode(&self.raster)
+            self.active_workers = 1
+        elif self.raster.file_format == "TIFF":
+            self.active_workers = try parallel.decode(&self.raster, tiff.decode_chunk, self.threads)
+        else:
+            self.active_workers = try parallel.decode(&self.raster, exr.decode_chunk, self.threads)
+
+    mutating func discard_pixels():
+        if self.raster.pixels.length > 0:
+            free(self.raster.pixels) in memory.heap
+        var empty: f64[]
+        self.raster.pixels = empty
+        self.active_workers = 0
+
+    pub mutating func seek(frame: usize) -> !:
+        try self.ensure_open()
+        if frame == self.raster.frame:
+            return
+        let selected = try Image.open_bytes(self.raster.encoded, self.threads, frame, self.raster.max_bytes, self.raster.max_pixels)
+        defer selected.release()
+        let other = selected.value()
+        if self.raster.path.length > 0:
+            with memory.heap:
+                other.raster.path = try strings.copy(self.raster.path)
+        self.raster.close()
+        self.raster = other.raster
+        other.raster = model.Raster()
+        self.active_workers = 0
+
+    func offset(x: usize, y: usize, channel: usize) -> usize!:
+        if x >= self.raster.width or y >= self.raster.height or channel >= self.raster.channels.length:
+            error(invalid, "pixel or channel index out of range")
+        return (y * self.raster.width + x) * self.raster.channels.length + channel
+
+    pub mutating func get_sample(x: usize, y: usize, channel: usize = 0) -> f64!:
+        try self.load()
+        return self.raster.pixels[try self.offset(x, y, channel)]
+
+    pub mutating func put_sample(x: usize, y: usize, channel: usize, value: f64) -> !:
+        try self.load()
+        self.raster.pixels[try self.offset(x, y, channel)] = value
+
+    pub mutating func getpixel(x: usize, y: usize) -> Pixel!:
+        try self.load()
+        discard(try self.offset(x, y, 0))
+        var r: f64 = 0.0
+        var g: f64 = 0.0
+        var b: f64 = 0.0
+        var a = model.maximum(self.raster.channels[0].kind)
+        for c in 0..<self.raster.channels.length:
+            let name = self.raster.channels[c].name
+            let value = self.raster.pixels[(y * self.raster.width + x) * self.raster.channels.length + c]
+            if name == "Y":
+                r = value
+                g = value
+                b = value
+            elif name == "R":
+                r = value
+            elif name == "G":
+                g = value
+            elif name == "B":
+                b = value
+            elif name == "A":
+                a = value
+        return Pixel(r, g, b, a)
+
+    pub mutating func putpixel(x: usize, y: usize, pixel: Pixel) -> !:
+        try self.load()
+        discard(try self.offset(x, y, 0))
+        for c in 0..<self.raster.channels.length:
+            let name = self.raster.channels[c].name
+            if name != "Y" and name != "R" and name != "G" and name != "B" and name != "A":
+                error(invalid, "use put_sample for named non-color channels")
+        for c in 0..<self.raster.channels.length:
+            let name = self.raster.channels[c].name
+            self.raster.pixels[(y * self.raster.width + x) * self.raster.channels.length + c] = pixel.a if name == "A" else pixel.g if name == "G" else pixel.b if name == "B" else pixel.r
+
+    pub func metadata_count() -> usize!:
+        try self.ensure_open()
+        return self.raster.attributes.length
+
+    pub func metadata_key(index: usize) -> str!:
+        try self.ensure_open()
+        if index >= self.raster.attributes.length:
+            error(invalid, "metadata index out of range")
+        return self.raster.attributes[index].name
+
+    pub func metadata(name: str) -> str!:
+        try self.ensure_open()
+        for entry in self.raster.attributes:
+            if entry.name == name:
+                if entry.type_name != "string":
+                    error(invalid, "typed metadata must be read with metadata_bytes")
+                return (str)entry.data
+        return ""
+
+    pub func metadata_type(name: str) -> str!:
+        try self.ensure_open()
+        for entry in self.raster.attributes:
+            if entry.name == name:
+                return entry.type_name
+        return ""
+
+    pub func metadata_bytes(name: str) -> const u8[]!:
+        try self.ensure_open()
+        for entry in self.raster.attributes:
+            if entry.name == name:
+                return entry.data
+        return b""
+
+    pub mutating func set_origin(x: i64, y: i64) -> !:
+        try self.ensure_open()
+        if x < -2147483648 or y < -2147483648 or x > 2147483647 - (i64)self.raster.width + 1 or y > 2147483647 - (i64)self.raster.height + 1:
+            error(invalid, "image data window exceeds int32")
+        self.raster.xmin = x
+        self.raster.ymin = y
+
+    pub func source_path() -> str!:
+        try self.ensure_open()
+        return self.raster.path
+
+    pub mutating func set_metadata(name: str, value: str) -> !:
+        try self.ensure_open()
+        if strings.contains(name, "\0"):
+            error(invalid, "metadata name contains NUL")
+        try self.raster.attribute(name, "string", value.bytes)
+
+    pub mutating func save(path: str, file_format: str = "", compression: str = "zip", quality: i64 = 90, tile: usize = 0, bigtiff: bool = false) -> !:
+        try check_path(path)
+        # Managed Luce text is a byte view, not necessarily NUL-terminated.
+        let destination = try strings.copy(path)
+        defer strings.release(destination)
+        try self.load()
+        let extension = strings.find_last(path, ".")
+        var selected = file_format
+        if selected.length == 0:
+            let dot = extension else error(invalid, "output format is required without a filename extension")
+            selected = (str)path.bytes[dot + 1..]
+        let lower = try strings.to_lower(selected)
+        defer strings.release(lower)
+        var encoded = Buffer(maximum = self.raster.max_bytes)
+        defer encoded.close()
+        if lower == "png":
+            if tile != 0 or bigtiff:
+                error(invalid, "tile and BigTIFF options do not apply to PNG")
+            try png.encode(&self.raster, &encoded)
+        elif lower == "jpg" or lower == "jpeg":
+            if tile != 0 or bigtiff:
+                error(invalid, "tile and BigTIFF options do not apply to JPEG")
+            try jpeg.encode(&self.raster, &encoded, quality)
+        elif lower == "tif" or lower == "tiff":
+            try tiff.encode(&self.raster, &encoded, compression, tile, bigtiff)
+        elif lower == "exr":
+            if bigtiff:
+                error(invalid, "BigTIFF option does not apply to EXR")
+            try exr.encode(&self.raster, &encoded, compression, tile)
+        else:
+            error(unsupported, "unsupported output image format")
+        try files.write_atomic((c_api.str)destination, encoded.view())
+
+    pub mutating func copy() -> interop.Reference[Image]!:
+        return try self.crop(0, 0, try self.width(), try self.height())
+
+    pub mutating func crop(left: usize, top: usize, right: usize, bottom: usize) -> interop.Reference[Image]!:
+        try self.load()
+        if left >= right or top >= bottom or right > self.raster.width or bottom > self.raster.height:
+            error(invalid, "crop rectangle is empty or outside the image")
+        var raster = model.Raster(width = right - left, height = bottom - top, xmin = self.raster.xmin + (i64)left, ymin = self.raster.ymin + (i64)top, max_bytes = self.raster.max_bytes)
+        errdefer raster.close()
+        for channel in self.raster.channels:
+            try raster.channel(channel.name, channel.kind)
+        for attr in self.raster.attributes:
+            try raster.attribute(attr.name, attr.type_name, attr.data)
+        try raster.allocate()
+        let nc = raster.channels.length
+        for y in 0..<raster.height:
+            for x in 0..<raster.width:
+                for c in 0..<nc:
+                    raster.pixels[(y * raster.width + x) * nc + c] = self.raster.pixels[((top + y) * self.raster.width + left + x) * nc + c]
+        return try Image.own(raster, self.threads)
+
+    pub mutating func get_channel(name: str) -> interop.Reference[Image]!:
+        try self.load()
+        let channel = try self.raster.find_channel(name)
+        var raster = model.Raster(width = self.raster.width, height = self.raster.height, xmin = self.raster.xmin, ymin = self.raster.ymin, max_bytes = self.raster.max_bytes)
+        errdefer raster.close()
+        try raster.channel("Y", self.raster.channels[channel].kind)
+        try raster.allocate()
+        for i in 0..<raster.pixels.length:
+            raster.pixels[i] = self.raster.pixels[i * self.raster.channels.length + channel]
+        return try Image.own(raster, self.threads)
+
+    pub mutating func convert(mode: str) -> interop.Reference[Image]!:
+        try self.load()
+        let out = try Image.create(mode, self.raster.width, self.raster.height, max_bytes = self.raster.max_bytes)
+        errdefer out.release()
+        let target = out.value()
+        let source_max = model.maximum(self.raster.channels[0].kind)
+        let target_max = model.maximum(target.raster.channels[0].kind)
+        let integer = (i64)target.raster.channels[0].kind <= 3
+        for y in 0..<self.raster.height:
+            for x in 0..<self.raster.width:
+                let pixel = try self.getpixel(x, y)
+                for c in 0..<target.raster.channels.length:
+                    let name = target.raster.channels[c].name
+                    let source = pixel.a if name == "A" else pixel.g if name == "G" else pixel.b if name == "B" else 0.299 * pixel.r + 0.587 * pixel.g + 0.114 * pixel.b if name == "Y" else pixel.r
+                    let value = source / source_max * target_max
+                    target.raster.pixels[(y * self.raster.width + x) * target.raster.channels.length + c] = math.floor(math.clamp(value, 0.0, target_max) + 0.5) if integer else value
+        return out
+
+    ## Nearest is appropriate for discrete IDs. Bilinear must never filter IDs.
+    pub mutating func resize(width: usize, height: usize, resample: str = "nearest") -> interop.Reference[Image]!:
+        try self.load()
+        if resample != "nearest" and resample != "bilinear":
+            error(invalid, "resample must be nearest or bilinear")
+        var raster = model.Raster(width = width, height = height, max_bytes = self.raster.max_bytes)
+        errdefer raster.close()
+        for channel in self.raster.channels:
+            try raster.channel(channel.name, channel.kind)
+        try raster.allocate()
+        let nc = raster.channels.length
+        for y in 0..<height:
+            for x in 0..<width:
+                let sx = math.clamp(((f64)x + 0.5) * (f64)self.raster.width / (f64)width - 0.5, 0.0, (f64)(self.raster.width - 1))
+                let sy = math.clamp(((f64)y + 0.5) * (f64)self.raster.height / (f64)height - 0.5, 0.0, (f64)(self.raster.height - 1))
+                for c in 0..<nc:
+                    var value: f64 = 0.0
+                    if resample == "nearest":
+                        value = self.raster.pixels[((usize)math.floor(sy + 0.5) * self.raster.width + (usize)math.floor(sx + 0.5)) * nc + c]
+                    else:
+                        let x0 = (usize)math.floor(sx)
+                        let y0 = (usize)math.floor(sy)
+                        let x1 = x0 + 1 if x0 + 1 < self.raster.width else x0
+                        let y1 = y0 + 1 if y0 + 1 < self.raster.height else y0
+                        let fx = sx - (f64)x0
+                        let fy = sy - (f64)y0
+                        let top = self.raster.pixels[(y0 * self.raster.width + x0) * nc + c] * (1.0 - fx) + self.raster.pixels[(y0 * self.raster.width + x1) * nc + c] * fx
+                        let bottom = self.raster.pixels[(y1 * self.raster.width + x0) * nc + c] * (1.0 - fx) + self.raster.pixels[(y1 * self.raster.width + x1) * nc + c] * fx
+                        value = top * (1.0 - fy) + bottom * fy
+                        if (i64)raster.channels[c].kind <= 3:
+                            value = math.floor(value + 0.5)
+                    raster.pixels[(y * width + x) * nc + c] = value
+        return try Image.own(raster, self.threads)
+
+    pub mutating func close():
+        if self.closed:
+            return
+        self.raster.close()
+        self.closed = true
+
+pub let image_type: interop.Type[Image] = interop.Type[Image]("Image", Image.close, closeable = true)

@@ -1,0 +1,15 @@
+import image
+import strings
+import time
+
+pub func main(arguments: str[]) -> i32!:
+    let threads = strings.parse_u64(arguments[2]) else return 2
+    let opened = time.now()
+    let img = try image.Image.open(arguments[1], threads = (usize)threads)
+    defer img.release()
+    let parsed = time.now()
+    try img.value().load()
+    let decoded = time.now()
+    let used = img.value().workers_used()
+    print(f"{parsed - opened} {decoded - parsed} {used}")
+    return 0

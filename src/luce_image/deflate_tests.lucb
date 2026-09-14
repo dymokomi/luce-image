@@ -1,0 +1,22 @@
+import files
+import memory
+import c
+from luce_image.binary import Buffer
+import luce_image.deflate as deflate
+
+pub func main(arguments: str[]) -> i32!:
+    let raw = try files.read((c.str)arguments[1])
+    defer free(raw)
+    let packed = try files.read((c.str)arguments[2])
+    defer free(packed)
+    let out = try new u8[raw.length]
+    defer free(out)
+    try deflate.inflate(packed, out)
+    assert((str)out == (str)raw)
+    var encoded = Buffer()
+    defer encoded.close()
+    try deflate.compress(raw, &encoded)
+    try deflate.inflate(encoded.view(), out)
+    assert((str)out == (str)raw)
+    try files.write((c.str)arguments[3], encoded.view())
+    return 0

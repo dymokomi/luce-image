@@ -1,0 +1,10 @@
+from image import Image
+
+pub func main(arguments: list[str]) -> int!:
+    if arguments.length != 2:
+        print("usage: convert_image INPUT OUTPUT.png")
+        return 1
+    let source = Image.open(arguments[0], threads = 4)
+    print(source.size())
+    source.convert("RGB").save(arguments[1])
+    return 0

@@ -1,0 +1,5 @@
+Pillow==12.2.0
+numpy==2.5.3
+tifffile==2026.9.9
+imagecodecs==2026.8.16
+OpenEXR==3.4.15

@@ -1,0 +1,62 @@
+## Bounded work stealing over independent chunks; no shared decoder state.
+import thread
+import memory
+from luce_image.model import Raster
+from luce_image.errors import corrupt, invalid
+
+struct Work:
+    var image: Raster*
+    var decode: func(Raster*, usize) -> unit!
+    var count: usize
+    var next: @usize
+    var failed: @bool
+
+struct Worker:
+    var work: Work*
+    var completed: usize
+
+func run(raw: void*?):
+    let worker = (Worker*)(raw else return)
+    let work = worker.work
+    while not work.failed.load(.acquire):
+        let index = work.next.add(1, .relaxed)
+        if index >= work.count:
+            return
+        work.decode(work.image, index) catch failure:
+            work.failed.store(true, .release)
+            return
+        worker.completed += 1
+
+pub func decode(image: Raster*, operation: func(Raster*, usize) -> unit!, threads: usize) -> usize!:
+    if threads < 1 or threads > 64:
+        error(invalid, "thread count must be in 1-64")
+    let count = image.chunks.length
+    let n = threads if threads < count else count
+    if n <= 1:
+        for i in 0..<count:
+            try operation(image, i)
+        return 1
+    var work = Work(image = image, decode = operation, count = count)
+    let workers = try alloc Worker[n] in memory.heap
+    defer free(workers) in memory.heap
+    var handles: thread.Handle[64]
+    var started: usize = 0
+    for i in 0..<n:
+        workers[i] = Worker(work = &work)
+    for i in 1..<n:
+        handles[started] = thread.spawn(run, (void*)&workers[i], name = "luce-image") catch failure:
+            work.failed.store(true, .release)
+            for j in 0..<started:
+                try handles[j].join()
+            error(failure.code, failure.message)
+        started += 1
+    run((void*)&workers[0])
+    for i in 0..<started:
+        try handles[i].join()
+    if work.failed.load(.acquire):
+        error(corrupt, "image chunk decode failed; retry with threads=1 for detailed error")
+    var active: usize = 0
+    for worker in workers:
+        if worker.completed > 0:
+            active += 1
+    return active

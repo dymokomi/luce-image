@@ -1,0 +1,42 @@
+## Cryptomatte 1.2 MurmurHash3_x86_32, seed zero, over UTF-8 bytes.
+import luce_image.binary as binary
+
+func rotate(value: u32, bits: u32) -> u32:
+    return (value << bits) | (value >> (32 - bits))
+
+func mix(value: u32) -> u32:
+    return rotate(value *% 3432918353, 15) *% 461845907
+
+pub func murmur(text: str) -> u32:
+    let data = text.bytes
+    var h: u32 = 0
+    var offset: usize = 0
+    while data.length - offset >= 4:
+        let k = (u32)data[offset] | ((u32)data[offset + 1] << 8) | ((u32)data[offset + 2] << 16) | ((u32)data[offset + 3] << 24)
+        h = rotate(h ^ mix(k), 13) *% 5 +% 3864292196
+        offset += 4
+    var tail: u32 = 0
+    for i in 0..<data.length - offset:
+        tail |= (u32)data[offset + i] << (i * 8)
+    if data.length != offset:
+        h ^= mix(tail)
+    h ^= (u32)data.length
+    h ^= h >> 16
+    h *%= 2246822507
+    h ^= h >> 13
+    h *%= 3266489909
+    h ^= h >> 16
+    return h
+
+pub func safe_bits(value: u32) -> u32:
+    let exponent = (value >> 23) & 255
+    return value ^ 8388608 if exponent == 0 or exponent == 255 else value
+
+pub func identifier(text: str) -> f64:
+    return binary.float_value(safe_bits(murmur(text)))
+
+pub func hexadecimal(value: u32, out: u8[]) -> str:
+    let digits = "0123456789abcdef"
+    for i in 0..<(usize)8:
+        out[i] = digits.bytes[(usize)((value >> ((7 - i) * 4)) & 15)]
+    return (str)out[..<8]

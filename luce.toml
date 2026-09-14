@@ -1,0 +1,7 @@
+[package]
+name = "luce_image"
+source = "src"
+
+[exports]
+image = "luce_image.image"
+cryptomatte = "luce_image.cryptomatte"

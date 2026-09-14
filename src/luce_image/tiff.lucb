@@ -1,0 +1,450 @@
+## TIFF 6.0/BigTIFF directories, strips/tiles, separate planes and predictors.
+import memory
+import math
+import luce_image.binary as binary
+import luce_image.deflate as deflate
+from luce_image.binary import Reader, Buffer
+from luce_image.model import Raster, Chunk, SampleType
+from luce_image.errors import corrupt, unsupported, invalid, limit
+
+struct Field:
+    var data: const u8[]
+    var count: usize
+    var width: usize
+    var little: bool = true
+
+    func at(index: usize, fallback: u64 = 0) -> u64!:
+        if self.count == 0:
+            return fallback
+        if index >= self.count or self.width == 0 or self.width > 8:
+            error(corrupt, "TIFF field index or type invalid")
+        var reader = Reader(data = self.data, position = index * self.width, little = self.little)
+        return try reader.uint(self.width)
+
+func field(image: const Raster*, directory: u64, big: bool, tag: u64) -> Field!:
+    var r = Reader(data = try binary.slice(image.encoded, directory, (u64)image.encoded.length - directory), little = image.little)
+    let count = try r.uint(8 if big else 2)
+    if count > 65536:
+        error(limit, "TIFF directory has too many entries")
+    for i in 0..<(usize)count:
+        let name = try r.uint(2)
+        let kind = try r.uint(2)
+        let items = try r.uint(8 if big else 4)
+        let inline_bytes = try r.take(8 if big else 4)
+        if name == tag:
+            let widths: usize[19] = [0,1,1,2,4,8,1,1,2,4,8,4,8,4,0,0,8,8,8]
+            if kind >= 19 or widths[(usize)kind] == 0:
+                error(unsupported, "unsupported TIFF field type")
+            let width = widths[(usize)kind]
+            let bytes = items *? (u64)width else error(corrupt, "TIFF field extent overflows")
+            var data = inline_bytes[..<0]
+            if bytes <= (u64)inline_bytes.length:
+                data = inline_bytes[..<(usize)bytes]
+            else:
+                var offset_reader = Reader(data = inline_bytes, little = image.little)
+                data = try binary.slice(image.encoded, try offset_reader.uint(inline_bytes.length), bytes)
+            return Field(data, (usize)items, width, image.little)
+    return Field()
+
+func scalar(image: const Raster*, directory: u64, big: bool, tag: u64, fallback: u64) -> u64!:
+    return try (try field(image, directory, big, tag)).at(0, fallback)
+
+pub func probe(image: Raster*) -> !:
+    var r = Reader(data = image.encoded)
+    let order = (str)(try r.take(2))
+    if order != "II" and order != "MM":
+        error(corrupt, "invalid TIFF byte order")
+    image.little = order == "II"
+    r.little = image.little
+    let magic = try r.uint(2)
+    let big = magic == 43
+    if magic != 42 and not big:
+        error(corrupt, "invalid TIFF signature")
+    if big and ((try r.uint(2)) != 8 or (try r.uint(2)) != 0):
+        error(corrupt, "invalid BigTIFF header")
+    var offset = try r.uint(8 if big else 4)
+    var chosen: u64 = 0
+    var visited: u64[4096]
+    var count: usize = 0
+    while offset != 0:
+        if count == visited.length:
+            error(limit, "TIFF exceeds directory limit")
+        for i in 0..<count:
+            if visited[i] == offset:
+                error(corrupt, "cyclic TIFF directory chain")
+        visited[count] = offset
+        if count == image.frame:
+            chosen = offset
+        count += 1
+        var directory = Reader(data = try binary.slice(image.encoded, offset, (u64)image.encoded.length - (offset if offset <= (u64)image.encoded.length else (u64)image.encoded.length)), little = image.little)
+        let entries = try directory.uint(8 if big else 2)
+        if entries > 65536:
+            error(limit, "TIFF directory exceeds entry limit")
+        discard(try directory.take((usize)entries * (20 if big else 12)))
+        offset = try directory.uint(8 if big else 4)
+    if chosen == 0:
+        error(invalid, "TIFF frame out of range")
+    image.frames = count
+    let w = (usize)(try scalar(image, chosen, big, 256, 0))
+    let h = (usize)(try scalar(image, chosen, big, 257, 0))
+    image.width = w
+    image.height = h
+    let samples = (usize)(try scalar(image, chosen, big, 277, 1))
+    if samples < 1 or samples > 4:
+        error(unsupported, "TIFF currently supports one to four samples per pixel")
+    let depths = try field(image, chosen, big, 258)
+    image.bits = (usize)(try depths.at(0, 1))
+    for i in 0..<depths.count:
+        if try depths.at(i) != (u64)image.bits:
+            error(unsupported, "mixed TIFF bit depths")
+    image.photo = try scalar(image, chosen, big, 262, 1)
+    image.compression = try scalar(image, chosen, big, 259, 1)
+    image.planar = try scalar(image, chosen, big, 284, 1)
+    image.predictor = try scalar(image, chosen, big, 317, 1)
+    image.orientation = try scalar(image, chosen, big, 274, 1)
+    let sample_kind = try scalar(image, chosen, big, 339, 1)
+    let bits = image.bits
+    var kind = SampleType.uint8
+    if sample_kind == 1:
+        if bits != 1 and bits != 2 and bits != 4 and bits != 8 and bits != 16 and bits != 32:
+            error(unsupported, "unsupported TIFF integer bit depth")
+        kind = .uint8 if bits <= 8 else .uint16 if bits == 16 else .uint32
+    elif sample_kind == 2 and (bits == 8 or bits == 16 or bits == 32):
+        kind = .int8 if bits == 8 else .int16 if bits == 16 else .int32
+    elif sample_kind == 3 and (bits == 16 or bits == 32 or bits == 64):
+        kind = .float16 if bits == 16 else .float32 if bits == 32 else .float64
+    else:
+        error(unsupported, "unsupported TIFF sample type")
+    if image.photo > 3 or image.planar < 1 or image.planar > 2 or image.orientation < 1 or image.orientation > 8 or (image.photo == 2 and samples < 3):
+        error(unsupported, "unsupported TIFF color or storage layout")
+    if image.predictor < 1 or image.predictor > 3 or (image.predictor == 2 and sample_kind == 3) or (image.predictor == 3 and sample_kind != 3):
+        error(unsupported, "unsupported TIFF predictor/sample combination")
+    if image.compression != 1 and image.compression != 5 and image.compression != 8 and image.compression != 32946 and image.compression != 32773:
+        error(unsupported, "unsupported TIFF compression")
+    if (try scalar(image, chosen, big, 266, 1)) != 1:
+        error(unsupported, "reversed TIFF fill order is not supported")
+    if image.photo == 3:
+        if samples != 1 or bits > 16 or sample_kind != 1:
+            error(corrupt, "invalid TIFF palette layout")
+        let palette = try field(image, chosen, big, 320)
+        if palette.width != 2 or palette.count != ((usize)1 << bits) * 3:
+            error(corrupt, "invalid TIFF color map")
+        image.palette = palette.data
+        try image.standard(3, .uint16)
+    else:
+        try image.standard(samples, kind)
+    if image.orientation >= 5:
+        image.width = h
+        image.height = w
+    discard(try image.validate())
+    let tiled = (try scalar(image, chosen, big, 322, 0)) != 0
+    let tw = (usize)(try scalar(image, chosen, big, 322, (u64)w))
+    var th = (usize)(try scalar(image, chosen, big, 323 if tiled else 278, (u64)h))
+    if not tiled and th > h:
+        th = h
+    if tw == 0 or th == 0 or tw > 1000000 or th > 1000000:
+        error(corrupt, "invalid TIFF chunk dimensions")
+    let across = (w + tw - 1) // tw
+    let down = (h + th - 1) // th
+    let planes = samples if image.planar == 2 else 1
+    let total = across * down * planes
+    let offsets = try field(image, chosen, big, 324 if tiled else 273)
+    let sizes = try field(image, chosen, big, 325 if tiled else 279)
+    if offsets.count != total or sizes.count != total or total > image.max_bytes // sizeof(Chunk):
+        error(corrupt, "invalid TIFF chunk table")
+    image.chunks = try new Chunk[total] in memory.heap
+    for index in 0..<total:
+        let start = try offsets.at(index)
+        let size = try sizes.at(index)
+        discard(try binary.slice(image.encoded, start, size))
+        let local_index = index % (across * down)
+        let y = local_index // across * th
+        image.chunks[index] = Chunk(start, size, local_index % across * tw, y, tw, th if tiled else (h - y if h - y < th else th), index // (across * down))
+    let description = try field(image, chosen, big, 270)
+    if description.count > 0:
+        let data = description.data
+        try image.attribute("description", "string", data[..<data.length - 1] if data[data.length - 1] == 0 else data)
+    image.file_format = "TIFF"
+
+func packbits(data: const u8[], out: u8[]) -> !:
+    var r = Reader(data = data)
+    var used: usize = 0
+    while r.position < data.length:
+        let code = try r.byte()
+        if code <= 127:
+            let count = (usize)code + 1
+            if count > out.length - used:
+                error(corrupt, "PackBits literal exceeds chunk")
+            memory.copy(out[used..], try r.take(count), count)
+            used += count
+        elif code > 128:
+            let count = 257 - (usize)code
+            if count > out.length - used:
+                error(corrupt, "PackBits run exceeds chunk")
+            let value = try r.byte()
+            for i in 0..<count:
+                out[used] = value
+                used += 1
+    if used != out.length:
+        error(corrupt, "PackBits chunk has incorrect length")
+
+func lzw(data: const u8[], out: u8[]) -> !:
+    var prefix: u16[4096]
+    var suffix: u8[4096]
+    var stack: u8[4096]
+    var bit: usize = 0
+    var width: usize = 9
+    var next: usize = 258
+    var previous: usize = 4096
+    var first: u8 = 0
+    var used: usize = 0
+    while true:
+        if bit + width > data.length * 8:
+            error(corrupt, "truncated TIFF LZW")
+        var code: usize = 0
+        for i in 0..<width:
+            code = (code << 1) | (usize)((data[bit // 8] >> (7 - bit % 8)) & 1)
+            bit += 1
+        if code == 256:
+            width = 9
+            next = 258
+            previous = 4096
+            continue
+        if code == 257:
+            break
+        let original = code
+        var count: usize = 0
+        if code == next and previous != 4096:
+            stack[count] = first
+            count += 1
+            code = previous
+        elif code >= next:
+            error(corrupt, "invalid TIFF LZW code")
+        while code >= 258:
+            if code >= next or count == stack.length:
+                error(corrupt, "invalid TIFF LZW dictionary chain")
+            stack[count] = suffix[code]
+            count += 1
+            code = (usize)prefix[code]
+        if code > 255 or count == stack.length:
+            error(corrupt, "invalid TIFF LZW literal")
+        first = (u8)code
+        stack[count] = first
+        count += 1
+        if count > out.length - used:
+            error(corrupt, "TIFF LZW exceeds chunk")
+        while count > 0:
+            count -= 1
+            out[used] = stack[count]
+            used += 1
+        if previous != 4096 and next < 4096:
+            prefix[next] = (u16)previous
+            suffix[next] = first
+            next += 1
+            if next == ((usize)1 << width) - 1 and width < 12:
+                width += 1
+        previous = original
+    if used != out.length:
+        error(corrupt, "TIFF LZW chunk has incorrect length")
+
+func number(value: u64, kind: SampleType) -> f64:
+    if kind == .float16:
+        return binary.half((u16)value)
+    if kind == .float32:
+        return binary.float_value((u32)value)
+    if kind == .float64:
+        return binary.double_value(value)
+    if kind == .int8:
+        return (f64)(i8)value
+    if kind == .int16:
+        return (f64)(i16)value
+    if kind == .int32:
+        return (f64)(i32)value
+    return (f64)value
+
+pub func decode_chunk(image: Raster*, index: usize) -> !:
+    let chunk = image.chunks[index]
+    let nc: usize = 1 if image.photo == 3 else image.channels.length
+    let stride: usize = 1 if image.planar == 2 else nc
+    let rowbytes = (chunk.width * stride * image.bits + 7) // 8
+    if chunk.height > image.max_bytes // rowbytes:
+        error(limit, "TIFF decoded chunk exceeds byte limit")
+    let raw = try alloc u8[rowbytes * chunk.height] in memory.heap
+    defer free(raw) in memory.heap
+    let data = try binary.slice(image.encoded, chunk.offset, chunk.size)
+    if image.compression == 1:
+        if data.length != raw.length:
+            error(corrupt, "uncompressed TIFF chunk length mismatch")
+        memory.copy(raw, data, raw.length)
+    elif image.compression == 5:
+        try lzw(data, raw)
+    elif image.compression == 32773:
+        try packbits(data, raw)
+    else:
+        try deflate.inflate(data, raw)
+    let source_width = image.height if image.orientation >= 5 else image.width
+    let source_height = image.width if image.orientation >= 5 else image.height
+    let cols = source_width - chunk.x if source_width - chunk.x < chunk.width else chunk.width
+    let rows = source_height - chunk.y if source_height - chunk.y < chunk.height else chunk.height
+    let kind = image.channels[0].kind
+    let mask: u64 = 18446744073709551615 if image.bits == 64 else ((u64)1 << image.bits) - 1
+    let temporary = try alloc u8[rowbytes if image.predictor == 3 else 0] in memory.heap
+    defer free(temporary) in memory.heap
+    for y in 0..<rows:
+        let row = raw[y * rowbytes..<(y + 1) * rowbytes]
+        if image.predictor == 3:
+            for i in stride..<rowbytes:
+                row[i] +%= row[i - stride]
+            let samples = chunk.width * stride
+            let bytes = image.bits // 8
+            for i in 0..<samples:
+                for b in 0..<bytes:
+                    temporary[i * bytes + (bytes - 1 - b if image.little else b)] = row[b * samples + i]
+            memory.copy(row, temporary, rowbytes)
+        var previous: u64[4]
+        for x in 0..<cols:
+            let sx = chunk.x + x
+            let sy = chunk.y + y
+            var dx = sx
+            var dy = sy
+            let o = image.orientation
+            if o == 2 or o == 3:
+                dx = source_width - 1 - sx
+            if o == 3 or o == 4:
+                dy = source_height - 1 - sy
+            if o >= 5:
+                dx = source_height - 1 - sy if o == 6 or o == 7 else sy
+                dy = source_width - 1 - sx if o == 7 or o == 8 else sx
+            let target = (dy * image.width + dx) * image.channels.length
+            for c in 0..<stride:
+                let sample_index = x * stride + c
+                var value: u64 = 0
+                if image.bits < 8:
+                    value = ((u64)row[sample_index * image.bits // 8] >> (8 - image.bits - sample_index * image.bits % 8)) & mask
+                else:
+                    var reader = Reader(data = row, position = sample_index * (image.bits // 8), little = image.little)
+                    value = try reader.uint(image.bits // 8)
+                if image.predictor == 2:
+                    value = (value +% previous[c]) & mask
+                    previous[c] = value
+                if image.photo == 3:
+                    for color in 0..<(usize)3:
+                        var palette = Reader(data = image.palette, position = (color * ((usize)1 << image.bits) + (usize)value) * 2, little = image.little)
+                        image.pixels[target + color] = (f64)(try palette.uint(2))
+                else:
+                    let channel = chunk.plane if image.planar == 2 else c
+                    var result = number(value, kind)
+                    if image.bits < 8:
+                        result = result * 255.0 / (f64)mask
+                    if image.photo == 0 and channel == 0:
+                        result = (255.0 if image.bits <= 8 else (f64)mask if (i64)kind <= 3 else 1.0) - result
+                    image.pixels[target + channel] = result
+
+func entry(output: Buffer*, tag: u64, kind: u64, count: u64, value: u64, big: bool) -> !:
+    try output.uint(tag, 2)
+    try output.uint(kind, 2)
+    try output.uint(count, 8 if big else 4)
+    try output.uint(value, 8 if big else 4)
+
+## Deterministic strip/tile writer. Compression is none or pure-Base DEFLATE.
+pub func encode(image: const Raster*, output: Buffer*, compression: str = "zip", tile: usize = 0, big: bool = false) -> !:
+    let nc = image.channels.length
+    let kind = image.channels[0].kind
+    if nc > 4 or (compression != "zip" and compression != "deflate" and compression != "none"):
+        error(unsupported, "TIFF writer supports 1-4 channels and none/deflate compression")
+    for channel in image.channels:
+        if channel.kind != kind:
+            error(unsupported, "TIFF requires matching channel types")
+    if tile != 0 and (tile < 16 or tile > 4096 or tile % 16 != 0):
+        error(invalid, "TIFF tile size must be a multiple of 16 in 16-4096")
+    let bits: usize = 8 if kind == .uint8 or kind == .int8 else 16 if kind == .uint16 or kind == .float16 or kind == .int16 else 64 if kind == .float64 else 32
+    let sample_kind: u64 = 3 if kind == .float16 or kind == .float32 or kind == .float64 else 2 if (i64)kind >= 7 else 1
+    let tw = tile if tile > 0 else image.width
+    let th = tile if tile > 0 else (64 if image.height > 64 else image.height)
+    let across = (image.width + tw - 1) // tw
+    let down = (image.height + th - 1) // th
+    let chunks = across * down
+    let offsets = try new u64[chunks] in memory.heap
+    defer free(offsets) in memory.heap
+    let sizes = try new u64[chunks] in memory.heap
+    defer free(sizes) in memory.heap
+    try output.text("II")
+    try output.uint(43 if big else 42, 2)
+    if big:
+        try output.uint(8, 2)
+        try output.uint(0, 2)
+    let directory_pointer = output.used
+    try output.uint(0, 8 if big else 4)
+    for index in 0..<chunks:
+        let x0 = index % across * tw
+        let y0 = index // across * th
+        let rows = th if tile > 0 else (image.height - y0 if image.height - y0 < th else th)
+        var raw = Buffer(maximum = image.max_bytes)
+        defer raw.close()
+        for y in 0..<rows:
+            for x in 0..<tw:
+                for c in 0..<nc:
+                    let value = image.pixels[((y0 + y) * image.width + x0 + x) * nc + c] if x0 + x < image.width and y0 + y < image.height else 0.0
+                    var encoded: u64 = 0
+                    if kind == .float16:
+                        encoded = (u64)binary.to_half(value)
+                    elif kind == .float32:
+                        encoded = (u64)binary.float_bits(value)
+                    elif kind == .float64:
+                        encoded = binary.double_bits(value)
+                    else:
+                        let lo = -(f64)((u64)1 << (bits - 1)) if sample_kind == 2 else 0.0
+                        let hi = (f64)(((u64)1 << (bits - 1)) - 1) if sample_kind == 2 else (f64)(((u64)1 << bits) - 1)
+                        if not math.is_finite(value) or value < lo or value > hi or math.floor(value) != value:
+                            error(invalid, "TIFF integer sample out of range")
+                        encoded = (u64)(i64)value if sample_kind == 2 else (u64)value
+                    try raw.uint(encoded, bits // 8)
+        offsets[index] = (u64)output.used
+        if compression == "none":
+            try output.put(raw.view())
+        else:
+            try deflate.compress(raw.view(), output)
+        sizes[index] = (u64)output.used - offsets[index]
+    let slot: usize = 8 if big else 4
+    let offsets_at = (u64)output.used
+    for value in offsets:
+        try output.uint(value, slot)
+    let sizes_at = (u64)output.used
+    for value in sizes:
+        try output.uint(value, slot)
+    let depths_at = (u64)output.used
+    for c in 0..<nc:
+        try output.uint((u64)bits, 2)
+    var depth_value = depths_at
+    if nc * 2 <= slot:
+        depth_value = 0
+        for c in 0..<nc:
+            depth_value |= (u64)bits << (16 * c)
+    let directory = (u64)output.used
+    for i in 0..<slot:
+        output.data[directory_pointer + i] = (u8)(directory >> (8 * i))
+    let entries: u64 = 13 + (1 if nc == 2 or nc == 4 else 0) + (1 if tile > 0 else 0)
+    try output.uint(entries, 8 if big else 2)
+    try entry(output, 256, 4, 1, (u64)image.width, big)
+    try entry(output, 257, 4, 1, (u64)image.height, big)
+    try entry(output, 258, 3, (u64)nc, depth_value, big)
+    try entry(output, 259, 3, 1, 1 if compression == "none" else 8, big)
+    try entry(output, 262, 3, 1, 2 if nc >= 3 else 1, big)
+    if tile == 0:
+        try entry(output, 273, 16 if big else 4, (u64)chunks, offsets[0] if chunks == 1 else offsets_at, big)
+    try entry(output, 274, 3, 1, 1, big)
+    try entry(output, 277, 3, 1, (u64)nc, big)
+    if tile == 0:
+        try entry(output, 278, 4, 1, (u64)th, big)
+        try entry(output, 279, 16 if big else 4, (u64)chunks, sizes[0] if chunks == 1 else sizes_at, big)
+    try entry(output, 284, 3, 1, 1, big)
+    try entry(output, 317, 3, 1, 1, big)
+    if tile > 0:
+        try entry(output, 322, 4, 1, (u64)tw, big)
+        try entry(output, 323, 4, 1, (u64)th, big)
+        try entry(output, 324, 16 if big else 4, (u64)chunks, offsets[0] if chunks == 1 else offsets_at, big)
+        try entry(output, 325, 16 if big else 4, (u64)chunks, sizes[0] if chunks == 1 else sizes_at, big)
+    if nc == 2 or nc == 4:
+        try entry(output, 338, 3, 1, 2, big)
+    try entry(output, 339, 3, 1, sample_kind, big)
+    try output.uint(0, slot)

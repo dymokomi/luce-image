@@ -1,0 +1,29 @@
+from image import Image
+
+pub func main(arguments: list[str]) -> int!:
+    for name in ["pages.tif", "parts.exr"]:
+        let image = Image.open(arguments[0] + "/" + name, max_pixels = 35)
+        assert(image.n_frames() == 2)
+        assert(image.getpixel(0, 0).r == 10.0)
+        var refused = false
+        image.seek(1) catch:
+            refused = true
+        assert(refused)
+        assert(image.tell() == 0)
+        assert(image.getpixel(0, 0).r == 10.0)
+        let unlimited = Image.open(arguments[0] + "/" + name, frame = 1)
+        assert(unlimited.tell() == 1)
+        assert(unlimited.size() == (13, 9))
+        assert(unlimited.getpixel(0, 0).r == 20.0)
+        unlimited.seek(0)
+        assert(unlimited.size() == (7, 5))
+        assert(unlimited.getpixel(0, 0).r == 10.0)
+        unlimited.seek(1)
+        assert(unlimited.getpixel(0, 0).r == 20.0)
+        refused = false
+        unlimited.seek(2) catch:
+            refused = true
+        assert(refused)
+        assert(unlimited.tell() == 1)
+    print("PASS TIFF pages and EXR parts, transactional seek and retained limits")
+    return 0

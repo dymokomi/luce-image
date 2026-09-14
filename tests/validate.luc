@@ -1,0 +1,8 @@
+from image import Image
+
+pub func main(arguments: list[str]) -> int!:
+    let image = Image.open(arguments[0], threads = 4, max_bytes = 16777216, max_pixels = 1048576) catch:
+        return 2
+    image.load() catch:
+        return 2
+    return 0

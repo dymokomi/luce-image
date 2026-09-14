@@ -1,0 +1,54 @@
+from image import Image, Pixel
+
+pub func main(arguments: list[str]) -> int!:
+    let image = Image.create("RGB", 37, 131, color = Pixel(10.0, 20.0, 30.0))
+    image.putpixel(3, 4, Pixel(200.0, 100.0, 50.0))
+    assert(image.size() == (37, 131))
+    let copy = image.copy()
+    copy.putpixel(3, 4, Pixel(1.0, 2.0, 3.0))
+    assert(image.getpixel(3, 4).r == 200.0)
+    image.save(arguments[0] + "/api.png")
+    let opened = Image.open(arguments[0] + "/api.png")
+    assert(not opened.is_loaded())
+    assert(opened.getpixel(3, 4).r == 200.0)
+    let crop = image.crop(3, 4, 5, 7)
+    assert(crop.size() == (2, 3))
+    let scaled = image.resize(19, 66, resample = "bilinear")
+    assert(scaled.size() == (19, 66))
+    let float_image = image.convert("RGBF")
+    float_image.save(arguments[0] + "/api.exr")
+    let exr = Image.open(arguments[0] + "/api.exr", threads = 4)
+    assert(exr.channel_count() == 3)
+    assert(exr.getpixel(3, 4).r > 0.78)
+    image.save(arguments[0] + "/api.tif", tile = 16)
+    let tiff = Image.open(arguments[0] + "/api.tif", threads = 4)
+    assert(tiff.getpixel(3, 4).r == 200.0)
+    assert(tiff.workers_used() > 1)
+    image.save(arguments[0] + "/api.jpg", quality = 95)
+    let jpeg = Image.open(arguments[0] + "/api.jpg")
+    assert(jpeg.size() == image.size())
+    var refused = false
+    image.save(arguments[0] + "/api.png", file_format = "jpg", quality = 0) catch:
+        refused = true
+    assert(refused)
+    assert(Image.open(arguments[0] + "/api.png").getpixel(3, 4).r == 200.0)
+    refused = false
+    let limited = Image.open(arguments[0] + "/api.png", max_bytes = 16) catch:
+        refused = true
+        recover image
+    assert(refused)
+    refused = false
+    let invalid_size = image.resize(0, 1) catch:
+        refused = true
+        recover image
+    assert(refused)
+    let alias = image
+    image.close()
+    alias.close()
+    var failed = false
+    let ignored = alias.width() catch:
+        failed = true
+        recover 0
+    assert(failed)
+    print("PASS Luce Image ownership, operations and four codecs")
+    return 0

@@ -1,0 +1,165 @@
+import memory
+import strings
+from luce_image.errors import invalid, corrupt, limit
+from luce_image.binary import Buffer
+
+## Integer channels use their integer units. Floating channels are scene-linear
+## values with no automatic gamma or alpha operation. f64 storage preserves all
+## UINT32, HALF, FLOAT and DOUBLE source values (including Cryptomatte IDs).
+pub enum SampleType as i64:
+    uint8 = 1
+    uint16 = 2
+    uint32 = 3
+    float16 = 4
+    float32 = 5
+    float64 = 6
+    int8 = 7
+    int16 = 8
+    int32 = 9
+
+pub struct Channel:
+    pub var name: str
+    pub var kind: SampleType
+
+pub struct Attribute:
+    pub var name: str
+    pub var type_name: str
+    pub var data: u8[]
+
+pub struct Chunk:
+    pub var offset: u64
+    pub var size: u64
+    pub var x: usize
+    pub var y: usize
+    pub var width: usize
+    pub var height: usize
+    pub var plane: usize
+
+pub struct Raster:
+    pub var width: usize
+    pub var height: usize
+    pub var xmin: i64
+    pub var ymin: i64
+    pub var channels: Channel[]
+    pub var attributes: Attribute[]
+    pub var chunks: Chunk[]
+    pub var encoded: u8[]
+    pub var pixels: f64[]
+    pub var path: str
+    pub var file_format: str
+    pub var frames: usize = 1
+    pub var frame: usize
+    pub var max_bytes: usize = 1073741824
+    pub var max_pixels: usize = 268435456
+    pub var compression: u64
+    pub var bits: usize = 8
+    pub var photo: u64
+    pub var planar: u64 = 1
+    pub var predictor: u64 = 1
+    pub var orientation: u64 = 1
+    pub var little: bool = true
+    pub var interlaced: bool
+    pub var palette: const u8[]
+    pub var transparency: const u8[]
+
+    pub func validate() -> usize!:
+        if self.width == 0 or self.height == 0 or self.width > 1000000 or self.height > 1000000 or self.channels.length == 0 or self.channels.length > 1024:
+            error(invalid, "invalid dimensions or channel count")
+        let pixels = self.width *? self.height else error(limit, "image size overflows")
+        if pixels > self.max_pixels or pixels > self.max_bytes // 8 // self.channels.length:
+            error(limit, "image exceeds configured pixel or byte limit")
+        return pixels * self.channels.length
+
+    pub mutating func allocate() -> !:
+        let count = try self.validate()
+        if self.pixels.length != 0:
+            error(invalid, "pixels already allocated")
+        self.pixels = try new f64[count] in memory.heap
+
+    pub mutating func channel(name: str, kind: SampleType) -> !:
+        if name.length == 0 or name.length > 255 or strings.contains(name, "\0") or self.channels.length >= 1024:
+            error(invalid, "invalid channel name or excessive channel count")
+        for item in self.channels:
+            if item.name == name:
+                error(invalid, "duplicate channel")
+        with memory.heap:
+            let copied = try strings.copy(name)
+            errdefer strings.release(copied)
+            let next = try alloc Channel[self.channels.length + 1]
+            for i in 0..<self.channels.length:
+                next[i] = self.channels[i]
+            next[self.channels.length] = Channel(copied, kind)
+            if self.channels.length > 0:
+                free(self.channels)
+            self.channels = next
+
+    pub mutating func standard(count: usize, kind: SampleType) -> !:
+        let rgb: str[4] = ["R", "G", "B", "A"]
+        if count == 0 or count > 4:
+            error(invalid, "unsupported standard channel count")
+        for c in 0..<count:
+            try self.channel(("Y" if c == 0 else "A") if count < 3 else rgb[c], kind)
+
+    pub mutating func attribute(name: str, type_name: str, data: const u8[]) -> !:
+        if name.length == 0 or name.length > 255 or type_name.length > 255 or data.length > 67108864 or self.attributes.length >= 65536:
+            error(limit, "metadata exceeds limit")
+        with memory.heap:
+            let bytes = try alloc u8[data.length]
+            errdefer free(bytes)
+            memory.copy(bytes, data, data.length)
+            for i in 0..<self.attributes.length:
+                if self.attributes[i].name == name:
+                    let kind = try strings.copy(type_name)
+                    strings.release(self.attributes[i].type_name)
+                    free(self.attributes[i].data)
+                    self.attributes[i].data = bytes
+                    self.attributes[i].type_name = kind
+                    return
+            let key = try strings.copy(name)
+            errdefer strings.release(key)
+            let kind = try strings.copy(type_name)
+            errdefer strings.release(kind)
+            let next = try alloc Attribute[self.attributes.length + 1]
+            for i in 0..<self.attributes.length:
+                next[i] = self.attributes[i]
+            next[self.attributes.length] = Attribute(key, kind, bytes)
+            if self.attributes.length > 0:
+                free(self.attributes)
+            self.attributes = next
+
+    pub func get(name: str) -> str:
+        for entry in self.attributes:
+            if entry.name == name:
+                return (str)entry.data
+        return ""
+
+    pub func find_channel(name: str) -> usize!:
+        for c in 0..<self.channels.length:
+            if self.channels[c].name == name:
+                return c
+        error(invalid, "channel not found")
+
+    pub mutating func close():
+        with memory.heap:
+            for entry in self.channels:
+                strings.release(entry.name)
+            for entry in self.attributes:
+                strings.release(entry.name)
+                strings.release(entry.type_name)
+                free(entry.data)
+            if self.channels.length > 0:
+                free(self.channels)
+            if self.attributes.length > 0:
+                free(self.attributes)
+            if self.chunks.length > 0:
+                free(self.chunks)
+            if self.encoded.length > 0:
+                free(self.encoded)
+            if self.pixels.length > 0:
+                free(self.pixels)
+            if self.path.length > 0:
+                strings.release(self.path)
+        self = Raster()
+
+pub func maximum(kind: SampleType) -> f64:
+    return 255.0 if kind == .uint8 else 65535.0 if kind == .uint16 else 4294967295.0 if kind == .uint32 else 1.0

@@ -1,0 +1,56 @@
+import files
+import memory
+import c
+import strings
+import luce_image.png as png
+import luce_image.tiff as tiff
+import luce_image.exr as exr
+import luce_image.jpeg as jpeg
+from luce_image.model import Raster
+from luce_image.binary import Buffer, double_bits
+
+pub func main(arguments: str[]) -> i32!:
+    var raster = Raster()
+    defer raster.close()
+    raster.encoded = try files.read((c.str)arguments[1])
+    if arguments.length > 5:
+        raster.frame = (usize)(strings.parse_u64(arguments[5]) else 0)
+    if raster.encoded[0] == 137:
+        try png.probe(&raster)
+        try raster.allocate()
+        try png.decode(&raster)
+    elif raster.encoded[0] == 255:
+        try jpeg.probe(&raster)
+        try raster.allocate()
+        try jpeg.decode(&raster)
+    elif raster.encoded[0] == 118:
+        try exr.probe(&raster)
+        try raster.allocate()
+        for i in 0..<raster.chunks.length:
+            try exr.decode_chunk(&raster, i)
+    else:
+        try tiff.probe(&raster)
+        try raster.allocate()
+        for i in 0..<raster.chunks.length:
+            try tiff.decode_chunk(&raster, i)
+    var raw = Buffer()
+    defer raw.close()
+    try raw.uint((u64)raster.width, 4)
+    try raw.uint((u64)raster.height, 4)
+    try raw.uint((u64)raster.channels.length, 4)
+    for value in raster.pixels:
+        try raw.uint(double_bits(value), 8)
+    try files.write((c.str)arguments[2], raw.view())
+    var encoded = Buffer()
+    defer encoded.close()
+    if arguments[3] == "png":
+        try png.encode(&raster, &encoded)
+    elif arguments[3] == "jpg":
+        try jpeg.encode(&raster, &encoded, quality = 95)
+    elif arguments[3] == "exr" or arguments[3] == "exrtile" or arguments[3] == "piz" or arguments[3] == "piztile" or arguments[3] == "rle" or arguments[3] == "zips" or arguments[3] == "none":
+        let compression = "piz" if arguments[3] == "piz" or arguments[3] == "piztile" else arguments[3] if arguments[3] == "rle" or arguments[3] == "zips" or arguments[3] == "none" else "zip"
+        try exr.encode(&raster, &encoded, compression = compression, tile = 16 if arguments[3] == "exrtile" or arguments[3] == "piztile" else 0)
+    else:
+        try tiff.encode(&raster, &encoded, tile = 16 if arguments[3] == "tile" else 0, big = arguments[3] == "big")
+    try files.write((c.str)arguments[4], encoded.view())
+    return 0

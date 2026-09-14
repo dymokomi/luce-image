@@ -1,0 +1,198 @@
+## Bounded, strict JSON object parser for Cryptomatte manifests.
+import memory
+import strings
+import utf8
+import luce_image.crypto_hash as hashing
+from luce_image.binary import Reader, Buffer
+from luce_image.errors import corrupt, invalid, limit
+
+pub struct Entry:
+    pub var name: str
+    pub var bits: u32
+    var next: usize
+
+pub struct Manifest:
+    pub var entries: Entry[]
+    pub var count: usize
+    var buckets: usize[]
+
+    pub func find(name: str) -> usize?:
+        if self.buckets.length == 0:
+            return none
+        var index = self.buckets[(usize)(hashing.murmur(name) & 65535)]
+        while index > 0:
+            let entry = self.entries[index - 1]
+            if entry.name == name:
+                return index - 1
+            index = entry.next
+        return none
+
+    pub mutating func add(name: str, bits: u32) -> !:
+        if self.find(name) != none:
+            error(invalid, "duplicate manifest name")
+        if self.count >= 1048576 or name.length > 1048576 or not utf8.valid(name.bytes):
+            error(limit, "manifest name, encoding or entry count exceeds limits")
+        with memory.heap:
+            if self.buckets.length == 0:
+                self.buckets = try new usize[65536]
+            if self.count == self.entries.length:
+                let grown = try new Entry[64 if self.count == 0 else self.count * 2]
+                for i in 0..<self.count:
+                    grown[i] = self.entries[i]
+                if self.entries.length > 0:
+                    free(self.entries)
+                self.entries = grown
+            let copied = try strings.copy(name)
+            let bucket = (usize)(hashing.murmur(name) & 65535)
+            self.entries[self.count] = Entry(copied, bits, self.buckets[bucket])
+            self.count += 1
+            self.buckets[bucket] = self.count
+
+    pub mutating func ensure(name: str) -> u32!:
+        if let index = self.find(name):
+            return self.entries[index].bits
+        let bits = hashing.murmur(name)
+        try self.add(name, bits)
+        return bits
+
+    pub func resolve(name: str) -> u32:
+        if let index = self.find(name):
+            return hashing.safe_bits(self.entries[index].bits)
+        return hashing.safe_bits(hashing.murmur(name))
+
+    pub func name_for(bits: u32) -> str:
+        for i in 0..<self.count:
+            if hashing.safe_bits(self.entries[i].bits) == bits:
+                return self.entries[i].name
+        return ""
+
+    pub mutating func parse(text: str) -> !:
+        if self.count != 0 or text.length > 67108864:
+            error(invalid, "manifest parser requires empty storage and at most 64 MiB")
+        var r = Reader(data = text.bytes)
+        skip(&r)
+        if try r.byte() != '{':
+            error(corrupt, "manifest must be a JSON object")
+        skip(&r)
+        if r.position < r.data.length and r.data[r.position] == '}':
+            r.position += 1
+        else:
+            while true:
+                var name = Buffer(maximum = 1048576)
+                defer name.close()
+                try string(&r, &name)
+                skip(&r)
+                if try r.byte() != ':':
+                    error(corrupt, "manifest member has no colon")
+                skip(&r)
+                var value = Buffer(maximum = 32)
+                defer value.close()
+                try string(&r, &value)
+                if value.used != 8:
+                    error(corrupt, "manifest ID must have eight hex digits")
+                var bits: u32 = 0
+                for byte in value.view():
+                    bits = (bits << 4) | (try hex_digit(byte))
+                try self.add((str)name.view(), bits)
+                skip(&r)
+                let next = try r.byte()
+                if next == '}':
+                    break
+                if next != ',':
+                    error(corrupt, "manifest member separator invalid")
+                skip(&r)
+        skip(&r)
+        if r.position != r.data.length:
+            error(corrupt, "trailing data after manifest")
+
+    pub func encode(output: Buffer*) -> !:
+        try output.byte('{')
+        for i in 0..<self.count:
+            if i > 0:
+                try output.byte(',')
+            try quote(self.entries[i].name, output)
+            try output.byte(':')
+            var digits_buffer: u8[8]
+            try quote(hashing.hexadecimal(self.entries[i].bits, digits_buffer), output)
+        try output.byte('}')
+
+    pub mutating func close():
+        with memory.heap:
+            for i in 0..<self.count:
+                strings.release(self.entries[i].name)
+            if self.entries.length > 0:
+                free(self.entries)
+            if self.buckets.length > 0:
+                free(self.buckets)
+        self = Manifest()
+
+func skip(r: Reader*):
+    while r.position < r.data.length:
+        let b = r.data[r.position]
+        if b != ' ' and b != '\t' and b != '\n' and b != '\r':
+            return
+        r.position += 1
+
+func hex_digit(byte: u8) -> u32!:
+    if byte >= '0' and byte <= '9':
+        return (u32)(byte - '0')
+    if byte >= 'a' and byte <= 'f':
+        return (u32)(byte - 'a') + 10
+    if byte >= 'A' and byte <= 'F':
+        return (u32)(byte - 'A') + 10
+    error(corrupt, "invalid manifest hexadecimal digit")
+
+func hex4(r: Reader*) -> u32!:
+    var value: u32 = 0
+    for i in 0..<4:
+        value = (value << 4) | (try hex_digit(try r.byte()))
+    return value
+
+func string(r: Reader*, out: Buffer*) -> !:
+    if try r.byte() != '"':
+        error(corrupt, "manifest member must be a JSON string")
+    while true:
+        let b = try r.byte()
+        if b == '"':
+            break
+        if b < 32:
+            error(corrupt, "unescaped control character in JSON string")
+        if b != '\\':
+            try out.byte(b)
+            continue
+        let escaped = try r.byte()
+        if escaped == 'u':
+            var scalar = try hex4(r)
+            if scalar >= 55296 and scalar <= 56319:
+                if try r.byte() != '\\' or try r.byte() != 'u':
+                    error(corrupt, "JSON high surrogate has no low surrogate")
+                let low = try hex4(r)
+                if low < 56320 or low > 57343:
+                    error(corrupt, "invalid JSON low surrogate")
+                scalar = 65536 + ((scalar - 55296) << 10) + low - 56320
+            var encoded: u8[4]
+            let count = utf8.encode(scalar, encoded) else error(corrupt, "invalid Unicode scalar in manifest")
+            try out.put(encoded[..<count])
+        elif escaped == '"' or escaped == '\\' or escaped == '/':
+            try out.byte(escaped)
+        elif escaped == 'b' or escaped == 'f' or escaped == 'n' or escaped == 'r' or escaped == 't':
+            try out.byte(8 if escaped == 'b' else 12 if escaped == 'f' else 10 if escaped == 'n' else 13 if escaped == 'r' else 9)
+        else:
+            error(corrupt, "invalid JSON escape")
+    if not utf8.valid(out.view()):
+        error(corrupt, "manifest string is not UTF-8")
+
+func quote(text: str, output: Buffer*) -> !:
+    try output.byte('"')
+    let digits = "0123456789abcdef"
+    for b in text.bytes:
+        if b == '"' or b == '\\':
+            try output.byte('\\')
+            try output.byte(b)
+        elif b < 32:
+            try output.text("\\u00")
+            try output.byte(digits.bytes[b >> 4])
+            try output.byte(digits.bytes[b & 15])
+        else:
+            try output.byte(b)
+    try output.byte('"')

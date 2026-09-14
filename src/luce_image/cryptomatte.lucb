@@ -1,0 +1,449 @@
+## Cryptomatte 1.2: metadata, embedded/sidecar manifests, extraction and encoding.
+import c as c_api
+import files
+import paths
+import memory
+import strings
+import math
+import interop
+import ownership
+import luce_image.crypto_hash as hashing
+import luce_image.binary as binary
+from luce_image.binary import Buffer
+from luce_image.manifest import Manifest
+from luce_image.image import Image, SampleType
+from luce_image.errors import invalid, corrupt, unsupported, limit
+
+pub func hash_name(name: str) -> i64:
+    return (i64)hashing.murmur(name)
+
+pub func id_for_name(name: str) -> f64:
+    return hashing.identifier(name)
+
+pub func hash_to_id(value: i64) -> f64!:
+    if value < 0 or value > 4294967295:
+        error(invalid, "Cryptomatte hash must fit uint32")
+    return binary.float_value(hashing.safe_bits((u32)value))
+
+pub func metadata_key(name: str) -> interop.Owned[str]!:
+    var digits: u8[8]
+    let text = hashing.hexadecimal(hashing.murmur(name), digits)
+    return try interop.copy_text((str)text.bytes[..<7])
+
+pub func layer_count(image: interop.Reference[Image]) -> usize!:
+    let native = try image.get()
+    var count: usize = 0
+    for i in 0..<(try native.metadata_count()):
+        let key = try native.metadata_key(i)
+        if strings.starts_with(key, "cryptomatte/") and strings.ends_with(key, "/name"):
+            count += 1
+    return count
+
+pub func layer_name(image: interop.Reference[Image], index: usize) -> str!:
+    let native = try image.get()
+    var count: usize = 0
+    for i in 0..<(try native.metadata_count()):
+        let key = try native.metadata_key(i)
+        if strings.starts_with(key, "cryptomatte/") and strings.ends_with(key, "/name"):
+            if count == index:
+                return try native.metadata(key)
+            count += 1
+    error(invalid, "Cryptomatte layer index out of range")
+
+func channel_name(layer: str, number: usize, suffix: str) -> str!:
+    var digits: u8[32]
+    let text = try strings.format_u64((u64)number, digits)
+    return try strings.join([layer, "0" if number < 10 else "", text, ".", suffix], "")
+
+func metadata(image: Image*, prefix: str, suffix: str) -> str!:
+    let key = try strings.join([prefix, suffix], "")
+    defer strings.release(key)
+    return try image.metadata(key)
+
+func set_metadata(image: Image*, prefix: str, suffix: str, value: str) -> !:
+    let key = try strings.join([prefix, suffix], "")
+    defer strings.release(key)
+    try image.set_metadata(key, value)
+
+func safe_sidecar(name: str) -> !:
+    if name.length == 0 or paths.is_rooted(name) or strings.contains(name, "\\") or strings.contains(name, ":") or strings.contains(name, "\0") or not strings.ends_with(name, ".json"):
+        error(invalid, "invalid Cryptomatte sidecar path")
+    var start: usize = 0
+    for i in 0..<name.length + 1:
+        if i == name.length or name.bytes[i] == '/':
+            let part = (str)name.bytes[start..<i]
+            if part == "." or part == ".." or part.length == 0:
+                error(invalid, "Cryptomatte sidecar must be a relative descendant path")
+            start = i + 1
+
+pub struct Cryptomatte:
+    var source: interop.Reference[Image]?
+    var layer_name: str
+    var prefix: str
+    var manifest: Manifest
+    var indices: usize[]
+
+    pub func init(image: interop.Reference[Image], layer: str, load_sidecar: bool = true) -> !:
+        self.source = none
+        self.layer_name = ""
+        self.prefix = ""
+        self.manifest = Manifest()
+        var empty: usize[]
+        self.indices = empty
+        try self.configure(image, layer, load_sidecar)
+
+    mutating func configure(image: interop.Reference[Image], layer: str, load_sidecar: bool) -> !:
+        self.source = image.clone()
+        errdefer self.close()
+        with memory.heap:
+            self.layer_name = try strings.copy(layer)
+            let native = try image.get()
+            var found = false
+            for i in 0..<(try native.metadata_count()):
+                let key = try native.metadata_key(i)
+                if strings.starts_with(key, "cryptomatte/") and strings.ends_with(key, "/name") and (try native.metadata(key)) == layer:
+                    if found or key.length <= 17 or key.length > 24:
+                        error(corrupt, "invalid or ambiguous Cryptomatte metadata key")
+                    self.prefix = try strings.copy((str)key.bytes[..<key.length - 4])
+                    found = true
+            if not found:
+                error(invalid, "Cryptomatte layer not found")
+            if (try metadata(native, self.prefix, "hash")) != "MurmurHash3_32" or (try metadata(native, self.prefix, "conversion")) != "uint32_to_float32":
+                error(unsupported, "unsupported Cryptomatte hash or conversion")
+            var maximum: usize = 0
+            var has_channels = false
+            for i in 0..<(try native.channel_count()):
+                let name = try native.channel_name(i)
+                if not strings.starts_with(name, layer) or name.length <= layer.length + 3:
+                    continue
+                let tail = (str)name.bytes[layer.length..]
+                let dot = strings.find_last(tail, ".") else continue
+                if dot < 2:
+                    continue
+                let suffix = (str)tail.bytes[dot + 1..]
+                if suffix != "R" and suffix != "G" and suffix != "B" and suffix != "A" and suffix != "r" and suffix != "g" and suffix != "b" and suffix != "a" and suffix != "red" and suffix != "green" and suffix != "blue" and suffix != "alpha":
+                    continue
+                let number = strings.parse_u64((str)tail.bytes[..<dot]) else continue
+                if number > 511:
+                    error(limit, "Cryptomatte channel set exceeds rank limit")
+                maximum = (usize)number if (usize)number > maximum else maximum
+                has_channels = true
+            if not has_channels:
+                error(corrupt, "Cryptomatte layer has no ranked channels")
+            self.indices = try new usize[(maximum + 1) * 4]
+            let upper: str[4] = ["R", "G", "B", "A"]
+            let lower: str[4] = ["r", "g", "b", "a"]
+            let full: str[4] = ["red", "green", "blue", "alpha"]
+            for rank in 0..<maximum + 1:
+                for color in 0..<(usize)4:
+                    let name = try channel_name(layer, rank, upper[color])
+                    defer strings.release(name)
+                    let lower_name = try channel_name(layer, rank, lower[color])
+                    defer strings.release(lower_name)
+                    let full_name = try channel_name(layer, rank, full[color])
+                    defer strings.release(full_name)
+                    let index = native.channel_index(name) catch:
+                        recover native.channel_index(lower_name) catch:
+                            recover try native.channel_index(full_name)
+                    if (try native.channel_type(index)) != .float32:
+                        error(corrupt, "Cryptomatte channels must be lossless FLOAT32")
+                    self.indices[rank * 4 + color] = index
+            let embedded = try metadata(native, self.prefix, "manifest")
+            if embedded.length > 0:
+                try self.manifest.parse(embedded)
+            else:
+                let sidecar = try metadata(native, self.prefix, "manif_file")
+                if sidecar.length > 0 and load_sidecar:
+                    try safe_sidecar(sidecar)
+                    let source = try native.source_path()
+                    if source.length == 0:
+                        error(invalid, "byte-backed EXR has no directory for a sidecar")
+                    let file = try paths.join(paths.directory(source), sidecar)
+                    defer strings.release(file)
+                    let bytes = try files.read_limit((c_api.str)file, 67108864)
+                    defer free(bytes)
+                    try self.manifest.parse((str)bytes)
+
+    pub func name() -> str:
+        return self.layer_name
+
+    pub func rank_count() -> usize:
+        return self.indices.length // 2
+
+    pub func manifest_count() -> usize:
+        return self.manifest.count
+
+    pub func manifest_name(index: usize) -> str!:
+        if index >= self.manifest.count:
+            error(invalid, "manifest index out of range")
+        return self.manifest.entries[index].name
+
+    pub func manifest_json() -> interop.Owned[str]!:
+        var output = Buffer(maximum = 67108864)
+        defer output.close()
+        try self.manifest.encode(&output)
+        return try interop.copy_text((str)output.view())
+
+    pub func write_manifest(path: str) -> !:
+        if path.length == 0 or strings.contains(path, "\0"):
+            error(invalid, "invalid manifest output path")
+        let destination = try strings.copy(path)
+        defer strings.release(destination)
+        let encoded = try self.manifest_json()
+        defer encoded.release()
+        try files.write_atomic((c_api.str)destination, encoded.value.bytes)
+
+    pub func id_for(name: str) -> f64:
+        return binary.float_value(self.manifest.resolve(name))
+
+    pub func pick(x: usize, y: usize, rank: usize = 0) -> f64!:
+        if rank >= self.rank_count():
+            error(invalid, "Cryptomatte rank out of range")
+        let source = self.source else error(invalid, "Cryptomatte is closed")
+        return try source.value().get_sample(x, y, self.indices[rank * 2])
+
+    pub func pick_name(x: usize, y: usize, rank: usize = 0) -> str!:
+        return self.manifest.name_for(binary.float_bits(try self.pick(x, y, rank)))
+
+    pub func extract(names: const str[], invert: bool = false) -> interop.Reference[Image]!:
+        let ids = try alloc f64[names.length] in memory.heap
+        defer free(ids) in memory.heap
+        for i in 0..<names.length:
+            ids[i] = self.id_for(names[i])
+        return try self.extract_ids(ids, invert)
+
+    pub func extract_ids(ids: const f64[], invert: bool = false) -> interop.Reference[Image]!:
+        let source = self.source else error(invalid, "Cryptomatte is closed")
+        let image = try source.get()
+        try image.load()
+        for value in ids:
+            if not math.is_finite(value):
+                error(invalid, "Cryptomatte selection contains a non-finite ID")
+        let width = try image.width()
+        let height = try image.height()
+        let mask = try Image.create("F", width, height)
+        errdefer mask.release()
+        let target = mask.value()
+        let (xmin, ymin) = try image.origin()
+        try target.set_origin(xmin, ymin)
+        for y in 0..<height:
+            for x in 0..<width:
+                var coverage: f64 = 0.0
+                for rank in 0..<self.rank_count():
+                    let bits = binary.float_bits(try image.get_sample(x, y, self.indices[rank * 2]))
+                    let amount = try image.get_sample(x, y, self.indices[rank * 2 + 1])
+                    if not math.is_finite(amount) or amount < 0.0 or amount > 1.0:
+                        error(corrupt, "Cryptomatte coverage outside 0-1")
+                    for id in ids:
+                        if binary.float_bits(id) == bits:
+                            coverage += amount
+                            break
+                coverage = math.clamp(coverage, 0.0, 1.0)
+                try target.put_sample(x, y, 0, 1.0 - coverage if invert else coverage)
+        return mask
+
+    pub mutating func close():
+        if let source = self.source:
+            self.source = none
+            source.release()
+        with memory.heap:
+            if self.layer_name.length > 0:
+                strings.release(self.layer_name)
+            if self.prefix.length > 0:
+                strings.release(self.prefix)
+            if self.indices.length > 0:
+                free(self.indices)
+        self.manifest.close()
+        self.layer_name = ""
+        self.prefix = ""
+        var empty: usize[]
+        self.indices = empty
+
+    pub func trace(visit: func(ownership.Object*, void*) -> unit, context: void*):
+        if let source = self.source:
+            source.trace(visit, context)
+
+pub let cryptomatte_type: interop.Type[Cryptomatte] = interop.Type[Cryptomatte]("Cryptomatte", Cryptomatte.close, Cryptomatte.trace, closeable = true)
+
+struct Contribution:
+    var bits: u32
+    var weight: f64
+    var next: usize
+
+## Submit every surface in one sample together; uncovered opacity is ID zero.
+## Normalize once by total filter weight, aggregate duplicates, then truncate
+## ranks without renormalizing retained coverage. This preserves transparency.
+pub struct CryptomatteBuilder:
+    var width: usize
+    var height: usize
+    var levels: usize
+    var layer_name: str
+    var heads: usize[]
+    var weights: f64[]
+    var entries: Contribution[]
+    var count: usize
+    var manifest: Manifest
+    var max_bytes: usize
+
+    pub func init(width: usize, height: usize, layer: str = "CryptoObject", levels: usize = 3, max_bytes: usize = 1073741824) -> !:
+        self.width = width
+        self.height = height
+        self.levels = levels
+        self.max_bytes = max_bytes
+        self.layer_name = ""
+        var heads: usize[]
+        var weights: f64[]
+        var entries: Contribution[]
+        self.heads = heads
+        self.weights = weights
+        self.entries = entries
+        self.count = 0
+        self.manifest = Manifest()
+        try self.configure(layer)
+
+    mutating func configure(layer: str) -> !:
+        let width = self.width
+        let height = self.height
+        let levels = self.levels
+        let max_bytes = self.max_bytes
+        if width == 0 or height == 0 or levels == 0 or levels > 256 or layer.length == 0 or layer.length > 240 or strings.contains(layer, "\0"):
+            error(invalid, "invalid Cryptomatte dimensions, name or rank levels")
+        let pixels = width *? height else error(limit, "Cryptomatte dimensions overflow")
+        if pixels > max_bytes // 16:
+            error(limit, "Cryptomatte accumulators exceed byte limit")
+        errdefer self.close()
+        with memory.heap:
+            self.layer_name = try strings.copy(layer)
+            self.heads = try new usize[pixels]
+            self.weights = try new f64[pixels]
+
+    mutating func reserve(additional: usize) -> !:
+        let required = self.count +? additional else error(limit, "Cryptomatte sample count overflows")
+        if required > self.max_bytes // sizeof(Contribution):
+            error(limit, "Cryptomatte contributions exceed byte limit")
+        if required <= self.entries.length:
+            return
+        var capacity = self.entries.length if self.entries.length > 0 else 64
+        while capacity < required:
+            capacity *= 2
+        if capacity > self.max_bytes // sizeof(Contribution):
+            capacity = required
+        let entries = try new Contribution[capacity] in memory.heap
+        for i in 0..<self.count:
+            entries[i] = self.entries[i]
+        if self.entries.length > 0:
+            free(self.entries) in memory.heap
+        self.entries = entries
+
+    mutating func add(pixel: usize, bits: u32, weight: f64):
+        if weight == 0.0:
+            return
+        var index = self.heads[pixel]
+        while index != 0:
+            let entry = &self.entries[index - 1]
+            if entry.bits == bits:
+                entry.weight += weight
+                return
+            index = entry.next
+        self.entries[self.count] = Contribution(bits, weight, self.heads[pixel])
+        self.count += 1
+        self.heads[pixel] = self.count
+
+    pub mutating func add_sample(x: usize, y: usize, names: const str[], coverages: const f64[], weight: f64 = 1.0) -> !:
+        if x >= self.width or y >= self.height or names.length != coverages.length or not math.is_finite(weight) or weight < 0.0 or weight > 1.0e100 or self.heads.length == 0:
+            error(invalid, "invalid Cryptomatte sample")
+        var coverage: f64 = 0.0
+        for amount in coverages:
+            if not math.is_finite(amount) or amount < 0.0 or amount > 1.0:
+                error(invalid, "sample coverage must be in 0-1")
+            coverage += amount
+        if coverage > 1.000000000001:
+            error(invalid, "sample surface coverage exceeds one")
+        let bits = try alloc u32[names.length] in memory.heap
+        defer free(bits) in memory.heap
+        for i in 0..<names.length:
+            bits[i] = hashing.safe_bits(try self.manifest.ensure(names[i]))
+        try self.reserve(names.length + 1)
+        let pixel = y * self.width + x
+        self.weights[pixel] += weight
+        for i in 0..<names.length:
+            self.add(pixel, bits[i], coverages[i] * weight)
+        self.add(pixel, 0, (1.0 - coverage if coverage < 1.0 else 0.0) * weight)
+
+    pub func finish() -> interop.Reference[Image]!:
+        if self.heads.length == 0:
+            error(invalid, "Cryptomatte builder is closed")
+        with memory.heap:
+            let names = try new str[self.levels * 4]
+            defer free(names)
+            var initialized: usize = 0
+            defer release_names(names, &initialized)
+            let suffixes: str[4] = ["R", "G", "B", "A"]
+            for level in 0..<self.levels:
+                for c in 0..<(usize)4:
+                    names[initialized] = try channel_name(self.layer_name, level, suffixes[c])
+                    initialized += 1
+            let image = try Image.create_channels(self.width, self.height, names, max_bytes = self.max_bytes)
+            errdefer image.release()
+            let native = image.value()
+            let selected = try new usize[self.levels * 2]
+            defer free(selected)
+            for pixel in 0..<self.heads.length:
+                var selected_count: usize = 0
+                for rank in 0..<self.levels * 2:
+                    var best: usize = 0
+                    var index = self.heads[pixel]
+                    while index != 0:
+                        var used = false
+                        for i in 0..<selected_count:
+                            if selected[i] == index:
+                                used = true
+                        let entry = self.entries[index - 1]
+                        if not used and (best == 0 or entry.weight > self.entries[best - 1].weight or (entry.weight == self.entries[best - 1].weight and entry.bits < self.entries[best - 1].bits)):
+                            best = index
+                        index = entry.next
+                    if best == 0:
+                        break
+                    selected[selected_count] = best
+                    selected_count += 1
+                    let entry = self.entries[best - 1]
+                    try native.put_sample(pixel % self.width, pixel // self.width, rank * 2, binary.float_value(entry.bits))
+                    try native.put_sample(pixel % self.width, pixel // self.width, rank * 2 + 1, entry.weight / self.weights[pixel])
+            let key = try metadata_key(self.layer_name)
+            defer key.release()
+            let prefix = try strings.join(["cryptomatte/", key.value, "/"], "")
+            defer strings.release(prefix)
+            try set_metadata(native, prefix, "name", self.layer_name)
+            try set_metadata(native, prefix, "hash", "MurmurHash3_32")
+            try set_metadata(native, prefix, "conversion", "uint32_to_float32")
+            var encoded = Buffer(maximum = 67108864)
+            defer encoded.close()
+            try self.manifest.encode(&encoded)
+            try set_metadata(native, prefix, "manifest", (str)encoded.view())
+            return image
+
+    pub mutating func close():
+        with memory.heap:
+            if self.layer_name.length > 0:
+                strings.release(self.layer_name)
+            if self.heads.length > 0:
+                free(self.heads)
+            if self.weights.length > 0:
+                free(self.weights)
+            if self.entries.length > 0:
+                free(self.entries)
+        self.manifest.close()
+        self.layer_name = ""
+        var heads: usize[]
+        var weights: f64[]
+        var entries: Contribution[]
+        self.heads = heads
+        self.weights = weights
+        self.entries = entries
+        self.count = 0
+
+func release_names(names: str[], count: const usize*):
+    for i in 0..<*count:
+        strings.release(names[i])
+
+pub let builder_type: interop.Type[CryptomatteBuilder] = interop.Type[CryptomatteBuilder]("CryptomatteBuilder", CryptomatteBuilder.close, closeable = true)

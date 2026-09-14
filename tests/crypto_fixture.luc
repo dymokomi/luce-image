@@ -1,0 +1,16 @@
+from image import Image
+from cryptomatte import Cryptomatte, layer_count, layer_name
+
+pub func main(arguments: list[str]) -> int!:
+    let image = Image.open(arguments[0], threads = 4)
+    let count = layer_count(image)
+    assert(count > 0)
+    for i in 0..<count:
+        let layer = Cryptomatte(image, layer_name(image, i))
+        assert(layer.manifest_count() > 0)
+        let selected = layer.manifest_name(0)
+        let mask = layer.extract([selected])
+        mask.save(arguments[1] + "/mask" + str(i) + ".exr")
+        print(layer.name())
+        print(selected)
+    return 0

@@ -1,0 +1,61 @@
+import interop
+import memory
+from luce_image.manifest import Manifest
+from luce_image.binary import Buffer
+import luce_image.binary as binary
+import luce_image.crypto_hash as hashing
+
+test "Cryptomatte official hash vectors and exponent remapping":
+    assert(hashing.murmur("torus") == 4053562365)
+    assert(hashing.murmur("равнина") == 2518896926)
+    assert(hashing.murmur("") == 0)
+    assert(hashing.safe_bits(0) == 8388608)
+    assert(hashing.safe_bits(2139095040) == 2130706432)
+    assert(hashing.safe_bits(4294967295) == 4286578687)
+
+test "JSON escapes and surrogate pairs roundtrip without changing names":
+    var manifest = Manifest()
+    defer manifest.close()
+    try manifest.parse("{\"a\\\"b\\\\c\\n\":\"f19c6cfd\",\"\\uD83D\\uDE80\":\"12345678\",\"\\u0000\":\"87654321\"}")
+    assert(manifest.count == 3)
+    assert(manifest.find("a\"b\\c\n") != none)
+    assert(manifest.find("🚀") != none)
+    assert(manifest.find("\0") != none)
+    var encoded = Buffer()
+    defer encoded.close()
+    try manifest.encode(&encoded)
+    var parsed = Manifest()
+    defer parsed.close()
+    try parsed.parse((str)encoded.view())
+    assert(parsed.count == manifest.count)
+    for i in 0..<manifest.count:
+        assert(parsed.entries[i].name == manifest.entries[i].name)
+        assert(parsed.entries[i].bits == manifest.entries[i].bits)
+
+test "malformed manifests are rejected":
+    let inputs: str[12] = ["[]", "{", "{\"x\":3}", "{\"x\":\"123\"}", "{\"x\":\"gggggggg\"}", "{\"x\":\"12345678\",}", "{}x", "{\"x\":\"12345678\",\"x\":\"12345678\"}", "{\"\\uD800\":\"12345678\"}", "{\"\\uDC00\":\"12345678\"}", "{\"\\x\":\"12345678\"}", "{\"\n\":\"12345678\"}"]
+    for text in inputs:
+        var manifest = Manifest()
+        defer manifest.close()
+        var refused = false
+        manifest.parse(text) catch:
+            refused = true
+        assert(refused)
+
+test "all finite half values and infinities roundtrip exactly":
+    for bits in 0..<65536:
+        if (bits & 31744) != 31744 or (bits & 1023) == 0:
+            assert(binary.to_half(binary.half((u16)bits)) == (u16)bits)
+    assert(binary.to_half(1.00048828125) == 15360)
+    assert(binary.to_half(1.00146484375) == 15362)
+
+test "small buffers respect their allocation limit and recover from overflow":
+    var buffer = Buffer(maximum = 3)
+    defer buffer.close()
+    try buffer.put(b"abc")
+    assert(buffer.data.length == 3)
+    var refused = false
+    buffer.byte(0) catch:
+        refused = true
+    assert(refused)
+    assert((str)buffer.view() == "abc")

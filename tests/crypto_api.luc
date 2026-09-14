@@ -1,0 +1,60 @@
+from image import Image
+from cryptomatte import Cryptomatte, CryptomatteBuilder, hash_name, id_for_name, hash_to_id, metadata_key, layer_count, layer_name
+
+pub func main(arguments: list[str]) -> int!:
+    assert(hash_name("torus") == 4053562365)
+    assert(hash_name("равнина") == 2518896926)
+    assert(id_for_name("torus") < -1.5494e30)
+    assert(hash_to_id(0) > 0.0)
+    let builder = CryptomatteBuilder(3, 1, levels = 3)
+    builder.add_sample(0, 0, ["torus", "равнина"], [0.25, 0.5])
+    builder.add_sample(0, 0, ["torus"], [1.0], weight = 3.0)
+    builder.add_sample(1, 0, [], [])
+    builder.add_sample(2, 0, ["a", "b", "c", "d", "e", "f", "g", "h"], [0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125])
+    let image = builder.finish()
+    let layer = Cryptomatte(image, "CryptoObject")
+    assert(layer.rank_count() == 6)
+    assert(layer.manifest_count() == 10)
+    assert(layer.pick_name(0, 0) == "torus")
+    let torus = layer.extract(["torus", "torus"])
+    assert(torus.get_sample(0, 0) == 0.8125)
+    let inverse = layer.extract(["torus"], invert = true)
+    assert(inverse.get_sample(0, 0) == 0.1875)
+    let background = layer.extract_ids([0.0])
+    assert(background.get_sample(0, 0) == 0.0625)
+    assert(background.get_sample(1, 0) == 1.0)
+    let combined = layer.extract(["torus", "равнина"])
+    assert(combined.get_sample(0, 0) == 0.9375)
+    let truncated = layer.extract(["a", "b", "c", "d", "e", "f", "g", "h"])
+    assert(truncated.get_sample(2, 0) == 0.75)
+    image.save(arguments[0] + "/cryptomatte.exr")
+    let reopened = Image.open(arguments[0] + "/cryptomatte.exr")
+    let decoded = Cryptomatte(reopened, "CryptoObject")
+    assert(decoded.extract(["torus"]).get_sample(0, 0) == 0.8125)
+    assert(layer_count(reopened) == 1)
+    assert(layer_name(reopened, 0) == "CryptoObject")
+    let prefix = "cryptomatte/" + metadata_key("CryptoObject") + "/"
+    layer.write_manifest(arguments[0] + "/writer.json")
+    image.set_metadata(prefix + "manifest", "")
+    image.set_metadata(prefix + "manif_file", "writer.json")
+    image.set_origin(-10, 20)
+    image.save(arguments[0] + "/sidecar.exr", compression = "piz")
+    let sidecar = Cryptomatte(Image.open(arguments[0] + "/sidecar.exr"), "CryptoObject")
+    assert(sidecar.manifest_count() == 10)
+    assert(sidecar.extract(["torus"]).origin() == (-10, 20))
+    image.set_metadata(prefix + "manif_file", "../escape.json")
+    let no_sidecar = Cryptomatte(image, "CryptoObject", load_sidecar = false)
+    assert(no_sidecar.manifest_count() == 0)
+    var rejected = false
+    let bad_sidecar = Cryptomatte(image, "CryptoObject") catch:
+        rejected = true
+        recover layer
+    assert(rejected)
+    image.close()
+    var refused = false
+    let ignored = layer.extract(["torus"]) catch:
+        refused = true
+        recover torus
+    assert(refused)
+    print("PASS Cryptomatte vectors, manifests, weighted samples, ranking and EXR roundtrip")
+    return 0

@@ -1,0 +1,6 @@
+[package]
+name = "luce_image_examples"
+source = "."
+
+[dependencies]
+luce_image = ".."
