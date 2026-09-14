@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Corrupt inputs must be recoverable errors, never traps or unbounded work."""
 from pathlib import Path
+import argparse
 import random
 import subprocess
 import tempfile
@@ -9,6 +10,9 @@ import numpy as np
 import OpenEXR
 
 ROOT=Path(__file__).resolve().parents[1]
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--validator',type=Path,default=ROOT/'build/validate')
+validator=parser.parse_args().validator.resolve()
 rng=random.Random(76)
 count=0
 with tempfile.TemporaryDirectory() as tmp:
@@ -31,7 +35,7 @@ with tempfile.TemporaryDirectory() as tmp:
             cases.append(bytes(value))
         for data in cases:
             (p/'input').write_bytes(data)
-            result=subprocess.run([str(ROOT/'build/validate'),str(p/'input')],capture_output=True,timeout=5)
+            result=subprocess.run([str(validator),str(p/'input')],capture_output=True,timeout=5)
             assert result.returncode in [0,2],(count,result.returncode,result.stderr)
             assert b'trap:' not in result.stderr,(count,result.stderr)
             count+=1

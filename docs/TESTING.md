@@ -50,6 +50,20 @@ sources; they do not link native image libraries.
 The libpng oracle currently prints an interlace-handling warning on Adam7 cases;
 its resulting pixels are still checked. It is not a warning from luce-image.
 
+## Sanitizers
+
+The same Base implementation can be emitted as C and instrumented with Clang;
+this is not a native codec backend. For example, from the repository root:
+
+```sh
+LUCE_BASE="$PWD/build/toolchain/luce-base" build/toolchain/luce build tests/validate.luc --emit=c -o build/validate-sanitized.c
+cc -std=gnu11 -O1 -w -fno-strict-aliasing -fsanitize=address,undefined -fno-omit-frame-pointer -I ../luce-base/runtime build/validate-sanitized.c ../luce-base/runtime/lucb_rt.c -lm -pthread -o build/validate-sanitized
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 build/test-env/bin/python tests/check_malformed.py --validator build/validate-sanitized
+```
+
+This checks memory access and undefined behavior on the mutation corpus. Leak
+detection is disabled in this macOS recipe; it is not a leak-cleanliness claim.
+
 ## Performance
 
 ```sh

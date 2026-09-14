@@ -83,6 +83,7 @@ compiler versions instead. See [testing](docs/TESTING.md) for dependencies and C
 Documentation: [API](docs/API.md), [formats](docs/FORMATS.md),
 [design and limits](docs/DESIGN.md), [upstream attribution](THIRD_PARTY.md).
 [Measured thread scaling](docs/BENCHMARK.md) records the initial benchmark.
+[Validation results](docs/VALIDATION.md) distinguish local checks from CI.
 
 Original package code is MIT licensed; ported OpenEXR algorithms and upstream
 Cryptomatte fixtures retain their BSD notices. See [LICENSE](LICENSE) and

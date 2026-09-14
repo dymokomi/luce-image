@@ -22,3 +22,22 @@ schemes or CPUs. The Base implementations still have substantial optimization
 opportunities. OS caching affects the open figures.
 
 Reproduce with `build/test-env/bin/python tools/benchmark.py --size 1024`.
+
+## Larger image: 4096×4096
+
+Same source/compiler, host, fixture construction and three-process median
+method, run with no other local test/compiler jobs. RGB f64 pixel storage alone
+is 384 MiB; encoded bytes and worker scratch are additional.
+
+| Format | Threads | Open/probe ms | Decode ms | Workers used |
+| --- | ---: | ---: | ---: | ---: |
+| TIFF | 1 | 68.402 | 14846.770 | 1 |
+| TIFF | 2 | 67.377 | 7660.427 | 2 |
+| TIFF | 4 | 65.863 | 3992.463 | 4 |
+| EXR | 1 | 25.095 | 6494.080 | 1 |
+| EXR | 2 | 24.178 | 3306.574 | 2 |
+| EXR | 4 | 24.510 | 1696.354 | 4 |
+
+Four-worker decode was 3.72× faster for TIFF and 3.83× for EXR. Absolute times
+still leave room for substantial codec optimization. Reproduce with
+`build/test-env/bin/python tools/benchmark.py --size 4096`.
