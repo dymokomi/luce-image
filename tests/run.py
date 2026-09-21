@@ -22,7 +22,9 @@ def main():
         except ImportError: raise SystemExit(f'Missing {dependency}; install tests/requirements.txt in a virtual environment and run with that Python.')
     if not args.base.is_file() or not args.luce.is_file():
         raise SystemExit('Build isolated compilers with python3 tools/bootstrap.py, or supply --base and --luce.')
-    env=dict(os.environ,LUCE_BASE=str(args.base.resolve()))
+    env=dict(os.environ, LUCE_BASE=str(args.base.resolve()),
+             LUCE_STD=str(ROOT.parent / 'luce-base/src/std'),
+             LUCE_CACHE=str(ROOT / 'build/cache'))
     modes=([['--backend=c']] if args.backend=='c' else [['--native','--opt',str(args.opt)]] if args.opt is not None else
            [['--native','--opt',str(i)] for i in range(4)]+[['--backend=c'],['--backend=c','--release']])
     (ROOT/'build').mkdir(exist_ok=True)
