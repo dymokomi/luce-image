@@ -1,0 +1,16 @@
+#prisma 4.0
+def package "luce-image" {
+    str owner = "dymokomi"
+    str version = "0.1.0"
+    str language = "luce-base"
+    str description = "JPEG, PNG, TIFF and OpenEXR image I/O for Luce, implemented in Luce Base, with a Pillow-inspired owning Image API and Cryptomatte 1.2 reading and authoring."
+    str readme = "README.md"
+
+    def export "image" {
+        str module = "luce_image.image"
+    }
+
+    def export "cryptomatte" {
+        str module = "luce_image.cryptomatte"
+    }
+}
