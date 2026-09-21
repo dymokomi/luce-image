@@ -1,0 +1,46 @@
+name: Correctness
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  codecs:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: luce-image
+      - id: pins
+        run: |
+          echo "base=$(cat luce-image/bootstrap/BASE)" >> "$GITHUB_OUTPUT"
+          echo "luce=$(cat luce-image/bootstrap/LUCE)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          repository: dymokomi/luce-base
+          ref: ${{ steps.pins.outputs.base }}
+          path: luce-base
+      - uses: actions/checkout@v7
+        with:
+          repository: dymokomi/luce
+          ref: ${{ steps.pins.outputs.luce }}
+          path: luce
+      - name: Select Clang
+        run: |
+          mkdir -p "$RUNNER_TEMP/luce-bin"
+          ln -s "$(command -v clang)" "$RUNNER_TEMP/luce-bin/cc"
+          echo "$RUNNER_TEMP/luce-bin" >> "$GITHUB_PATH"
+      - name: Install independent codec oracles
+        working-directory: luce-image
+        run: |
+          python3 -m venv build/test-env
+          build/test-env/bin/python -m pip install -r tests/requirements.txt
+      - name: Build pinned compilers
+        working-directory: luce-image
+        run: build/test-env/bin/python tools/bootstrap.py
+      - name: Full codec matrix
+        working-directory: luce-image
+        run: ./test.sh
