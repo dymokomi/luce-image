@@ -52,6 +52,7 @@ pub struct Canvas:
     var filters: Filters?
     var brush: Brush
     var stroke: Stroke*?
+    var preview: Snapshot?
     var mask_editing: bool
     ## The selection lives on the CPU here and is copied into the GPU document at bind.
     var selection: Selection
@@ -83,6 +84,7 @@ pub struct Canvas:
         self.filters = none
         self.brush = Brush()
         self.stroke = none
+        self.preview = none
         self.mask_editing = false
         self.selection = try Selection.create((u32)width, (u32)height)
         var no_points: f64[]
@@ -550,6 +552,60 @@ pub struct Canvas:
     pub static func adjustment_count() -> i64:
         return (i64)adjustment_count
 
+    ## Start previewing edits to a layer: until `end_preview`, each
+    ## `preview_adjust` or `preview_blur` shows its effect on the layer's
+    ## pixels from before the preview began, not on the previous preview.
+    pub mutating func begin_preview(id: i64) -> !:
+        try self.require_open()
+        if self.stroke != none:
+            error(invalid, "finish the stroke first")
+        if self.preview != none:
+            error(invalid, "a preview is already in progress")
+        let document = self.document else error(invalid, "draw the document once before previewing")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = layer.tiles() else error(invalid, "a group cannot be previewed")
+        self.preview = Snapshot(layer = (u64)id, tiles = try tiles.clone(), mask = false)
+
+    pub func previewing() -> bool:
+        return self.preview != none
+
+    ## Show adjustment `kind` (as `adjust_layer`) applied to the layer as it was when the preview began.
+    pub mutating func preview_adjust(kind: i64, a: f64, b: f64, c: f64, d: f64, e: f64) -> !:
+        if kind < 0 or kind >= (i64)adjustment_count:
+            error(invalid, "no such adjustment")
+        let layer = try self.restore_preview()
+        let document = self.document else trap("preview without a document")
+        let adjuster = self.adjuster else trap("preview without an adjuster")
+        try adjuster.apply(document, layer, (u32)kind, a, b, c, d, e)
+
+    ## Show a Gaussian blur of `radius` applied to the layer as it was when the preview began.
+    pub mutating func preview_blur(radius: f64) -> !:
+        let layer = try self.restore_preview()
+        let document = self.document else trap("preview without a document")
+        let filters = self.filters else trap("preview without filters")
+        try filters.gaussian_blur(document, layer, radius)
+
+    ## Finish the preview: keep what it shows as one undoable edit, or put the
+    ## layer's pixels back as they were.
+    pub mutating func end_preview(keep: bool) -> !:
+        try self.require_open()
+        let preview = self.preview else error(invalid, "no preview is in progress")
+        self.preview = none
+        let document = self.document else trap("preview without a document")
+        if keep:
+            try self.remember(preview.layer, preview.tiles)
+        else:
+            var shown = try document.take_tiles(preview.layer, preview.tiles)
+            shown.destroy()
+
+    ## Put the previewed layer's original pixels back; the layer's id.
+    mutating func restore_preview() -> u64!:
+        try self.require_open()
+        let preview = self.preview else error(invalid, "no preview is in progress")
+        let document = self.document else trap("preview without a document")
+        try document.set_tiles(preview.layer, try preview.tiles.clone())
+        return preview.layer
+
     ## Blur a layer's pixels with a Gaussian of `radius` pixels (0.5..250). Undoable.
     pub mutating func blur_layer(id: i64, radius: f64) -> !:
         try self.require_open()
@@ -624,6 +680,8 @@ pub struct Canvas:
         try self.require_open()
         if self.stroke != none:
             error(invalid, "finish the stroke first")
+        if self.preview != none:
+            error(invalid, "finish the preview first")
         if self.history_count == 0:
             error(invalid, "nothing to undo")
         let document = self.document else trap("history without a document")
@@ -637,6 +695,8 @@ pub struct Canvas:
         try self.require_open()
         if self.stroke != none:
             error(invalid, "finish the stroke first")
+        if self.preview != none:
+            error(invalid, "finish the preview first")
         if self.future_count == 0:
             error(invalid, "nothing to redo")
         let document = self.document else trap("history without a document")
@@ -917,6 +977,10 @@ pub struct Canvas:
         if let stroke = self.stroke:
             self.stroke = none
             finish_boxed(stroke)
+        if let preview = self.preview:
+            var owned = preview.tiles
+            owned.destroy()
+            self.preview = none
         if let pipeline = self.ants:
             var owned = pipeline
             owned.destroy()
@@ -1342,3 +1406,57 @@ test "canvas strokes paint the selected layer and undo restores it":
     assert(canvas.width() == 16 and canvas.height() == 16 and not canvas.has_selection())
     try canvas.resize_image(32, 8)
     assert(canvas.width() == 32 and canvas.height() == 8)
+
+## The red byte at the centre of a 32×32 draw of `canvas`, for tests.
+func shown_centre(canvas: Canvas*, target: gpu.Texture*, pixels: u8[]) -> u8!:
+    let frame = try target.frame()
+    defer frame.release()
+    let root = try frame.value().target()
+    defer root.release()
+    try canvas.draw(root, gpu.Rect(width = 32.0, height = 32.0), 1.0, 0.0, 0.0)
+    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    try target.read(pixels)
+    return pixels[(16 * 32 + 16) * 4]
+
+test "previews show edits on the original pixels and end kept or dropped":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(32, 32)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Grey")
+    var target = try gpu.Texture.create(device, 32, 32, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    var pixels: u8[32 * 32 * 4]
+    discard(try shown_centre(&canvas, &target, pixels))
+    try canvas.set_brush(40.0, 1.0, 1.0, 1.0, 0.05, 0.05, 0.05, false)
+    try canvas.begin_stroke(layer, 16.0, 16.0)
+    try canvas.end_stroke()
+    # Dark grey: adjustments work in sRGB, where 0.05 linear is 0.25 and inverts to 0.75.
+    let base = try shown_centre(&canvas, &target, pixels)
+    assert(base > 5 and base < 25)
+    try canvas.begin_preview(layer)
+    assert(canvas.previewing())
+    try canvas.preview_adjust(2, 0.0, 0.0, 0.0, 0.0, 0.0)
+    let inverted = try shown_centre(&canvas, &target, pixels)
+    assert(inverted > base + 40)
+    # A second preview applies to the original, not to the inverted pixels.
+    try canvas.preview_adjust(0, 0.3, 0.0, 0.0, 0.0, 0.0)
+    let brighter = try shown_centre(&canvas, &target, pixels)
+    assert(brighter > base and brighter < inverted)
+    var rejected = false
+    canvas.undo() catch failure:
+        assert(failure.code == invalid)
+        rejected = true
+    assert(rejected)
+    try canvas.end_preview(false)
+    assert(not canvas.previewing())
+    assert((try shown_centre(&canvas, &target, pixels)) == base)
+    try canvas.begin_preview(layer)
+    try canvas.preview_adjust(2, 0.0, 0.0, 0.0, 0.0, 0.0)
+    try canvas.end_preview(true)
+    assert(canvas.can_undo())
+    assert((try shown_centre(&canvas, &target, pixels)) == inverted)
+    try canvas.undo()
+    assert((try shown_centre(&canvas, &target, pixels)) == base)
