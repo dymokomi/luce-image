@@ -290,6 +290,20 @@ pub struct Canvas:
         try self.require_open()
         self.live().ellipse(x, y, width, height, try selection_mode(mode))
 
+    ## The magic wand on layer `id`: select the pixels within `tolerance`
+    ## (0..255, sRGB, alpha included) of the colour at (`x`, `y`), only those
+    ## reachable through such pixels when `contiguous`, combined by `mode`.
+    pub mutating func select_wand(id: i64, x: i64, y: i64, tolerance: f64, contiguous: bool, mode: i64 = 0) -> !:
+        try self.require_open()
+        let document = self.document else error(invalid, "draw the document once before using the wand")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = layer.tiles() else error(invalid, "a group has no pixels to sample")
+        let count = (usize)self.extent_x * (usize)self.extent_y * 4
+        let pixels = try alloc f32[count] in memory.heap
+        defer free(pixels) in memory.heap
+        try tiles.read(pixels)
+        try self.live().wand(pixels, x, y, tolerance, contiguous, try selection_mode(mode))
+
     ## Collect a polygon point for `select_polygon`.
     pub mutating func add_point(x: f64, y: f64) -> !:
         try self.require_open()
@@ -1512,6 +1526,10 @@ test "previews show edits on the original pixels and end kept or dropped":
     assert((try shown_centre(&canvas, &target, pixels)) == inverted)
     try canvas.undo()
     assert((try shown_centre(&canvas, &target, pixels)) == base)
+    # The wand on the painted dot selects it and nothing of the transparent surround.
+    try canvas.select_wand(layer, 16, 16, 32.0, true, 0)
+    assert(canvas.has_selection() and canvas.selected_at(16, 16) == 255 and canvas.selected_at(1, 1) == 0)
+    try canvas.deselect()
     # Curves: lifting the midtones brightens the dark grey; resetting restores identity.
     try canvas.add_curve_point(0, 0.25, 0.6)
     assert((try canvas.curve_point_count(0)) == 3 and (try canvas.curve_value(0, 0.25)) > 0.59)

@@ -174,6 +174,83 @@ pub struct Selection:
             self.outside(math.imax(0, (i64)math.floor(min_x)), top, math.imin((i64)self.extent_x, (i64)math.ceil(max_x)), bottom)
         self.finish()
 
+    ## The magic wand: every pixel of `pixels` (RGBA straight-alpha linear
+    ## samples, this selection's size) whose colour is within `tolerance`
+    ## (0..255, in sRGB, alpha included) of the one at (`x`, `y`), reachable
+    ## through such pixels when `contiguous`, combined by `mode`.
+    pub mutating func wand(pixels: const f32[], x: i64, y: i64, tolerance: f64, contiguous: bool, mode: Mode) -> !:
+        let width = (usize)self.extent_x
+        let height = (usize)self.extent_y
+        if pixels.length != width * height * 4:
+            error(invalid, "pixel buffer must hold width * height RGBA samples")
+        if x < 0 or y < 0 or x >= (i64)width or y >= (i64)height:
+            error(invalid, "the wand point lies outside the document")
+        if not math.is_finite(tolerance) or tolerance < 0.0 or tolerance > 255.0:
+            error(invalid, "wand tolerance is 0..255")
+        if mode == Mode.replace:
+            for index in 0..<self.coverage.length:
+                self.coverage[index] = 0
+        # Colours compared as 8-bit sRGB, the way the tolerance is stated.
+        let bytes = try alloc u8[width * height * 4] in memory.heap
+        defer free(bytes) in memory.heap
+        for index in 0..<(width * height):
+            for channel in 0..<(usize)3:
+                bytes[index * 4 + channel] = srgb_byte(pixels[index * 4 + channel])
+            bytes[index * 4 + 3] = (u8)(math.clamp((f64)pixels[index * 4 + 3], 0.0, 1.0) * 255.0 + 0.5)
+        let seed = (usize)y * width + (usize)x
+        let limit = (i64)math.floor(tolerance + 0.5)
+        let matched = try alloc u8[width * height] in memory.heap
+        defer free(matched) in memory.heap
+        for index in 0..<(width * height):
+            matched[index] = 0
+        var left = (i64)width
+        var top = (i64)height
+        var right: i64 = 0
+        var bottom: i64 = 0
+        if contiguous:
+            let queue = try alloc u32[width * height] in memory.heap
+            defer free(queue) in memory.heap
+            var head: usize = 0
+            var tail: usize = 0
+            queue[tail] = (u32)seed
+            tail += 1
+            matched[seed] = 1
+            while head < tail:
+                let index = (usize)queue[head]
+                head += 1
+                let column = (i64)(index % width)
+                let row = (i64)(index // width)
+                left = math.imin(left, column)
+                right = math.imax(right, column + 1)
+                top = math.imin(top, row)
+                bottom = math.imax(bottom, row + 1)
+                for step in 0..<(usize)4:
+                    let nx = column + (1 if step == 0 else (-1 if step == 1 else 0))
+                    let ny = row + (1 if step == 2 else (-1 if step == 3 else 0))
+                    if nx < 0 or ny < 0 or nx >= (i64)width or ny >= (i64)height:
+                        continue
+                    let next = (usize)ny * width + (usize)nx
+                    if matched[next] == 0 and within(bytes, seed, next, limit):
+                        matched[next] = 1
+                        queue[tail] = (u32)next
+                        tail += 1
+        else:
+            for index in 0..<(width * height):
+                if within(bytes, seed, index, limit):
+                    matched[index] = 1
+                    let column = (i64)(index % width)
+                    let row = (i64)(index // width)
+                    left = math.imin(left, column)
+                    right = math.imax(right, column + 1)
+                    top = math.imin(top, row)
+                    bottom = math.imax(bottom, row + 1)
+        for index in 0..<(width * height):
+            if matched[index] != 0:
+                self.combine(index, 255, mode)
+        if mode == Mode.intersect:
+            self.outside(left, top, right, bottom)
+        self.finish()
+
     ## Grow (positive) or shrink (negative) the selection by `pixels` with a
     ## square structuring element, then soften its edge over `feather` pixels.
     pub mutating func adjust(pixels: i64, feather: i64) -> !:
@@ -302,6 +379,21 @@ pub struct Selection:
         var empty: u8[]
         self.coverage = empty
 
+## A linear-light sample as an 8-bit sRGB value.
+func srgb_byte(value: f32) -> u8:
+    let c = math.clamp((f64)value, 0.0, 1.0)
+    let encoded = c * 12.92 if c <= 0.0031308 else 1.055 * math.pow(c, 1.0 / 2.4) - 0.055
+    return (u8)(encoded * 255.0 + 0.5)
+
+## Whether pixel `b` of `bytes` is within `limit` of pixel `a` on every channel.
+func within(bytes: const u8[], a: usize, b: usize, limit: i64) -> bool:
+    for channel in 0..<(usize)4:
+        let difference = (i64)bytes[a * 4 + channel] - (i64)bytes[b * 4 + channel]
+        if difference > limit or -difference > limit:
+            return false
+    return true
+
+
 test "selection shapes combine, invert, grow and feather":
     var selection = try Selection.create(64, 48)
     defer selection.destroy()
@@ -327,3 +419,29 @@ test "selection shapes combine, invert, grow and feather":
     assert(selection.at(63, 47) == 255)
     selection.clear()
     assert(selection.is_empty())
+
+test "the wand selects like colours, contiguously or not":
+    var selection = try Selection.create(8, 4)
+    defer selection.destroy()
+    # Two red patches split by a blue column; the rest transparent.
+    var pixels: f32[8 * 4 * 4]
+    for y in 0..<(usize)4:
+        for x in 0..<(usize)8:
+            let index = (y * 8 + x) * 4
+            if x == 4:
+                pixels[index + 2] = 1.0
+                pixels[index + 3] = 1.0
+            elif x < 4 or x > 5:
+                pixels[index] = 1.0 if x != 6 else 0.9
+                pixels[index + 3] = 1.0
+    try selection.wand(pixels, 1, 1, 10.0, true, Mode.replace)
+    assert(selection.at(0, 0) == 255 and selection.at(3, 3) == 255 and selection.at(4, 1) == 0 and selection.at(7, 1) == 0 and selection.at(5, 1) == 0)
+    try selection.wand(pixels, 1, 1, 10.0, false, Mode.replace)
+    assert(selection.at(7, 1) == 255 and selection.at(6, 1) == 0)
+    try selection.wand(pixels, 1, 1, 40.0, false, Mode.replace)
+    assert(selection.at(6, 1) == 255 and selection.at(4, 1) == 0)
+    var rejected = false
+    selection.wand(pixels, 9, 0, 10.0, true, Mode.replace) catch failure:
+        assert(failure.code == invalid)
+        rejected = true
+    assert(rejected)
