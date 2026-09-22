@@ -3,8 +3,8 @@ import memory
 import strings
 import utf8
 import luce_image.crypto_hash as hashing
-from luce_image.binary import Reader, Buffer
-from luce_image.errors import corrupt, invalid, limit
+from binary import Reader, Buffer
+from raster_errors import corrupt, invalid, limit
 
 pub struct Entry:
     pub var name: str

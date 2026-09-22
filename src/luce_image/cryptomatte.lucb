@@ -8,11 +8,11 @@ import math
 import interop
 import ownership
 import luce_image.crypto_hash as hashing
-import luce_image.binary as binary
-from luce_image.binary import Buffer
+import binary
+from binary import Buffer
 from luce_image.manifest import Manifest
 from luce_image.image import Image, SampleType
-from luce_image.errors import invalid, corrupt, unsupported, limit
+from raster_errors import invalid, corrupt, unsupported, limit
 
 pub func hash_name(name: str) -> i64:
     return (i64)hashing.murmur(name)

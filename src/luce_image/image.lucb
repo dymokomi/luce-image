@@ -5,14 +5,14 @@ import interop
 import memory
 import math
 import strings
-import luce_image.model as model
-import luce_image.png as png
-import luce_image.jpeg as jpeg
-import luce_image.tiff as tiff
-import luce_image.exr as exr
+import raster as model
+import png
+import jpeg
+import tiff
+import exr
 import luce_image.parallel as parallel
-from luce_image.binary import Buffer
-from luce_image.errors import invalid, unsupported
+from binary import Buffer
+from raster_errors import invalid, unsupported
 
 pub type SampleType = model.SampleType
 

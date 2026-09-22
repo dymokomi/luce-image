@@ -1,8 +1,8 @@
 import interop
 import memory
 from luce_image.manifest import Manifest
-from luce_image.binary import Buffer
-import luce_image.binary as binary
+from binary import Buffer
+import binary
 import luce_image.crypto_hash as hashing
 
 test "Cryptomatte official hash vectors and exponent remapping":

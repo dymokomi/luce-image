@@ -7,7 +7,7 @@ import math
 from luce_image.tiles import Tiles, tile_size, box, unbox
 from luce_image.document import Document
 from luce_image.shaders import blur_frag_words, blur_frag_msl
-from luce_image.errors import invalid
+from raster_errors import invalid
 
 pub struct Filters:
     var owner: gpu.Device

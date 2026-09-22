@@ -8,7 +8,7 @@ import memory
 from luce_image.tiles import Tiles, tile_size
 from luce_image.document import Document
 from luce_image.shaders import warp_frag_words, warp_frag_msl
-from luce_image.errors import invalid
+from raster_errors import invalid
 
 ## Move `layer`'s pixels (or its mask) by (`dx`, `dy`); returns the tiles from before.
 pub func translate(document: Document*, layer: u64, dx: i64, dy: i64, on_mask: bool = false) -> Tiles!:

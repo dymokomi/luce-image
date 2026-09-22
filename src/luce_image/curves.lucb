@@ -4,7 +4,7 @@
 ## overshoots between points, as Photoshop's does. Channel 0 is the master
 ## RGB curve, applied after the red, green and blue curves (1..3).
 import math
-from luce_image.errors import invalid
+from raster_errors import invalid
 
 ## The most control points one channel takes.
 pub let curve_points: usize = 16

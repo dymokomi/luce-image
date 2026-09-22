@@ -9,7 +9,7 @@ import memory
 import strings
 from luce_image.tiles import Tiles, box, unbox
 from luce_image.selection import Selection
-from luce_image.errors import invalid, limit
+from raster_errors import invalid, limit
 
 pub let blend_mode_count: u32 = 26
 

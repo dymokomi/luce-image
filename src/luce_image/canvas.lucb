@@ -28,7 +28,7 @@ from luce_image.geometry import resize_canvas, resize_image
 from luce_image.selection import Selection, Mode
 from luce_image.shaders import ants_frag_words, ants_frag_msl
 from luce_image.half import from_half
-from luce_image.errors import invalid, limit
+from raster_errors import invalid, limit
 
 struct Record:
     var id: u64

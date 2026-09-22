@@ -7,7 +7,7 @@ import fonts
 import math
 from luce_image.tiles import Tiles, tile_size
 from luce_image.document import Document
-from luce_image.errors import invalid
+from raster_errors import invalid
 
 ## The face for `size` pixels: sizes past the face's 64-point limit come from
 ## rasterising a smaller face at a scale; the scale to use is returned too.

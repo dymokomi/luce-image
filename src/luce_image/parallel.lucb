@@ -1,8 +1,8 @@
 ## Bounded work stealing over independent chunks; no shared decoder state.
 import thread
 import memory
-from luce_image.model import Raster
-from luce_image.errors import corrupt, invalid
+from raster import Raster
+from raster_errors import corrupt, invalid
 
 struct Work:
     var image: Raster*

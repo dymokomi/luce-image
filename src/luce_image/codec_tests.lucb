@@ -2,12 +2,12 @@ import files
 import memory
 import c
 import strings
-import luce_image.png as png
-import luce_image.tiff as tiff
-import luce_image.exr as exr
-import luce_image.jpeg as jpeg
-from luce_image.model import Raster
-from luce_image.binary import Buffer, double_bits
+import png
+import tiff
+import exr
+import jpeg
+from raster import Raster
+from binary import Buffer, double_bits
 
 pub func main(arguments: str[]) -> i32!:
     var raster = Raster()

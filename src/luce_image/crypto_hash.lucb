@@ -1,5 +1,5 @@
 ## Cryptomatte 1.2 MurmurHash3_x86_32, seed zero, over UTF-8 bytes.
-import luce_image.binary as binary
+import binary
 
 func rotate(value: u32, bits: u32) -> u32:
     return (value << bits) | (value >> (32 - bits))

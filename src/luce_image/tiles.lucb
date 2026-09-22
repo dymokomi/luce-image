@@ -8,7 +8,7 @@
 import gpu
 import memory
 from luce_image.half import to_half, from_half
-from luce_image.errors import invalid, limit
+from raster_errors import invalid, limit
 
 pub let tile_size: u32 = 256
 

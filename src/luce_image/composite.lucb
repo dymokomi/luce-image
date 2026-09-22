@@ -11,7 +11,7 @@ import memory
 from luce_image.tiles import Tiles, Tile, tile_size
 from luce_image.document import Document, Layer
 from luce_image.style import Styler
-from luce_image.errors import invalid, limit
+from raster_errors import invalid, limit
 from luce_image.half import from_half
 from luce_image.shaders import composite_frag_words, composite_frag_msl
 

@@ -1,4 +1,0 @@
-pub let invalid: ErrorCode = ErrorCode.package(200)
-pub let unsupported: ErrorCode = ErrorCode.package(201)
-pub let limit: ErrorCode = ErrorCode.package(202)
-pub let corrupt: ErrorCode = ErrorCode.package(203)

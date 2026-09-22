@@ -12,7 +12,7 @@ from luce_image.tiles import Tiles, tile_size
 from luce_image.document import Document, Layer
 from luce_image.selection import Mode
 from luce_image.shaders import segment_frag_words, segment_frag_msl, paint_frag_words, paint_frag_msl, gradient_frag_words, gradient_frag_msl
-from luce_image.errors import invalid, limit
+from raster_errors import invalid, limit
 
 ## How a stroke paints.
 pub struct Brush:

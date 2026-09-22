@@ -8,7 +8,7 @@ import math
 import memory
 from luce_image.tiles import Tiles, tile_size, box, unbox
 from luce_image.document import Document, Layer
-from luce_image.errors import invalid
+from raster_errors import invalid
 
 ## `tiles` drawn into a `width` by `height` layer with its pixels scaled by
 ## (`scale_x`, `scale_y`) and its origin at (`offset_x`, `offset_y`).

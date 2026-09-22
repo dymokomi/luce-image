@@ -6,7 +6,7 @@ import gpu
 import math
 import memory
 from luce_image.tiles import Tiles, tile_size, box, unbox
-from luce_image.errors import invalid
+from raster_errors import invalid
 
 ## How a new shape combines with the selection so far.
 pub enum Mode as u8:
