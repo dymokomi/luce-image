@@ -192,6 +192,70 @@ pub struct Canvas:
     pub func layer_blend(index: i64) -> i64!:
         return (try self.record(index)).blend
 
+    ## Move a layer one step up (1) or down (-1) in the stack.
+    pub mutating func reorder_layer(id: i64, step: i64) -> !:
+        try self.require_open()
+        let index = try self.index((u64)id)
+        let target = (i64)index + step
+        if target < 0 or target >= (i64)self.count:
+            return
+        if let document = self.document:
+            try document.reorder((u64)id, step)
+        let moved = self.records[index]
+        self.records[index] = self.records[(usize)target]
+        self.records[(usize)target] = moved
+
+    ## Copy a layer with its mask and appearance just above it; returns the copy's id.
+    pub mutating func duplicate_layer(id: i64, name: str) -> i64!:
+        try self.require_open()
+        if self.stroke != none:
+            error(invalid, "finish the stroke first")
+        let index = try self.index((u64)id)
+        let created = try self.add_layer(name)
+        let copy = try self.index((u64)created)
+        self.records[copy].visible = self.records[index].visible
+        self.records[copy].opacity = self.records[index].opacity
+        self.records[copy].blend = self.records[index].blend
+        self.records[copy].clipped = self.records[index].clipped
+        self.records[copy].masked = self.records[index].masked
+        if let document = self.document:
+            # The GPU copy carries the pixels; the record added above is replaced by it.
+            try document.remove((u64)created)
+            let actual = try document.duplicate((u64)id, name)
+            self.records[copy].id = actual
+            self.next_id = actual + 1
+        elif let picture = self.records[index].picture:
+            self.records[copy].picture = picture.clone()
+        # Place the copy right above the source.
+        var at = copy
+        while at > index + 1:
+            let swap = self.records[at]
+            self.records[at] = self.records[at - 1]
+            self.records[at - 1] = swap
+            at -= 1
+        return (i64)self.records[index + 1].id
+
+    ## Merge a layer into the one below it. Not undoable: history entries for
+    ## both layers are dropped.
+    pub mutating func merge_down(id: i64) -> !:
+        try self.require_open()
+        if self.stroke != none:
+            error(invalid, "finish the stroke first")
+        let document = self.document else error(invalid, "draw the document once before merging")
+        let composer = self.composer else error(invalid, "draw the document once before merging")
+        let index = try self.index((u64)id)
+        if index == 0:
+            error(invalid, "nothing below to merge into")
+        try composer.merge_down(document, (u64)id)
+        strings.release(self.records[index].name)
+        if let picture = self.records[index].picture:
+            picture.release()
+        for shift in index..<(self.count - 1):
+            self.records[shift] = self.records[shift + 1]
+        self.count -= 1
+        clear_snapshots(&self.history, &self.history_count)
+        clear_snapshots(&self.future, &self.future_count)
+
     # mark: Selection ========================================================================
 
     ## Select a rectangle in document pixels, clamped; an empty one deselects.
@@ -873,3 +937,11 @@ test "canvas strokes paint the selected layer and undo restores it":
     try canvas.undo()
     try canvas.blur_layer(layer, 2.0)
     assert(canvas.can_undo())
+    # Duplicate above, reorder, merge down: two layers become one with both.
+    let twin = try canvas.duplicate_layer(layer, "Twin")
+    assert(canvas.layer_count() == 2 and (try canvas.layer_id(1)) == twin and (try canvas.layer_name(1)) == "Twin")
+    try canvas.reorder_layer(twin, -1)
+    assert((try canvas.layer_id(0)) == twin)
+    try canvas.reorder_layer(twin, 1)
+    try canvas.merge_down(twin)
+    assert(canvas.layer_count() == 1 and (try canvas.layer_id(0)) == layer and not canvas.can_undo())

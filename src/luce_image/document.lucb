@@ -145,6 +145,65 @@ pub struct Document:
         self.revision += 1
         return id
 
+    ## Move a layer one step up (`step` 1) or down (-1) among its siblings.
+    pub mutating func reorder(id: u64, step: i64) -> !:
+        let parent = parent_of(self.root, id) else error(invalid, "no such layer")
+        var index: usize = 0
+        while parent.children[index].id != id:
+            index += 1
+        let target = (i64)index + step
+        if target < 0 or target >= (i64)parent.child_count:
+            return
+        let moved = parent.children[index]
+        parent.children[index] = parent.children[(usize)target]
+        parent.children[(usize)target] = moved
+        self.revision += 1
+
+    ## Copy a raster layer with its mask and appearance, placed just above it.
+    pub mutating func duplicate(id: u64, name: str) -> u64!:
+        let source = self.find(id) else error(invalid, "no such layer")
+        if source.group:
+            error(invalid, "groups cannot be duplicated yet")
+        let tiles = source.tiles() else error(invalid, "no pixels to duplicate")
+        var copy = try tiles.clone()
+        errdefer copy.destroy()
+        let parent = parent_of(self.root, id) else error(invalid, "no such layer")
+        let created = try self.add(name, none if parent == self.root else parent.id, false, copy)
+        let layer = self.find(created) else trap("just added")
+        layer.visible = source.visible
+        layer.opacity = source.opacity
+        layer.blend = source.blend
+        layer.clipped = source.clipped
+        if let mask = source.mask_tiles():
+            var mask_copy = try mask.clone()
+            errdefer mask_copy.destroy()
+            layer.mask = try box(mask_copy)
+        # Place it right above the source.
+        var origin: usize = 0
+        while parent.children[origin].id != created:
+            origin += 1
+        var to: usize = 0
+        while parent.children[to].id != id:
+            to += 1
+        let moved = parent.children[origin]
+        var index = origin
+        while index > to + 1:
+            parent.children[index] = parent.children[index - 1]
+            index -= 1
+        parent.children[to + 1] = moved
+        self.revision += 1
+        return created
+
+    ## The sibling directly below `id`, if any.
+    pub func below(id: u64) -> Layer*?:
+        let parent = parent_of(self.root, id) else return none
+        var index: usize = 0
+        while parent.children[index].id != id:
+            index += 1
+        if index == 0:
+            return none
+        return parent.children[index - 1]
+
     ## Remove a layer or a group with everything in it.
     pub mutating func remove(id: u64) -> !:
         if not remove_in(self.root, id):
@@ -255,6 +314,14 @@ pub func unbox_document(document: Document*):
     document.destroy()
     free(document) in memory.heap
 
+func parent_of(layer: Layer*, id: u64) -> Layer*?:
+    for child in layer.children[..<layer.child_count]:
+        if child.id == id:
+            return layer
+        if let found = parent_of(child, id):
+            return found
+    return none
+
 func find_in(layer: Layer*, id: u64) -> Layer*?:
     for child in layer.children[..<layer.child_count]:
         if child.id == id:
@@ -303,3 +370,12 @@ test "document layers, groups, removal and appearance":
     assert(found.revision == 2)
     try document.remove(group)
     assert(document.find(inner) == none and document.layers().length == 1)
+    let second = try document.add_layer("Second")
+    try document.set_appearance(second, true, 0.5, 6)
+    let copy = try document.duplicate(second, "Second copy")
+    assert(document.layers().length == 3 and document.layers()[2].id == copy and (document.find(copy) else trap("copy")).blend == 6)
+    try document.reorder(copy, -3)
+    assert(document.layers()[2].id == copy)
+    try document.reorder(copy, -1)
+    assert(document.layers()[1].id == copy and document.layers()[2].id == second)
+    assert((document.below(second) else trap("below")).id == copy and document.below(background) == none)
