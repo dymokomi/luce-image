@@ -13,6 +13,8 @@ layout(push_constant) uniform Params {
 } params;
 layout(set = 0, binding = 1) uniform sampler2D backdrop;
 layout(set = 0, binding = 2) uniform sampler2D layer;
+layout(set = 0, binding = 3) uniform sampler2D mask;   // red reveals; white when absent
+layout(set = 0, binding = 4) uniform sampler2D base;   // the clip base's alpha; white when unclipped
 
 float lum(vec3 c) { return dot(c, vec3(0.3, 0.59, 0.11)); }
 vec3 clip_color(vec3 c) {
@@ -76,7 +78,7 @@ void main() {
     vec2 layer_uv = (params.region.xy + p) / 256.0;
     vec4 src = texture(layer, layer_uv);
     if (p.x >= params.region.z || p.y >= params.region.w) src = vec4(0.0);
-    float sa = src.a * params.opacity;
+    float sa = src.a * params.opacity * texture(mask, layer_uv).r * texture(base, layer_uv).a;
     int mode = int(params.mode + 0.5);
     vec3 mixed = blend(mode, bd.rgb, src.rgb);
     // W3C compositing: the blend applies where both are present, the plain

@@ -24,6 +24,8 @@ struct Record:
     var visible: bool
     var opacity: f64
     var blend: i64
+    var masked: bool
+    var clipped: bool
     ## A picture waiting to become tiles once a device is bound.
     var picture: interop.Reference[Image]?
 
@@ -40,6 +42,7 @@ pub struct Canvas:
     var adjuster: Adjuster?
     var brush: Brush
     var stroke: Stroke*?
+    var mask_editing: bool
     var history: Snapshot[]
     var history_count: usize
     var future: Snapshot[]
@@ -63,6 +66,7 @@ pub struct Canvas:
         self.adjuster = none
         self.brush = Brush()
         self.stroke = none
+        self.mask_editing = false
         var no_history: Snapshot[]
         self.history = no_history
         self.history_count = 0
@@ -109,7 +113,7 @@ pub struct Canvas:
         if let document = self.document:
             let created = try document.add_layer(name)
             assert(created == id)
-        self.records[self.count] = Record(id = id, name = copied, visible = true, opacity = 1.0, blend = 0, picture = none)
+        self.records[self.count] = Record(id = id, name = copied, visible = true, opacity = 1.0, blend = 0, masked = false, clipped = false, picture = none)
         self.count += 1
         self.next_id += 1
         return (i64)id
@@ -176,6 +180,42 @@ pub struct Canvas:
     pub func layer_blend(index: i64) -> i64!:
         return (try self.record(index)).blend
 
+    # mark: Masks and clipping ==============================================================
+
+    ## Give a layer a mask that reveals everything, or remove its mask.
+    pub mutating func set_mask(id: i64, present: bool) -> !:
+        try self.require_open()
+        if self.stroke != none:
+            error(invalid, "finish the stroke first")
+        let index = try self.index((u64)id)
+        if let document = self.document:
+            try document.set_mask((u64)id, present)
+        self.records[index].masked = present
+        if not present and self.mask_editing:
+            self.mask_editing = false
+
+    pub func layer_masked(index: i64) -> bool!:
+        return (try self.record(index)).masked
+
+    ## Route strokes to the selected layer's mask instead of its pixels: white
+    ## reveals, black hides.
+    pub mutating func edit_mask(enabled: bool):
+        self.mask_editing = enabled
+
+    pub func editing_mask() -> bool:
+        return self.mask_editing
+
+    ## Clip a layer to the nearest unclipped layer below it, or unclip it.
+    pub mutating func set_clipped(id: i64, clipped: bool) -> !:
+        try self.require_open()
+        let index = try self.index((u64)id)
+        if let document = self.document:
+            try document.set_clipped((u64)id, clipped)
+        self.records[index].clipped = clipped
+
+    pub func layer_clipped(index: i64) -> bool!:
+        return (try self.record(index)).clipped
+
     ## How many blend modes there are.
     pub static func blend_mode_count() -> i64:
         return (i64)blend_mode_count
@@ -220,9 +260,11 @@ pub struct Canvas:
             error(invalid, "a stroke is already in progress")
         let document = self.document else error(invalid, "draw the document once before painting")
         var painter = self.painter else error(invalid, "draw the document once before painting")
-        let stroke = try begin_boxed(&painter, document, (u64)layer, self.brush, x, y)
+        let index = try self.index((u64)layer)
+        let on_mask = self.mask_editing and self.records[index].masked
+        let stroke = try begin_boxed(&painter, document, (u64)layer, self.brush, x, y, on_mask)
         errdefer finish_boxed(stroke)
-        try self.remember((u64)layer, try stroke.original().clone())
+        try self.remember((u64)layer, try stroke.original().clone(), on_mask)
         self.stroke = stroke
 
     ## Continue the stroke to a document point.
@@ -280,8 +322,8 @@ pub struct Canvas:
         let document = self.document else trap("history without a document")
         let entry = self.history[self.history_count - 1]
         self.history_count -= 1
-        let current = try document.take_tiles(entry.layer, entry.tiles)
-        try push(&self.future, &self.future_count, Snapshot(layer = entry.layer, tiles = current))
+        let current = try (document.take_mask(entry.layer, entry.tiles) if entry.mask else document.take_tiles(entry.layer, entry.tiles))
+        try push(&self.future, &self.future_count, Snapshot(layer = entry.layer, tiles = current, mask = entry.mask))
 
     ## Redo the last undone stroke.
     pub mutating func redo() -> !:
@@ -293,12 +335,12 @@ pub struct Canvas:
         let document = self.document else trap("history without a document")
         let entry = self.future[self.future_count - 1]
         self.future_count -= 1
-        let current = try document.take_tiles(entry.layer, entry.tiles)
-        try push(&self.history, &self.history_count, Snapshot(layer = entry.layer, tiles = current))
+        let current = try (document.take_mask(entry.layer, entry.tiles) if entry.mask else document.take_tiles(entry.layer, entry.tiles))
+        try push(&self.history, &self.history_count, Snapshot(layer = entry.layer, tiles = current, mask = entry.mask))
 
     ## Record a layer's pixels before a change, dropping the redo trail and the
     ## oldest entries past the limit.
-    mutating func remember(layer: u64, tiles: Tiles) -> !:
+    mutating func remember(layer: u64, tiles: Tiles, mask: bool = false) -> !:
         var owned = tiles
         errdefer owned.destroy()
         clear_snapshots(&self.future, &self.future_count)
@@ -307,7 +349,7 @@ pub struct Canvas:
             for index in 1..<self.history_count:
                 self.history[index - 1] = self.history[index]
             self.history_count -= 1
-        try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = tiles))
+        try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = tiles, mask = mask))
 
     ## Write the flattened document to `path` as an 8-bit RGBA picture in the
     ## format its extension names. Needs the document drawn at least once.
@@ -397,6 +439,10 @@ pub struct Canvas:
             let record = self.records[index]
             discard(try document.add_layer(record.name))
             try document.set_appearance(record.id, record.visible, record.opacity, (u32)record.blend)
+            if record.masked:
+                try document.set_mask(record.id, true)
+            if record.clipped:
+                try document.set_clipped(record.id, true)
         binding.document = try box_document(document)
         var composer = try Composer.create(device)
         errdefer composer.destroy()
@@ -482,6 +528,7 @@ struct Binding:
 struct Snapshot:
     var layer: u64
     var tiles: Tiles
+    var mask: bool
 
 func push(list: Snapshot[]*, count: usize*, entry: Snapshot) -> !:
     if *count == list.length:
@@ -640,3 +687,33 @@ test "canvas strokes paint the selected layer and undo restores it":
     assert(pixel[0] == 255 and pixel[1] == 0 and pixel[2] == 255)
     try canvas.undo()
     assert(canvas.can_redo())
+    # A mask painted black over the stroke's middle hides it there; undoing the
+    # mask stroke shows it again.
+    try canvas.set_mask(layer, true)
+    assert(try canvas.layer_masked(0))
+    canvas.edit_mask(true)
+    try canvas.set_brush(12.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, false)
+    try canvas.begin_stroke(layer, 32.0, 32.0)
+    try canvas.end_stroke()
+    canvas.edit_mask(false)
+    let fifth = try target.frame()
+    defer fifth.release()
+    let masked = try fifth.value().target()
+    defer masked.release()
+    try canvas.draw(masked, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
+    discard(try fifth.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    try target.read(pixel, gpu.Region(32, 32, 1, 1))
+    assert(pixel[1] == 0)
+    try target.read(pixel, gpu.Region(12, 32, 1, 1))
+    assert(pixel[1] == 255)
+    try canvas.undo()
+    let sixth = try target.frame()
+    defer sixth.release()
+    let unmasked = try sixth.value().target()
+    defer unmasked.release()
+    try canvas.draw(unmasked, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
+    discard(try sixth.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    try target.read(pixel, gpu.Region(32, 32, 1, 1))
+    assert(pixel[1] == 255)
+    try canvas.set_clipped(layer, true)
+    assert(try canvas.layer_clipped(0))

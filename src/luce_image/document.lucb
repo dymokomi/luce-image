@@ -23,8 +23,13 @@ pub struct Layer:
     ## 19 divide, 20 hue, 21 saturation, 22 color, 23 luminosity, 24 darker
     ## color, 25 lighter color.
     pub var blend: u32
+    ## Take alpha from the nearest unclipped layer below, like Photoshop's
+    ## clipping mask.
+    pub var clipped: bool
     pub var group: bool
     var pixels: Tiles*?
+    ## The layer mask: red reveals, a missing tile reveals fully.
+    var mask: Tiles*?
     var children: Layer*[]
     var child_count: usize
     ## Bumps whenever the pixels are replaced.
@@ -33,6 +38,10 @@ pub struct Layer:
     ## The layer's tiles, borrowed; `none` for a group.
     pub func tiles() -> Tiles*?:
         return self.pixels
+
+    ## The layer's mask tiles, borrowed; `none` without a mask.
+    pub func mask_tiles() -> Tiles*?:
+        return self.mask
 
     ## The children of a group, bottom to top.
     pub func layers() -> Layer*[]:
@@ -44,6 +53,8 @@ func layer_destroy(layer: Layer*):
     if layer.children.length > 0:
         free(layer.children) in memory.heap
     if let tiles = layer.pixels:
+        unbox(tiles)
+    if let tiles = layer.mask:
         unbox(tiles)
     strings.release(layer.name)
     free(layer) in memory.heap
@@ -156,6 +167,41 @@ pub struct Document:
         let taken = *previous
         free(previous) in memory.heap
         return taken
+
+    ## Give a raster layer an empty mask (revealing everything) or take it away.
+    pub mutating func set_mask(id: u64, present: bool) -> !:
+        let layer = self.find(id) else error(invalid, "no such layer")
+        if layer.group:
+            error(invalid, "a group cannot have a mask")
+        if present and layer.mask == none:
+            let tiles = try Tiles.create(self.owner, self.extent_x, self.extent_y)
+            layer.mask = try box(tiles)
+        elif not present:
+            if let tiles = layer.mask:
+                unbox(tiles)
+            layer.mask = none
+        layer.revision += 1
+        self.revision += 1
+
+    ## Replace a layer's mask with `tiles` and hand back the mask it had.
+    pub mutating func take_mask(id: u64, tiles: Tiles) -> Tiles!:
+        var holder: Tiles*? = try box(tiles)
+        errdefer release_tiles(&holder)
+        let layer = self.find(id) else error(invalid, "no such layer")
+        let previous = layer.mask else error(invalid, "the layer has no mask")
+        if tiles.width() != self.extent_x or tiles.height() != self.extent_y:
+            error(invalid, "tiles must match the document's size")
+        layer.mask = holder
+        layer.revision += 1
+        let taken = *previous
+        free(previous) in memory.heap
+        return taken
+
+    ## Clip a layer to the one below, or unclip it.
+    pub mutating func set_clipped(id: u64, clipped: bool) -> !:
+        let layer = self.find(id) else error(invalid, "no such layer")
+        layer.clipped = clipped
+        self.revision += 1
 
     ## Set a layer's visibility, opacity and blend mode.
     pub mutating func set_appearance(id: u64, visible: bool, opacity: f64, blend: u32 = 0) -> !:

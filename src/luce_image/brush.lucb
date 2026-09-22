@@ -75,16 +75,21 @@ pub struct Stroke:
     # starts from here, and it is what undo wants.
     var before: Tiles
     var empty: gpu.Texture?
+    ## What a missing cell counts as: transparent for pixels, white for a mask.
+    var fill: gpu.Color
     var active: bool
+    var on_mask: bool
 
-    ## Begin at a point, painting the first dab there.
-    pub static func begin(painter: Painter*, document: Document*, layer: u64, brush: Brush, x: f64, y: f64) -> Stroke!:
+    ## Begin at a point on `layer`'s pixels, or on its mask, painting the first
+    ## dab there. A mask's missing cells count as white (revealing).
+    pub static func begin(painter: Painter*, document: Document*, layer: u64, brush: Brush, x: f64, y: f64, on_mask: bool = false) -> Stroke!:
         try brush.check()
         let target = document.find(layer) else error(invalid, "no such layer")
-        let tiles = target.tiles() else error(invalid, "a group cannot be painted")
+        let tiles = (target.mask_tiles() else error(invalid, "the layer has no mask")) if on_mask else (target.tiles() else error(invalid, "a group cannot be painted"))
         if not math.is_finite(x) or not math.is_finite(y):
             error(invalid, "stroke coordinates must be finite")
-        var stroke = Stroke(layer = layer, brush = brush, last_x = x, last_y = y, before = try tiles.clone(), empty = none, active = true)
+        let fill = gpu.Color(1.0, 1.0, 1.0, 1.0) if on_mask else gpu.Color(0.0, 0.0, 0.0, 0.0)
+        var stroke = Stroke(layer = layer, brush = brush, last_x = x, last_y = y, before = try tiles.clone(), empty = none, fill = fill, active = true, on_mask = on_mask)
         errdefer stroke.destroy()
         try stroke.segment(painter, document, x, y, x, y)
         return stroke
@@ -114,7 +119,7 @@ pub struct Stroke:
 
     mutating func segment(painter: Painter*, document: Document*, x0: f64, y0: f64, x1: f64, y1: f64) -> !:
         let target = document.find(self.layer) else error(invalid, "the painted layer is gone")
-        let tiles = target.tiles() else error(invalid, "the painted layer has no pixels")
+        let tiles = (target.mask_tiles() else error(invalid, "the painted mask is gone")) if self.on_mask else (target.tiles() else error(invalid, "the painted layer has no pixels"))
         let reach = self.brush.diameter * 0.5 + 1.0
         let left = math.max(0.0, math.floor((math.min(x0, x1) - reach) / (f64)tile_size))
         let top = math.max(0.0, math.floor((math.min(y0, y1) - reach) / (f64)tile_size))
@@ -170,11 +175,16 @@ pub struct Stroke:
         discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         try tiles.set(entry.column, entry.row, fresh)
 
-    ## One transparent tile standing in for cells the layer had nothing at.
+    ## One tile of the fill colour standing in for cells the layer had nothing at.
     mutating func blank_tile(tiles: Tiles*) -> gpu.Texture!:
         if let existing = self.empty:
             return existing
-        let created = try tiles.blank()
+        var created = try tiles.blank()
+        if self.fill.alpha > 0.0:
+            errdefer created.destroy()
+            let frame = try created.frame()
+            defer frame.release()
+            discard(try frame.value().present(self.fill))
         self.empty = created
         return created
 
@@ -217,11 +227,11 @@ pub struct Stroke:
         self.before.destroy()
 
 ## A stroke on the heap, for holders that keep a pointer.
-pub func begin_boxed(painter: Painter*, document: Document*, layer: u64, brush: Brush, x: f64, y: f64) -> Stroke*!:
-    var stroke = try Stroke.begin(painter, document, layer, brush, x, y)
+pub func begin_boxed(painter: Painter*, document: Document*, layer: u64, brush: Brush, x: f64, y: f64, on_mask: bool = false) -> Stroke*!:
+    var stroke = try Stroke.begin(painter, document, layer, brush, x, y, on_mask)
     errdefer stroke.destroy()
     return try new Stroke(layer = stroke.layer, brush = stroke.brush, last_x = stroke.last_x, last_y = stroke.last_y, touched = stroke.touched,
-                          count = stroke.count, before = stroke.before, empty = stroke.empty, active = stroke.active) in memory.heap
+                          count = stroke.count, before = stroke.before, empty = stroke.empty, fill = stroke.fill, active = stroke.active, on_mask = stroke.on_mask) in memory.heap
 
 ## End a boxed stroke and free the box.
 pub func finish_boxed(stroke: Stroke*):

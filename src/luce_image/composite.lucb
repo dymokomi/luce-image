@@ -29,6 +29,7 @@ pub struct Composer:
     var shader: gpu.Shader
     var pipeline: gpu.Pipeline
     var blank: gpu.Texture
+    var white: gpu.Texture
     ## How many tiles were rendered rather than found, for tests and tuning.
     pub var renders: u64
 
@@ -51,7 +52,11 @@ pub struct Composer:
         for index in 0..<zeros.length:
             zeros[index] = 0
         try blank.upload(zeros)
-        return Composer(owner = device, entries = entries, count = 0, budget = budget, tick = 0, shader = shader, pipeline = pipeline, blank = blank, renders = 0)
+        var white = try gpu.Texture.create(device, 1, 1, gpu.Format.rgba16_float)
+        errdefer white.destroy()
+        # 1.0 as a half is 0x3c00.
+        try white.upload([(u8)0, (u8)0x3c, (u8)0, (u8)0x3c, (u8)0, (u8)0x3c, (u8)0, (u8)0x3c])
+        return Composer(owner = device, entries = entries, count = 0, budget = budget, tick = 0, shader = shader, pipeline = pipeline, blank = blank, white = white, renders = 0)
 
     ## The flattened tile at `column`, `row` of pyramid `level`, borrowed until
     ## the next call. Straight-alpha rgba16_float, transparent where nothing is.
@@ -107,16 +112,32 @@ pub struct Composer:
         return backdrop
 
     mutating func flatten_layers(layers: Layer*[], opacity: f64, column: u32, row: u32, backdrop: gpu.Texture*, owned: bool*) -> !:
+        # The layer a clipped layer takes its alpha from: the nearest unclipped
+        # raster layer below it in this group.
+        var base: gpu.Texture? = none
+        var base_missing = false
         for layer in layers:
             if not layer.visible or layer.opacity == 0.0:
                 continue
             let effective = opacity * layer.opacity
             if layer.group:
                 try self.flatten_layers(layer.layers(), effective, column, row, backdrop, owned)
+                base = none
+                base_missing = false
                 continue
             let tiles = layer.tiles() else continue
+            if not layer.clipped:
+                base = tiles.texture(column, row)
+                base_missing = base == none
             let texture = tiles.texture(column, row) else continue
             let area = tiles.region(column, row)
+            var clip = self.blank if layer.clipped and base_missing else (base else self.blank)
+            if not layer.clipped:
+                clip = self.white
+            var mask = self.white
+            if let mask_tiles = layer.mask_tiles():
+                if let mask_texture = mask_tiles.texture(column, row):
+                    mask = mask_texture
             var params: f32[6] = [0.0, 0.0, (f32)area.width, (f32)area.height, (f32)effective, (f32)layer.blend]
             var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
             errdefer fresh.destroy()
@@ -124,7 +145,7 @@ pub struct Composer:
             defer frame.release()
             let target = try frame.value().target()
             defer target.release()
-            try gpu.shade(target.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 24), [*backdrop, texture], gpu.Filter.nearest)
+            try gpu.shade(target.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 24), [*backdrop, texture, mask, clip], gpu.Filter.nearest)
             discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
             if *owned:
                 backdrop.destroy()
@@ -193,13 +214,14 @@ pub struct Composer:
         self.entries = empty
         self.budget = 0
         self.blank.destroy()
+        self.white.destroy()
         self.pipeline.destroy()
         self.shader.destroy()
 
 ## Move a compositor onto the heap, for holders that keep a pointer.
 pub func box_composer(composer: Composer) -> Composer*!:
     return try new Composer(owner = composer.owner, entries = composer.entries, count = composer.count, budget = composer.budget, tick = composer.tick,
-                            shader = composer.shader, pipeline = composer.pipeline, blank = composer.blank, renders = composer.renders) in memory.heap
+                            shader = composer.shader, pipeline = composer.pipeline, blank = composer.blank, white = composer.white, renders = composer.renders) in memory.heap
 
 ## Destroy a boxed compositor and free the box.
 pub func unbox_composer(composer: Composer*):
@@ -228,6 +250,7 @@ func hash_layers(seed: u64, layers: Layer*[], opacity: f64, first_column: u32, f
         digest = fnv_mix(digest, layer.revision)
         digest = fnv_mix(digest, effective.bits())
         digest = fnv_mix(digest, (u64)layer.blend)
+        digest = fnv_mix(digest, 1 if layer.clipped else 0)
     return digest
 
 func drop_owned(texture: gpu.Texture*, owned: bool):
@@ -309,6 +332,38 @@ test "composite flattens layers with opacity, caches by identity and scales leve
     let red_left = from_half((u16)bytes[0] | ((u16)bytes[1] << 8))
     assert(red_left > 0.49 and red_left < 0.51 and from_half((u16)bytes[2] | ((u16)bytes[3] << 8)) < 0.01)
     assert(from_half((u16)bytes[6] | ((u16)bytes[7] << 8)) == 1.0)
+    # A mask painted black at the pixel hides the top layer there; clipping the
+    # top layer to an empty layer below hides it everywhere.
+    try document.set_appearance(top, true, 1.0, 0)
+    try document.set_mask(top, true)
+    var hide = try Tiles.create(device, 300, 260)
+    for index in 0..<count:
+        pixels[index] = 0.0
+    for index in 0..<(usize)(300 * 260):
+        pixels[index * 4 + 3] = 1.0
+    pixels[(10 * 300 + 20) * 4 + 3] = 1.0
+    pixels[(10 * 300 + 21) * 4] = 1.0
+    pixels[(10 * 300 + 21) * 4 + 3] = 1.0
+    try hide.write(pixels)
+    let old_mask = try document.take_mask(top, hide)
+    var dropped = old_mask
+    dropped.destroy()
+    let masked = try composer.tile(&document, 0, 0, 0)
+    try masked.read(bytes, gpu.Region(20, 10, 1, 1))
+    assert(from_half((u16)bytes[0] | ((u16)bytes[1] << 8)) > 0.99 and from_half((u16)bytes[2] | ((u16)bytes[3] << 8)) < 0.01)
+    try document.set_mask(top, false)
+    let between = try document.add_layer("Empty")
+    try document.remove(between)
+    let holder = try document.add_group("Holder")
+    let clipped = try document.add_layer("Clipped", holder)
+    try document.set_tiles(clipped, try green.clone())
+    try document.set_clipped(clipped, true)
+    let alone = try composer.tile(&document, 0, 0, 0)
+    try alone.read(bytes, gpu.Region(20, 10, 1, 1))
+    # The top (unclipped, green at half alpha) still shows; the clipped copy in
+    # the group has no base and adds nothing: red 0.5 as before.
+    let clipped_red = from_half((u16)bytes[0] | ((u16)bytes[1] << 8))
+    assert(clipped_red > 0.49 and clipped_red < 0.51)
     var rejected = false
     discard(composer.tile(&document, 4, 0, 0) catch failure:
         assert(failure.code == invalid)
