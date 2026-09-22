@@ -6,7 +6,7 @@ Pillow-inspired owning `Image` API and Cryptomatte 1.2 reading and authoring.
 **Every file format is its own package.** luce-image's `Image` opens and saves
 through `luce-png`, `luce-jpeg`, `luce-tiff` and `luce-exr` (and reads Photoshop
 documents through `luce-psd`), which share `luce-raster` (the pixel model, byte
-readers and error codes) and `luce-deflate`; each depends only on the standard
+readers and error codes) and `luce-compress`; each depends only on the standard
 library and those two. luce-image adds the owning `Image` API, threaded decoding,
 Cryptomatte and the layered-document engine.
 

@@ -2,7 +2,7 @@ import files
 import memory
 import c
 from binary import Buffer
-import deflate
+import compress
 
 pub func main(arguments: str[]) -> i32!:
     let raw = try files.read((c.str)arguments[1])
@@ -11,12 +11,14 @@ pub func main(arguments: str[]) -> i32!:
     defer free(packed)
     let out = try new u8[raw.length]
     defer free(out)
-    try deflate.inflate(packed, out)
+    try compress.inflate(packed, out)
     assert((str)out == (str)raw)
     var encoded = Buffer()
     defer encoded.close()
-    try deflate.compress(raw, &encoded)
-    try deflate.inflate(encoded.view(), out)
+    let zipped = try compress.compress(raw)
+    defer free(zipped) in memory.heap
+    try encoded.put(zipped)
+    try compress.inflate(encoded.view(), out)
     assert((str)out == (str)raw)
     try files.write((c.str)arguments[3], encoded.view())
     return 0

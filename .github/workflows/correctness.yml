@@ -23,7 +23,7 @@ jobs:
           echo "tls=$(cat luce-image/bootstrap/TLS)" >> "$GITHUB_OUTPUT"
           echo "psd=$(cat luce-image/bootstrap/PSD)" >> "$GITHUB_OUTPUT"
           echo "raster=$(cat luce-image/bootstrap/RASTER)" >> "$GITHUB_OUTPUT"
-          echo "deflate=$(cat luce-image/bootstrap/DEFLATE)" >> "$GITHUB_OUTPUT"
+          echo "compress=$(cat luce-image/bootstrap/COMPRESS)" >> "$GITHUB_OUTPUT"
           echo "png=$(cat luce-image/bootstrap/PNG)" >> "$GITHUB_OUTPUT"
           echo "jpeg=$(cat luce-image/bootstrap/JPEG)" >> "$GITHUB_OUTPUT"
           echo "tiff=$(cat luce-image/bootstrap/TIFF)" >> "$GITHUB_OUTPUT"
@@ -65,9 +65,9 @@ jobs:
           path: luce-raster
       - uses: actions/checkout@v7
         with:
-          repository: dymokomi/luce-deflate
-          ref: ${{ steps.pins.outputs.deflate }}
-          path: luce-deflate
+          repository: dymokomi/luce-compress
+          ref: ${{ steps.pins.outputs.compress }}
+          path: luce-compress
       - uses: actions/checkout@v7
         with:
           repository: dymokomi/luce-png
