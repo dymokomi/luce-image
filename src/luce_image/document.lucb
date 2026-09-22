@@ -8,6 +8,7 @@ import math
 import memory
 import strings
 from luce_image.tiles import Tiles, box, unbox
+from luce_image.selection import Selection
 from luce_image.errors import invalid, limit
 
 pub let blend_mode_count: u32 = 26
@@ -75,13 +76,6 @@ func layer_destroy(layer: Layer*):
     strings.release(layer.name)
     free(layer) in memory.heap
 
-## A rectangular selection in document pixels; width 0 means none.
-pub struct Selection:
-    pub var x: i64
-    pub var y: i64
-    pub var width: i64
-    pub var height: i64
-
 pub struct Document:
     var owner: gpu.Device
     var extent_x: u32
@@ -101,7 +95,9 @@ pub struct Document:
         with memory.heap:
             title = try strings.copy("root")
         let root = try new Layer(id = 0, name = title, group = true, pixels = none, revision = 0) in memory.heap
-        return Document(owner = device, extent_x = width, extent_y = height, selection = Selection(), root = root, next_id = 1, revision = 1)
+        var selection = try Selection.create(width, height)
+        errdefer selection.destroy()
+        return Document(owner = device, extent_x = width, extent_y = height, selection = selection, root = root, next_id = 1, revision = 1)
 
     pub func width() -> u32:
         return self.extent_x
@@ -253,23 +249,17 @@ pub struct Document:
         return taken
 
     ## Adopt new extents after every layer has been rebuilt for them.
-    pub mutating func set_extent(width: u32, height: u32):
+    pub mutating func set_extent(width: u32, height: u32) -> !:
         self.extent_x = width
         self.extent_y = height
-        self.selection = Selection()
+        var replacement = try Selection.create(width, height)
+        self.selection.destroy()
+        self.selection = replacement
         self.revision += 1
 
-    ## Select a rectangle, clamped to the document; an empty one deselects.
-    pub mutating func select(x: i64, y: i64, width: i64, height: i64):
-        let left = math.imax(0, x)
-        let top = math.imax(0, y)
-        let right = math.imin((i64)self.extent_x, x + width)
-        let bottom = math.imin((i64)self.extent_y, y + height)
-        if right <= left or bottom <= top:
-            self.selection = Selection()
-        else:
-            self.selection = Selection(x = left, y = top, width = right - left, height = bottom - top)
-        self.revision += 1
+    ## The selection's GPU tiles, or none when nothing is selected.
+    pub mutating func selection_tiles() -> Tiles*?!:
+        return try self.selection.gpu_tiles(self.owner)
 
     ## Give a raster layer an empty mask (revealing everything) or take it away.
     pub mutating func set_mask(id: u64, present: bool) -> !:
@@ -319,6 +309,7 @@ pub struct Document:
         self.revision += 1
 
     pub mutating func destroy():
+        self.selection.destroy()
         layer_destroy(self.root)
 
 func release_tiles(holder: Tiles*?*):

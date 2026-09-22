@@ -1,0 +1,329 @@
+## A per-pixel selection: one coverage byte per document pixel on the CPU,
+## where the shapes are drawn and the morphology runs, mirrored into GPU tiles
+## (red channel) on demand for the shaders that clip strokes and fills. Shapes
+## combine in Photoshop's modes: replace, add, subtract, intersect.
+import gpu
+import math
+import memory
+from luce_image.tiles import Tiles, tile_size, box, unbox
+from luce_image.errors import invalid
+
+## How a new shape combines with the selection so far.
+pub enum Mode as u8:
+    replace = 0
+    add = 1
+    subtract = 2
+    intersect = 3
+
+pub struct Selection:
+    var extent_x: u32
+    var extent_y: u32
+    var coverage: u8[]
+    var tiles: Tiles*?
+    var owner: gpu.Device?
+    var uploaded: bool
+    var empty: bool
+    ## The bounding box of the selected pixels, valid when not empty.
+    pub var left: i64
+    pub var top: i64
+    pub var right: i64
+    pub var bottom: i64
+
+    pub static func create(width: u32, height: u32) -> Selection!:
+        if width == 0 or height == 0 or width > 65536 or height > 65536:
+            error(invalid, "selection dimensions must be in 1..65536")
+        let coverage = try alloc u8[(usize)width * (usize)height] in memory.heap
+        for index in 0..<coverage.length:
+            coverage[index] = 0
+        return Selection(extent_x = width, extent_y = height, coverage = coverage, tiles = none, owner = none, uploaded = false, empty = true)
+
+    pub func is_empty() -> bool:
+        return self.empty
+
+    pub func width() -> u32:
+        return self.extent_x
+
+    pub func height() -> u32:
+        return self.extent_y
+
+    ## Coverage 0..255 at a pixel; 255 everywhere when nothing is selected.
+    pub func at(x: i64, y: i64) -> u8:
+        if self.empty:
+            return 255
+        if x < 0 or y < 0 or x >= (i64)self.extent_x or y >= (i64)self.extent_y:
+            return 0
+        return self.coverage[(usize)y * (usize)self.extent_x + (usize)x]
+
+    pub mutating func clear():
+        for index in 0..<self.coverage.length:
+            self.coverage[index] = 0
+        self.finish()
+
+    pub mutating func select_all():
+        for index in 0..<self.coverage.length:
+            self.coverage[index] = 255
+        self.finish()
+
+    pub mutating func invert():
+        for index in 0..<self.coverage.length:
+            self.coverage[index] = 255 - self.coverage[index]
+        self.finish()
+
+    ## A rectangle, combined by `mode`.
+    pub mutating func rectangle(x: i64, y: i64, width: i64, height: i64, mode: Mode):
+        self.shape(x, y, width, height, mode, false)
+
+    ## An ellipse inscribed in a rectangle, combined by `mode`, antialiased.
+    pub mutating func ellipse(x: i64, y: i64, width: i64, height: i64, mode: Mode):
+        self.shape(x, y, width, height, mode, true)
+
+    mutating func shape(x: i64, y: i64, width: i64, height: i64, mode: Mode, round: bool):
+        if mode == Mode.replace:
+            for index in 0..<self.coverage.length:
+                self.coverage[index] = 0
+        let left = math.imax(0, x)
+        let top = math.imax(0, y)
+        let right = math.imin((i64)self.extent_x, x + width)
+        let bottom = math.imin((i64)self.extent_y, y + height)
+        if right > left and bottom > top:
+            let cx = (f64)x + (f64)width * 0.5
+            let cy = (f64)y + (f64)height * 0.5
+            let rx = math.max(0.5, (f64)width * 0.5)
+            let ry = math.max(0.5, (f64)height * 0.5)
+            for row in top..<bottom:
+                for column in left..<right:
+                    var value: u8 = 255
+                    if round:
+                        # Distance to the ellipse edge in its own units, antialiased over one pixel.
+                        let dx = ((f64)column + 0.5 - cx) / rx
+                        let dy = ((f64)row + 0.5 - cy) / ry
+                        let d = math.sqrt(dx * dx + dy * dy)
+                        let edge = math.min(rx, ry)
+                        let coverage = math.clamp((1.0 - d) * edge + 0.5, 0.0, 1.0)
+                        value = (u8)(coverage * 255.0 + 0.5)
+                    self.combine((usize)row * (usize)self.extent_x + (usize)column, value, mode)
+        if mode == Mode.intersect:
+            self.outside(left, top, right, bottom)
+        self.finish()
+
+    ## A polygon from `points` (x, y pairs in document pixels), even-odd filled,
+    ## combined by `mode`.
+    pub mutating func polygon(points: const f64[], mode: Mode) -> !:
+        if points.length < 6 or points.length % 2 != 0:
+            error(invalid, "a polygon needs at least three points")
+        for value in points:
+            if not math.is_finite(value):
+                error(invalid, "polygon points must be finite")
+        if mode == Mode.replace:
+            for index in 0..<self.coverage.length:
+                self.coverage[index] = 0
+        var min_y = points[1]
+        var max_y = points[1]
+        var min_x = points[0]
+        var max_x = points[0]
+        var index: usize = 0
+        while index < points.length:
+            min_x = math.min(min_x, points[index])
+            max_x = math.max(max_x, points[index])
+            min_y = math.min(min_y, points[index + 1])
+            max_y = math.max(max_y, points[index + 1])
+            index += 2
+        let top = math.imax(0, (i64)math.floor(min_y))
+        let bottom = math.imin((i64)self.extent_y, (i64)math.ceil(max_y))
+        let count = points.length // 2
+        # Scanline crossings at each row's centre, four subsamples per row for
+        # a little antialiasing along near-horizontal edges.
+        let crossings = try alloc f64[count] in memory.heap
+        defer free(crossings) in memory.heap
+        let accumulate = try alloc u16[(usize)self.extent_x] in memory.heap
+        defer free(accumulate) in memory.heap
+        for row in top..<bottom:
+            for column in 0..<(usize)self.extent_x:
+                accumulate[column] = 0
+            for sample in 0..<(usize)4:
+                let y = (f64)row + ((f64)sample + 0.5) * 0.25
+                var found: usize = 0
+                for edge in 0..<count:
+                    let ax = points[edge * 2]
+                    let ay = points[edge * 2 + 1]
+                    let bx = points[((edge + 1) % count) * 2]
+                    let by = points[((edge + 1) % count) * 2 + 1]
+                    if (ay <= y and by > y) or (by <= y and ay > y):
+                        crossings[found] = ax + (y - ay) * (bx - ax) / (by - ay)
+                        found += 1
+                # Sort the crossings and fill between pairs.
+                for i in 1..<found:
+                    let value = crossings[i]
+                    var at = i
+                    while at > 0 and crossings[at - 1] > value:
+                        crossings[at] = crossings[at - 1]
+                        at -= 1
+                    crossings[at] = value
+                var pair: usize = 0
+                while pair + 1 < found:
+                    let start = math.imax(0, (i64)math.floor(crossings[pair] + 0.5))
+                    let stop = math.imin((i64)self.extent_x, (i64)math.floor(crossings[pair + 1] + 0.5))
+                    for column in start..<stop:
+                        accumulate[(usize)column] += 64
+                    pair += 2
+            for column in 0..<(usize)self.extent_x:
+                if accumulate[column] > 0:
+                    let value = (u8)(math.imin(255, (i64)accumulate[column] - 1) if accumulate[column] == 256 else (i64)accumulate[column])
+                    self.combine((usize)row * (usize)self.extent_x + column, value, mode)
+        if mode == Mode.intersect:
+            self.outside(math.imax(0, (i64)math.floor(min_x)), top, math.imin((i64)self.extent_x, (i64)math.ceil(max_x)), bottom)
+        self.finish()
+
+    ## Grow (positive) or shrink (negative) the selection by `pixels` with a
+    ## square structuring element, then soften its edge over `feather` pixels.
+    pub mutating func adjust(pixels: i64, feather: i64) -> !:
+        if pixels < -512 or pixels > 512 or feather < 0 or feather > 512:
+            error(invalid, "expand and contract are limited to 512 pixels, feather to 0..512")
+        if pixels != 0:
+            let scratch = try alloc u8[self.coverage.length] in memory.heap
+            defer free(scratch) in memory.heap
+            let grow = pixels > 0
+            let radius = (usize)math.iabs(pixels)
+            try self.morph(scratch, radius, grow, true)
+            try self.morph(scratch, radius, grow, false)
+        if feather > 0:
+            let scratch = try alloc u8[self.coverage.length] in memory.heap
+            defer free(scratch) in memory.heap
+            try self.soften(scratch, (usize)feather, true)
+            try self.soften(scratch, (usize)feather, false)
+        self.finish()
+
+    ## One separable pass of a max (grow) or min (shrink) filter.
+    mutating func morph(scratch: u8[], radius: usize, grow: bool, horizontal: bool) -> !:
+        let w = (usize)self.extent_x
+        let h = (usize)self.extent_y
+        for y in 0..<h:
+            for x in 0..<w:
+                var value: u8 = 0 if grow else 255
+                let span = (i64)radius
+                for offset in -span..<(span + 1):
+                    let sx = (i64)x + (offset if horizontal else 0)
+                    let sy = (i64)y + (0 if horizontal else offset)
+                    var sample: u8 = 0
+                    if sx >= 0 and sy >= 0 and sx < (i64)w and sy < (i64)h:
+                        sample = self.coverage[(usize)sy * w + (usize)sx]
+                    if grow:
+                        if sample > value:
+                            value = sample
+                    elif sample < value:
+                        value = sample
+                scratch[y * w + x] = value
+        memory.copy(self.coverage, scratch, self.coverage.length)
+
+    ## One separable pass of a box blur of `radius`.
+    mutating func soften(scratch: u8[], radius: usize, horizontal: bool) -> !:
+        let w = (usize)self.extent_x
+        let h = (usize)self.extent_y
+        let span = (i64)radius
+        for y in 0..<h:
+            for x in 0..<w:
+                var total: i64 = 0
+                var count: i64 = 0
+                for offset in -span..<(span + 1):
+                    let sx = (i64)x + (offset if horizontal else 0)
+                    let sy = (i64)y + (0 if horizontal else offset)
+                    if sx >= 0 and sy >= 0 and sx < (i64)w and sy < (i64)h:
+                        total += (i64)self.coverage[(usize)sy * w + (usize)sx]
+                    count += 1
+                scratch[y * w + x] = (u8)(total // count)
+        memory.copy(self.coverage, scratch, self.coverage.length)
+
+    mutating func combine(index: usize, value: u8, mode: Mode):
+        let current = self.coverage[index]
+        if mode == Mode.replace or mode == Mode.add:
+            self.coverage[index] = value if value > current else current
+        elif mode == Mode.subtract:
+            self.coverage[index] = current - (value if value < current else current)
+        else:
+            self.coverage[index] = value if value < current else current
+
+    ## Intersecting clears everything outside the shape's rectangle.
+    mutating func outside(left: i64, top: i64, right: i64, bottom: i64):
+        for row in 0..<(i64)self.extent_y:
+            for column in 0..<(i64)self.extent_x:
+                if row < top or row >= bottom or column < left or column >= right:
+                    self.coverage[(usize)row * (usize)self.extent_x + (usize)column] = 0
+
+    ## Recompute emptiness and bounds; the GPU mirror is stale until `gpu_tiles`.
+    mutating func finish():
+        self.empty = true
+        self.left = (i64)self.extent_x
+        self.top = (i64)self.extent_y
+        self.right = 0
+        self.bottom = 0
+        for row in 0..<(i64)self.extent_y:
+            for column in 0..<(i64)self.extent_x:
+                if self.coverage[(usize)row * (usize)self.extent_x + (usize)column] > 0:
+                    self.empty = false
+                    self.left = math.imin(self.left, column)
+                    self.top = math.imin(self.top, row)
+                    self.right = math.imax(self.right, column + 1)
+                    self.bottom = math.imax(self.bottom, row + 1)
+        self.uploaded = false
+
+    ## The selection as GPU tiles (coverage in red, alpha one), refreshed after
+    ## every change; `none` when nothing is selected.
+    pub mutating func gpu_tiles(device: gpu.Device) -> Tiles*?!:
+        if self.empty:
+            return none
+        if self.owner == none:
+            self.owner = device
+        if not self.uploaded or self.tiles == none:
+            let count = (usize)self.extent_x * (usize)self.extent_y * 4
+            let pixels = try alloc f32[count] in memory.heap
+            defer free(pixels) in memory.heap
+            for index in 0..<self.coverage.length:
+                let value = (f32)self.coverage[index] / 255.0
+                pixels[index * 4] = value
+                pixels[index * 4 + 1] = value
+                pixels[index * 4 + 2] = value
+                pixels[index * 4 + 3] = 1.0
+            var fresh = try Tiles.create(device, self.extent_x, self.extent_y)
+            errdefer fresh.destroy()
+            try fresh.write(pixels)
+            let boxed = try box(fresh)
+            if let previous = self.tiles:
+                unbox(previous)
+            self.tiles = boxed
+            self.uploaded = true
+        return self.tiles
+
+    pub mutating func destroy():
+        if let tiles = self.tiles:
+            unbox(tiles)
+            self.tiles = none
+        if self.coverage.length > 0:
+            free(self.coverage) in memory.heap
+        var empty: u8[]
+        self.coverage = empty
+
+test "selection shapes combine, invert, grow and feather":
+    var selection = try Selection.create(64, 48)
+    defer selection.destroy()
+    assert(selection.is_empty() and selection.at(5, 5) == 255)
+    selection.rectangle(10, 10, 20, 10, Mode.replace)
+    assert(not selection.is_empty() and selection.at(15, 15) == 255 and selection.at(5, 5) == 0)
+    assert(selection.left == 10 and selection.top == 10 and selection.right == 30 and selection.bottom == 20)
+    selection.ellipse(40, 10, 20, 20, Mode.add)
+    assert(selection.at(50, 20) == 255 and selection.at(41, 11) == 0 and selection.at(15, 15) == 255)
+    selection.rectangle(0, 0, 64, 15, Mode.subtract)
+    assert(selection.at(15, 12) == 0 and selection.at(15, 17) == 255)
+    selection.rectangle(0, 0, 25, 48, Mode.intersect)
+    assert(selection.at(15, 17) == 255 and selection.at(50, 20) == 0)
+    selection.invert()
+    assert(selection.at(15, 17) == 0 and selection.at(50, 20) == 255)
+    try selection.polygon([2.0, 2.0, 12.0, 2.0, 7.0, 12.0], Mode.replace)
+    assert(selection.at(7, 5) == 255 and selection.at(2, 10) == 0 and selection.at(20, 20) == 0)
+    try selection.adjust(2, 0)
+    assert(selection.at(1, 1) == 255 and selection.at(0, 0) == 255)
+    try selection.adjust(-2, 3)
+    assert(selection.at(7, 5) > 0 and selection.at(7, 5) < 255)
+    selection.select_all()
+    assert(selection.at(63, 47) == 255)
+    selection.clear()
+    assert(selection.is_empty())

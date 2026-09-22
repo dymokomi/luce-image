@@ -9,7 +9,8 @@ import gpu
 import memory
 import math
 from luce_image.tiles import Tiles, tile_size
-from luce_image.document import Document, Layer, Selection
+from luce_image.document import Document, Layer
+from luce_image.selection import Mode
 from luce_image.shaders import segment_frag_words, segment_frag_msl, paint_frag_words, paint_frag_msl
 from luce_image.errors import invalid, limit
 
@@ -39,6 +40,9 @@ pub struct Painter:
     var paint_shader: gpu.Shader
     var segment: gpu.Pipeline
     var paint: gpu.Pipeline
+    ## One white and one black texel: "everything selected" and "nothing selected".
+    var white: gpu.Texture
+    var black: gpu.Texture
 
     pub static func create(device: gpu.Device) -> Painter!:
         var segment_shader = try gpu.Shader.create(device, segment_frag_words, segment_frag_msl)
@@ -49,9 +53,17 @@ pub struct Painter:
         errdefer segment.destroy()
         var paint = try gpu.Pipeline.create(device, paint_shader, gpu.Blend.replace, gpu.Format.rgba16_float)
         errdefer paint.destroy()
-        return Painter(owner = device, segment_shader = segment_shader, paint_shader = paint_shader, segment = segment, paint = paint)
+        var white = try gpu.Texture.create(device, 1, 1, gpu.Format.rgba8_linear)
+        errdefer white.destroy()
+        try white.upload([(u8)255, (u8)255, (u8)255, (u8)255])
+        var black = try gpu.Texture.create(device, 1, 1, gpu.Format.rgba8_linear)
+        errdefer black.destroy()
+        try black.upload([(u8)0, (u8)0, (u8)0, (u8)255])
+        return Painter(owner = device, segment_shader = segment_shader, paint_shader = paint_shader, segment = segment, paint = paint, white = white, black = black)
 
     pub mutating func destroy():
+        self.black.destroy()
+        self.white.destroy()
         self.paint.destroy()
         self.segment.destroy()
         self.paint_shader.destroy()
@@ -79,8 +91,8 @@ pub struct Stroke:
     var fill: gpu.Color
     var active: bool
     var on_mask: bool
-    ## The document's selection when the stroke began; painting stays inside it.
-    var selection: Selection
+    ## The document's selection tiles when the stroke began; painting stays inside it.
+    var selection: Tiles*?
 
     ## Begin at a point on `layer`'s pixels, or on its mask, painting the first
     ## dab there. A mask's missing cells count as white (revealing).
@@ -92,7 +104,7 @@ pub struct Stroke:
             error(invalid, "stroke coordinates must be finite")
         let fill = gpu.Color(1.0, 1.0, 1.0, 1.0) if on_mask else gpu.Color(0.0, 0.0, 0.0, 0.0)
         var stroke = Stroke(layer = layer, brush = brush, last_x = x, last_y = y, before = try tiles.clone(), empty = none, fill = fill, active = true, on_mask = on_mask,
-                            selection = document.selection)
+                            selection = try document.selection_tiles())
         errdefer stroke.destroy()
         try stroke.segment(painter, document, x, y, x, y)
         return stroke
@@ -167,16 +179,18 @@ pub struct Stroke:
         let entry = self.touched[index]
         var fresh = try tiles.blank()
         errdefer fresh.destroy()
-        var params: f32[12] = [(f32)self.brush.color.red, (f32)self.brush.color.green, (f32)self.brush.color.blue, 1.0,
-                               (f32)self.brush.opacity, 1.0 if self.brush.erase else 0.0, 0.0, 0.0,
-                               (f32)(self.selection.x - (i64)(entry.column * tile_size)), (f32)(self.selection.y - (i64)(entry.row * tile_size)),
-                               (f32)self.selection.width, (f32)self.selection.height]
+        var params: f32[8] = [(f32)self.brush.color.red, (f32)self.brush.color.green, (f32)self.brush.color.blue, 1.0,
+                              (f32)self.brush.opacity, 1.0 if self.brush.erase else 0.0, 0.0, 0.0]
+        var clip = painter.white
+        if let selected = self.selection:
+            params[7] = 1.0
+            clip = selected.texture(entry.column, entry.row) else painter.black
         let frame = try fresh.frame()
         defer frame.release()
         let target = try frame.value().target()
         defer target.release()
         let original = self.before.texture(entry.column, entry.row) else try self.blank_tile(tiles)
-        try gpu.shade(target.value(), painter.paint, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 48), [original, entry.coverage], gpu.Filter.nearest)
+        try gpu.shade(target.value(), painter.paint, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 32), [original, entry.coverage, clip], gpu.Filter.nearest)
         discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         try tiles.set(entry.column, entry.row, fresh)
 
@@ -240,7 +254,7 @@ pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brus
     let tiles = (target.mask_tiles() else error(invalid, "the layer has no mask")) if on_mask else (target.tiles() else error(invalid, "a group cannot be filled"))
     var before = try tiles.clone()
     errdefer before.destroy()
-    let selection = document.selection
+    let selection = try document.selection_tiles()
     let fill = gpu.Color(1.0, 1.0, 1.0, 1.0) if on_mask else gpu.Color(0.0, 0.0, 0.0, 0.0)
     # A destroyed zero-value texture is a no-op, so the stand-in can always be dropped.
     var empty = gpu.Texture()
@@ -251,13 +265,12 @@ pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brus
     try coverage.upload([(u8)255])
     for row in 0..<tiles.rows():
         for column in 0..<tiles.columns():
-            let left = (i64)(column * tile_size)
-            let top = (i64)(row * tile_size)
-            if selection.width > 0:
-                if selection.x >= left + (i64)tile_size or selection.y >= top + (i64)tile_size or selection.x + selection.width <= left or selection.y + selection.height <= top:
-                    continue
-            var params: f32[12] = [(f32)brush.color.red, (f32)brush.color.green, (f32)brush.color.blue, 1.0, (f32)brush.opacity, 1.0 if brush.erase else 0.0, 0.0, 1.0,
-                                   (f32)(selection.x - left), (f32)(selection.y - top), (f32)selection.width, (f32)selection.height]
+            var clip = painter.white
+            var params: f32[8] = [(f32)brush.color.red, (f32)brush.color.green, (f32)brush.color.blue, 1.0, (f32)brush.opacity, 1.0 if brush.erase else 0.0, 1.0, 0.0]
+            if let selected = selection:
+                # A selection cell with no tile selects nothing there.
+                clip = selected.texture(column, row) else continue
+                params[7] = 1.0
             var source = gpu.Texture()
             if let existing = before.texture(column, row):
                 source = existing
@@ -276,8 +289,8 @@ pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brus
             defer frame.release()
             let area = try frame.value().target()
             defer area.release()
-            try gpu.shade(area.value(), painter.paint, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 48),
-                          [source, coverage], gpu.Filter.nearest)
+            try gpu.shade(area.value(), painter.paint, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 32),
+                          [source, coverage, clip], gpu.Filter.nearest)
             discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
             try tiles.set(column, row, fresh)
     target.revision += 1
@@ -334,7 +347,7 @@ test "a stroke paints and erases only the tiles it reaches":
     assert(pixels[centre + 3] > 0.45 and pixels[centre + 3] < 0.55 and pixels[centre] > 0.99)
     assert(pixels[(150 * 600 + 100) * 4 + 3] > 0.99)
     # A selection limits both strokes and fills to its rectangle.
-    document.select(0, 0, 300, 100)
+    document.selection.rectangle(0, 0, 300, 100, Mode.replace)
     brush.erase = false
     brush.opacity = 1.0
     brush.color = gpu.Color(0.0, 0.0, 1.0, 1.0)

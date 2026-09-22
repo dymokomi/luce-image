@@ -18,4 +18,10 @@ def package "luce-image" {
     def export "canvas" {
         str module = "luce_image.canvas"
     }
+
+    def dependency "luce-prism" {
+        str owner = "dymokomi"
+        str version = "^0.1.0"
+        str path = "../luce-prism"
+    }
 }

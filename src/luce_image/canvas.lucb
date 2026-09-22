@@ -3,11 +3,14 @@
 ## drawing at any zoom and offset onto a render target. GPU storage is bound to
 ## the device of the first target it is drawn on; until then layers and their
 ## pictures wait on the CPU, so a document can be built before it is shown.
+import files
 import gpu
 import interop
 import math
 import memory
 import ownership
+import paths
+import prism
 import strings
 from luce_image.image import Image, Pixel
 from luce_image.tiles import Tiles, tile_size, tile_columns
@@ -18,6 +21,8 @@ from luce_image.adjust import Adjuster, adjustment_count
 from luce_image.filter import Filters
 from luce_image.transform import translate
 from luce_image.geometry import resize_canvas, resize_image
+from luce_image.selection import Selection, Mode
+from luce_image.shaders import ants_frag_words, ants_frag_msl
 from luce_image.half import from_half
 from luce_image.errors import invalid, limit
 
@@ -29,8 +34,9 @@ struct Record:
     var blend: i64
     var masked: bool
     var clipped: bool
-    ## A picture waiting to become tiles once a device is bound.
+    ## A picture waiting to become tiles once a device is bound, and a mask likewise.
     var picture: interop.Reference[Image]?
+    var mask_picture: interop.Reference[Image]?
 
 pub struct Canvas:
     var extent_x: u32
@@ -47,10 +53,12 @@ pub struct Canvas:
     var brush: Brush
     var stroke: Stroke*?
     var mask_editing: bool
-    var sel_x: i64
-    var sel_y: i64
-    var sel_width: i64
-    var sel_height: i64
+    ## The selection lives on the CPU here and is copied into the GPU document at bind.
+    var selection: Selection
+    var polygon: f64[]
+    var polygon_count: usize
+    var ants_shader: gpu.Shader?
+    var ants: gpu.Pipeline?
     var history: Snapshot[]
     var history_count: usize
     var future: Snapshot[]
@@ -76,10 +84,12 @@ pub struct Canvas:
         self.brush = Brush()
         self.stroke = none
         self.mask_editing = false
-        self.sel_x = 0
-        self.sel_y = 0
-        self.sel_width = 0
-        self.sel_height = 0
+        self.selection = try Selection.create((u32)width, (u32)height)
+        var no_points: f64[]
+        self.polygon = no_points
+        self.polygon_count = 0
+        self.ants_shader = none
+        self.ants = none
         var no_history: Snapshot[]
         self.history = no_history
         self.history_count = 0
@@ -87,8 +97,11 @@ pub struct Canvas:
         self.future_count = 0
         self.closed = false
 
-    ## A document the size of the picture at `path`, holding it as one layer.
+    ## A document from `path`: an `.l2d` package with its layers, or a picture
+    ## of any supported format as one layer.
     pub static func open(path: str) -> interop.Reference[Canvas]!:
+        if ends_with(path, ".l2d"):
+            return try open_package(path)
         let picture = try Image.open(path)
         errdefer picture.release()
         let width = try picture.value().width()
@@ -126,7 +139,7 @@ pub struct Canvas:
         if let document = self.document:
             let created = try document.add_layer(name)
             assert(created == id)
-        self.records[self.count] = Record(id = id, name = copied, visible = true, opacity = 1.0, blend = 0, masked = false, clipped = false, picture = none)
+        self.records[self.count] = Record(id = id, name = copied, visible = true, opacity = 1.0, blend = 0, masked = false, clipped = false, picture = none, mask_picture = none)
         self.count += 1
         self.next_id += 1
         return (i64)id
@@ -170,6 +183,8 @@ pub struct Canvas:
             try document.remove((u64)id)
         strings.release(self.records[index].name)
         if let picture = self.records[index].picture:
+            picture.release()
+        if let picture = self.records[index].mask_picture:
             picture.release()
         for shift in index..<(self.count - 1):
             self.records[shift] = self.records[shift + 1]
@@ -259,45 +274,136 @@ pub struct Canvas:
 
     # mark: Selection ========================================================================
 
-    ## Select a rectangle in document pixels, clamped; an empty one deselects.
-    pub mutating func select(x: i64, y: i64, width: i64, height: i64) -> !:
+    ## Select a rectangle, combined with the selection by `mode` (0 replace,
+    ## 1 add, 2 subtract, 3 intersect).
+    pub mutating func select_rectangle(x: i64, y: i64, width: i64, height: i64, mode: i64 = 0) -> !:
         try self.require_open()
-        let left = x if x > 0 else 0
-        let top = y if y > 0 else 0
-        var right = x + width
-        if right > (i64)self.extent_x:
-            right = (i64)self.extent_x
-        var bottom = y + height
-        if bottom > (i64)self.extent_y:
-            bottom = (i64)self.extent_y
-        if right <= left or bottom <= top:
-            self.sel_width = 0
-            self.sel_height = 0
-        else:
-            self.sel_x = left
-            self.sel_y = top
-            self.sel_width = right - left
-            self.sel_height = bottom - top
-        if let document = self.document:
-            document.select(self.sel_x, self.sel_y, self.sel_width, self.sel_height)
+        self.live().rectangle(x, y, width, height, try selection_mode(mode))
+
+    ## Select an ellipse inscribed in a rectangle, combined by `mode`.
+    pub mutating func select_ellipse(x: i64, y: i64, width: i64, height: i64, mode: i64 = 0) -> !:
+        try self.require_open()
+        self.live().ellipse(x, y, width, height, try selection_mode(mode))
+
+    ## Collect a polygon point for `select_polygon`.
+    pub mutating func add_point(x: f64, y: f64) -> !:
+        try self.require_open()
+        if not math.is_finite(x) or not math.is_finite(y):
+            error(invalid, "polygon points must be finite")
+        if self.polygon_count + 2 > self.polygon.length:
+            let capacity = 64 if self.polygon.length == 0 else self.polygon.length * 2
+            let grown = try alloc f64[capacity] in memory.heap
+            if self.polygon_count > 0:
+                memory.copy(grown, self.polygon, self.polygon_count)
+            if self.polygon.length > 0:
+                free(self.polygon) in memory.heap
+            self.polygon = grown
+        self.polygon[self.polygon_count] = x
+        self.polygon[self.polygon_count + 1] = y
+        self.polygon_count += 2
+
+    pub mutating func clear_points():
+        self.polygon_count = 0
+
+    ## Select the polygon of the collected points, combined by `mode`, and forget them.
+    pub mutating func select_polygon(mode: i64 = 0) -> !:
+        try self.require_open()
+        if self.polygon_count < 6:
+            self.polygon_count = 0
+            error(invalid, "a polygon needs at least three points")
+        try self.live().polygon(self.polygon[..<self.polygon_count], try selection_mode(mode))
+        self.polygon_count = 0
+
+    pub mutating func select_all() -> !:
+        try self.require_open()
+        self.live().select_all()
 
     pub mutating func deselect() -> !:
-        try self.select(0, 0, 0, 0)
+        try self.require_open()
+        self.live().clear()
+
+    pub mutating func invert_selection() -> !:
+        try self.require_open()
+        self.live().invert()
+
+    ## Grow (positive) or shrink (negative) the selection and feather its edge.
+    pub mutating func adjust_selection(pixels: i64, feather: i64) -> !:
+        try self.require_open()
+        try self.live().adjust(pixels, feather)
 
     pub func has_selection() -> bool:
-        return self.sel_width > 0
+        return not self.current().is_empty()
 
+    ## The selection's bounding box, in document pixels.
     pub func selection_left() -> i64:
-        return self.sel_x
+        return self.current().left if self.has_selection() else 0
 
     pub func selection_top() -> i64:
-        return self.sel_y
+        return self.current().top if self.has_selection() else 0
 
     pub func selection_width() -> i64:
-        return self.sel_width
+        return (self.current().right - self.current().left) if self.has_selection() else 0
 
     pub func selection_height() -> i64:
-        return self.sel_height
+        return (self.current().bottom - self.current().top) if self.has_selection() else 0
+
+    ## Coverage 0..255 at a document pixel.
+    pub func selected_at(x: i64, y: i64) -> i64:
+        return (i64)self.current().at(x, y)
+
+    ## Draw the selection's marching ants over the document as drawn by `draw`
+    ## with the same rectangle, zoom and offset; `phase` animates the dashes.
+    pub mutating func draw_selection(target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, phase: f64) -> !:
+        try self.require_open()
+        if not self.has_selection() or rectangle.width <= 0.0 or rectangle.height <= 0.0:
+            return
+        if not math.is_finite(zoom) or zoom <= 0.0 or not math.is_finite(phase):
+            error(invalid, "zoom must be positive and the phase finite")
+        let checked = try target.get()
+        let document = self.document else return
+        let tiles = (try document.selection_tiles()) else return
+        let pipeline = try self.ants_pipeline()
+        let clipped = try checked.clipped(rectangle)
+        defer clipped.release()
+        let area = clipped.value()
+        let size = try checked.size()
+        let scale = size.pixel_width / size.width if size.width > 0.0 else 1.0
+        for row in 0..<tiles.rows():
+            for column in 0..<tiles.columns():
+                let texture = tiles.texture(column, row) else continue
+                let covered = tiles.region(column, row)
+                let left = rectangle.x + offset_x + (f64)(column * tile_size) * zoom
+                let top = rectangle.y + offset_y + (f64)(row * tile_size) * zoom
+                let width = (f64)covered.width * zoom
+                let height = (f64)covered.height * zoom
+                if left >= rectangle.x + rectangle.width or top >= rectangle.y + rectangle.height or left + width <= rectangle.x or top + height <= rectangle.y:
+                    continue
+                # One document pixel of margin so edges on the tile boundary show.
+                let margin = zoom
+                var params: f32[6] = [(f32)(left * scale), (f32)(top * scale), (f32)(zoom * scale), (f32)phase, (f32)covered.width, (f32)covered.height]
+                try gpu.shade(area, pipeline, gpu.Rect(left - margin, top - margin, width + margin * 2.0, height + margin * 2.0), u8[]((u8*)&params[0], 24), [texture], gpu.Filter.nearest)
+
+    mutating func ants_pipeline() -> gpu.Pipeline!:
+        if let existing = self.ants:
+            return existing
+        let device = self.device else error(invalid, "draw the document once first")
+        var shader = try gpu.Shader.create(device, ants_frag_words, ants_frag_msl)
+        errdefer shader.destroy()
+        let pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.over)
+        self.ants_shader = shader
+        self.ants = pipeline
+        return pipeline
+
+    ## The selection being edited: the document's once bound, the cold one before.
+    mutating func live() -> Selection*:
+        if let document = self.document:
+            return &document.selection
+        return &self.selection
+
+    func current() -> const Selection*:
+        if let document = self.document:
+            return &document.selection
+        return &self.selection
 
     ## Fill the selection (or the whole layer) on `layer` with the brush colour
     ## at its opacity, or clear it when `erase`. Undoable.
@@ -462,13 +568,13 @@ pub struct Canvas:
             error(invalid, "canvas dimensions must be in 1..65536")
         let document = self.document else error(invalid, "draw the document once before resizing")
         try resize_canvas(document, (u32)width, (u32)height, offset_x, offset_y)
-        self.adopt_extent((u32)width, (u32)height)
+        try self.adopt_extent((u32)width, (u32)height)
 
-    ## Crop the canvas to the selection.
+    ## Crop the canvas to the selection's bounding box.
     pub mutating func crop() -> !:
         if not self.has_selection():
             error(invalid, "nothing is selected")
-        try self.resize_canvas(self.sel_width, self.sel_height, -self.sel_x, -self.sel_y)
+        try self.resize_canvas(self.selection_width(), self.selection_height(), -self.selection_left(), -self.selection_top())
 
     ## Resample the whole image to a new size. Not undoable: the history is dropped.
     pub mutating func resize_image(width: i64, height: i64) -> !:
@@ -479,13 +585,14 @@ pub struct Canvas:
             error(invalid, "image dimensions must be in 1..65536")
         let document = self.document else error(invalid, "draw the document once before resizing")
         try resize_image(document, (u32)width, (u32)height)
-        self.adopt_extent((u32)width, (u32)height)
+        try self.adopt_extent((u32)width, (u32)height)
 
-    mutating func adopt_extent(width: u32, height: u32):
+    mutating func adopt_extent(width: u32, height: u32) -> !:
         self.extent_x = width
         self.extent_y = height
-        self.sel_width = 0
-        self.sel_height = 0
+        var replacement = try Selection.create(width, height)
+        self.selection.destroy()
+        self.selection = replacement
         clear_snapshots(&self.history, &self.history_count)
         clear_snapshots(&self.future, &self.future_count)
 
@@ -546,6 +653,65 @@ pub struct Canvas:
                 self.history[index - 1] = self.history[index]
             self.history_count -= 1
         try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = tiles, mask = mask))
+
+    ## Write the document with all its layers to `path`, an `.l2d` directory
+    ## package: `document.prisma` and one PNG per layer and mask. Needs the
+    ## document drawn once.
+    pub mutating func save_package(path: str) -> !:
+        try self.require_open()
+        if not ends_with(path, ".l2d"):
+            error(invalid, "a document package is a directory named *.l2d")
+        let document = self.document else error(invalid, "draw the document once before saving")
+        try files.ensure_directory(path)
+        let layers_dir = try paths.join(path, "layers")
+        try files.ensure_directory(layers_dir)
+        let native = try new prism.Document() in memory.heap
+        let manifest = try interop.Reference[prism.Document].adopt(native, prism.document_type, memory.heap)
+        defer manifest.release()
+        try manifest.value().add("/document", "document")
+        try set_integer(manifest.value(), "/document", "width", (i64)self.extent_x)
+        try set_integer(manifest.value(), "/document", "height", (i64)self.extent_y)
+        try manifest.value().add("/layers", "layers")
+        let count = (usize)self.extent_x * (usize)self.extent_y * 4
+        let pixels = try alloc f32[count] in memory.heap
+        defer free(pixels) in memory.heap
+        for index in 0..<self.count:
+            let record = self.records[index]
+            var name_buffer: u8[64]
+            let element = try format_path(name_buffer, "/layers/layer", index)
+            try manifest.value().add(element, "layer")
+            let text = try prism.Value.text(record.name)
+            defer text.release()
+            try manifest.value().set(element, "name", text)
+            try set_integer(manifest.value(), element, "visible", 1 if record.visible else 0)
+            let opacity = try prism.Value.number(record.opacity)
+            defer opacity.release()
+            try manifest.value().set(element, "opacity", opacity)
+            try set_integer(manifest.value(), element, "blend", record.blend)
+            try set_integer(manifest.value(), element, "clipped", 1 if record.clipped else 0)
+            try set_integer(manifest.value(), element, "mask", 1 if record.masked else 0)
+            let layer = document.find(record.id) else error(invalid, "a layer is missing")
+            var file_buffer: u8[64]
+            let tiles = layer.tiles() else error(invalid, "a layer has no pixels")
+            try tiles.read(pixels)
+            try write_picture(layers_dir, try format_file(file_buffer, "layer", index, ".png"), self.extent_x, self.extent_y, pixels)
+            if let mask = layer.mask_tiles():
+                try mask.read(pixels)
+                # A mask cell the layer never painted reveals everything: write it white.
+                for row in 0..<mask.rows():
+                    for column in 0..<mask.columns():
+                        if mask.texture(column, row) != none:
+                            continue
+                        let area = mask.region(column, row)
+                        for y in 0..<(usize)area.height:
+                            for x in 0..<(usize)area.width:
+                                let at = (((usize)row * (usize)tile_size + y) * (usize)self.extent_x + (usize)column * (usize)tile_size + x) * 4
+                                pixels[at] = 1.0
+                                pixels[at + 1] = 1.0
+                                pixels[at + 2] = 1.0
+                                pixels[at + 3] = 1.0
+                try write_picture(layers_dir, try format_file(file_buffer, "layer", index, ".mask.png"), self.extent_x, self.extent_y, pixels)
+        try manifest.value().save(try paths.join(path, "document.prisma"), prism.Encoding.text)
 
     ## Write the flattened document to `path` as an 8-bit RGBA picture in the
     ## format its extension names. Needs the document drawn at least once.
@@ -639,6 +805,39 @@ pub struct Canvas:
                                            (f64)area.width * scale_x, (f64)area.height * scale_y)
                 try gpu.draw_image(checked, texture, destination, area, 1.0, gpu.Filter.linear)
 
+    ## Draw the document as `draw` does, but with layer `id` shown displaced by
+    ## (`dx`, `dy`) document pixels without touching its pixels: the live
+    ## preview of a move. The displaced layer is drawn on top of the rest in
+    ## normal blending at its opacity.
+    pub mutating func draw_moving(target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64,
+                                  id: i64, dx: f64, dy: f64) -> !:
+        try self.require_open()
+        let index = try self.index((u64)id)
+        if self.document == none:
+            try self.draw(target, rectangle, zoom, offset_x, offset_y)
+            return
+        let document = self.document else trap("checked")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let shown = layer.visible
+        layer.visible = false
+        document.revision += 1
+        try self.draw(target, rectangle, zoom, offset_x, offset_y)
+        layer.visible = shown
+        document.revision += 1
+        if not shown or rectangle.width <= 0.0 or rectangle.height <= 0.0:
+            return
+        let checked = try target.get()
+        let clipped = try checked.clipped(rectangle)
+        defer clipped.release()
+        let tiles = layer.tiles() else return
+        for row in 0..<tiles.rows():
+            for column in 0..<tiles.columns():
+                let texture = tiles.texture(column, row) else continue
+                let area = tiles.region(column, row)
+                let destination = gpu.Rect(rectangle.x + offset_x + ((f64)(column * tile_size) + dx) * zoom, rectangle.y + offset_y + ((f64)(row * tile_size) + dy) * zoom,
+                                           (f64)area.width * zoom, (f64)area.height * zoom)
+                try gpu.draw_image(clipped.value(), texture, destination, area, self.records[index].opacity, gpu.Filter.nearest if zoom >= 1.0 else gpu.Filter.linear)
+
     ## Create the GPU document on the target's device and move waiting pictures in.
     mutating func bind(target: const gpu.RenderTarget*) -> !:
         if self.document != none:
@@ -671,7 +870,11 @@ pub struct Canvas:
         self.painter = binding.painter
         self.adjuster = binding.adjuster
         self.filters = binding.filters
-        document.select(self.sel_x, self.sel_y, self.sel_width, self.sel_height)
+        # The cold selection moves into the boxed document; a fresh empty one takes its place here.
+        let bound = binding.document else trap("boxed")
+        bound.selection.destroy()
+        bound.selection = self.selection
+        self.selection = try Selection.create(self.extent_x, self.extent_y)
         self.document = binding.document
         self.composer = binding.composer
         binding = Binding(device = none, document = none, composer = none, painter = none, adjuster = none, filters = none)
@@ -681,6 +884,12 @@ pub struct Canvas:
                 defer picture.release()
                 let tiles = try self.tiles_of(picture)
                 try (self.document else trap("bound")).set_tiles(self.records[index].id, tiles)
+            if let picture = self.records[index].mask_picture:
+                self.records[index].mask_picture = none
+                defer picture.release()
+                let tiles = try self.tiles_of(picture)
+                var old = try (self.document else trap("bound")).take_mask(self.records[index].id, tiles)
+                old.destroy()
 
     func index(id: u64) -> usize!:
         for index in 0..<self.count:
@@ -704,6 +913,17 @@ pub struct Canvas:
         if let stroke = self.stroke:
             self.stroke = none
             finish_boxed(stroke)
+        if let pipeline = self.ants:
+            var owned = pipeline
+            owned.destroy()
+            self.ants = none
+        if let shader = self.ants_shader:
+            var owned = shader
+            owned.destroy()
+            self.ants_shader = none
+        self.selection.destroy()
+        if self.polygon.length > 0:
+            free(self.polygon) in memory.heap
         clear_snapshots(&self.history, &self.history_count)
         clear_snapshots(&self.future, &self.future_count)
         if self.history.length > 0:
@@ -722,6 +942,8 @@ pub struct Canvas:
             strings.release(self.records[index].name)
             if let picture = self.records[index].picture:
                 picture.release()
+            if let picture = self.records[index].mask_picture:
+                picture.release()
         if self.records.length > 0:
             free(self.records) in memory.heap
         var empty: Record[]
@@ -732,10 +954,115 @@ pub struct Canvas:
         for index in 0..<self.count:
             if let picture = self.records[index].picture:
                 picture.trace(visit, context)
+            if let picture = self.records[index].mask_picture:
+                picture.trace(visit, context)
 
 let blend_names: str[26] = ["Normal", "Darken", "Multiply", "Color Burn", "Linear Burn", "Lighten", "Screen", "Color Dodge", "Linear Dodge",
                             "Overlay", "Soft Light", "Hard Light", "Vivid Light", "Linear Light", "Pin Light", "Hard Mix", "Difference", "Exclusion",
                             "Subtract", "Divide", "Hue", "Saturation", "Color", "Luminosity", "Darker Color", "Lighter Color"]
+
+func selection_mode(mode: i64) -> Mode!:
+    if mode == 0: return Mode.replace
+    if mode == 1: return Mode.add
+    if mode == 2: return Mode.subtract
+    if mode == 3: return Mode.intersect
+    error(invalid, "selection modes are 0 replace, 1 add, 2 subtract, 3 intersect")
+
+func ends_with(text: str, suffix: str) -> bool:
+    if text.length < suffix.length:
+        return false
+    return (str)text.bytes[text.length - suffix.length..] == suffix
+
+func set_integer(doc: prism.Document*, path: str, name: str, value: i64) -> !:
+    let holder = try prism.Value.integer(value)
+    defer holder.release()
+    try doc.set(path, name, holder)
+
+func get_integer(doc: prism.Document*, path: str, name: str) -> i64!:
+    let holder = try doc.get(path, name)
+    defer holder.release()
+    return try holder.value().integer_at()
+
+func get_number(doc: prism.Document*, path: str, name: str) -> f64!:
+    let holder = try doc.get(path, name)
+    defer holder.release()
+    return try holder.value().number_at()
+
+func format_digits(buffer: u8[], at: usize, value: usize) -> usize:
+    var digits: u8[24]
+    var count: usize = 0
+    var remaining = value
+    if remaining == 0:
+        digits[0] = '0'
+        count = 1
+    while remaining > 0:
+        digits[count] = (u8)('0' + (u8)(remaining % 10))
+        remaining //= 10
+        count += 1
+    var position = at
+    while count > 0:
+        count -= 1
+        buffer[position] = digits[count]
+        position += 1
+    return position
+
+func format_path(buffer: u8[], prefix: str, index: usize) -> str!:
+    if prefix.length + 24 > buffer.length:
+        error(invalid, "path too long")
+    memory.copy(buffer, prefix.bytes, prefix.length)
+    let end = format_digits(buffer, prefix.length, index)
+    return (str)buffer[..<end]
+
+func format_file(buffer: u8[], prefix: str, index: usize, suffix: str) -> str!:
+    if prefix.length + suffix.length + 24 > buffer.length:
+        error(invalid, "file name too long")
+    memory.copy(buffer, prefix.bytes, prefix.length)
+    var end = format_digits(buffer, prefix.length, index)
+    memory.copy(buffer[end..], suffix.bytes, suffix.length)
+    end += suffix.length
+    return (str)buffer[..<end]
+
+func write_picture(directory: str, name: str, width: u32, height: u32, pixels: const f32[]) -> !:
+    let picture = try Image.from_linear_rgba((usize)width, (usize)height, pixels)
+    defer picture.release()
+    let target = try paths.join(directory, name)
+    try picture.value().save(target)
+
+## A canvas from an `.l2d` package: the manifest's layers, their pictures
+## waiting to be bound.
+func open_package(path: str) -> interop.Reference[Canvas]!:
+    let manifest_path = try paths.join(path, "document.prisma")
+    let text = try files.read_text(manifest_path)
+    defer text.release()
+    let manifest = try prism.Document.decode(text.value.bytes)
+    defer manifest.release()
+    let doc = manifest.value()
+    let width = try get_integer(doc, "/document", "width")
+    let height = try get_integer(doc, "/document", "height")
+    var reservation = try interop.Reservation[Canvas](canvas_type)
+    errdefer reservation.cancel()
+    let native = try new Canvas(width, height) in memory.heap
+    errdefer native.close()
+    let layers_dir = try paths.join(path, "layers")
+    for index in 0..<doc.child_count("/layers"):
+        let element = doc.child_at("/layers", index) else error(invalid, "a layer element is missing")
+        let name_value = try doc.get(element, "name")
+        defer name_value.release()
+        let id = try native.add_layer(try name_value.value().text_at())
+        let visible = (try get_integer(doc, element, "visible")) != 0
+        let opacity = try get_number(doc, element, "opacity")
+        let blend = try get_integer(doc, element, "blend")
+        try native.set_layer(id, visible, opacity, blend)
+        try native.set_clipped(id, (try get_integer(doc, element, "clipped")) != 0)
+        var file_buffer: u8[64]
+        let picture = try Image.open(try paths.join(layers_dir, try format_file(file_buffer, "layer", index, ".png")))
+        try native.place((u64)id, picture)
+        if (try get_integer(doc, element, "mask")) != 0:
+            try native.set_mask(id, true)
+            let mask = try Image.open(try paths.join(layers_dir, try format_file(file_buffer, "layer", index, ".mask.png")))
+            let slot = try native.index((u64)id)
+            native.records[slot].mask_picture = mask
+    return reservation.publish(native, memory.heap)
 
 ## What binding creates, released in reverse on failure or close.
 struct Binding:
@@ -944,8 +1271,8 @@ test "canvas strokes paint the selected layer and undo restores it":
     assert(try canvas.layer_clipped(0))
     try canvas.set_clipped(layer, false)
     # A selection limits the fill: the left half turns red, the right stays.
-    try canvas.select(0, 0, 32, 64)
-    assert(canvas.has_selection() and canvas.selection_width() == 32)
+    try canvas.select_rectangle(0, 0, 32, 64)
+    assert(canvas.has_selection() and canvas.selection_width() == 32 and canvas.selected_at(5, 5) == 255 and canvas.selected_at(40, 5) == 0)
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
     try canvas.fill(layer, false)
     let seventh = try target.frame()
@@ -983,7 +1310,26 @@ test "canvas strokes paint the selected layer and undo restores it":
     try canvas.reorder_layer(twin, 1)
     try canvas.merge_down(twin)
     assert(canvas.layer_count() == 1 and (try canvas.layer_id(0)) == layer and not canvas.can_undo())
-    try canvas.select(8, 8, 16, 16)
+    # The document round-trips through an .l2d package with its layers.
+    try canvas.set_mask(layer, true)
+    try canvas.save_package("build/canvas-test.l2d")
+    let restored = try Canvas.open("build/canvas-test.l2d")
+    defer restored.release()
+    assert(restored.value().layer_count() == 1 and (try restored.value().layer_name(0)) == "Paint" and (try restored.value().layer_masked(0)))
+    let ninth = try target.frame()
+    defer ninth.release()
+    let shown = try ninth.value().target()
+    defer shown.release()
+    try restored.value().draw(shown, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
+    discard(try ninth.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    # The blurred, moved stroke over the red fill, as it was before saving
+    # (sRGB 170, 203, 0 in the file; the linear target stores about 102, 153, 0).
+    try target.read(pixel, gpu.Region(32, 32, 1, 1))
+    assert(pixel[0] > 85 and pixel[0] < 120 and pixel[1] > 135 and pixel[1] < 170 and pixel[2] == 0)
+    try target.read(pixel, gpu.Region(12, 32, 1, 1))
+    assert(pixel[0] == 255 and pixel[1] == 0)
+    try canvas.set_mask(layer, false)
+    try canvas.select_ellipse(8, 8, 16, 16)
     try canvas.crop()
     assert(canvas.width() == 16 and canvas.height() == 16 and not canvas.has_selection())
     try canvas.resize_image(32, 8)
