@@ -1,0 +1,100 @@
+## Destructive adjustments: a layer's tiles rewritten through one fragment
+## program, tile by tile. Only tiles the layer has are touched; the rest stay
+## transparent. The caller keeps the tiles from before for undo.
+import gpu
+import memory
+import math
+from luce_image.tiles import Tiles, tile_size
+from luce_image.document import Document
+from luce_image.shaders import adjust_frag_words, adjust_frag_msl
+from luce_image.errors import invalid
+
+## The adjustments `adjust.frag` knows, by number.
+pub let brightness_contrast: u32 = 0
+pub let hue_saturation: u32 = 1
+pub let invert: u32 = 2
+pub let levels: u32 = 3
+pub let desaturate: u32 = 4
+pub let threshold: u32 = 5
+pub let posterize: u32 = 6
+pub let adjustment_count: u32 = 7
+
+## The pipeline a device needs to adjust, built once.
+pub struct Adjuster:
+    var owner: gpu.Device
+    var shader: gpu.Shader
+    var pipeline: gpu.Pipeline
+
+    pub static func create(device: gpu.Device) -> Adjuster!:
+        var shader = try gpu.Shader.create(device, adjust_frag_words, adjust_frag_msl)
+        errdefer shader.destroy()
+        var pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.replace, gpu.Format.rgba16_float)
+        errdefer pipeline.destroy()
+        return Adjuster(owner = device, shader = shader, pipeline = pipeline)
+
+    ## Rewrite every tile of `layer` with adjustment `kind` and its parameters.
+    pub func apply(document: Document*, layer: u64, kind: u32, a: f64, b: f64, c: f64, d: f64, e: f64) -> !:
+        if kind >= adjustment_count:
+            error(invalid, "no such adjustment")
+        for value in [a, b, c, d, e]:
+            if not math.is_finite(value):
+                error(invalid, "adjustment parameters must be finite")
+        let target = document.find(layer) else error(invalid, "no such layer")
+        let tiles = target.tiles() else error(invalid, "a group cannot be adjusted")
+        var params: f32[6] = [(f32)kind, (f32)a, (f32)b, (f32)c, (f32)d, (f32)e]
+        for row in 0..<tiles.rows():
+            for column in 0..<tiles.columns():
+                let source = tiles.texture(column, row) else continue
+                var fresh = try tiles.blank()
+                errdefer fresh.destroy()
+                let frame = try fresh.frame()
+                defer frame.release()
+                let area = try frame.value().target()
+                defer area.release()
+                try gpu.shade(area.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 24), [source], gpu.Filter.nearest)
+                discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+                try tiles.set(column, row, fresh)
+        target.revision += 1
+
+    pub mutating func destroy():
+        self.pipeline.destroy()
+        self.shader.destroy()
+
+test "adjustments rewrite a layer's tiles":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var document = try Document.create(device, 300, 40)
+    defer document.destroy()
+    let layer = try document.add_layer("Colour")
+    let count = (usize)300 * 40 * 4
+    let pixels = try alloc f32[count] in memory.heap
+    defer free(pixels) in memory.heap
+    for index in 0..<count:
+        pixels[index] = 0.0
+    # Opaque red on the left tile only.
+    for y in 0..<(usize)40:
+        for x in 0..<(usize)200:
+            pixels[(y * 300 + x) * 4] = 1.0
+            pixels[(y * 300 + x) * 4 + 3] = 1.0
+    var tiles = try Tiles.create(device, 300, 40)
+    try tiles.write(pixels)
+    try document.set_tiles(layer, tiles)
+    var adjuster = try Adjuster.create(device)
+    defer adjuster.destroy()
+    try adjuster.apply(&document, layer, invert, 0.0, 0.0, 0.0, 0.0, 0.0)
+    let current = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
+    try current.read(pixels)
+    # Inverted red is cyan; the empty right tile stays empty; alpha is kept.
+    assert(pixels[(20 * 300 + 100) * 4] < 0.01 and pixels[(20 * 300 + 100) * 4 + 1] > 0.99 and pixels[(20 * 300 + 100) * 4 + 3] == 1.0)
+    assert(current.texture(1, 0) == none)
+    try adjuster.apply(&document, layer, desaturate, 0.0, 0.0, 0.0, 0.0, 0.0)
+    try current.read(pixels)
+    let grey = pixels[(20 * 300 + 100) * 4]
+    assert(grey > 0.3 and grey < 0.6 and math.abs((f64)grey - (f64)pixels[(20 * 300 + 100) * 4 + 2]) < 0.01)
+    var rejected = false
+    adjuster.apply(&document, layer, 99, 0.0, 0.0, 0.0, 0.0, 0.0) catch failure:
+        assert(failure.code == invalid)
+        rejected = true
+    assert(rejected)

@@ -11,9 +11,10 @@ import ownership
 import strings
 from luce_image.image import Image, Pixel
 from luce_image.tiles import Tiles, tile_size, tile_columns
-from luce_image.document import Document, box_document, unbox_document
+from luce_image.document import Document, box_document, unbox_document, blend_mode_count
 from luce_image.composite import Composer, box_composer, unbox_composer
 from luce_image.brush import Brush, Painter, Stroke, begin_boxed, finish_boxed
+from luce_image.adjust import Adjuster, adjustment_count
 from luce_image.half import from_half
 from luce_image.errors import invalid, limit
 
@@ -22,6 +23,7 @@ struct Record:
     var name: str
     var visible: bool
     var opacity: f64
+    var blend: i64
     ## A picture waiting to become tiles once a device is bound.
     var picture: interop.Reference[Image]?
 
@@ -35,6 +37,7 @@ pub struct Canvas:
     var document: Document*?
     var composer: Composer*?
     var painter: Painter?
+    var adjuster: Adjuster?
     var brush: Brush
     var stroke: Stroke*?
     var history: Snapshot[]
@@ -57,6 +60,7 @@ pub struct Canvas:
         self.document = none
         self.composer = none
         self.painter = none
+        self.adjuster = none
         self.brush = Brush()
         self.stroke = none
         var no_history: Snapshot[]
@@ -105,7 +109,7 @@ pub struct Canvas:
         if let document = self.document:
             let created = try document.add_layer(name)
             assert(created == id)
-        self.records[self.count] = Record(id = id, name = copied, visible = true, opacity = 1.0, picture = none)
+        self.records[self.count] = Record(id = id, name = copied, visible = true, opacity = 1.0, blend = 0, picture = none)
         self.count += 1
         self.next_id += 1
         return (i64)id
@@ -154,15 +158,33 @@ pub struct Canvas:
             self.records[shift] = self.records[shift + 1]
         self.count -= 1
 
-    pub mutating func set_layer(id: i64, visible: bool, opacity: f64) -> !:
+    ## Set a layer's visibility, opacity and blend mode (Photoshop's, by number;
+    ## `blend_mode_name` lists them).
+    pub mutating func set_layer(id: i64, visible: bool, opacity: f64, blend: i64 = 0) -> !:
         try self.require_open()
         if not math.is_finite(opacity) or opacity < 0.0 or opacity > 1.0:
             error(invalid, "opacity must be in 0..1")
+        if blend < 0 or blend >= (i64)blend_mode_count:
+            error(invalid, "no such blend mode")
         let index = try self.index((u64)id)
         if let document = self.document:
-            try document.set_appearance((u64)id, visible, opacity)
+            try document.set_appearance((u64)id, visible, opacity, (u32)blend)
         self.records[index].visible = visible
         self.records[index].opacity = opacity
+        self.records[index].blend = blend
+
+    pub func layer_blend(index: i64) -> i64!:
+        return (try self.record(index)).blend
+
+    ## How many blend modes there are.
+    pub static func blend_mode_count() -> i64:
+        return (i64)blend_mode_count
+
+    ## The name of a blend mode.
+    pub static func blend_mode_name(mode: i64) -> str!:
+        if mode < 0 or mode >= (i64)blend_mode_count:
+            error(invalid, "no such blend mode")
+        return blend_names[(usize)mode]
 
     ## Layers from the bottom up.
     pub func layer_count() -> i64:
@@ -220,6 +242,27 @@ pub struct Canvas:
 
     pub func painting() -> bool:
         return self.stroke != none
+
+    ## Rewrite a layer's pixels with a destructive adjustment: 0 brightness/
+    ## contrast (a, b in -1..1), 1 hue/saturation/lightness (a in turns, b, c
+    ## in -1..1), 2 invert, 3 levels (a input black, b input white, c gamma,
+    ## d output black, e output white, all 0..1 but gamma), 4 desaturate,
+    ## 5 threshold (a), 6 posterize (a levels). Undoable.
+    pub mutating func adjust_layer(id: i64, kind: i64, a: f64, b: f64, c: f64, d: f64, e: f64) -> !:
+        try self.require_open()
+        if self.stroke != none:
+            error(invalid, "finish the stroke first")
+        if kind < 0 or kind >= (i64)adjustment_count:
+            error(invalid, "no such adjustment")
+        let document = self.document else error(invalid, "draw the document once before adjusting")
+        let adjuster = self.adjuster else error(invalid, "draw the document once before adjusting")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = layer.tiles() else error(invalid, "a group cannot be adjusted")
+        try self.remember((u64)id, try tiles.clone())
+        try adjuster.apply(document, (u64)id, (u32)kind, a, b, c, d, e)
+
+    pub static func adjustment_count() -> i64:
+        return (i64)adjustment_count
 
     pub func can_undo() -> bool:
         return self.history_count > 0
@@ -345,7 +388,7 @@ pub struct Canvas:
             if failure.code == gpu.unavailable:
                 return
             error(failure.code, failure.message)
-        var binding = Binding(device = acquired, document = none, composer = none, painter = none)
+        var binding = Binding(device = acquired, document = none, composer = none, painter = none, adjuster = none)
         errdefer unwind(&binding)
         let device = binding.device else trap("bound")
         var document = try Document.create(device, self.extent_x, self.extent_y)
@@ -353,17 +396,19 @@ pub struct Canvas:
         for index in 0..<self.count:
             let record = self.records[index]
             discard(try document.add_layer(record.name))
-            try document.set_appearance(record.id, record.visible, record.opacity)
+            try document.set_appearance(record.id, record.visible, record.opacity, (u32)record.blend)
         binding.document = try box_document(document)
         var composer = try Composer.create(device)
         errdefer composer.destroy()
         binding.composer = try box_composer(composer)
         binding.painter = try Painter.create(device)
+        binding.adjuster = try Adjuster.create(device)
         self.device = binding.device
         self.painter = binding.painter
+        self.adjuster = binding.adjuster
         self.document = binding.document
         self.composer = binding.composer
-        binding = Binding(device = none, document = none, composer = none, painter = none)
+        binding = Binding(device = none, document = none, composer = none, painter = none, adjuster = none)
         for index in 0..<self.count:
             if let picture = self.records[index].picture:
                 self.records[index].picture = none
@@ -399,11 +444,12 @@ pub struct Canvas:
             free(self.history) in memory.heap
         if self.future.length > 0:
             free(self.future) in memory.heap
-        var binding = Binding(device = self.device, document = self.document, composer = self.composer, painter = self.painter)
+        var binding = Binding(device = self.device, document = self.document, composer = self.composer, painter = self.painter, adjuster = self.adjuster)
         self.device = none
         self.document = none
         self.composer = none
         self.painter = none
+        self.adjuster = none
         unwind(&binding)
         for index in 0..<self.count:
             strings.release(self.records[index].name)
@@ -420,12 +466,17 @@ pub struct Canvas:
             if let picture = self.records[index].picture:
                 picture.trace(visit, context)
 
+let blend_names: str[26] = ["Normal", "Darken", "Multiply", "Color Burn", "Linear Burn", "Lighten", "Screen", "Color Dodge", "Linear Dodge",
+                            "Overlay", "Soft Light", "Hard Light", "Vivid Light", "Linear Light", "Pin Light", "Hard Mix", "Difference", "Exclusion",
+                            "Subtract", "Divide", "Hue", "Saturation", "Color", "Luminosity", "Darker Color", "Lighter Color"]
+
 ## What binding creates, released in reverse on failure or close.
 struct Binding:
     var device: gpu.Device?
     var document: Document*?
     var composer: Composer*?
     var painter: Painter?
+    var adjuster: Adjuster?
 
 ## A layer's pixels at one moment, shared with whatever else holds them.
 struct Snapshot:
@@ -454,6 +505,9 @@ func gpu_check_color(color: gpu.Color) -> !:
         error(invalid, "brush colour components must be in 0..1")
 
 func unwind(binding: Binding*):
+    if let adjuster = binding.adjuster:
+        var owned = adjuster
+        owned.destroy()
     if let painter = binding.painter:
         var owned = painter
         owned.destroy()
@@ -464,7 +518,7 @@ func unwind(binding: Binding*):
     if let device = binding.device:
         var owned = device
         owned.destroy()
-    *binding = Binding(device = none, document = none, composer = none, painter = none)
+    *binding = Binding(device = none, document = none, composer = none, painter = none, adjuster = none)
 
 func min(a: u32, b: u32) -> u32:
     return a if a < b else b
@@ -574,3 +628,15 @@ test "canvas strokes paint the selected layer and undo restores it":
     assert(pixel[1] == 0)
     try canvas.redo()
     assert(canvas.can_undo() and not canvas.can_redo())
+    # Inverting the painted layer turns its green stroke magenta, undoably.
+    try canvas.adjust_layer(layer, 2, 0.0, 0.0, 0.0, 0.0, 0.0)
+    let fourth = try target.frame()
+    defer fourth.release()
+    let last = try fourth.value().target()
+    defer last.release()
+    try canvas.draw(last, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
+    discard(try fourth.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    try target.read(pixel, gpu.Region(32, 32, 1, 1))
+    assert(pixel[0] == 255 and pixel[1] == 0 and pixel[2] == 255)
+    try canvas.undo()
+    assert(canvas.can_redo())

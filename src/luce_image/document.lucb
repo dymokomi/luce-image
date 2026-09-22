@@ -9,11 +9,20 @@ import strings
 from luce_image.tiles import Tiles, box, unbox
 from luce_image.errors import invalid, limit
 
+pub let blend_mode_count: u32 = 26
+
 pub struct Layer:
     pub var id: u64
     pub var name: str
     pub var visible: bool = true
     pub var opacity: f64 = 1.0
+    ## Photoshop's blend modes by number: 0 normal, 1 darken, 2 multiply, 3 color
+    ## burn, 4 linear burn, 5 lighten, 6 screen, 7 color dodge, 8 linear dodge,
+    ## 9 overlay, 10 soft light, 11 hard light, 12 vivid light, 13 linear light,
+    ## 14 pin light, 15 hard mix, 16 difference, 17 exclusion, 18 subtract,
+    ## 19 divide, 20 hue, 21 saturation, 22 color, 23 luminosity, 24 darker
+    ## color, 25 lighter color.
+    pub var blend: u32
     pub var group: bool
     var pixels: Tiles*?
     var children: Layer*[]
@@ -148,13 +157,16 @@ pub struct Document:
         free(previous) in memory.heap
         return taken
 
-    ## Set a layer's visibility and opacity.
-    pub mutating func set_appearance(id: u64, visible: bool, opacity: f64) -> !:
+    ## Set a layer's visibility, opacity and blend mode.
+    pub mutating func set_appearance(id: u64, visible: bool, opacity: f64, blend: u32 = 0) -> !:
         if not (opacity >= 0.0 and opacity <= 1.0):
             error(invalid, "opacity must be in 0..1")
+        if blend > blend_mode_count - 1:
+            error(invalid, "no such blend mode")
         let layer = self.find(id) else error(invalid, "no such layer")
         layer.visible = visible
         layer.opacity = opacity
+        layer.blend = blend
         self.revision += 1
 
     pub mutating func destroy():

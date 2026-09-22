@@ -12,6 +12,7 @@ from luce_image.tiles import Tiles, Tile, tile_size
 from luce_image.document import Document, Layer
 from luce_image.errors import invalid, limit
 from luce_image.half import from_half
+from luce_image.shaders import composite_frag_words, composite_frag_msl
 
 struct Entry:
     var digest: u64
@@ -25,6 +26,9 @@ pub struct Composer:
     var count: usize
     var budget: usize
     var tick: u64
+    var shader: gpu.Shader
+    var pipeline: gpu.Pipeline
+    var blank: gpu.Texture
     ## How many tiles were rendered rather than found, for tests and tuning.
     pub var renders: u64
 
@@ -33,9 +37,21 @@ pub struct Composer:
         if budget == 0 or budget > 65536:
             error(invalid, "the tile budget must be in 1..65536")
         let entries = try alloc Entry[budget] in memory.heap
+        errdefer free(entries) in memory.heap
         for index in 0..<budget:
             entries[index] = Entry(digest = 0, texture = gpu.Texture(), used = 0, live = false)
-        return Composer(owner = device, entries = entries, count = 0, budget = budget, tick = 0, renders = 0)
+        var shader = try gpu.Shader.create(device, composite_frag_words, composite_frag_msl)
+        errdefer shader.destroy()
+        var pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.replace, gpu.Format.rgba16_float)
+        errdefer pipeline.destroy()
+        var blank = try gpu.Texture.create(device, tile_size, tile_size, gpu.Format.rgba16_float)
+        errdefer blank.destroy()
+        let zeros = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+        defer free(zeros) in memory.heap
+        for index in 0..<zeros.length:
+            zeros[index] = 0
+        try blank.upload(zeros)
+        return Composer(owner = device, entries = entries, count = 0, budget = budget, tick = 0, shader = shader, pipeline = pipeline, blank = blank, renders = 0)
 
     ## The flattened tile at `column`, `row` of pyramid `level`, borrowed until
     ## the next call. Straight-alpha rgba16_float, transparent where nothing is.
@@ -43,9 +59,7 @@ pub struct Composer:
         if level > 16:
             error(invalid, "pyramid levels go up to 16")
         let span = 1u32 << level
-        let first_column = column * span
-        let first_row = row * span
-        if first_column * tile_size >= document.width() or first_row * tile_size >= document.height():
+        if column * span * tile_size >= document.width() or row * span * tile_size >= document.height():
             error(invalid, "the requested tile lies outside the document")
         self.tick += 1
         var digest = fnv_start()
@@ -54,24 +68,102 @@ pub struct Composer:
         digest = fnv_mix(digest, (u64)row)
         digest = fnv_mix(digest, (u64)document.width())
         digest = fnv_mix(digest, (u64)document.height())
-        digest = hash_layers(digest, document.layers(), 1.0, first_column, first_row, span)
-        for index in 0..<self.count:
-            if self.entries[index].live and self.entries[index].digest == digest:
-                self.entries[index].used = self.tick
-                return self.entries[index].texture
-        var texture = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        digest = hash_layers(digest, document.layers(), 1.0, column * span, row * span, span)
+        if let found = self.lookup(digest):
+            return found
+        var texture = gpu.Texture()
+        if level == 0:
+            texture = try self.flatten(document, column, row)
+        else:
+            texture = try self.halve(document, column, row, level)
         errdefer texture.destroy()
-        let frame = try texture.frame()
-        defer frame.release()
-        let target = try frame.value().target()
-        defer target.release()
-        try draw_layers(target.value(), document.layers(), 1.0, first_column, first_row, span)
-        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         self.renders += 1
         let slot = self.slot()
         if self.entries[slot].live:
             self.entries[slot].texture.destroy()
         self.entries[slot] = Entry(digest = digest, texture = texture, used = self.tick, live = true)
+        return texture
+
+    mutating func lookup(digest: u64) -> gpu.Texture?:
+        for index in 0..<self.count:
+            if self.entries[index].live and self.entries[index].digest == digest:
+                self.entries[index].used = self.tick
+                return self.entries[index].texture
+        return none
+
+    ## A level-0 tile: every contributing layer composited in turn over the
+    ## result so far, through the blend shader, each pass into a fresh tile.
+    mutating func flatten(document: const Document*, column: u32, row: u32) -> gpu.Texture!:
+        var backdrop = self.blank
+        var owned = false
+        errdefer drop_owned(&backdrop, owned)
+        try self.flatten_layers(document.layers(), 1.0, column, row, &backdrop, &owned)
+        if not owned:
+            # Nothing contributed: a transparent tile of its own, so the cache can destroy it.
+            backdrop = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+            let frame = try backdrop.frame()
+            defer frame.release()
+            discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        return backdrop
+
+    mutating func flatten_layers(layers: Layer*[], opacity: f64, column: u32, row: u32, backdrop: gpu.Texture*, owned: bool*) -> !:
+        for layer in layers:
+            if not layer.visible or layer.opacity == 0.0:
+                continue
+            let effective = opacity * layer.opacity
+            if layer.group:
+                try self.flatten_layers(layer.layers(), effective, column, row, backdrop, owned)
+                continue
+            let tiles = layer.tiles() else continue
+            let texture = tiles.texture(column, row) else continue
+            let area = tiles.region(column, row)
+            var params: f32[6] = [0.0, 0.0, (f32)area.width, (f32)area.height, (f32)effective, (f32)layer.blend]
+            var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+            errdefer fresh.destroy()
+            let frame = try fresh.frame()
+            defer frame.release()
+            let target = try frame.value().target()
+            defer target.release()
+            try gpu.shade(target.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 24), [*backdrop, texture], gpu.Filter.nearest)
+            discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+            if *owned:
+                backdrop.destroy()
+            *backdrop = fresh
+            *owned = true
+
+    ## A coarser tile: the four tiles of the level below, each drawn at half size.
+    mutating func halve(document: const Document*, column: u32, row: u32, level: u32) -> gpu.Texture!:
+        var texture = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        errdefer texture.destroy()
+        let half = (f64)tile_size * 0.5
+        let below = 1u32 << (level - 1)
+        # Drawing into a fresh frame while fetching finer tiles may evict cache
+        # entries, so the frame is recorded after all four are looked up.
+        var parts: gpu.Texture[4]
+        var count: usize = 0
+        var positions: gpu.Rect[4]
+        var regions: gpu.Region[4]
+        for dy in 0..<(u32)2:
+            for dx in 0..<(u32)2:
+                let fine_column = column * 2 + dx
+                let fine_row = row * 2 + dy
+                if fine_column * below * tile_size >= document.width() or fine_row * below * tile_size >= document.height():
+                    continue
+                let source = try self.tile(document, fine_column, fine_row, level - 1)
+                # The finer tile covers this many texels of the document at its level.
+                let covered_x = min(tile_size, (document.width() - fine_column * below * tile_size + below - 1) // below)
+                let covered_y = min(tile_size, (document.height() - fine_row * below * tile_size + below - 1) // below)
+                parts[count] = source
+                positions[count] = gpu.Rect(x = (f64)dx * half, y = (f64)dy * half, width = (f64)covered_x * 0.5, height = (f64)covered_y * 0.5)
+                regions[count] = gpu.Region(0, 0, covered_x, covered_y)
+                count += 1
+        let frame = try texture.frame()
+        defer frame.release()
+        let target = try frame.value().target()
+        defer target.release()
+        for index in 0..<count:
+            try gpu.draw_image(target.value(), parts[index], positions[index], regions[index], 1.0, gpu.Filter.linear)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         return texture
 
     ## The next free slot, or the least recently used one when full.
@@ -100,11 +192,14 @@ pub struct Composer:
         var empty: Entry[]
         self.entries = empty
         self.budget = 0
+        self.blank.destroy()
+        self.pipeline.destroy()
+        self.shader.destroy()
 
 ## Move a compositor onto the heap, for holders that keep a pointer.
 pub func box_composer(composer: Composer) -> Composer*!:
-    return try new Composer(owner = composer.owner, entries = composer.entries, count = composer.count,
-                            budget = composer.budget, tick = composer.tick, renders = composer.renders) in memory.heap
+    return try new Composer(owner = composer.owner, entries = composer.entries, count = composer.count, budget = composer.budget, tick = composer.tick,
+                            shader = composer.shader, pipeline = composer.pipeline, blank = composer.blank, renders = composer.renders) in memory.heap
 
 ## Destroy a boxed compositor and free the box.
 pub func unbox_composer(composer: Composer*):
@@ -132,27 +227,12 @@ func hash_layers(seed: u64, layers: Layer*[], opacity: f64, first_column: u32, f
         digest = fnv_mix(digest, layer.id)
         digest = fnv_mix(digest, layer.revision)
         digest = fnv_mix(digest, effective.bits())
+        digest = fnv_mix(digest, (u64)layer.blend)
     return digest
 
-## Draw every contributing layer, bottom to top, onto a 256-point target that
-## covers `span` by `span` level-0 cells from (`first_column`, `first_row`).
-func draw_layers(target: const gpu.RenderTarget*, layers: Layer*[], opacity: f64, first_column: u32, first_row: u32, span: u32) -> !:
-    let scale = (f64)tile_size / ((f64)tile_size * (f64)span)
-    for layer in layers:
-        if not layer.visible or layer.opacity == 0.0:
-            continue
-        let effective = opacity * layer.opacity
-        if layer.group:
-            try draw_layers(target, layer.layers(), effective, first_column, first_row, span)
-            continue
-        let tiles = layer.tiles() else continue
-        for row in first_row..<min(first_row + span, tiles.rows()):
-            for column in first_column..<min(first_column + span, tiles.columns()):
-                let texture = tiles.texture(column, row) else continue
-                let area = tiles.region(column, row)
-                let rectangle = gpu.Rect(x = (f64)((column - first_column) * tile_size) * scale, y = (f64)((row - first_row) * tile_size) * scale,
-                                         width = (f64)area.width * scale, height = (f64)area.height * scale)
-                try gpu.draw_image(target, texture, rectangle, area, effective, gpu.Filter.nearest if span == 1 else gpu.Filter.linear)
+func drop_owned(texture: gpu.Texture*, owned: bool):
+    if owned:
+        texture.destroy()
 
 func min(a: u32, b: u32) -> u32:
     return a if a < b else b
@@ -221,6 +301,14 @@ test "composite flattens layers with opacity, caches by identity and scales leve
     assert(from_half((u16)bytes[0] | ((u16)bytes[1] << 8)) > 0.99)
     try coarse.read(bytes, gpu.Region(200, 200, 1, 1))
     assert(from_half((u16)bytes[6] | ((u16)bytes[7] << 8)) == 0.0)
+    # Multiply: half-alpha green over red blends to black where it lands, so
+    # the pixel is half red; the cache key sees the mode change.
+    try document.set_appearance(top, true, 1.0, 2)
+    let multiplied = try composer.tile(&document, 0, 0, 0)
+    try multiplied.read(bytes, gpu.Region(20, 10, 1, 1))
+    let red_left = from_half((u16)bytes[0] | ((u16)bytes[1] << 8))
+    assert(red_left > 0.49 and red_left < 0.51 and from_half((u16)bytes[2] | ((u16)bytes[3] << 8)) < 0.01)
+    assert(from_half((u16)bytes[6] | ((u16)bytes[7] << 8)) == 1.0)
     var rejected = false
     discard(composer.tile(&document, 4, 0, 0) catch failure:
         assert(failure.code == invalid)
