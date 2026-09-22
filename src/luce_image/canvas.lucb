@@ -422,6 +422,27 @@ pub struct Canvas:
                 try gpu.draw_image(area, texture, destination, gpu.Region(0, 0, covered_x, covered_y), 1.0,
                                    gpu.Filter.nearest if zoom >= 1.0 else gpu.Filter.linear)
 
+    ## Draw one layer's own pixels (or its mask when `mask` is set) scaled into
+    ## `rectangle` of `target`, for thumbnails. Needs the document bound.
+    pub mutating func draw_layer(target: interop.View[gpu.RenderTarget], index: i64, rectangle: gpu.Rect, mask: bool = false) -> !:
+        try self.require_open()
+        let record = try self.record(index)
+        if rectangle.width <= 0.0 or rectangle.height <= 0.0:
+            return
+        let checked = try target.get()
+        let document = self.document else return
+        let layer = document.find(record.id) else return
+        let tiles = (layer.mask_tiles() else return) if mask else (layer.tiles() else return)
+        let scale_x = rectangle.width / (f64)self.extent_x
+        let scale_y = rectangle.height / (f64)self.extent_y
+        for row in 0..<tiles.rows():
+            for column in 0..<tiles.columns():
+                let texture = tiles.texture(column, row) else continue
+                let area = tiles.region(column, row)
+                let destination = gpu.Rect(rectangle.x + (f64)(column * tile_size) * scale_x, rectangle.y + (f64)(row * tile_size) * scale_y,
+                                           (f64)area.width * scale_x, (f64)area.height * scale_y)
+                try gpu.draw_image(checked, texture, destination, area, 1.0, gpu.Filter.linear)
+
     ## Create the GPU document on the target's device and move waiting pictures in.
     mutating func bind(target: const gpu.RenderTarget*) -> !:
         if self.document != none:
