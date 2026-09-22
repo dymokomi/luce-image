@@ -76,6 +76,12 @@ struct Touched:
     var coverage: gpu.Texture
 
 ## A stroke in progress on one layer.
+## A pressure as a diameter factor: unknown (zero or not finite) and full press both paint at full size.
+func pressure_scale(pressure: f64) -> f64:
+    if not math.is_finite(pressure) or pressure <= 0.0 or pressure >= 1.0:
+        return 1.0
+    return math.max(0.05, pressure)
+
 pub struct Stroke:
     var layer: u64
     var brush: Brush
@@ -89,6 +95,8 @@ pub struct Stroke:
     var empty: gpu.Texture?
     ## What a missing cell counts as: transparent for pixels, white for a mask.
     var fill: gpu.Color
+    ## The stylus pressure of the current segment, scaling the diameter.
+    var pressure: f64
     var active: bool
     var on_mask: bool
     ## The document's selection tiles when the stroke began; painting stays inside it.
@@ -96,7 +104,7 @@ pub struct Stroke:
 
     ## Begin at a point on `layer`'s pixels, or on its mask, painting the first
     ## dab there. A mask's missing cells count as white (revealing).
-    pub static func begin(painter: Painter*, document: Document*, layer: u64, brush: Brush, x: f64, y: f64, on_mask: bool = false) -> Stroke!:
+    pub static func begin(painter: Painter*, document: Document*, layer: u64, brush: Brush, x: f64, y: f64, on_mask: bool = false, pressure: f64 = 1.0) -> Stroke!:
         try brush.check()
         let target = document.find(layer) else error(invalid, "no such layer")
         let tiles = (target.mask_tiles() else error(invalid, "the layer has no mask")) if on_mask else (target.tiles() else error(invalid, "a group cannot be painted"))
@@ -104,17 +112,19 @@ pub struct Stroke:
             error(invalid, "stroke coordinates must be finite")
         let fill = gpu.Color(1.0, 1.0, 1.0, 1.0) if on_mask else gpu.Color(0.0, 0.0, 0.0, 0.0)
         var stroke = Stroke(layer = layer, brush = brush, last_x = x, last_y = y, before = try tiles.clone(), empty = none, fill = fill, active = true, on_mask = on_mask,
-                            selection = try document.selection_tiles())
+                            selection = try document.selection_tiles(), pressure = pressure_scale(pressure))
         errdefer stroke.destroy()
         try stroke.segment(painter, document, x, y, x, y)
         return stroke
 
-    ## Continue to a point, painting the segment from the last one.
-    pub mutating func extend(painter: Painter*, document: Document*, x: f64, y: f64) -> !:
+    ## Continue to a point, painting the segment from the last one; `pressure`
+    ## (0..1, or 1 for a mouse) scales the brush's diameter along it.
+    pub mutating func extend(painter: Painter*, document: Document*, x: f64, y: f64, pressure: f64 = 1.0) -> !:
         if not self.active:
             error(invalid, "the stroke has ended")
         if not math.is_finite(x) or not math.is_finite(y):
             error(invalid, "stroke coordinates must be finite")
+        self.pressure = pressure_scale(pressure)
         try self.segment(painter, document, self.last_x, self.last_y, x, y)
         self.last_x = x
         self.last_y = y
@@ -135,7 +145,7 @@ pub struct Stroke:
     mutating func segment(painter: Painter*, document: Document*, x0: f64, y0: f64, x1: f64, y1: f64) -> !:
         let target = document.find(self.layer) else error(invalid, "the painted layer is gone")
         let tiles = (target.mask_tiles() else error(invalid, "the painted mask is gone")) if self.on_mask else (target.tiles() else error(invalid, "the painted layer has no pixels"))
-        let reach = self.brush.diameter * 0.5 + 1.0
+        let reach = self.brush.diameter * self.pressure * 0.5 + 1.0
         let left = math.max(0.0, math.floor((math.min(x0, x1) - reach) / (f64)tile_size))
         let top = math.max(0.0, math.floor((math.min(y0, y1) - reach) / (f64)tile_size))
         let right = math.min((f64)(tiles.columns() - 1), math.floor((math.max(x0, x1) + reach) / (f64)tile_size))
@@ -159,7 +169,7 @@ pub struct Stroke:
         let origin_x = (f64)(column * tile_size)
         let origin_y = (f64)(row * tile_size)
         var segment: f32[9] = [0.0, 0.0, (f32)(x0 - origin_x), (f32)(y0 - origin_y), (f32)(x1 - origin_x), (f32)(y1 - origin_y),
-                               (f32)(self.brush.diameter * 0.5), (f32)self.brush.hardness, (f32)self.brush.flow]
+                               (f32)(self.brush.diameter * self.pressure * 0.5), (f32)self.brush.hardness, (f32)self.brush.flow]
         var grown = try gpu.Texture.create(painter.owner, tile_size, tile_size, gpu.Format.r8)
         errdefer grown.destroy()
         let frame = try grown.frame()
@@ -298,12 +308,12 @@ pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brus
 
 
 ## A stroke on the heap, for holders that keep a pointer.
-pub func begin_boxed(painter: Painter*, document: Document*, layer: u64, brush: Brush, x: f64, y: f64, on_mask: bool = false) -> Stroke*!:
-    var stroke = try Stroke.begin(painter, document, layer, brush, x, y, on_mask)
+pub func begin_boxed(painter: Painter*, document: Document*, layer: u64, brush: Brush, x: f64, y: f64, on_mask: bool = false, pressure: f64 = 1.0) -> Stroke*!:
+    var stroke = try Stroke.begin(painter, document, layer, brush, x, y, on_mask, pressure)
     errdefer stroke.destroy()
     return try new Stroke(layer = stroke.layer, brush = stroke.brush, last_x = stroke.last_x, last_y = stroke.last_y, touched = stroke.touched,
                           count = stroke.count, before = stroke.before, empty = stroke.empty, fill = stroke.fill, active = stroke.active, on_mask = stroke.on_mask,
-                          selection = stroke.selection) in memory.heap
+                          selection = stroke.selection, pressure = stroke.pressure) in memory.heap
 
 ## End a boxed stroke and free the box.
 pub func finish_boxed(stroke: Stroke*):

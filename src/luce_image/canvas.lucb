@@ -586,7 +586,7 @@ pub struct Canvas:
     ## Start painting on `layer` at a document point. The document must have
     ## been drawn once, so its pixels are on a device. The layer's pixels before
     ## the stroke go on the history.
-    pub mutating func begin_stroke(layer: i64, x: f64, y: f64) -> !:
+    pub mutating func begin_stroke(layer: i64, x: f64, y: f64, pressure: f64 = 1.0) -> !:
         try self.require_open()
         if self.stroke != none:
             error(invalid, "a stroke is already in progress")
@@ -596,18 +596,18 @@ pub struct Canvas:
         var painter = self.painter else error(invalid, "draw the document once before painting")
         let index = try self.index((u64)layer)
         let on_mask = self.mask_editing and self.records[index].masked
-        let stroke = try begin_boxed(&painter, document, (u64)layer, self.brush, x, y, on_mask)
+        let stroke = try begin_boxed(&painter, document, (u64)layer, self.brush, x, y, on_mask, pressure)
         errdefer finish_boxed(stroke)
         try self.remember((u64)layer, try stroke.original().clone(), on_mask)
         self.stroke = stroke
 
     ## Continue the stroke to a document point.
-    pub mutating func extend_stroke(x: f64, y: f64) -> !:
+    pub mutating func extend_stroke(x: f64, y: f64, pressure: f64 = 1.0) -> !:
         try self.require_open()
         let stroke = self.stroke else error(invalid, "no stroke is in progress")
         let document = self.document else trap("stroke without a document")
         var painter = self.painter else trap("stroke without a painter")
-        try stroke.extend(&painter, document, x, y)
+        try stroke.extend(&painter, document, x, y, pressure)
 
     ## End the stroke, keeping what it painted.
     pub mutating func end_stroke() -> !:
