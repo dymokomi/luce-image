@@ -21,6 +21,7 @@ jobs:
           echo "crypto=$(cat luce-image/bootstrap/CRYPTO)" >> "$GITHUB_OUTPUT"
           echo "prism=$(cat luce-image/bootstrap/PRISM)" >> "$GITHUB_OUTPUT"
           echo "tls=$(cat luce-image/bootstrap/TLS)" >> "$GITHUB_OUTPUT"
+          echo "psd=$(cat luce-image/bootstrap/PSD)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
         with:
           repository: dymokomi/luce-base
@@ -46,6 +47,11 @@ jobs:
           repository: dymokomi/luce-tls
           ref: ${{ steps.pins.outputs.tls }}
           path: luce-tls
+      - uses: actions/checkout@v7
+        with:
+          repository: dymokomi/luce-psd
+          ref: ${{ steps.pins.outputs.psd }}
+          path: luce-psd
       - name: Select Clang
         run: |
           mkdir -p "$RUNNER_TEMP/luce-bin"
