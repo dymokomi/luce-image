@@ -368,6 +368,8 @@ pub struct Canvas:
         let area = clipped.value()
         let size = try checked.size()
         let scale = size.pixel_width / size.width if size.width > 0.0 else 1.0
+        # gl_FragCoord counts from the frame's corner, not this target's.
+        let placement = try checked.placement()
         for row in 0..<tiles.rows():
             for column in 0..<tiles.columns():
                 let texture = tiles.texture(column, row) else continue
@@ -382,7 +384,7 @@ pub struct Canvas:
                 let below_tile = tiles.texture(column, row + 1) else composer_blank(&self)
                 let limit_x = (f64)self.extent_x - (f64)(column * tile_size)
                 let limit_y = (f64)self.extent_y - (f64)(row * tile_size)
-                var params: f32[8] = [(f32)(left * scale), (f32)(top * scale), (f32)(zoom * scale), (f32)phase, (f32)covered.width, (f32)covered.height, (f32)limit_x, (f32)limit_y]
+                var params: f32[8] = [(f32)((placement.x + left) * scale), (f32)((placement.y + top) * scale), (f32)(zoom * scale), (f32)phase, (f32)covered.width, (f32)covered.height, (f32)limit_x, (f32)limit_y]
                 try gpu.shade(area, pipeline, gpu.Rect(left, top, width, height), u8[]((u8*)&params[0], 32), [texture, right_tile, below_tile], gpu.Filter.nearest)
 
     mutating func ants_pipeline() -> gpu.Pipeline!:
