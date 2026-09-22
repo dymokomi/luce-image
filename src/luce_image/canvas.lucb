@@ -61,6 +61,8 @@ pub struct Canvas:
     var preview: Snapshot?
     var curves: Curves
     var table: gpu.Texture?
+    ## The last colour the eyedropper read, straight alpha, linear light.
+    var picked: f64[4]
     var mask_editing: bool
     ## The selection lives on the CPU here and is copied into the GPU document at bind.
     var selection: Selection
@@ -96,6 +98,8 @@ pub struct Canvas:
         self.preview = none
         self.curves = Curves.identity()
         self.table = none
+        var nothing: f64[4]
+        self.picked = nothing
         self.mask_editing = false
         self.selection = try Selection.create((u32)width, (u32)height)
         var no_points: f64[]
@@ -774,6 +778,32 @@ pub struct Canvas:
         let document = self.document else trap("preview without a document")
         let transformer = self.transformer else trap("preview without a transformer")
         try transformer.apply(document, layer, scale_x, scale_y, angle * math.pi / 180.0, dx, dy)
+
+    ## The eyedropper: read the flattened document's colour at a pixel into
+    ## `picked_red` and friends (linear light, straight alpha).
+    pub mutating func pick(x: i64, y: i64) -> !:
+        try self.require_open()
+        if x < 0 or y < 0 or x >= (i64)self.extent_x or y >= (i64)self.extent_y:
+            error(invalid, "the picked pixel lies outside the document")
+        let document = self.document else error(invalid, "draw the document once before picking")
+        let composer = self.composer else error(invalid, "draw the document once before picking")
+        let texture = try composer.tile(document, (u32)(x // (i64)tile_size), (u32)(y // (i64)tile_size), 0)
+        var bytes: u8[8]
+        try texture.read(bytes, gpu.Region((u32)(x % (i64)tile_size), (u32)(y % (i64)tile_size), 1, 1))
+        for channel in 0..<(usize)4:
+            self.picked[channel] = (f64)from_half((u16)bytes[channel * 2] | ((u16)bytes[channel * 2 + 1] << 8))
+
+    pub func picked_red() -> f64:
+        return self.picked[0]
+
+    pub func picked_green() -> f64:
+        return self.picked[1]
+
+    pub func picked_blue() -> f64:
+        return self.picked[2]
+
+    pub func picked_alpha() -> f64:
+        return self.picked[3]
 
     ## Set `text` into a layer's pixels with its top-left at (`x`, `y`), `size`
     ## pixels tall (8..256), in a linear colour. Rasterised type, as Photoshop
@@ -1720,6 +1750,11 @@ test "previews show edits on the original pixels and end kept or dropped":
     assert((try shown_centre(&canvas, &target, pixels)) == inverted)
     try canvas.undo()
     assert((try shown_centre(&canvas, &target, pixels)) == base)
+    # The eyedropper reads the dot's grey back, and nothing at a bare corner.
+    try canvas.pick(16, 16)
+    assert(math.abs(canvas.picked_red() - 0.05) < 0.01 and canvas.picked_alpha() > 0.99)
+    try canvas.pick(0, 0)
+    assert(canvas.picked_alpha() == 0.0)
     # Text lands on the layer and is undoable.
     try canvas.draw_text(layer, 0.0, 0.0, "X", 24.0, 0.0, 1.0, 0.0)
     try canvas.undo()
