@@ -1,0 +1,186 @@
+## Curves: a tone curve per channel through the user's control points, folded
+## into one lookup table the `curves` adjustment samples. Points interpolate
+## with a monotone cubic (Fritsch–Carlson), so the curve is smooth and never
+## overshoots between points, as Photoshop's does. Channel 0 is the master
+## RGB curve, applied after the red, green and blue curves (1..3).
+import math
+from luce_image.errors import invalid
+
+## The most control points one channel takes.
+pub let curve_points: usize = 16
+
+## The lookup table's entries per channel.
+pub let lut_size: usize = 256
+
+## One channel's control points, sorted by input.
+pub struct Curve:
+    var xs: f64[16]
+    var ys: f64[16]
+    var count: usize
+
+    ## The identity: (0, 0) to (1, 1).
+    pub static func identity() -> Curve:
+        var curve = Curve(count = 0)
+        curve.xs[0] = 0.0
+        curve.ys[0] = 0.0
+        curve.xs[1] = 1.0
+        curve.ys[1] = 1.0
+        curve.count = 2
+        return curve
+
+    pub func length() -> usize:
+        return self.count
+
+    pub func x(index: usize) -> f64:
+        return self.xs[index]
+
+    pub func y(index: usize) -> f64:
+        return self.ys[index]
+
+    ## Add a point, keeping the points sorted by input; a point at an existing
+    ## input replaces it.
+    pub mutating func add(x: f64, y: f64) -> !:
+        if not math.is_finite(x) or not math.is_finite(y) or x < 0.0 or x > 1.0 or y < 0.0 or y > 1.0:
+            error(invalid, "curve points lie in 0..1")
+        var index: usize = 0
+        while index < self.count and self.xs[index] < x:
+            index += 1
+        if index < self.count and self.xs[index] == x:
+            self.ys[index] = y
+            return
+        if self.count == curve_points:
+            error(invalid, "a curve takes at most 16 points")
+        var slot = self.count
+        while slot > index:
+            self.xs[slot] = self.xs[slot - 1]
+            self.ys[slot] = self.ys[slot - 1]
+            slot -= 1
+        self.xs[index] = x
+        self.ys[index] = y
+        self.count += 1
+
+    pub mutating func clear():
+        self.count = 0
+
+    ## The curve's output for `x`: a monotone cubic through the points, held
+    ## flat beyond the first and last.
+    pub func evaluate(x: f64) -> f64:
+        if self.count == 0:
+            return x
+        if self.count == 1 or x <= self.xs[0]:
+            return self.ys[0]
+        let last = self.count - 1
+        if x >= self.xs[last]:
+            return self.ys[last]
+        var segment: usize = 0
+        while segment + 1 < last and x >= self.xs[segment + 1]:
+            segment += 1
+        let h = self.xs[segment + 1] - self.xs[segment]
+        let t = (x - self.xs[segment]) / h
+        let m0 = self.tangent(segment)
+        let m1 = self.tangent(segment + 1)
+        let y0 = self.ys[segment]
+        let y1 = self.ys[segment + 1]
+        let t2 = t * t
+        let t3 = t2 * t
+        let value = (2.0 * t3 - 3.0 * t2 + 1.0) * y0 + (t3 - 2.0 * t2 + t) * h * m0 + (-2.0 * t3 + 3.0 * t2) * y1 + (t3 - t2) * h * m1
+        return math.clamp(value, 0.0, 1.0)
+
+    ## The Fritsch–Carlson tangent at point `index`: the harmonic mean of the
+    ## neighbouring secants, zero where the curve changes direction.
+    func tangent(index: usize) -> f64:
+        let last = self.count - 1
+        if index == 0:
+            return self.secant(0)
+        if index == last:
+            return self.secant(last - 1)
+        let before = self.secant(index - 1)
+        let after = self.secant(index)
+        if before * after <= 0.0:
+            return 0.0
+        return 2.0 / (1.0 / before + 1.0 / after)
+
+    func secant(segment: usize) -> f64:
+        let h = self.xs[segment + 1] - self.xs[segment]
+        if h <= 0.0:
+            return 0.0
+        return (self.ys[segment + 1] - self.ys[segment]) / h
+
+## The four channels' curves and the table they fold into.
+pub struct Curves:
+    var channels: Curve[4]
+
+    pub static func identity() -> Curves:
+        var curves = Curves()
+        for index in 0..<(usize)4:
+            curves.channels[index] = Curve.identity()
+        return curves
+
+    pub func channel(index: usize) -> const Curve*!:
+        try check_channel(index)
+        return &self.channels[index]
+
+    ## Add a point to one channel's curve (see `Curve.add`).
+    pub mutating func add(channel: usize, x: f64, y: f64) -> !:
+        try check_channel(channel)
+        try self.channels[channel].add(x, y)
+
+    ## Empty one channel's curve; with no points it passes values through.
+    pub mutating func clear(channel: usize) -> !:
+        try check_channel(channel)
+        self.channels[channel].clear()
+
+    pub func is_identity() -> bool:
+        for curve in self.channels:
+            if curve.count != 2 or curve.xs[0] != 0.0 or curve.ys[0] != 0.0 or curve.xs[1] != 1.0 or curve.ys[1] != 1.0:
+                return false
+        return true
+
+    ## Write the table: `lut_size` RGBA bytes, red/green/blue holding each
+    ## channel's curve with the master curve applied after it.
+    pub func fill(table: u8[]) -> !:
+        if table.length < lut_size * 4:
+            error(invalid, "the curve table takes 1024 bytes")
+        for entry in 0..<lut_size:
+            let input = (f64)entry / (f64)(lut_size - 1)
+            for channel in 1..<(usize)4:
+                let shaped = self.channels[0].evaluate(self.channels[channel].evaluate(input))
+                table[entry * 4 + channel - 1] = (u8)math.floor(shaped * 255.0 + 0.5)
+            table[entry * 4 + 3] = 255
+
+func check_channel(index: usize) -> !:
+    if index >= 4:
+        error(invalid, "curve channels are 0 (RGB), 1 (red), 2 (green) and 3 (blue)")
+
+test "curves interpolate monotonically and fold into a table":
+    var curve = Curve.identity()
+    assert(math.abs(curve.evaluate(0.3) - 0.3) < 1e-9)
+    try curve.add(0.5, 0.75)
+    assert(curve.length() == 3 and curve.x(1) == 0.5)
+    assert(math.abs(curve.evaluate(0.5) - 0.75) < 1e-9)
+    # Brightening in the middle, monotone throughout, and never overshooting.
+    var previous = 0.0
+    var x = 0.0
+    while x <= 1.0:
+        let value = curve.evaluate(x)
+        assert(value >= previous - 1e-9 and value <= 1.0)
+        previous = value
+        x += 0.01
+    assert(curve.evaluate(0.25) > 0.25 and curve.evaluate(0.9) > 0.9)
+    try curve.add(0.5, 0.6)
+    assert(curve.length() == 3 and math.abs(curve.evaluate(0.5) - 0.6) < 1e-9)
+    var rejected = false
+    curve.add(1.5, 0.0) catch failure:
+        assert(failure.code == invalid)
+        rejected = true
+    assert(rejected)
+    var curves = Curves.identity()
+    assert(curves.is_identity())
+    var table: u8[1024]
+    try curves.fill(table)
+    assert(table[128 * 4] == 128 and table[255 * 4 + 2] == 255 and table[3] == 255)
+    try curves.add(2, 0.5, 0.25)
+    assert((try curves.channel(2)).length() == 3)
+    assert(not curves.is_identity())
+    try curves.fill(table)
+    assert(table[128 * 4] == 128 and table[128 * 4 + 1] < 70)

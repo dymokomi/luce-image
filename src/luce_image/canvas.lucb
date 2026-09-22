@@ -17,7 +17,8 @@ from luce_image.tiles import Tiles, tile_size, tile_columns
 from luce_image.document import Document, box_document, unbox_document, blend_mode_count
 from luce_image.composite import Composer, box_composer, unbox_composer
 from luce_image.brush import Brush, Painter, Stroke, begin_boxed, finish_boxed, fill_selection
-from luce_image.adjust import Adjuster, adjustment_count
+from luce_image.adjust import Adjuster, adjustment_count, curves
+from luce_image.curves import Curves, lut_size
 from luce_image.filter import Filters
 from luce_image.transform import translate
 from luce_image.geometry import resize_canvas, resize_image
@@ -53,6 +54,8 @@ pub struct Canvas:
     var brush: Brush
     var stroke: Stroke*?
     var preview: Snapshot?
+    var curves: Curves
+    var table: gpu.Texture?
     var mask_editing: bool
     ## The selection lives on the CPU here and is copied into the GPU document at bind.
     var selection: Selection
@@ -85,6 +88,8 @@ pub struct Canvas:
         self.brush = Brush()
         self.stroke = none
         self.preview = none
+        self.curves = Curves.identity()
+        self.table = none
         self.mask_editing = false
         self.selection = try Selection.create((u32)width, (u32)height)
         var no_points: f64[]
@@ -543,11 +548,57 @@ pub struct Canvas:
         let adjuster = self.adjuster else error(invalid, "draw the document once before adjusting")
         let layer = document.find((u64)id) else error(invalid, "no such layer")
         let tiles = layer.tiles() else error(invalid, "a group cannot be adjusted")
+        let table = try self.curve_table((u32)kind)
         try self.remember((u64)id, try tiles.clone())
-        try adjuster.apply(document, (u64)id, (u32)kind, a, b, c, d, e)
+        try adjuster.apply(document, (u64)id, (u32)kind, a, b, c, d, e, table)
 
     pub static func adjustment_count() -> i64:
         return (i64)adjustment_count
+
+    ## Add a control point to a curve for the `curves` adjustment (kind 7):
+    ## channel 0 is RGB, applied after 1 red, 2 green and 3 blue; x and y in
+    ## 0..1; a point at an existing x replaces it; at most 16 per channel.
+    pub mutating func add_curve_point(channel: i64, x: f64, y: f64) -> !:
+        try self.curves.add(try curve_channel(channel), x, y)
+
+    ## Reset a channel's curve to the identity.
+    pub mutating func reset_curve(channel: i64) -> !:
+        let index = try curve_channel(channel)
+        try self.curves.clear(index)
+        try self.curves.add(index, 0.0, 0.0)
+        try self.curves.add(index, 1.0, 1.0)
+
+    pub func curve_point_count(channel: i64) -> i64!:
+        return (i64)(try self.curves.channel(try curve_channel(channel))).length()
+
+    pub func curve_point_x(channel: i64, index: i64) -> f64!:
+        let curve = try self.curves.channel(try curve_channel(channel))
+        if index < 0 or index >= (i64)curve.length():
+            error(invalid, "no such curve point")
+        return curve.x((usize)index)
+
+    pub func curve_point_y(channel: i64, index: i64) -> f64!:
+        let curve = try self.curves.channel(try curve_channel(channel))
+        if index < 0 or index >= (i64)curve.length():
+            error(invalid, "no such curve point")
+        return curve.y((usize)index)
+
+    ## The curve's output for `x` on `channel`, for drawing it.
+    pub func curve_value(channel: i64, x: f64) -> f64!:
+        return (try self.curves.channel(try curve_channel(channel))).evaluate(x)
+
+    ## The 256×1 table the curves adjustment samples, refreshed from the
+    ## curves; none for other kinds.
+    mutating func curve_table(kind: u32) -> gpu.Texture?!:
+        if kind != curves:
+            return none
+        let device = self.device else error(invalid, "draw the document once before adjusting")
+        var table = self.table else try gpu.Texture.create(device, (u32)lut_size, 1, gpu.Format.rgba8_linear)
+        self.table = table
+        var bytes: u8[1024]
+        try self.curves.fill(bytes)
+        try table.upload(bytes)
+        return table
 
     ## Start previewing edits to a layer: until `end_preview`, each
     ## `preview_adjust` or `preview_blur` shows its effect on the layer's
@@ -567,10 +618,11 @@ pub struct Canvas:
     pub mutating func preview_adjust(kind: i64, a: f64, b: f64, c: f64, d: f64, e: f64) -> !:
         if kind < 0 or kind >= (i64)adjustment_count:
             error(invalid, "no such adjustment")
+        let table = try self.curve_table((u32)kind)
         let layer = try self.restore_preview()
         let document = self.document else trap("preview without a document")
         let adjuster = self.adjuster else trap("preview without an adjuster")
-        try adjuster.apply(document, layer, (u32)kind, a, b, c, d, e)
+        try adjuster.apply(document, layer, (u32)kind, a, b, c, d, e, table)
 
     ## Show a Gaussian blur of `radius` applied to the layer as it was when the preview began.
     pub mutating func preview_blur(radius: f64) -> !:
@@ -972,6 +1024,10 @@ pub struct Canvas:
             var owned = preview.tiles
             owned.destroy()
             self.preview = none
+        if let table = self.table:
+            var owned = table
+            owned.destroy()
+            self.table = none
         if let pipeline = self.ants:
             var owned = pipeline
             owned.destroy()
@@ -1181,6 +1237,11 @@ func unwind(binding: Binding*):
         var owned = device
         owned.destroy()
     *binding = Binding(device = none, document = none, composer = none, painter = none, adjuster = none, filters = none)
+
+func curve_channel(channel: i64) -> usize!:
+    if channel < 0 or channel > 3:
+        error(invalid, "curve channels are 0 (RGB), 1 (red), 2 (green) and 3 (blue)")
+    return (usize)channel
 
 func min(a: u32, b: u32) -> u32:
     return a if a < b else b
@@ -1449,5 +1510,15 @@ test "previews show edits on the original pixels and end kept or dropped":
     try canvas.end_preview(true)
     assert(canvas.can_undo())
     assert((try shown_centre(&canvas, &target, pixels)) == inverted)
+    try canvas.undo()
+    assert((try shown_centre(&canvas, &target, pixels)) == base)
+    # Curves: lifting the midtones brightens the dark grey; resetting restores identity.
+    try canvas.add_curve_point(0, 0.25, 0.6)
+    assert((try canvas.curve_point_count(0)) == 3 and (try canvas.curve_value(0, 0.25)) > 0.59)
+    try canvas.adjust_layer(layer, 7, 0.0, 0.0, 0.0, 0.0, 0.0)
+    let lifted = try shown_centre(&canvas, &target, pixels)
+    assert(lifted > base + 40)
+    try canvas.reset_curve(0)
+    assert((try canvas.curve_point_count(0)) == 2)
     try canvas.undo()
     assert((try shown_centre(&canvas, &target, pixels)) == base)

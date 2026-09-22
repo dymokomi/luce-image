@@ -8,11 +8,13 @@
 //   4 desaturate (black and white)
 //   5 threshold: a = level
 //   6 posterize: a = levels
+//   7 curves: image 2 is a 256×1 table; red/green/blue map each channel
 #version 450
 layout(location = 0) in vec4 vertex_color;
 layout(location = 0) out vec4 fragment_color;
 layout(push_constant) uniform Params { float kind, a, b, c, d, e; } params;
 layout(set = 0, binding = 1) uniform sampler2D tile;
+layout(set = 0, binding = 2) uniform sampler2D lut;
 
 vec3 to_srgb(vec3 c) { return mix(c * 12.92, 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c)); }
 vec3 to_linear(vec3 c) { return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c)); }
@@ -71,6 +73,10 @@ void main() {
     } else if (kind == 6) {
         float n = max(params.a, 2.0) - 1.0;
         c = floor(c * n + 0.5) / n;
+    } else if (kind == 7) {
+        c = vec3(texture(lut, vec2((c.r * 255.0 + 0.5) / 256.0, 0.5)).r,
+                 texture(lut, vec2((c.g * 255.0 + 0.5) / 256.0, 0.5)).g,
+                 texture(lut, vec2((c.b * 255.0 + 0.5) / 256.0, 0.5)).b);
     }
     fragment_color = vec4(to_linear(clamp(c, 0.0, 1.0)), o.a);
 }
