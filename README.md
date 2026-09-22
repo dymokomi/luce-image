@@ -46,6 +46,29 @@ The managed Luce handle owns the Base image. `close()` is idempotent and closes
 all aliases; use `copy()` for independent pixels. No manual freeing is needed in
 Luce. Native Base consumers release their `interop.Reference`.
 
+## Layered documents: `Canvas`
+
+The editor engine behind luced-2d, all Luce Base on the GPU (`std.gpu`), with a
+Luce-facing `Canvas` object:
+
+- A layer tree of 256×256 rgba16 tiles in linear light, straight alpha; the 26
+  Photoshop blend modes, opacity, visibility, layer masks and clipping masks,
+  composited per tile through one shader with a cache keyed on what each tile
+  depends on, and a pyramid for zoomed-out views.
+- Per-pixel selections (rectangle, ellipse, polygon/lasso, magic wand; add,
+  subtract, intersect, invert, expand, contract, feather) that painting, fills
+  and crops respect, drawn as marching ants.
+- GPU brush and eraser strokes with soft edges; destructive adjustments
+  (brightness/contrast, hue/saturation/lightness, invert, levels, curves,
+  desaturate, threshold, posterize), Gaussian blur, free transform, move,
+  canvas and image resize, text from `std.fonts`; each undoable, and each
+  previewable live on the layer's original pixels before it is kept.
+- Layer styles — drop shadow, outer glow, stroke — rendered under the layer by
+  the compositor, non-destructively.
+- Documents open from any picture, from `.l2d` packages (`document.prisma` and
+  one PNG per layer and mask) and from Photoshop `.psd` files; they save as
+  `.l2d` or flatten to a picture.
+
 ## Cryptomatte
 
 ```luce
