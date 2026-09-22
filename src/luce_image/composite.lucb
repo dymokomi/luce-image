@@ -1,0 +1,219 @@
+## The compositor: answers a request for one tile of the flattened document at
+## a pyramid level, from a cache keyed on what the tile depends on. Level 0 is
+## document pixels; level L covers 2^L by 2^L level-0 tiles in one 256 by 256
+## texture. The key is an identity digest over the contributing layers (id,
+## revision, visibility, effective opacity) plus the cell and level, so a change
+## to one layer invalidates only the tiles it touches, and a change to a top
+## layer's opacity never re-renders what lies below it in another tile. There is
+## one way to produce pixels; export asks for level-0 tiles like the screen.
+import gpu
+import memory
+from luce_image.tiles import Tiles, Tile, tile_size
+from luce_image.document import Document, Layer
+from luce_image.errors import invalid, limit
+from luce_image.half import from_half
+
+struct Entry:
+    var digest: u64
+    var texture: gpu.Texture
+    var used: u64
+    var live: bool
+
+pub struct Composer:
+    var owner: gpu.Device
+    var entries: Entry[]
+    var count: usize
+    var budget: usize
+    var tick: u64
+    ## How many tiles were rendered rather than found, for tests and tuning.
+    pub var renders: u64
+
+    ## A compositor keeping at most `budget` rendered tiles (1 MiB each).
+    pub static func create(device: gpu.Device, budget: usize = 512) -> Composer!:
+        if budget == 0 or budget > 65536:
+            error(invalid, "the tile budget must be in 1..65536")
+        let entries = try alloc Entry[budget] in memory.heap
+        for index in 0..<budget:
+            entries[index] = Entry(digest = 0, texture = gpu.Texture(), used = 0, live = false)
+        return Composer(owner = device, entries = entries, count = 0, budget = budget, tick = 0, renders = 0)
+
+    ## The flattened tile at `column`, `row` of pyramid `level`, borrowed until
+    ## the next call. Straight-alpha rgba16_float, transparent where nothing is.
+    pub mutating func tile(document: const Document*, column: u32, row: u32, level: u32) -> gpu.Texture!:
+        if level > 16:
+            error(invalid, "pyramid levels go up to 16")
+        let span = 1u32 << level
+        let first_column = column * span
+        let first_row = row * span
+        if first_column * tile_size >= document.width() or first_row * tile_size >= document.height():
+            error(invalid, "the requested tile lies outside the document")
+        self.tick += 1
+        var digest = fnv_start()
+        digest = fnv_mix(digest, (u64)level)
+        digest = fnv_mix(digest, (u64)column)
+        digest = fnv_mix(digest, (u64)row)
+        digest = fnv_mix(digest, (u64)document.width())
+        digest = fnv_mix(digest, (u64)document.height())
+        digest = hash_layers(digest, document.layers(), 1.0, first_column, first_row, span)
+        for index in 0..<self.count:
+            if self.entries[index].live and self.entries[index].digest == digest:
+                self.entries[index].used = self.tick
+                return self.entries[index].texture
+        var texture = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        errdefer texture.destroy()
+        let frame = try texture.frame()
+        defer frame.release()
+        let target = try frame.value().target()
+        defer target.release()
+        try draw_layers(target.value(), document.layers(), 1.0, first_column, first_row, span)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        self.renders += 1
+        let slot = self.slot()
+        if self.entries[slot].live:
+            self.entries[slot].texture.destroy()
+        self.entries[slot] = Entry(digest = digest, texture = texture, used = self.tick, live = true)
+        return texture
+
+    ## The next free slot, or the least recently used one when full.
+    mutating func slot() -> usize:
+        if self.count < self.budget:
+            self.count += 1
+            return self.count - 1
+        var oldest: usize = 0
+        for index in 1..<self.count:
+            if self.entries[index].used < self.entries[oldest].used:
+                oldest = index
+        return oldest
+
+    ## Forget every rendered tile.
+    pub mutating func clear():
+        for index in 0..<self.count:
+            if self.entries[index].live:
+                self.entries[index].texture.destroy()
+                self.entries[index].live = false
+        self.count = 0
+
+    pub mutating func destroy():
+        self.clear()
+        if self.entries.length > 0:
+            free(self.entries) in memory.heap
+        var empty: Entry[]
+        self.entries = empty
+        self.budget = 0
+
+## Fold every layer that contributes to the cells in range into `digest`.
+func hash_layers(seed: u64, layers: Layer*[], opacity: f64, first_column: u32, first_row: u32, span: u32) -> u64:
+    var digest = seed
+    for layer in layers:
+        if not layer.visible or layer.opacity == 0.0:
+            continue
+        let effective = opacity * layer.opacity
+        if layer.group:
+            digest = hash_layers(digest, layer.layers(), effective, first_column, first_row, span)
+            continue
+        let tiles = layer.tiles() else continue
+        var touches = false
+        for row in first_row..<min(first_row + span, tiles.rows()):
+            for column in first_column..<min(first_column + span, tiles.columns()):
+                if tiles.tile(column, row) != none:
+                    touches = true
+        if not touches:
+            continue
+        digest = fnv_mix(digest, layer.id)
+        digest = fnv_mix(digest, layer.revision)
+        digest = fnv_mix(digest, effective.bits())
+    return digest
+
+## Draw every contributing layer, bottom to top, onto a 256-point target that
+## covers `span` by `span` level-0 cells from (`first_column`, `first_row`).
+func draw_layers(target: const gpu.RenderTarget*, layers: Layer*[], opacity: f64, first_column: u32, first_row: u32, span: u32) -> !:
+    let scale = (f64)tile_size / ((f64)tile_size * (f64)span)
+    for layer in layers:
+        if not layer.visible or layer.opacity == 0.0:
+            continue
+        let effective = opacity * layer.opacity
+        if layer.group:
+            try draw_layers(target, layer.layers(), effective, first_column, first_row, span)
+            continue
+        let tiles = layer.tiles() else continue
+        for row in first_row..<min(first_row + span, tiles.rows()):
+            for column in first_column..<min(first_column + span, tiles.columns()):
+                let texture = tiles.texture(column, row) else continue
+                let area = tiles.region(column, row)
+                let rectangle = gpu.Rect(x = (f64)((column - first_column) * tile_size) * scale, y = (f64)((row - first_row) * tile_size) * scale,
+                                         width = (f64)area.width * scale, height = (f64)area.height * scale)
+                try gpu.draw_image(target, texture, rectangle, area, effective, gpu.Filter.nearest if span == 1 else gpu.Filter.linear)
+
+func min(a: u32, b: u32) -> u32:
+    return a if a < b else b
+
+func fnv_start() -> u64:
+    return 14695981039346656037
+
+func fnv_mix(digest: u64, value: u64) -> u64:
+    var mixed = digest
+    for shift in 0..<(u64)8:
+        mixed = (mixed ^ ((value >> (shift * 8)) & 0xff)) *% 1099511628211
+    return mixed
+
+test "composite flattens layers with opacity, caches by identity and scales levels":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var document = try Document.create(device, 300, 260)
+    defer document.destroy()
+    let count = (usize)300 * 260 * 4
+    let pixels = try alloc f32[count] in memory.heap
+    defer free(pixels) in memory.heap
+    for index in 0..<count:
+        pixels[index] = 0.0
+    # Bottom: opaque red over the top-left 300x260; top: 50% green pixel at (20, 10).
+    for index in 0..<(usize)(300 * 260):
+        pixels[index * 4] = 1.0
+        pixels[index * 4 + 3] = 1.0
+    let bottom = try document.add_layer("Bottom")
+    var red = try Tiles.create(device, 300, 260)
+    try red.write(pixels)
+    try document.set_tiles(bottom, red)
+    for index in 0..<count:
+        pixels[index] = 0.0
+    pixels[(10 * 300 + 20) * 4 + 1] = 1.0
+    pixels[(10 * 300 + 20) * 4 + 3] = 0.5
+    let top = try document.add_layer("Top")
+    var green = try Tiles.create(device, 300, 260)
+    try green.write(pixels)
+    try document.set_tiles(top, green)
+    var composer = try Composer.create(device, 4)
+    defer composer.destroy()
+    let flat = try composer.tile(&document, 0, 0, 0)
+    assert(composer.renders == 1)
+    var bytes: u8[8]
+    try flat.read(bytes, gpu.Region(20, 10, 1, 1))
+    let r = from_half((u16)bytes[0] | ((u16)bytes[1] << 8))
+    let g = from_half((u16)bytes[2] | ((u16)bytes[3] << 8))
+    let a = from_half((u16)bytes[6] | ((u16)bytes[7] << 8))
+    assert(r > 0.49 and r < 0.51 and g > 0.49 and g < 0.51 and a == 1.0)
+    # The same request is a cache hit; a change to the top layer is not, and
+    # hiding it leaves the bottom-only tile at (1, 1) untouched.
+    discard(try composer.tile(&document, 0, 0, 0))
+    assert(composer.renders == 1)
+    discard(try composer.tile(&document, 1, 1, 0))
+    assert(composer.renders == 2)
+    try document.set_appearance(top, true, 0.25)
+    discard(try composer.tile(&document, 0, 0, 0))
+    assert(composer.renders == 3)
+    discard(try composer.tile(&document, 1, 1, 0))
+    assert(composer.renders == 3)
+    # Level 1 covers the whole document in one tile.
+    let coarse = try composer.tile(&document, 0, 0, 1)
+    try coarse.read(bytes, gpu.Region(100, 100, 1, 1))
+    assert(from_half((u16)bytes[0] | ((u16)bytes[1] << 8)) > 0.99)
+    try coarse.read(bytes, gpu.Region(200, 200, 1, 1))
+    assert(from_half((u16)bytes[6] | ((u16)bytes[7] << 8)) == 0.0)
+    var rejected = false
+    discard(composer.tile(&document, 4, 0, 0) catch failure:
+        assert(failure.code == invalid)
+        rejected = true
+        recover coarse)
+    assert(rejected)

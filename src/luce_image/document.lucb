@@ -1,0 +1,200 @@
+## A layered document: a tree of layers over a canvas of fixed size, each
+## raster layer holding shared GPU tiles in document space. Groups hold layers
+## bottom to top and are pass-through: their opacity multiplies into their
+## children and their visibility gates them. Editing replaces a layer's tiles;
+## every replacement bumps revisions that the compositor keys its cache on.
+import gpu
+import memory
+import strings
+from luce_image.tiles import Tiles, box, unbox
+from luce_image.errors import invalid, limit
+
+pub struct Layer:
+    pub var id: u64
+    pub var name: str
+    pub var visible: bool = true
+    pub var opacity: f64 = 1.0
+    pub var group: bool
+    var pixels: Tiles*?
+    var children: Layer*[]
+    var child_count: usize
+    ## Bumps whenever the pixels are replaced.
+    pub var revision: u64
+
+    ## The layer's tiles, borrowed; `none` for a group.
+    pub func tiles() -> Tiles*?:
+        return self.pixels
+
+    ## The children of a group, bottom to top.
+    pub func layers() -> Layer*[]:
+        return self.children[..<self.child_count]
+
+func layer_destroy(layer: Layer*):
+    for child in layer.children[..<layer.child_count]:
+        layer_destroy(child)
+    if layer.children.length > 0:
+        free(layer.children) in memory.heap
+    if let tiles = layer.pixels:
+        unbox(tiles)
+    strings.release(layer.name)
+    free(layer) in memory.heap
+
+pub struct Document:
+    var owner: gpu.Device
+    var extent_x: u32
+    var extent_y: u32
+    var root: Layer*
+    var next_id: u64
+    ## Bumps whenever the tree changes shape or a layer's attributes change.
+    pub var revision: u64
+
+    ## An empty `width` by `height` document with no layers.
+    pub static func create(device: gpu.Device, width: u32, height: u32) -> Document!:
+        if width == 0 or height == 0 or width > 65536 or height > 65536:
+            error(invalid, "document dimensions must be in 1..65536")
+        var title: str = ""
+        with memory.heap:
+            title = try strings.copy("root")
+        let root = try new Layer(id = 0, name = title, group = true, pixels = none, revision = 0) in memory.heap
+        return Document(owner = device, extent_x = width, extent_y = height, root = root, next_id = 1, revision = 1)
+
+    pub func width() -> u32:
+        return self.extent_x
+
+    pub func height() -> u32:
+        return self.extent_y
+
+    pub func device() -> gpu.Device:
+        return self.owner
+
+    ## The top-level layers, bottom to top.
+    pub func layers() -> Layer*[]:
+        return self.root.layers()
+
+    ## The layer with `id`, borrowed.
+    pub func find(id: u64) -> Layer*?:
+        return find_in(self.root, id)
+
+    ## Add a transparent raster layer on top of `parent` (the root by default).
+    pub mutating func add_layer(name: str, parent: u64? = none) -> u64!:
+        let tiles = try Tiles.create(self.owner, self.extent_x, self.extent_y)
+        return try self.add(name, parent, false, tiles)
+
+    ## Add an empty group on top of `parent` (the root by default).
+    pub mutating func add_group(name: str, parent: u64? = none) -> u64!:
+        return try self.add(name, parent, true, none)
+
+    mutating func add(name: str, parent: u64?, group: bool, tiles: Tiles?) -> u64!:
+        var holder: Tiles*? = none
+        if let owned = tiles:
+            holder = try box(owned)
+        errdefer release_tiles(&holder)
+        var target = self.root
+        if let id = parent:
+            target = self.find(id) else error(invalid, "no such parent layer")
+            if not target.group:
+                error(invalid, "only a group can hold layers")
+        if target.child_count == target.children.length:
+            let capacity = 8 if target.children.length == 0 else target.children.length * 2
+            let grown = try alloc Layer*[capacity] in memory.heap
+            if target.child_count > 0:
+                memory.copy(grown, target.children, target.child_count)
+            if target.children.length > 0:
+                free(target.children) in memory.heap
+            target.children = grown
+        var copied: str = ""
+        with memory.heap:
+            copied = try strings.copy(name)
+        errdefer strings.release(copied)
+        let id = self.next_id
+        let layer = try new Layer(id = id, name = copied, group = group, pixels = holder, revision = 1) in memory.heap
+        holder = none
+        target.children[target.child_count] = layer
+        target.child_count += 1
+        self.next_id += 1
+        self.revision += 1
+        return id
+
+    ## Remove a layer or a group with everything in it.
+    pub mutating func remove(id: u64) -> !:
+        if not remove_in(self.root, id):
+            error(invalid, "no such layer")
+        self.revision += 1
+
+    ## Replace a raster layer's pixels, taking ownership of `tiles`.
+    pub mutating func set_tiles(id: u64, tiles: Tiles) -> !:
+        var holder: Tiles*? = try box(tiles)
+        errdefer release_tiles(&holder)
+        let layer = self.find(id) else error(invalid, "no such layer")
+        if layer.group or tiles.width() != self.extent_x or tiles.height() != self.extent_y:
+            error(invalid, "tiles must match a raster layer of the document's size")
+        if let previous = layer.pixels:
+            unbox(previous)
+        layer.pixels = holder
+        layer.revision += 1
+
+    ## Set a layer's visibility and opacity.
+    pub mutating func set_appearance(id: u64, visible: bool, opacity: f64) -> !:
+        if not (opacity >= 0.0 and opacity <= 1.0):
+            error(invalid, "opacity must be in 0..1")
+        let layer = self.find(id) else error(invalid, "no such layer")
+        layer.visible = visible
+        layer.opacity = opacity
+        self.revision += 1
+
+    pub mutating func destroy():
+        layer_destroy(self.root)
+
+func release_tiles(holder: Tiles*?*):
+    if let owned = *holder:
+        unbox(owned)
+        *holder = none
+
+func find_in(layer: Layer*, id: u64) -> Layer*?:
+    for child in layer.children[..<layer.child_count]:
+        if child.id == id:
+            return child
+        if let found = find_in(child, id):
+            return found
+    return none
+
+func remove_in(layer: Layer*, id: u64) -> bool:
+    for index in 0..<layer.child_count:
+        let child = layer.children[index]
+        if child.id == id:
+            layer_destroy(child)
+            for shift in index..<(layer.child_count - 1):
+                layer.children[shift] = layer.children[shift + 1]
+            layer.child_count -= 1
+            return true
+        if remove_in(child, id):
+            return true
+    return false
+
+test "document layers, groups, removal and appearance":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var document = try Document.create(device, 64, 48)
+    defer document.destroy()
+    let background = try document.add_layer("Background")
+    let group = try document.add_group("Group")
+    let inner = try document.add_layer("Inner", group)
+    assert(document.layers().length == 2 and document.layers()[1].id == group)
+    let found = document.find(inner) else trap("missing layer")
+    assert(found.name == "Inner" and found.tiles() != none and found.revision == 1)
+    assert((document.find(group) else trap("missing group")).layers()[0].id == inner)
+    try document.set_appearance(background, false, 0.5)
+    assert(not (document.find(background) else trap("missing")).visible)
+    var rejected = false
+    discard(document.add_layer("Bad", inner) catch failure:
+        assert(failure.code == invalid)
+        rejected = true
+        recover 0)
+    assert(rejected)
+    let replacement = try Tiles.create(device, 64, 48)
+    try document.set_tiles(inner, replacement)
+    assert(found.revision == 2)
+    try document.remove(group)
+    assert(document.find(inner) == none and document.layers().length == 1)

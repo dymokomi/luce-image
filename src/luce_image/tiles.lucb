@@ -1,0 +1,249 @@
+## GPU-resident layer pixels, cut into 256 by 256 tiles that are immutable and
+## structurally shared: cloning a Tiles is O(tiles) pointer copies, replacing
+## one tile leaves every other one shared with the clone, and a tile's storage
+## goes when its last holder does. That sharing is what makes destructive
+## editing cheap: a stroke replaces only the tiles it touched, and history keeps
+## the old ones. Texels are straight-alpha rgba16_float in the document's
+## working space (linear light).
+import gpu
+import memory
+from luce_image.half import to_half, from_half
+from luce_image.errors import invalid, limit
+
+pub let tile_size: u32 = 256
+
+## One shared tile. Its texture is never written after publication.
+pub struct Tile:
+    var texture: gpu.Texture
+    var references: usize
+
+func retain(tile: Tile*) -> Tile*:
+    tile.references += 1
+    return tile
+
+func release(tile: Tile*):
+    tile.references -= 1
+    if tile.references == 0:
+        tile.texture.destroy()
+        free(tile) in memory.heap
+
+pub func tile_columns(width: u32) -> u32:
+    return (width + tile_size - 1) // tile_size
+
+## A layer's pixels: `columns` by `rows` cells, each a shared tile or `none`
+## for a fully transparent one. Copies do not alias; clone what you keep.
+pub struct Tiles:
+    var owner: gpu.Device
+    var extent_x: u32
+    var extent_y: u32
+    var cell_columns: u32
+    var cell_rows: u32
+    var cells: Tile*?[]
+
+    ## Fully transparent pixels for a `width` by `height` layer.
+    pub static func create(device: gpu.Device, width: u32, height: u32) -> Tiles!:
+        if width == 0 or height == 0 or width > 65536 or height > 65536:
+            error(invalid, "layer dimensions must be in 1..65536")
+        let columns = tile_columns(width)
+        let rows = tile_columns(height)
+        let cells = try alloc Tile*?[(usize)columns * (usize)rows] in memory.heap
+        for index in 0..<cells.length:
+            cells[index] = none
+        var owned = device
+        discard(try owned.backend())
+        return Tiles(owner = device, extent_x = width, extent_y = height, cell_columns = columns, cell_rows = rows, cells = cells)
+
+    pub func width() -> u32:
+        return self.extent_x
+
+    pub func height() -> u32:
+        return self.extent_y
+
+    pub func columns() -> u32:
+        return self.cell_columns
+
+    pub func rows() -> u32:
+        return self.cell_rows
+
+    ## The device the tiles live on.
+    pub func device() -> gpu.Device:
+        return self.owner
+
+    ## The texels a cell covers, in layer pixels.
+    pub func region(column: u32, row: u32) -> gpu.Region:
+        let x = column * tile_size
+        let y = row * tile_size
+        return gpu.Region(0, 0, min(tile_size, self.extent_x - x), min(tile_size, self.extent_y - y))
+
+    ## The tile at a cell, borrowed, or `none` when transparent.
+    pub func tile(column: u32, row: u32) -> Tile*?:
+        return self.cells[try_index(&self, column, row) else return none]
+
+    ## The tile texture at a cell, borrowed, or `none` when transparent.
+    pub func texture(column: u32, row: u32) -> gpu.Texture?:
+        let tile = self.tile(column, row) else return none
+        return tile.texture
+
+    ## A second holder of the same tiles.
+    pub func clone() -> Tiles!:
+        let cells = try alloc Tile*?[self.cells.length] in memory.heap
+        for index in 0..<cells.length:
+            cells[index] = none
+            if let tile = self.cells[index]:
+                cells[index] = retain(tile)
+        return Tiles(owner = self.owner, extent_x = self.extent_x, extent_y = self.extent_y, cell_columns = self.cell_columns, cell_rows = self.cell_rows, cells = cells)
+
+    ## Put `texture` (a full 256 by 256 rgba16_float texture this takes over) at a
+    ## cell, replacing what was there. Other holders keep the old tile.
+    pub mutating func set(column: u32, row: u32, texture: gpu.Texture) -> !:
+        let index = try self.index(column, row)
+        if (try texture.width()) != tile_size or (try texture.height()) != tile_size or (try texture.format()) != gpu.Format.rgba16_float:
+            error(invalid, "a tile is a 256 by 256 rgba16_float texture")
+        let tile = try new Tile(texture = texture, references = 1) in memory.heap
+        if let previous = self.cells[index]:
+            release(previous)
+        self.cells[index] = tile
+
+    ## Make a cell transparent again.
+    pub mutating func clear(column: u32, row: u32) -> !:
+        let index = try self.index(column, row)
+        if let previous = self.cells[index]:
+            release(previous)
+        self.cells[index] = none
+
+    ## A fresh tile texture on the device, cleared to transparent, ready to be
+    ## drawn into with a frame and then `set`.
+    pub func blank() -> gpu.Texture!:
+        var texture = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        errdefer texture.destroy()
+        let zeros = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+        defer free(zeros) in memory.heap
+        for index in 0..<zeros.length:
+            zeros[index] = 0
+        try texture.upload(zeros)
+        return texture
+
+    ## Replace every pixel from straight-alpha RGBA f32 samples, top-down, four
+    ## per pixel. Transparent tiles stay `none`.
+    pub mutating func write(pixels: const f32[]) -> !:
+        if pixels.length != (usize)self.extent_x * (usize)self.extent_y * 4:
+            error(invalid, "pixel data must hold width * height RGBA samples")
+        let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+        defer free(bytes) in memory.heap
+        for row in 0..<self.cell_rows:
+            for column in 0..<self.cell_columns:
+                let area = self.region(column, row)
+                var opaque = false
+                for y in 0..<(usize)area.height:
+                    for x in 0..<(usize)area.width:
+                        let source = (((usize)row * (usize)tile_size + y) * (usize)self.extent_x + (usize)column * (usize)tile_size + x) * 4
+                        let destination = (y * (usize)tile_size + x) * 8
+                        for channel in 0..<(usize)4:
+                            let half = to_half(pixels[source + channel])
+                            bytes[destination + channel * 2] = (u8)(half & 0xff)
+                            bytes[destination + channel * 2 + 1] = (u8)(half >> 8)
+                        if pixels[source + 3] != 0.0:
+                            opaque = true
+                if not opaque:
+                    try self.clear(column, row)
+                    continue
+                var texture = try self.blank()
+                errdefer texture.destroy()
+                try texture.upload(bytes[..<((usize)area.height * (usize)tile_size * 8)], gpu.Region(0, 0, tile_size, area.height))
+                try self.set(column, row, texture)
+
+    ## Read every pixel back as straight-alpha RGBA f32 samples, top-down.
+    pub func read(pixels: f32[]) -> !:
+        if pixels.length != (usize)self.extent_x * (usize)self.extent_y * 4:
+            error(invalid, "pixel buffer must hold width * height RGBA samples")
+        let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+        defer free(bytes) in memory.heap
+        for row in 0..<self.cell_rows:
+            for column in 0..<self.cell_columns:
+                let area = self.region(column, row)
+                let tile = self.cells[(usize)row * (usize)self.cell_columns + (usize)column]
+                if let cell = tile:
+                    try cell.texture.read(bytes[..<((usize)area.height * (usize)tile_size * 8)], gpu.Region(0, 0, tile_size, area.height))
+                for y in 0..<(usize)area.height:
+                    for x in 0..<(usize)area.width:
+                        let destination = (((usize)row * (usize)tile_size + y) * (usize)self.extent_x + (usize)column * (usize)tile_size + x) * 4
+                        let source = (y * (usize)tile_size + x) * 8
+                        for channel in 0..<(usize)4:
+                            var value: f32 = 0.0
+                            if tile != none:
+                                value = from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8))
+                            pixels[destination + channel] = value
+
+    func index(column: u32, row: u32) -> usize!:
+        if column >= self.cell_columns or row >= self.cell_rows:
+            error(invalid, "tile cell out of range")
+        return (usize)row * (usize)self.cell_columns + (usize)column
+
+    pub mutating func destroy():
+        for index in 0..<self.cells.length:
+            if let tile = self.cells[index]:
+                release(tile)
+        if self.cells.length > 0:
+            free(self.cells) in memory.heap
+        var empty: Tile*?[]
+        self.cells = empty
+        self.cell_columns = 0
+        self.cell_rows = 0
+
+## Move `tiles` onto the heap, for holders that keep a pointer.
+pub func box(tiles: Tiles) -> Tiles*!:
+    return try new Tiles(owner = tiles.owner, extent_x = tiles.extent_x, extent_y = tiles.extent_y,
+                         cell_columns = tiles.cell_columns, cell_rows = tiles.cell_rows, cells = tiles.cells) in memory.heap
+
+## Destroy boxed tiles and free the box.
+pub func unbox(tiles: Tiles*):
+    tiles.destroy()
+    free(tiles) in memory.heap
+
+func try_index(tiles: const Tiles*, column: u32, row: u32) -> usize?:
+    if column >= tiles.cell_columns or row >= tiles.cell_rows:
+        return none
+    return (usize)row * (usize)tiles.cell_columns + (usize)column
+
+func min(a: u32, b: u32) -> u32:
+    return a if a < b else b
+
+test "tiles share, replace, write and read on a device":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var tiles = try Tiles.create(device, 300, 260)
+    defer tiles.destroy()
+    assert(tiles.columns() == 2 and tiles.rows() == 2 and tiles.region(1, 1).width == 44 and tiles.region(1, 1).height == 4)
+    let count = (usize)300 * 260 * 4
+    let pixels = try alloc f32[count] in memory.heap
+    defer free(pixels) in memory.heap
+    for index in 0..<count:
+        pixels[index] = 0.0
+    # One red pixel in the top-left tile, one half-transparent green in the bottom-right one.
+    pixels[(10 * 300 + 20) * 4] = 1.0
+    pixels[(10 * 300 + 20) * 4 + 3] = 1.0
+    pixels[(258 * 300 + 270) * 4 + 1] = 0.25
+    pixels[(258 * 300 + 270) * 4 + 3] = 0.5
+    try tiles.write(pixels)
+    assert(tiles.texture(0, 0) != none and tiles.texture(1, 0) == none and tiles.texture(0, 1) == none and tiles.texture(1, 1) != none)
+    var copy = try tiles.clone()
+    defer copy.destroy()
+    assert((tiles.tile(0, 0) else trap("missing tile")).references == 2)
+    let fresh = try tiles.blank()
+    try tiles.set(0, 0, fresh)
+    assert((copy.tile(0, 0) else trap("missing tile")).references == 1)
+    let back = try alloc f32[count] in memory.heap
+    defer free(back) in memory.heap
+    try copy.read(back)
+    assert(back[(10 * 300 + 20) * 4] == 1.0 and back[(10 * 300 + 20) * 4 + 3] == 1.0)
+    assert(back[(258 * 300 + 270) * 4 + 1] == 0.25 and back[(258 * 300 + 270) * 4 + 3] == 0.5)
+    assert(back[0] == 0.0 and back[count - 1] == 0.0)
+    try tiles.read(back)
+    assert(back[(10 * 300 + 20) * 4] == 0.0 and back[(258 * 300 + 270) * 4 + 3] == 0.5)
+    var rejected = false
+    tiles.set(5, 0, try tiles.blank()) catch failure:
+        assert(failure.code == invalid)
+        rejected = true
+    assert(rejected)
