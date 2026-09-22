@@ -7,6 +7,7 @@ import math
 import memory
 from luce_image.tiles import Tiles, tile_size
 from luce_image.document import Document
+from luce_image.shaders import warp_frag_words, warp_frag_msl
 from luce_image.errors import invalid
 
 ## Move `layer`'s pixels (or its mask) by (`dx`, `dy`); returns the tiles from before.
@@ -62,6 +63,161 @@ pub func translate(document: Document*, layer: u64, dx: i64, dy: i64, on_mask: b
 
 func floor_div(a: i64, b: i64) -> i64:
     return (a - math.mod_floor(a, b)) // b
+
+## Free transform: a layer's pixels scaled, rotated and moved together, resampled
+## on the GPU through `warp.frag`. Built once per device.
+pub struct Transformer:
+    var owner: gpu.Device
+    var shader: gpu.Shader
+    var pipeline: gpu.Pipeline
+
+    pub static func create(device: gpu.Device) -> Transformer!:
+        var shader = try gpu.Shader.create(device, warp_frag_words, warp_frag_msl)
+        errdefer shader.destroy()
+        var pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.replace, gpu.Format.rgba16_float)
+        errdefer pipeline.destroy()
+        return Transformer(owner = device, shader = shader, pipeline = pipeline)
+
+    ## Replace `layer`'s pixels with them scaled by (`scale_x`, `scale_y`) and
+    ## rotated by `angle` radians about the centre of the pixels the layer has,
+    ## then moved by (`dx`, `dy`). What leaves the document is lost.
+    pub func apply(document: Document*, layer: u64, scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64) -> !:
+        for value in [scale_x, scale_y, angle, dx, dy]:
+            if not math.is_finite(value):
+                error(invalid, "transform parameters must be finite")
+        if math.abs(scale_x) < 0.001 or math.abs(scale_y) < 0.001 or math.abs(scale_x) > 1000.0 or math.abs(scale_y) > 1000.0:
+            error(invalid, "transform scales are 0.001..1000")
+        let target = document.find(layer) else error(invalid, "no such layer")
+        let tiles = target.tiles() else error(invalid, "a group cannot be transformed")
+        let width = tiles.width()
+        let height = tiles.height()
+        # The content's bounding box, at tile granularity, gives the pivot.
+        var left = tiles.columns()
+        var top = tiles.rows()
+        var right: u32 = 0
+        var bottom: u32 = 0
+        for row in 0..<tiles.rows():
+            for column in 0..<tiles.columns():
+                if tiles.texture(column, row) != none:
+                    left = min_u32(left, column)
+                    top = min_u32(top, row)
+                    right = max_u32(right, column + 1)
+                    bottom = max_u32(bottom, row + 1)
+        if right <= left or bottom <= top:
+            return
+        let box_left = (f64)(left * tile_size)
+        let box_top = (f64)(top * tile_size)
+        let box_right = math.min((f64)width, (f64)(right * tile_size))
+        let box_bottom = math.min((f64)height, (f64)(bottom * tile_size))
+        let cx = (box_left + box_right) * 0.5
+        let cy = (box_top + box_bottom) * 0.5
+        # Flatten the layer into one texture the shader can sample anywhere.
+        var flat = try gpu.Texture.create(self.owner, width, height, gpu.Format.rgba16_float)
+        defer flat.destroy()
+        let flat_frame = try flat.frame()
+        defer flat_frame.release()
+        let whole = try flat_frame.value().target()
+        defer whole.release()
+        for row in 0..<tiles.rows():
+            for column in 0..<tiles.columns():
+                let texture = tiles.texture(column, row) else continue
+                let area = tiles.region(column, row)
+                try gpu.draw_image(whole.value(), texture, gpu.Rect((f64)(column * tile_size), (f64)(row * tile_size), (f64)area.width, (f64)area.height), area, 1.0, gpu.Filter.nearest)
+        discard(try flat_frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        # Forward: p' = R S (p - c) + c + d. Inverse: p = S⁻¹ R⁻¹ (p' - c - d) + c.
+        let cos = math.cos(angle)
+        let sin = math.sin(angle)
+        let a = cos / scale_x
+        let b = sin / scale_x
+        let d = -sin / scale_y
+        let e = cos / scale_y
+        let ox = cx + dx
+        let oy = cy + dy
+        let c = cx - a * ox - b * oy
+        let f = cy - d * ox - e * oy
+        # Where the content lands, to skip tiles it cannot reach.
+        var out_left = (f64)width
+        var out_top = (f64)height
+        var out_right = 0.0
+        var out_bottom = 0.0
+        for corner in 0..<(usize)4:
+            let px = (box_left if corner % 2 == 0 else box_right) - cx
+            let py = (box_top if corner < 2 else box_bottom) - cy
+            let qx = (cos * px * scale_x - sin * py * scale_y) + ox
+            let qy = (sin * px * scale_x + cos * py * scale_y) + oy
+            out_left = math.min(out_left, qx)
+            out_right = math.max(out_right, qx)
+            out_top = math.min(out_top, qy)
+            out_bottom = math.max(out_bottom, qy)
+        var params: f32[10] = [(f32)a, (f32)b, (f32)c, (f32)d, (f32)e, (f32)f, 0.0, 0.0, (f32)width, (f32)height]
+        for row in 0..<tiles.rows():
+            for column in 0..<tiles.columns():
+                let tile_left = (f64)(column * tile_size)
+                let tile_top = (f64)(row * tile_size)
+                if tile_left > out_right + 1.0 or tile_top > out_bottom + 1.0 or tile_left + (f64)tile_size < out_left - 1.0 or tile_top + (f64)tile_size < out_top - 1.0:
+                    try tiles.clear(column, row)
+                    continue
+                params[6] = (f32)tile_left
+                params[7] = (f32)tile_top
+                var fresh = try tiles.blank()
+                errdefer fresh.destroy()
+                let frame = try fresh.frame()
+                defer frame.release()
+                let area = try frame.value().target()
+                defer area.release()
+                try gpu.shade(area.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 40), [flat], gpu.Filter.nearest)
+                discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+                try tiles.set(column, row, fresh)
+        target.revision += 1
+
+    pub mutating func destroy():
+        self.pipeline.destroy()
+        self.shader.destroy()
+
+func min_u32(a: u32, b: u32) -> u32:
+    return a if a < b else b
+
+func max_u32(a: u32, b: u32) -> u32:
+    return a if a > b else b
+
+test "a free transform scales a layer about its content and rotates it":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var document = try Document.create(device, 128, 128)
+    defer document.destroy()
+    let layer = try document.add_layer("Square")
+    let count = (usize)128 * 128 * 4
+    let pixels = try alloc f32[count] in memory.heap
+    defer free(pixels) in memory.heap
+    for index in 0..<count:
+        pixels[index] = 0.0
+    # An opaque green 32×32 square in the middle of the (single) tile.
+    for y in 48..<(usize)80:
+        for x in 48..<(usize)80:
+            pixels[(y * 128 + x) * 4 + 1] = 1.0
+            pixels[(y * 128 + x) * 4 + 3] = 1.0
+    var tiles = try Tiles.create(device, 128, 128)
+    try tiles.write(pixels)
+    try document.set_tiles(layer, tiles)
+    var transformer = try Transformer.create(device)
+    defer transformer.destroy()
+    # Doubling about the tile centre (64, 64) makes the square 64×64: (32..96).
+    try transformer.apply(&document, layer, 2.0, 2.0, 0.0, 0.0, 0.0)
+    let current = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
+    try current.read(pixels)
+    assert(pixels[(40 * 128 + 40) * 4 + 3] > 0.99 and pixels[(40 * 128 + 40) * 4 + 1] > 0.99)
+    assert(pixels[(20 * 128 + 64) * 4 + 3] < 0.01 and pixels[(64 * 128 + 100) * 4 + 3] < 0.01)
+    # A quarter turn keeps a centred square where it is; moving it by 40 shifts it.
+    try transformer.apply(&document, layer, 1.0, 1.0, math.pi * 0.5, 40.0, 0.0)
+    try current.read(pixels)
+    assert(pixels[(64 * 128 + 110) * 4 + 3] > 0.99 and pixels[(64 * 128 + 40) * 4 + 3] < 0.01)
+    var rejected = false
+    transformer.apply(&document, layer, 0.0, 1.0, 0.0, 0.0, 0.0) catch failure:
+        assert(failure.code == invalid)
+        rejected = true
+    assert(rejected)
 
 test "translating a layer moves its pixels across tiles and drops what leaves":
     var device = gpu.Device.open() catch failure:

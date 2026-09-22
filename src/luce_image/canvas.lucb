@@ -20,7 +20,7 @@ from luce_image.brush import Brush, Painter, Stroke, begin_boxed, finish_boxed, 
 from luce_image.adjust import Adjuster, adjustment_count, curves
 from luce_image.curves import Curves, lut_size
 from luce_image.filter import Filters
-from luce_image.transform import translate
+from luce_image.transform import translate, Transformer
 from luce_image.geometry import resize_canvas, resize_image
 from luce_image.selection import Selection, Mode
 from luce_image.shaders import ants_frag_words, ants_frag_msl
@@ -51,6 +51,7 @@ pub struct Canvas:
     var painter: Painter?
     var adjuster: Adjuster?
     var filters: Filters?
+    var transformer: Transformer?
     var brush: Brush
     var stroke: Stroke*?
     var preview: Snapshot?
@@ -85,6 +86,7 @@ pub struct Canvas:
         self.painter = none
         self.adjuster = none
         self.filters = none
+        self.transformer = none
         self.brush = Brush()
         self.stroke = none
         self.preview = none
@@ -684,6 +686,26 @@ pub struct Canvas:
         try self.remember((u64)id, try tiles.clone())
         try filters.gaussian_blur(document, (u64)id, radius)
 
+    ## Free transform: scale a layer's pixels by (`scale_x`, `scale_y`) and turn
+    ## them `angle` degrees about the centre of what the layer has, then move
+    ## them by (`dx`, `dy`) pixels; what leaves the document is lost. Undoable.
+    pub mutating func transform_layer(id: i64, scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        let document = self.document else error(invalid, "draw the document once before transforming")
+        let transformer = self.transformer else error(invalid, "draw the document once before transforming")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = layer.tiles() else error(invalid, "a group cannot be transformed")
+        try self.remember((u64)id, try tiles.clone())
+        try transformer.apply(document, (u64)id, scale_x, scale_y, angle * math.pi / 180.0, dx, dy)
+
+    ## Show a free transform (as `transform_layer`) of the previewed layer's original pixels.
+    pub mutating func preview_transform(scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64) -> !:
+        let layer = try self.restore_preview()
+        let document = self.document else trap("preview without a document")
+        let transformer = self.transformer else trap("preview without a transformer")
+        try transformer.apply(document, layer, scale_x, scale_y, angle * math.pi / 180.0, dx, dy)
+
     ## Change the canvas size, keeping the pixels with their top-left at the
     ## offset. Not undoable: the history is dropped.
     pub mutating func resize_canvas(width: i64, height: i64, offset_x: i64, offset_y: i64) -> !:
@@ -967,7 +989,7 @@ pub struct Canvas:
             if failure.code == gpu.unavailable:
                 return
             error(failure.code, failure.message)
-        var binding = Binding(device = acquired, document = none, composer = none, painter = none, adjuster = none, filters = none)
+        var binding = Binding(device = acquired, document = none, composer = none, painter = none, adjuster = none, filters = none, transformer = none)
         errdefer unwind(&binding)
         let device = binding.device else trap("bound")
         var document = try Document.create(device, self.extent_x, self.extent_y)
@@ -987,10 +1009,12 @@ pub struct Canvas:
         binding.painter = try Painter.create(device)
         binding.adjuster = try Adjuster.create(device)
         binding.filters = try Filters.create(device)
+        binding.transformer = try Transformer.create(device)
         self.device = binding.device
         self.painter = binding.painter
         self.adjuster = binding.adjuster
         self.filters = binding.filters
+        self.transformer = binding.transformer
         # The cold selection moves into the boxed document; a fresh empty one takes its place here.
         let bound = binding.document else trap("boxed")
         bound.selection.destroy()
@@ -1066,6 +1090,7 @@ pub struct Canvas:
         self.painter = none
         self.adjuster = none
         self.filters = none
+        self.transformer = none
         unwind(&binding)
         for index in 0..<self.count:
             strings.release(self.records[index].name)
@@ -1205,6 +1230,7 @@ struct Binding:
     var painter: Painter?
     var adjuster: Adjuster?
     var filters: Filters?
+    var transformer: Transformer?
 
 ## A layer's pixels at one moment, shared with whatever else holds them.
 struct Snapshot:
@@ -1234,6 +1260,9 @@ func gpu_check_color(color: gpu.Color) -> !:
         error(invalid, "brush colour components must be in 0..1")
 
 func unwind(binding: Binding*):
+    if let transformer = binding.transformer:
+        var owned = transformer
+        owned.destroy()
     if let filters = binding.filters:
         var owned = filters
         owned.destroy()
@@ -1250,7 +1279,7 @@ func unwind(binding: Binding*):
     if let device = binding.device:
         var owned = device
         owned.destroy()
-    *binding = Binding(device = none, document = none, composer = none, painter = none, adjuster = none, filters = none)
+    *binding = Binding(device = none, document = none, composer = none, painter = none, adjuster = none, filters = none, transformer = none)
 
 func curve_channel(channel: i64) -> usize!:
     if channel < 0 or channel > 3:
@@ -1525,6 +1554,12 @@ test "previews show edits on the original pixels and end kept or dropped":
     assert(canvas.can_undo())
     assert((try shown_centre(&canvas, &target, pixels)) == inverted)
     try canvas.undo()
+    assert((try shown_centre(&canvas, &target, pixels)) == base)
+    # A previewed transform is shown, then cancelled back to the original.
+    try canvas.begin_preview(layer)
+    try canvas.preview_transform(0.25, 0.25, 45.0, 0.0, 0.0)
+    assert((try shown_centre(&canvas, &target, pixels)) == base)
+    try canvas.end_preview(false)
     assert((try shown_centre(&canvas, &target, pixels)) == base)
     # The wand on the painted dot selects it and nothing of the transparent surround.
     try canvas.select_wand(layer, 16, 16, 32.0, true, 0)
