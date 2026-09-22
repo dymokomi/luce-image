@@ -378,10 +378,12 @@ pub struct Canvas:
                 let height = (f64)covered.height * zoom
                 if left >= rectangle.x + rectangle.width or top >= rectangle.y + rectangle.height or left + width <= rectangle.x or top + height <= rectangle.y:
                     continue
-                # One document pixel of margin so edges on the tile boundary show.
-                let margin = zoom
-                var params: f32[6] = [(f32)(left * scale), (f32)(top * scale), (f32)(zoom * scale), (f32)phase, (f32)covered.width, (f32)covered.height]
-                try gpu.shade(area, pipeline, gpu.Rect(left - margin, top - margin, width + margin * 2.0, height + margin * 2.0), u8[]((u8*)&params[0], 24), [texture], gpu.Filter.nearest)
+                let right_tile = tiles.texture(column + 1, row) else composer_blank(&self)
+                let below_tile = tiles.texture(column, row + 1) else composer_blank(&self)
+                let limit_x = (f64)self.extent_x - (f64)(column * tile_size)
+                let limit_y = (f64)self.extent_y - (f64)(row * tile_size)
+                var params: f32[8] = [(f32)(left * scale), (f32)(top * scale), (f32)(zoom * scale), (f32)phase, (f32)covered.width, (f32)covered.height, (f32)limit_x, (f32)limit_y]
+                try gpu.shade(area, pipeline, gpu.Rect(left, top, width, height), u8[]((u8*)&params[0], 32), [texture, right_tile, below_tile], gpu.Filter.nearest)
 
     mutating func ants_pipeline() -> gpu.Pipeline!:
         if let existing = self.ants:
@@ -960,6 +962,10 @@ pub struct Canvas:
 let blend_names: str[26] = ["Normal", "Darken", "Multiply", "Color Burn", "Linear Burn", "Lighten", "Screen", "Color Dodge", "Linear Dodge",
                             "Overlay", "Soft Light", "Hard Light", "Vivid Light", "Linear Light", "Pin Light", "Hard Mix", "Difference", "Exclusion",
                             "Subtract", "Divide", "Hue", "Saturation", "Color", "Luminosity", "Darker Color", "Lighter Color"]
+
+## A transparent texel for absent neighbour tiles.
+func composer_blank(canvas: Canvas*) -> gpu.Texture:
+    return (canvas.painter else trap("bound")).black
 
 func selection_mode(mode: i64) -> Mode!:
     if mode == 0: return Mode.replace

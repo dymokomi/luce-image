@@ -41,8 +41,8 @@ pub struct Painter:
     var segment: gpu.Pipeline
     var paint: gpu.Pipeline
     ## One white and one black texel: "everything selected" and "nothing selected".
-    var white: gpu.Texture
-    var black: gpu.Texture
+    pub var white: gpu.Texture
+    pub var black: gpu.Texture
 
     pub static func create(device: gpu.Device) -> Painter!:
         var segment_shader = try gpu.Shader.create(device, segment_frag_words, segment_frag_msl)
