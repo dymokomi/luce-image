@@ -1,0 +1,7 @@
+#prisma 4.0
+def package "luce_image_examples" {
+    str source = "."
+    def dependency "luce_image" {
+        str path = ".."
+    }
+}
