@@ -13,7 +13,7 @@ from luce_image.image import Image, Pixel
 from luce_image.tiles import Tiles, tile_size, tile_columns
 from luce_image.document import Document, box_document, unbox_document, blend_mode_count
 from luce_image.composite import Composer, box_composer, unbox_composer
-from luce_image.brush import Brush, Painter, Stroke, begin_boxed, finish_boxed
+from luce_image.brush import Brush, Painter, Stroke, begin_boxed, finish_boxed, fill_selection
 from luce_image.adjust import Adjuster, adjustment_count
 from luce_image.half import from_half
 from luce_image.errors import invalid, limit
@@ -43,6 +43,10 @@ pub struct Canvas:
     var brush: Brush
     var stroke: Stroke*?
     var mask_editing: bool
+    var sel_x: i64
+    var sel_y: i64
+    var sel_width: i64
+    var sel_height: i64
     var history: Snapshot[]
     var history_count: usize
     var future: Snapshot[]
@@ -67,6 +71,10 @@ pub struct Canvas:
         self.brush = Brush()
         self.stroke = none
         self.mask_editing = false
+        self.sel_x = 0
+        self.sel_y = 0
+        self.sel_width = 0
+        self.sel_height = 0
         var no_history: Snapshot[]
         self.history = no_history
         self.history_count = 0
@@ -179,6 +187,63 @@ pub struct Canvas:
 
     pub func layer_blend(index: i64) -> i64!:
         return (try self.record(index)).blend
+
+    # mark: Selection ========================================================================
+
+    ## Select a rectangle in document pixels, clamped; an empty one deselects.
+    pub mutating func select(x: i64, y: i64, width: i64, height: i64) -> !:
+        try self.require_open()
+        let left = x if x > 0 else 0
+        let top = y if y > 0 else 0
+        var right = x + width
+        if right > (i64)self.extent_x:
+            right = (i64)self.extent_x
+        var bottom = y + height
+        if bottom > (i64)self.extent_y:
+            bottom = (i64)self.extent_y
+        if right <= left or bottom <= top:
+            self.sel_width = 0
+            self.sel_height = 0
+        else:
+            self.sel_x = left
+            self.sel_y = top
+            self.sel_width = right - left
+            self.sel_height = bottom - top
+        if let document = self.document:
+            document.select(self.sel_x, self.sel_y, self.sel_width, self.sel_height)
+
+    pub mutating func deselect() -> !:
+        try self.select(0, 0, 0, 0)
+
+    pub func has_selection() -> bool:
+        return self.sel_width > 0
+
+    pub func selection_left() -> i64:
+        return self.sel_x
+
+    pub func selection_top() -> i64:
+        return self.sel_y
+
+    pub func selection_width() -> i64:
+        return self.sel_width
+
+    pub func selection_height() -> i64:
+        return self.sel_height
+
+    ## Fill the selection (or the whole layer) on `layer` with the brush colour
+    ## at its opacity, or clear it when `erase`. Undoable.
+    pub mutating func fill(layer: i64, erase: bool) -> !:
+        try self.require_open()
+        if self.stroke != none:
+            error(invalid, "finish the stroke first")
+        let document = self.document else error(invalid, "draw the document once before filling")
+        var painter = self.painter else error(invalid, "draw the document once before filling")
+        let index = try self.index((u64)layer)
+        let on_mask = self.mask_editing and self.records[index].masked
+        var brush = self.brush
+        brush.erase = erase
+        let before = try fill_selection(&painter, document, (u64)layer, brush, on_mask)
+        try self.remember((u64)layer, before, on_mask)
 
     # mark: Masks and clipping ==============================================================
 
@@ -473,6 +538,7 @@ pub struct Canvas:
         self.device = binding.device
         self.painter = binding.painter
         self.adjuster = binding.adjuster
+        document.select(self.sel_x, self.sel_y, self.sel_width, self.sel_height)
         self.document = binding.document
         self.composer = binding.composer
         binding = Binding(device = none, document = none, composer = none, painter = none, adjuster = none)
@@ -738,3 +804,21 @@ test "canvas strokes paint the selected layer and undo restores it":
     assert(pixel[1] == 255)
     try canvas.set_clipped(layer, true)
     assert(try canvas.layer_clipped(0))
+    try canvas.set_clipped(layer, false)
+    # A selection limits the fill: the left half turns red, the right stays.
+    try canvas.select(0, 0, 32, 64)
+    assert(canvas.has_selection() and canvas.selection_width() == 32)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.fill(layer, false)
+    let seventh = try target.frame()
+    defer seventh.release()
+    let filled = try seventh.value().target()
+    defer filled.release()
+    try canvas.draw(filled, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
+    discard(try seventh.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    try target.read(pixel, gpu.Region(5, 5, 1, 1))
+    assert(pixel[0] == 255 and pixel[1] == 0)
+    try target.read(pixel, gpu.Region(50, 5, 1, 1))
+    assert(pixel[0] == 0)
+    try canvas.deselect()
+    assert(not canvas.has_selection())

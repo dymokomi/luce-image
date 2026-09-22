@@ -4,6 +4,7 @@
 ## children and their visibility gates them. Editing replaces a layer's tiles;
 ## every replacement bumps revisions that the compositor keys its cache on.
 import gpu
+import math
 import memory
 import strings
 from luce_image.tiles import Tiles, box, unbox
@@ -59,10 +60,19 @@ func layer_destroy(layer: Layer*):
     strings.release(layer.name)
     free(layer) in memory.heap
 
+## A rectangular selection in document pixels; width 0 means none.
+pub struct Selection:
+    pub var x: i64
+    pub var y: i64
+    pub var width: i64
+    pub var height: i64
+
 pub struct Document:
     var owner: gpu.Device
     var extent_x: u32
     var extent_y: u32
+    ## The selection, part of the document so history can cover it.
+    pub var selection: Selection
     var root: Layer*
     var next_id: u64
     ## Bumps whenever the tree changes shape or a layer's attributes change.
@@ -76,7 +86,7 @@ pub struct Document:
         with memory.heap:
             title = try strings.copy("root")
         let root = try new Layer(id = 0, name = title, group = true, pixels = none, revision = 0) in memory.heap
-        return Document(owner = device, extent_x = width, extent_y = height, root = root, next_id = 1, revision = 1)
+        return Document(owner = device, extent_x = width, extent_y = height, selection = Selection(), root = root, next_id = 1, revision = 1)
 
     pub func width() -> u32:
         return self.extent_x
@@ -168,6 +178,18 @@ pub struct Document:
         free(previous) in memory.heap
         return taken
 
+    ## Select a rectangle, clamped to the document; an empty one deselects.
+    pub mutating func select(x: i64, y: i64, width: i64, height: i64):
+        let left = math.imax(0, x)
+        let top = math.imax(0, y)
+        let right = math.imin((i64)self.extent_x, x + width)
+        let bottom = math.imin((i64)self.extent_y, y + height)
+        if right <= left or bottom <= top:
+            self.selection = Selection()
+        else:
+            self.selection = Selection(x = left, y = top, width = right - left, height = bottom - top)
+        self.revision += 1
+
     ## Give a raster layer an empty mask (revealing everything) or take it away.
     pub mutating func set_mask(id: u64, present: bool) -> !:
         let layer = self.find(id) else error(invalid, "no such layer")
@@ -225,7 +247,7 @@ func release_tiles(holder: Tiles*?*):
 
 ## Move a document onto the heap, for holders that keep a pointer.
 pub func box_document(document: Document) -> Document*!:
-    return try new Document(owner = document.owner, extent_x = document.extent_x, extent_y = document.extent_y,
+    return try new Document(owner = document.owner, extent_x = document.extent_x, extent_y = document.extent_y, selection = document.selection,
                             root = document.root, next_id = document.next_id, revision = document.revision) in memory.heap
 
 ## Destroy a boxed document and free the box.
