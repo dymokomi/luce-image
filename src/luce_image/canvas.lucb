@@ -23,7 +23,7 @@ from luce_image.curves import Curves, lut_size
 from luce_image.filter import Filters
 from luce_image.transform import translate, Transformer
 from luce_image.text import draw_text, measure_text, text_height
-import luce_image.psd as psd
+import psd
 from luce_image.geometry import resize_canvas, resize_image
 from luce_image.selection import Selection, Mode
 from luce_image.shaders import ants_frag_words, ants_frag_msl
@@ -1441,12 +1441,13 @@ func open_psd(path: str) -> interop.Reference[Canvas]!:
     errdefer native.close()
     for index in 0..<parsed.count:
         let layer = &parsed.layers[index]
-        let picture = layer.picture else continue
+        if layer.pixels.length == 0:
+            continue
+        let picture = try Image.from_rgba8((usize)parsed.width, (usize)parsed.height, layer.pixels)
         let id = try native.add_layer((str)layer.name if layer.name.length > 0 else "Layer")
         try native.set_layer(id, layer.visible, layer.opacity, (i64)layer.blend)
         try native.set_clipped(id, layer.clipped)
         try native.place((u64)id, picture)
-        layer.picture = none
     if native.count == 0:
         discard(try native.add_layer("Background"))
     return reservation.publish(native, memory.heap)

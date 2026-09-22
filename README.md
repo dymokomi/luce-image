@@ -66,7 +66,7 @@ Luce-facing `Canvas` object:
 - Layer styles — drop shadow, outer glow, stroke — rendered under the layer by
   the compositor, non-destructively.
 - Documents open from any picture, from `.l2d` packages (`document.prisma` and
-  one PNG per layer and mask) and from Photoshop `.psd` files; they save as
+  one PNG per layer and mask) and from Photoshop `.psd` files (through the luce-psd package); they save as
   `.l2d` or flatten to a picture.
 
 ## Cryptomatte

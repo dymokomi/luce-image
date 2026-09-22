@@ -24,4 +24,10 @@ def package "luce-image" {
         str version = "^0.1.0"
         str path = "../luce-prism"
     }
+
+    def dependency "luce-psd" {
+        str owner = "dymokomi"
+        str version = "^0.1.0"
+        str path = "../luce-psd"
+    }
 }

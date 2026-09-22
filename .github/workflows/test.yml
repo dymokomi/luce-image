@@ -28,6 +28,7 @@ jobs:
           echo "crypto=$(tr -d '\n' < luce-image/bootstrap/CRYPTO)" >> "$GITHUB_OUTPUT"
           echo "prism=$(tr -d '\n' < luce-image/bootstrap/PRISM)" >> "$GITHUB_OUTPUT"
           echo "tls=$(tr -d '\n' < luce-image/bootstrap/TLS)" >> "$GITHUB_OUTPUT"
+          echo "psd=$(tr -d '\n' < luce-image/bootstrap/PSD)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           repository: dymokomi/luce-base
@@ -51,6 +52,12 @@ jobs:
           repository: dymokomi/luce-prism
           ref: ${{ steps.pins.outputs.prism }}
           path: luce-prism
+          token: ${{ secrets.LUCE_READ_TOKEN || github.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: dymokomi/luce-psd
+          ref: ${{ steps.pins.outputs.psd }}
+          path: luce-psd
           token: ${{ secrets.LUCE_READ_TOKEN || github.token }}
       - uses: actions/checkout@v4
         with:
