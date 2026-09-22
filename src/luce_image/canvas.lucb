@@ -487,6 +487,22 @@ pub struct Canvas:
             try document.set_clipped((u64)id, clipped)
         self.records[index].clipped = clipped
 
+    ## Give layer `id` a new name.
+    pub mutating func rename_layer(id: i64, name: str) -> !:
+        try self.require_open()
+        if name.length == 0 or name.length > 256:
+            error(invalid, "a layer name is 1..256 bytes")
+        let index = try self.index((u64)id)
+        var copied: str = ""
+        with memory.heap:
+            copied = try strings.copy(name)
+        if let document = self.document:
+            document.rename((u64)id, name) catch failure:
+                strings.release(copied)
+                error(failure.code, failure.message)
+        strings.release(self.records[index].name)
+        self.records[index].name = copied
+
     ## Layer styles, drawn under the layer by the compositor and kept with the
     ## document. Colours are linear 0..1; sizes and offsets in pixels.
     pub mutating func set_shadow(id: i64, on: bool, dx: f64, dy: f64, blur: f64, red: f64, green: f64, blue: f64, opacity: f64) -> !:
@@ -1779,6 +1795,9 @@ test "previews show edits on the original pixels and end kept or dropped":
     assert(math.abs(canvas.picked_red() - 0.05) < 0.01 and canvas.picked_alpha() > 0.99)
     try canvas.pick(0, 0)
     assert(canvas.picked_alpha() == 0.0)
+    # Renaming reaches the record and the bound layer.
+    try canvas.rename_layer(layer, "Dot")
+    assert((try canvas.layer_name(0)) == "Dot")
     # Text lands on the layer and is undoable.
     try canvas.draw_text(layer, 0.0, 0.0, "X", 24.0, 0.0, 1.0, 0.0)
     try canvas.undo()

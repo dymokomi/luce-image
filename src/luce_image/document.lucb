@@ -165,6 +165,15 @@ pub struct Document:
     pub mutating func add_group(name: str, parent: u64? = none) -> u64!:
         return try self.add(name, parent, true, none)
 
+    ## Give layer `id` a new name.
+    pub mutating func rename(id: u64, name: str) -> !:
+        let layer = self.find(id) else error(invalid, "no such layer")
+        var copied: str = ""
+        with memory.heap:
+            copied = try strings.copy(name)
+        strings.release(layer.name)
+        layer.name = copied
+
     mutating func add(name: str, parent: u64?, group: bool, tiles: Tiles?) -> u64!:
         var holder: Tiles*? = none
         if let owned = tiles:
