@@ -361,6 +361,38 @@ pub struct Image:
             error(unsupported, "unsupported output image format")
         try files.write_atomic((c_api.str)destination, encoded.view())
 
+    ## Every pixel as straight-alpha linear-light RGBA f32 samples, top-down,
+    ## four per pixel: integer modes are taken as sRGB-encoded, float modes as
+    ## linear already. For the editor's tiles; Base only.
+    pub mutating func linear_rgba(pixels: f32[]) -> !:
+        try self.load()
+        if pixels.length != self.raster.width * self.raster.height * 4:
+            error(invalid, "pixel buffer must hold width * height RGBA samples")
+        let kind = self.raster.channels[0].kind
+        let scale = 1.0 / model.maximum(kind)
+        let encoded = kind != .float16 and kind != .float32 and kind != .float64
+        for index in 0..<self.raster.width * self.raster.height:
+            let pixel = try self.getpixel(index % self.raster.width, index // self.raster.width)
+            pixels[index * 4] = (f32)(decode_srgb(pixel.r * scale) if encoded else pixel.r * scale)
+            pixels[index * 4 + 1] = (f32)(decode_srgb(pixel.g * scale) if encoded else pixel.g * scale)
+            pixels[index * 4 + 2] = (f32)(decode_srgb(pixel.b * scale) if encoded else pixel.b * scale)
+            pixels[index * 4 + 3] = (f32)(pixel.a * scale)
+
+    ## An 8-bit RGBA image from straight-alpha linear-light RGBA f32 samples,
+    ## sRGB-encoded and clamped. Base only.
+    pub static func from_linear_rgba(width: usize, height: usize, pixels: const f32[]) -> interop.Reference[Image]!:
+        if pixels.length != width * height * 4:
+            error(invalid, "pixel data must hold width * height RGBA samples")
+        let image = try Image.create("RGBA", width, height)
+        errdefer image.release()
+        let target = image.value()
+        for index in 0..<width * height:
+            target.raster.pixels[index * 4] = encode_srgb((f64)pixels[index * 4])
+            target.raster.pixels[index * 4 + 1] = encode_srgb((f64)pixels[index * 4 + 1])
+            target.raster.pixels[index * 4 + 2] = encode_srgb((f64)pixels[index * 4 + 2])
+            target.raster.pixels[index * 4 + 3] = math.floor(math.clamp((f64)pixels[index * 4 + 3], 0.0, 1.0) * 255.0 + 0.5)
+        return image
+
     pub mutating func copy() -> interop.Reference[Image]!:
         return try self.crop(0, 0, try self.width(), try self.height())
 
@@ -452,3 +484,14 @@ pub struct Image:
         self.closed = true
 
 pub let image_type: interop.Type[Image] = interop.Type[Image]("Image", Image.close, closeable = true)
+
+## The linear value of an sRGB-encoded component in 0..1.
+func decode_srgb(value: f64) -> f64:
+    let clamped = math.clamp(value, 0.0, 1.0)
+    return clamped / 12.92 if clamped <= 0.04045 else math.pow((clamped + 0.055) / 1.055, 2.4)
+
+## The 8-bit sRGB encoding of a linear component.
+func encode_srgb(value: f64) -> f64:
+    let clamped = math.clamp(value, 0.0, 1.0)
+    let encoded = clamped * 12.92 if clamped <= 0.0031308 else 1.055 * math.pow(clamped, 1.0 / 2.4) - 0.055
+    return math.floor(encoded * 255.0 + 0.5)

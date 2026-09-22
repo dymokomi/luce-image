@@ -101,6 +101,16 @@ pub struct Composer:
         self.entries = empty
         self.budget = 0
 
+## Move a compositor onto the heap, for holders that keep a pointer.
+pub func box_composer(composer: Composer) -> Composer*!:
+    return try new Composer(owner = composer.owner, entries = composer.entries, count = composer.count,
+                            budget = composer.budget, tick = composer.tick, renders = composer.renders) in memory.heap
+
+## Destroy a boxed compositor and free the box.
+pub func unbox_composer(composer: Composer*):
+    composer.destroy()
+    free(composer) in memory.heap
+
 ## Fold every layer that contributes to the cells in range into `digest`.
 func hash_layers(seed: u64, layers: Layer*[], opacity: f64, first_column: u32, first_row: u32, span: u32) -> u64:
     var digest = seed

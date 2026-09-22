@@ -1,0 +1,376 @@
+## The editor's document as one Luce-owned object: layers with names,
+## visibility and opacity, pixels loaded from files, a flattened save, and
+## drawing at any zoom and offset onto a render target. GPU storage is bound to
+## the device of the first target it is drawn on; until then layers and their
+## pictures wait on the CPU, so a document can be built before it is shown.
+import gpu
+import interop
+import math
+import memory
+import ownership
+import strings
+from luce_image.image import Image, Pixel
+from luce_image.tiles import Tiles, tile_size, tile_columns
+from luce_image.document import Document, box_document, unbox_document
+from luce_image.composite import Composer, box_composer, unbox_composer
+from luce_image.half import from_half
+from luce_image.errors import invalid, limit
+
+struct Record:
+    var id: u64
+    var name: str
+    var visible: bool
+    var opacity: f64
+    ## A picture waiting to become tiles once a device is bound.
+    var picture: interop.Reference[Image]?
+
+pub struct Canvas:
+    var extent_x: u32
+    var extent_y: u32
+    var records: Record[]
+    var count: usize
+    var next_id: u64
+    var device: gpu.Device?
+    var document: Document*?
+    var composer: Composer*?
+    var closed: bool
+
+    ## An empty `width` by `height` document with no layers.
+    pub func init(width: i64, height: i64) -> !:
+        if width < 1 or height < 1 or width > 65536 or height > 65536:
+            error(invalid, "document dimensions must be in 1..65536")
+        self.extent_x = (u32)width
+        self.extent_y = (u32)height
+        var empty: Record[]
+        self.records = empty
+        self.count = 0
+        self.next_id = 1
+        self.device = none
+        self.document = none
+        self.composer = none
+        self.closed = false
+
+    ## A document the size of the picture at `path`, holding it as one layer.
+    pub static func open(path: str) -> interop.Reference[Canvas]!:
+        let picture = try Image.open(path)
+        errdefer picture.release()
+        let width = try picture.value().width()
+        let height = try picture.value().height()
+        var reservation = try interop.Reservation[Canvas](canvas_type)
+        errdefer reservation.cancel()
+        let native = try new Canvas((i64)width, (i64)height) in memory.heap
+        errdefer native.close()
+        let id = try native.add_layer("Background")
+        try native.place((u64)id, picture)
+        return reservation.publish(native, memory.heap)
+
+    pub func width() -> i64:
+        return (i64)self.extent_x
+
+    pub func height() -> i64:
+        return (i64)self.extent_y
+
+    ## Add a transparent layer on top; returns its id.
+    pub mutating func add_layer(name: str) -> i64!:
+        try self.require_open()
+        if self.count == self.records.length:
+            let capacity = 8 if self.records.length == 0 else self.records.length * 2
+            let grown = try alloc Record[capacity] in memory.heap
+            if self.count > 0:
+                memory.copy(grown, self.records, self.count)
+            if self.records.length > 0:
+                free(self.records) in memory.heap
+            self.records = grown
+        var copied: str = ""
+        with memory.heap:
+            copied = try strings.copy(name)
+        errdefer strings.release(copied)
+        let id = self.next_id
+        if let document = self.document:
+            let created = try document.add_layer(name)
+            assert(created == id)
+        self.records[self.count] = Record(id = id, name = copied, visible = true, opacity = 1.0, picture = none)
+        self.count += 1
+        self.next_id += 1
+        return (i64)id
+
+    ## Replace a layer's pixels with the picture at `path`, which must be the
+    ## document's size.
+    pub mutating func load_layer(id: i64, path: str) -> !:
+        try self.require_open()
+        let picture = try Image.open(path)
+        errdefer picture.release()
+        if (try picture.value().width()) != (usize)self.extent_x or (try picture.value().height()) != (usize)self.extent_y:
+            error(invalid, "the picture must match the document's size")
+        try self.place((u64)id, picture)
+
+    mutating func place(id: u64, picture: interop.Reference[Image]) -> !:
+        let index = try self.index(id)
+        if let document = self.document:
+            try document.set_tiles(id, try self.tiles_of(picture))
+            picture.release()
+            return
+        if let previous = self.records[index].picture:
+            previous.release()
+        self.records[index].picture = picture
+
+    ## Tiles on the bound device holding `picture`'s pixels.
+    mutating func tiles_of(picture: interop.Reference[Image]) -> Tiles!:
+        let device = self.device else error(invalid, "the document is not bound to a device")
+        let count = (usize)self.extent_x * (usize)self.extent_y * 4
+        let pixels = try alloc f32[count] in memory.heap
+        defer free(pixels) in memory.heap
+        try picture.value().linear_rgba(pixels)
+        var tiles = try Tiles.create(device, self.extent_x, self.extent_y)
+        errdefer tiles.destroy()
+        try tiles.write(pixels)
+        return tiles
+
+    pub mutating func remove_layer(id: i64) -> !:
+        try self.require_open()
+        let index = try self.index((u64)id)
+        if let document = self.document:
+            try document.remove((u64)id)
+        strings.release(self.records[index].name)
+        if let picture = self.records[index].picture:
+            picture.release()
+        for shift in index..<(self.count - 1):
+            self.records[shift] = self.records[shift + 1]
+        self.count -= 1
+
+    pub mutating func set_layer(id: i64, visible: bool, opacity: f64) -> !:
+        try self.require_open()
+        if not math.is_finite(opacity) or opacity < 0.0 or opacity > 1.0:
+            error(invalid, "opacity must be in 0..1")
+        let index = try self.index((u64)id)
+        if let document = self.document:
+            try document.set_appearance((u64)id, visible, opacity)
+        self.records[index].visible = visible
+        self.records[index].opacity = opacity
+
+    ## Layers from the bottom up.
+    pub func layer_count() -> i64:
+        return (i64)self.count
+
+    pub func layer_id(index: i64) -> i64!:
+        return (i64)(try self.record(index)).id
+
+    pub func layer_name(index: i64) -> str!:
+        return (try self.record(index)).name
+
+    pub func layer_visible(index: i64) -> bool!:
+        return (try self.record(index)).visible
+
+    pub func layer_opacity(index: i64) -> f64!:
+        return (try self.record(index)).opacity
+
+    ## Write the flattened document to `path` as an 8-bit RGBA picture in the
+    ## format its extension names. Needs the document drawn at least once.
+    pub mutating func save(path: str) -> !:
+        try self.require_open()
+        let document = self.document else error(invalid, "draw the document once before saving")
+        let composer = self.composer else error(invalid, "draw the document once before saving")
+        let count = (usize)self.extent_x * (usize)self.extent_y * 4
+        let pixels = try alloc f32[count] in memory.heap
+        defer free(pixels) in memory.heap
+        let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+        defer free(bytes) in memory.heap
+        for row in 0..<tile_columns(self.extent_y):
+            for column in 0..<tile_columns(self.extent_x):
+                let texture = try composer.tile(document, column, row, 0)
+                let width = min(tile_size, self.extent_x - column * tile_size)
+                let height = min(tile_size, self.extent_y - row * tile_size)
+                try texture.read(bytes[..<((usize)width * (usize)height * 8)], gpu.Region(0, 0, width, height))
+                for y in 0..<(usize)height:
+                    for x in 0..<(usize)width:
+                        let source = (y * (usize)width + x) * 8
+                        let destination = (((usize)row * (usize)tile_size + y) * (usize)self.extent_x + (usize)column * (usize)tile_size + x) * 4
+                        for channel in 0..<(usize)4:
+                            pixels[destination + channel] = from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8))
+        let picture = try Image.from_linear_rgba((usize)self.extent_x, (usize)self.extent_y, pixels)
+        defer picture.release()
+        try picture.value().save(path)
+
+    ## Draw the document onto `target`, clipped to `rectangle` (in the target's
+    ## points), with its top-left corner at `rectangle`'s origin plus `offset`,
+    ## scaled by `zoom` (document pixels to points). Binds the device on first
+    ## use. Pixels are crisp at and above 100% and filtered below it.
+    pub mutating func draw(target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64) -> !:
+        try self.require_open()
+        if not math.is_finite(zoom) or zoom <= 0.0 or zoom > 256.0 or not math.is_finite(offset_x) or not math.is_finite(offset_y):
+            error(invalid, "zoom must be in 0..256 and offsets finite")
+        let checked = try target.get()
+        if rectangle.width <= 0.0 or rectangle.height <= 0.0:
+            return
+        try self.bind(checked)
+        let document = self.document else trap("bound without a document")
+        let composer = self.composer else trap("bound without a composer")
+        let clipped = try checked.clipped(rectangle)
+        defer clipped.release()
+        let area = clipped.value()
+        # The pyramid level whose tiles are at most one texel per point.
+        var level: u32 = 0
+        while level < 16 and zoom * (f64)(1u32 << (level + 1)) <= 1.0:
+            level += 1
+        let span = 1u32 << level
+        let tile_points = (f64)tile_size * (f64)span * zoom
+        let origin_x = rectangle.x + offset_x
+        let origin_y = rectangle.y + offset_y
+        let columns = (tile_columns(self.extent_x) + span - 1) // span
+        let rows = (tile_columns(self.extent_y) + span - 1) // span
+        for row in 0..<rows:
+            let top = origin_y + (f64)row * tile_points
+            if top >= rectangle.y + rectangle.height or top + tile_points <= rectangle.y:
+                continue
+            for column in 0..<columns:
+                let left = origin_x + (f64)column * tile_points
+                if left >= rectangle.x + rectangle.width or left + tile_points <= rectangle.x:
+                    continue
+                let texture = try composer.tile(document, column, row, level)
+                # The texels the document covers in this tile, and their extent in points.
+                let covered_x = min(tile_size, (self.extent_x - column * span * tile_size + span - 1) // span)
+                let covered_y = min(tile_size, (self.extent_y - row * span * tile_size + span - 1) // span)
+                let destination = gpu.Rect(left, top, (f64)covered_x * (f64)span * zoom, (f64)covered_y * (f64)span * zoom)
+                try gpu.draw_image(area, texture, destination, gpu.Region(0, 0, covered_x, covered_y), 1.0,
+                                   gpu.Filter.nearest if zoom >= 1.0 else gpu.Filter.linear)
+
+    ## Create the GPU document on the target's device and move waiting pictures in.
+    mutating func bind(target: const gpu.RenderTarget*) -> !:
+        if self.document != none:
+            return
+        var binding = Binding(device = try gpu.device_of(target), document = none, composer = none)
+        errdefer unwind(&binding)
+        let device = binding.device else trap("bound")
+        var document = try Document.create(device, self.extent_x, self.extent_y)
+        errdefer document.destroy()
+        for index in 0..<self.count:
+            let record = self.records[index]
+            discard(try document.add_layer(record.name))
+            try document.set_appearance(record.id, record.visible, record.opacity)
+        binding.document = try box_document(document)
+        var composer = try Composer.create(device)
+        errdefer composer.destroy()
+        binding.composer = try box_composer(composer)
+        self.device = binding.device
+        self.document = binding.document
+        self.composer = binding.composer
+        binding = Binding(device = none, document = none, composer = none)
+        for index in 0..<self.count:
+            if let picture = self.records[index].picture:
+                self.records[index].picture = none
+                defer picture.release()
+                let tiles = try self.tiles_of(picture)
+                try (self.document else trap("bound")).set_tiles(self.records[index].id, tiles)
+
+    func index(id: u64) -> usize!:
+        for index in 0..<self.count:
+            if self.records[index].id == id:
+                return index
+        error(invalid, "no such layer")
+
+    func record(index: i64) -> Record!:
+        if index < 0 or index >= (i64)self.count:
+            error(invalid, "layer index out of range")
+        return self.records[(usize)index]
+
+    func require_open() -> !:
+        if self.closed:
+            error(invalid, "the document is closed")
+
+    pub mutating func close():
+        if self.closed:
+            return
+        self.closed = true
+        var binding = Binding(device = self.device, document = self.document, composer = self.composer)
+        self.device = none
+        self.document = none
+        self.composer = none
+        unwind(&binding)
+        for index in 0..<self.count:
+            strings.release(self.records[index].name)
+            if let picture = self.records[index].picture:
+                picture.release()
+        if self.records.length > 0:
+            free(self.records) in memory.heap
+        var empty: Record[]
+        self.records = empty
+        self.count = 0
+
+    func trace(visit: func(ownership.Object*, void*) -> unit, context: void*):
+        for index in 0..<self.count:
+            if let picture = self.records[index].picture:
+                picture.trace(visit, context)
+
+## What binding creates, released in reverse on failure or close.
+struct Binding:
+    var device: gpu.Device?
+    var document: Document*?
+    var composer: Composer*?
+
+func unwind(binding: Binding*):
+    if let composer = binding.composer:
+        unbox_composer(composer)
+    if let document = binding.document:
+        unbox_document(document)
+    if let device = binding.device:
+        var owned = device
+        owned.destroy()
+    *binding = Binding(device = none, document = none, composer = none)
+
+func min(a: u32, b: u32) -> u32:
+    return a if a < b else b
+
+pub let canvas_type: interop.Type[Canvas] = interop.Type[Canvas]("Canvas", Canvas.close, Canvas.trace, closeable = true, main_thread = true)
+
+test "canvas builds cold, binds on draw, composes layers, saves and reopens":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    # A 40x30 red picture on disk.
+    let red = try Image.create("RGBA", 40, 30, Pixel(r = 255.0, g = 0.0, b = 0.0, a = 255.0))
+    defer red.release()
+    try red.value().save("build/canvas-test-red.png")
+    var canvas = try Canvas(40, 30)
+    defer canvas.close()
+    let background = try canvas.add_layer("Background")
+    try canvas.load_layer(background, "build/canvas-test-red.png")
+    let top = try canvas.add_layer("Top")
+    try canvas.set_layer(top, true, 0.5)
+    assert(canvas.layer_count() == 2 and (try canvas.layer_name(1)) == "Top" and (try canvas.layer_opacity(1)) == 0.5)
+    var rejected = false
+    canvas.save("build/canvas-test-out.png") catch failure:
+        assert(failure.code == invalid)
+        rejected = true
+    assert(rejected)
+    # Drawing onto a texture frame binds the device; a 2x zoom puts document
+    # pixel (0, 0) at points (4, 4) through (6, 6) inside the 64x64 target.
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    let frame = try target.frame()
+    defer frame.release()
+    let root = try frame.value().target()
+    defer root.release()
+    try canvas.draw(root, gpu.Rect(2.0, 2.0, 60.0, 60.0), 2.0, 2.0, 2.0)
+    discard(try frame.value().present(gpu.Color(0.0, 0.0, 1.0, 1.0)))
+    var pixel: u8[4]
+    try target.read(pixel, gpu.Region(5, 5, 1, 1))
+    assert(pixel[0] == 255 and pixel[1] == 0 and pixel[2] == 0 and pixel[3] == 255)
+    try target.read(pixel, gpu.Region(3, 3, 1, 1))
+    assert(pixel[0] == 0 and pixel[2] == 255)
+    # Pixels past the document (40 * 2 = 80 points from x 4, clipped at 62) stay blue.
+    try target.read(pixel, gpu.Region(1, 1, 1, 1))
+    assert(pixel[2] == 255)
+    # Layers added after binding go straight to the GPU document.
+    let third = try canvas.add_layer("Third")
+    try canvas.load_layer(third, "build/canvas-test-red.png")
+    try canvas.remove_layer(top)
+    assert(canvas.layer_count() == 2 and (try canvas.layer_id(1)) == third)
+    try canvas.save("build/canvas-test-out.png")
+    let reopened = try Canvas.open("build/canvas-test-out.png")
+    defer reopened.release()
+    assert(reopened.value().width() == 40 and reopened.value().layer_count() == 1)
+    let check = try Image.open("build/canvas-test-out.png")
+    defer check.release()
+    let sample = try check.value().getpixel(20, 15)
+    assert(sample.r == 255.0 and sample.g == 0.0 and sample.a == 255.0)

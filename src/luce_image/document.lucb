@@ -150,6 +150,16 @@ func release_tiles(holder: Tiles*?*):
         unbox(owned)
         *holder = none
 
+## Move a document onto the heap, for holders that keep a pointer.
+pub func box_document(document: Document) -> Document*!:
+    return try new Document(owner = document.owner, extent_x = document.extent_x, extent_y = document.extent_y,
+                            root = document.root, next_id = document.next_id, revision = document.revision) in memory.heap
+
+## Destroy a boxed document and free the box.
+pub func unbox_document(document: Document*):
+    document.destroy()
+    free(document) in memory.heap
+
 func find_in(layer: Layer*, id: u64) -> Layer*?:
     for child in layer.children[..<layer.child_count]:
         if child.id == id:
