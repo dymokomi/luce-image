@@ -226,8 +226,7 @@ pub struct Canvas:
     ## Copy a layer with its mask and appearance just above it; returns the copy's id.
     pub mutating func duplicate_layer(id: i64, name: str) -> i64!:
         try self.require_open()
-        if self.stroke != none:
-            error(invalid, "finish the stroke first")
+        try self.require_idle()
         let index = try self.index((u64)id)
         let created = try self.add_layer(name)
         let copy = try self.index((u64)created)
@@ -257,8 +256,7 @@ pub struct Canvas:
     ## both layers are dropped.
     pub mutating func merge_down(id: i64) -> !:
         try self.require_open()
-        if self.stroke != none:
-            error(invalid, "finish the stroke first")
+        try self.require_idle()
         let document = self.document else error(invalid, "draw the document once before merging")
         let composer = self.composer else error(invalid, "draw the document once before merging")
         let index = try self.index((u64)id)
@@ -415,8 +413,7 @@ pub struct Canvas:
     ## at its opacity, or clear it when `erase`. Undoable.
     pub mutating func fill(layer: i64, erase: bool) -> !:
         try self.require_open()
-        if self.stroke != none:
-            error(invalid, "finish the stroke first")
+        try self.require_idle()
         let document = self.document else error(invalid, "draw the document once before filling")
         var painter = self.painter else error(invalid, "draw the document once before filling")
         let index = try self.index((u64)layer)
@@ -431,8 +428,7 @@ pub struct Canvas:
     ## Give a layer a mask that reveals everything, or remove its mask.
     pub mutating func set_mask(id: i64, present: bool) -> !:
         try self.require_open()
-        if self.stroke != none:
-            error(invalid, "finish the stroke first")
+        try self.require_idle()
         let index = try self.index((u64)id)
         if let document = self.document:
             try document.set_mask((u64)id, present)
@@ -504,6 +500,8 @@ pub struct Canvas:
         try self.require_open()
         if self.stroke != none:
             error(invalid, "a stroke is already in progress")
+        if self.preview != none:
+            error(invalid, "finish the preview first")
         let document = self.document else error(invalid, "draw the document once before painting")
         var painter = self.painter else error(invalid, "draw the document once before painting")
         let index = try self.index((u64)layer)
@@ -538,8 +536,7 @@ pub struct Canvas:
     ## 5 threshold (a), 6 posterize (a levels). Undoable.
     pub mutating func adjust_layer(id: i64, kind: i64, a: f64, b: f64, c: f64, d: f64, e: f64) -> !:
         try self.require_open()
-        if self.stroke != none:
-            error(invalid, "finish the stroke first")
+        try self.require_idle()
         if kind < 0 or kind >= (i64)adjustment_count:
             error(invalid, "no such adjustment")
         let document = self.document else error(invalid, "draw the document once before adjusting")
@@ -557,10 +554,7 @@ pub struct Canvas:
     ## pixels from before the preview began, not on the previous preview.
     pub mutating func begin_preview(id: i64) -> !:
         try self.require_open()
-        if self.stroke != none:
-            error(invalid, "finish the stroke first")
-        if self.preview != none:
-            error(invalid, "a preview is already in progress")
+        try self.require_idle()
         let document = self.document else error(invalid, "draw the document once before previewing")
         let layer = document.find((u64)id) else error(invalid, "no such layer")
         let tiles = layer.tiles() else error(invalid, "a group cannot be previewed")
@@ -598,6 +592,13 @@ pub struct Canvas:
             var shown = try document.take_tiles(preview.layer, preview.tiles)
             shown.destroy()
 
+    ## No stroke and no preview may be in progress for edits and history.
+    func require_idle() -> !:
+        if self.stroke != none:
+            error(invalid, "finish the stroke first")
+        if self.preview != none:
+            error(invalid, "finish the preview first")
+
     ## Put the previewed layer's original pixels back; the layer's id.
     mutating func restore_preview() -> u64!:
         try self.require_open()
@@ -609,8 +610,7 @@ pub struct Canvas:
     ## Blur a layer's pixels with a Gaussian of `radius` pixels (0.5..250). Undoable.
     pub mutating func blur_layer(id: i64, radius: f64) -> !:
         try self.require_open()
-        if self.stroke != none:
-            error(invalid, "finish the stroke first")
+        try self.require_idle()
         let document = self.document else error(invalid, "draw the document once before filtering")
         let filters = self.filters else error(invalid, "draw the document once before filtering")
         let layer = document.find((u64)id) else error(invalid, "no such layer")
@@ -622,8 +622,7 @@ pub struct Canvas:
     ## offset. Not undoable: the history is dropped.
     pub mutating func resize_canvas(width: i64, height: i64, offset_x: i64, offset_y: i64) -> !:
         try self.require_open()
-        if self.stroke != none:
-            error(invalid, "finish the stroke first")
+        try self.require_idle()
         if width < 1 or height < 1 or width > 65536 or height > 65536:
             error(invalid, "canvas dimensions must be in 1..65536")
         let document = self.document else error(invalid, "draw the document once before resizing")
@@ -639,8 +638,7 @@ pub struct Canvas:
     ## Resample the whole image to a new size. Not undoable: the history is dropped.
     pub mutating func resize_image(width: i64, height: i64) -> !:
         try self.require_open()
-        if self.stroke != none:
-            error(invalid, "finish the stroke first")
+        try self.require_idle()
         if width < 1 or height < 1 or width > 65536 or height > 65536:
             error(invalid, "image dimensions must be in 1..65536")
         let document = self.document else error(invalid, "draw the document once before resizing")
@@ -659,8 +657,7 @@ pub struct Canvas:
     ## Move a layer's pixels (or its mask while editing it) by whole pixels. Undoable.
     pub mutating func move_layer(id: i64, dx: i64, dy: i64) -> !:
         try self.require_open()
-        if self.stroke != none:
-            error(invalid, "finish the stroke first")
+        try self.require_idle()
         if dx == 0 and dy == 0:
             return
         let document = self.document else error(invalid, "draw the document once before moving")
@@ -678,10 +675,7 @@ pub struct Canvas:
     ## Put back the pixels a layer had before its last stroke.
     pub mutating func undo() -> !:
         try self.require_open()
-        if self.stroke != none:
-            error(invalid, "finish the stroke first")
-        if self.preview != none:
-            error(invalid, "finish the preview first")
+        try self.require_idle()
         if self.history_count == 0:
             error(invalid, "nothing to undo")
         let document = self.document else trap("history without a document")
@@ -693,10 +687,7 @@ pub struct Canvas:
     ## Redo the last undone stroke.
     pub mutating func redo() -> !:
         try self.require_open()
-        if self.stroke != none:
-            error(invalid, "finish the stroke first")
-        if self.preview != none:
-            error(invalid, "finish the preview first")
+        try self.require_idle()
         if self.future_count == 0:
             error(invalid, "nothing to redo")
         let document = self.document else trap("history without a document")
