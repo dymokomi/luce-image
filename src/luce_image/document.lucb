@@ -133,6 +133,21 @@ pub struct Document:
         layer.pixels = holder
         layer.revision += 1
 
+    ## Replace a raster layer's pixels with `tiles` and hand back the pixels it
+    ## had, for history.
+    pub mutating func take_tiles(id: u64, tiles: Tiles) -> Tiles!:
+        var holder: Tiles*? = try box(tiles)
+        errdefer release_tiles(&holder)
+        let layer = self.find(id) else error(invalid, "no such layer")
+        let previous = layer.pixels else error(invalid, "a group has no pixels")
+        if tiles.width() != self.extent_x or tiles.height() != self.extent_y:
+            error(invalid, "tiles must match the document's size")
+        layer.pixels = holder
+        layer.revision += 1
+        let taken = *previous
+        free(previous) in memory.heap
+        return taken
+
     ## Set a layer's visibility and opacity.
     pub mutating func set_appearance(id: u64, visible: bool, opacity: f64) -> !:
         if not (opacity >= 0.0 and opacity <= 1.0):

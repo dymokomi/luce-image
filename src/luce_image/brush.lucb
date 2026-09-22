@@ -1,0 +1,266 @@
+## Painting: a stroke is a polyline in document pixels applied to one raster
+## layer as it is drawn. Each segment is rendered `over` into a coverage tile
+## for every tile it reaches, and the layer's tile is rebuilt from the tile it
+## had before the stroke plus that coverage. Tiles the stroke never reaches are
+## untouched; the ones it does are replaced, which the compositor's digest
+## notices. Ending a stroke drops the coverage; the tiles before it are the
+## caller's to keep for undo.
+import gpu
+import memory
+import math
+from luce_image.tiles import Tiles, tile_size
+from luce_image.document import Document, Layer
+from luce_image.shaders import segment_frag_words, segment_frag_msl, paint_frag_words, paint_frag_msl
+from luce_image.errors import invalid, limit
+
+## How a stroke paints.
+pub struct Brush:
+    ## Tip diameter in document pixels, 1..4096.
+    pub var diameter: f64 = 32.0
+    ## 0..1: the fraction of the radius at full coverage before the falloff.
+    pub var hardness: f64 = 0.75
+    ## 0..1: caps the stroke's coverage.
+    pub var opacity: f64 = 1.0
+    ## 0..1: how much each segment adds where it lands.
+    pub var flow: f64 = 1.0
+    ## Straight-alpha paint colour in linear light; alpha is ignored.
+    pub var color: gpu.Color = gpu.Color(0.0, 0.0, 0.0, 1.0)
+    ## Erase instead of paint.
+    pub var erase: bool
+
+    pub func check() -> !:
+        if not (self.diameter >= 1.0 and self.diameter <= 4096.0) or not (self.hardness >= 0.0 and self.hardness <= 1.0) or not (self.opacity >= 0.0 and self.opacity <= 1.0) or not (self.flow >= 0.0 and self.flow <= 1.0):
+            error(invalid, "brush diameter must be 1..4096 and hardness, opacity and flow 0..1")
+
+## The shader pipelines a device needs to paint, built on first use.
+pub struct Painter:
+    var owner: gpu.Device
+    var segment_shader: gpu.Shader
+    var paint_shader: gpu.Shader
+    var segment: gpu.Pipeline
+    var paint: gpu.Pipeline
+
+    pub static func create(device: gpu.Device) -> Painter!:
+        var segment_shader = try gpu.Shader.create(device, segment_frag_words, segment_frag_msl)
+        errdefer segment_shader.destroy()
+        var paint_shader = try gpu.Shader.create(device, paint_frag_words, paint_frag_msl)
+        errdefer paint_shader.destroy()
+        var segment = try gpu.Pipeline.create(device, segment_shader, gpu.Blend.over, gpu.Format.r8)
+        errdefer segment.destroy()
+        var paint = try gpu.Pipeline.create(device, paint_shader, gpu.Blend.replace, gpu.Format.rgba16_float)
+        errdefer paint.destroy()
+        return Painter(owner = device, segment_shader = segment_shader, paint_shader = paint_shader, segment = segment, paint = paint)
+
+    pub mutating func destroy():
+        self.paint.destroy()
+        self.segment.destroy()
+        self.paint_shader.destroy()
+        self.segment_shader.destroy()
+
+## One tile a stroke has reached and its coverage so far.
+struct Touched:
+    var column: u32
+    var row: u32
+    var coverage: gpu.Texture
+
+## A stroke in progress on one layer.
+pub struct Stroke:
+    var layer: u64
+    var brush: Brush
+    var last_x: f64
+    var last_y: f64
+    var touched: Touched[]
+    var count: usize
+    # The layer's tiles as they were when the stroke began: every rebuilt tile
+    # starts from here, and it is what undo wants.
+    var before: Tiles
+    var empty: gpu.Texture?
+    var active: bool
+
+    ## Begin at a point, painting the first dab there.
+    pub static func begin(painter: Painter*, document: Document*, layer: u64, brush: Brush, x: f64, y: f64) -> Stroke!:
+        try brush.check()
+        let target = document.find(layer) else error(invalid, "no such layer")
+        let tiles = target.tiles() else error(invalid, "a group cannot be painted")
+        if not math.is_finite(x) or not math.is_finite(y):
+            error(invalid, "stroke coordinates must be finite")
+        var stroke = Stroke(layer = layer, brush = brush, last_x = x, last_y = y, before = try tiles.clone(), empty = none, active = true)
+        errdefer stroke.destroy()
+        try stroke.segment(painter, document, x, y, x, y)
+        return stroke
+
+    ## Continue to a point, painting the segment from the last one.
+    pub mutating func extend(painter: Painter*, document: Document*, x: f64, y: f64) -> !:
+        if not self.active:
+            error(invalid, "the stroke has ended")
+        if not math.is_finite(x) or not math.is_finite(y):
+            error(invalid, "stroke coordinates must be finite")
+        try self.segment(painter, document, self.last_x, self.last_y, x, y)
+        self.last_x = x
+        self.last_y = y
+
+    ## The tiles touched so far, for callers that track damage.
+    pub func touched_count() -> usize:
+        return self.count
+
+    ## The layer's tiles from before the stroke, shared; clone to keep.
+    pub func original() -> const Tiles*:
+        return &self.before
+
+    ## End the stroke, keeping what it painted.
+    pub mutating func finish():
+        self.active = false
+        self.destroy()
+
+    mutating func segment(painter: Painter*, document: Document*, x0: f64, y0: f64, x1: f64, y1: f64) -> !:
+        let target = document.find(self.layer) else error(invalid, "the painted layer is gone")
+        let tiles = target.tiles() else error(invalid, "the painted layer has no pixels")
+        let reach = self.brush.diameter * 0.5 + 1.0
+        let left = math.max(0.0, math.floor((math.min(x0, x1) - reach) / (f64)tile_size))
+        let top = math.max(0.0, math.floor((math.min(y0, y1) - reach) / (f64)tile_size))
+        let right = math.min((f64)(tiles.columns() - 1), math.floor((math.max(x0, x1) + reach) / (f64)tile_size))
+        let bottom = math.min((f64)(tiles.rows() - 1), math.floor((math.max(y0, y1) + reach) / (f64)tile_size))
+        if right < left or bottom < top:
+            return
+        var row = (u32)top
+        while row <= (u32)bottom:
+            var column = (u32)left
+            while column <= (u32)right:
+                try self.touch(painter, tiles, column, row, x0, y0, x1, y1)
+                column += 1
+            row += 1
+        target.revision += 1
+
+    ## Add a segment's coverage to one tile and rebuild that tile. A texture
+    ## frame clears its target, so the coverage grows by ping-pong: the new
+    ## coverage is the old one drawn back plus the segment over it.
+    mutating func touch(painter: Painter*, tiles: Tiles*, column: u32, row: u32, x0: f64, y0: f64, x1: f64, y1: f64) -> !:
+        let index = try self.reach(painter, column, row)
+        let origin_x = (f64)(column * tile_size)
+        let origin_y = (f64)(row * tile_size)
+        var segment: f32[9] = [0.0, 0.0, (f32)(x0 - origin_x), (f32)(y0 - origin_y), (f32)(x1 - origin_x), (f32)(y1 - origin_y),
+                               (f32)(self.brush.diameter * 0.5), (f32)self.brush.hardness, (f32)self.brush.flow]
+        var grown = try gpu.Texture.create(painter.owner, tile_size, tile_size, gpu.Format.r8)
+        errdefer grown.destroy()
+        let frame = try grown.frame()
+        defer frame.release()
+        let target = try frame.value().target()
+        defer target.release()
+        let whole = gpu.Rect(width = (f64)tile_size, height = (f64)tile_size)
+        try gpu.draw_image(target.value(), self.touched[index].coverage, whole, none, 1.0, gpu.Filter.nearest)
+        try gpu.shade(target.value(), painter.segment, whole, u8[]((u8*)&segment[0], 36))
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        self.touched[index].coverage.destroy()
+        self.touched[index].coverage = grown
+        try self.rebuild(painter, tiles, index)
+
+    ## Rebuild the layer tile from the tile before the stroke and the coverage.
+    mutating func rebuild(painter: Painter*, tiles: Tiles*, index: usize) -> !:
+        let entry = self.touched[index]
+        var fresh = try tiles.blank()
+        errdefer fresh.destroy()
+        var params: f32[6] = [(f32)self.brush.color.red, (f32)self.brush.color.green, (f32)self.brush.color.blue, 1.0,
+                              (f32)self.brush.opacity, 1.0 if self.brush.erase else 0.0]
+        let frame = try fresh.frame()
+        defer frame.release()
+        let target = try frame.value().target()
+        defer target.release()
+        let original = self.before.texture(entry.column, entry.row) else try self.blank_tile(tiles)
+        try gpu.shade(target.value(), painter.paint, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 24), [original, entry.coverage], gpu.Filter.nearest)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        try tiles.set(entry.column, entry.row, fresh)
+
+    ## One transparent tile standing in for cells the layer had nothing at.
+    mutating func blank_tile(tiles: Tiles*) -> gpu.Texture!:
+        if let existing = self.empty:
+            return existing
+        let created = try tiles.blank()
+        self.empty = created
+        return created
+
+    ## The touched entry for a cell, created on first reach with a cleared coverage tile.
+    mutating func reach(painter: Painter*, column: u32, row: u32) -> usize!:
+        for index in 0..<self.count:
+            if self.touched[index].column == column and self.touched[index].row == row:
+                return index
+        if self.count == self.touched.length:
+            let capacity = 16 if self.touched.length == 0 else self.touched.length * 2
+            let grown = try alloc Touched[capacity] in memory.heap
+            if self.count > 0:
+                memory.copy(grown, self.touched, self.count)
+            if self.touched.length > 0:
+                free(self.touched) in memory.heap
+            self.touched = grown
+        var coverage = try gpu.Texture.create(painter.owner, tile_size, tile_size, gpu.Format.r8)
+        errdefer coverage.destroy()
+        let zeros = try alloc u8[(usize)tile_size * (usize)tile_size] in memory.heap
+        defer free(zeros) in memory.heap
+        for index in 0..<zeros.length:
+            zeros[index] = 0
+        try coverage.upload(zeros)
+        self.touched[self.count] = Touched(column = column, row = row, coverage = coverage)
+        self.count += 1
+        return self.count - 1
+
+    mutating func destroy():
+        for index in 0..<self.count:
+            self.touched[index].coverage.destroy()
+        if self.touched.length > 0:
+            free(self.touched) in memory.heap
+        var empty: Touched[]
+        self.touched = empty
+        self.count = 0
+        if let blank = self.empty:
+            var owned = blank
+            owned.destroy()
+            self.empty = none
+        self.before.destroy()
+
+## A stroke on the heap, for holders that keep a pointer.
+pub func begin_boxed(painter: Painter*, document: Document*, layer: u64, brush: Brush, x: f64, y: f64) -> Stroke*!:
+    var stroke = try Stroke.begin(painter, document, layer, brush, x, y)
+    errdefer stroke.destroy()
+    return try new Stroke(layer = stroke.layer, brush = stroke.brush, last_x = stroke.last_x, last_y = stroke.last_y, touched = stroke.touched,
+                          count = stroke.count, before = stroke.before, empty = stroke.empty, active = stroke.active) in memory.heap
+
+## End a boxed stroke and free the box.
+pub func finish_boxed(stroke: Stroke*):
+    stroke.finish()
+    free(stroke) in memory.heap
+
+test "a stroke paints and erases only the tiles it reaches":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var document = try Document.create(device, 600, 300)
+    defer document.destroy()
+    let layer = try document.add_layer("Paint")
+    var painter = try Painter.create(device)
+    defer painter.destroy()
+    var brush = Brush(diameter = 40.0, hardness = 0.5, color = gpu.Color(1.0, 0.0, 0.0, 1.0))
+    var stroke = try Stroke.begin(&painter, &document, layer, brush, 100.0, 150.0)
+    try stroke.extend(&painter, &document, 400.0, 150.0)
+    # Tiles (0,0) and (1,0) are reached; the row below and column 2 are not.
+    assert(stroke.touched_count() == 2)
+    stroke.finish()
+    let tiles = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
+    assert(tiles.texture(0, 0) != none and tiles.texture(1, 0) != none and tiles.texture(0, 1) == none and tiles.texture(2, 0) == none)
+    let count = (usize)600 * 300 * 4
+    let pixels = try alloc f32[count] in memory.heap
+    defer free(pixels) in memory.heap
+    try tiles.read(pixels)
+    let centre = (150 * 600 + 250) * 4
+    assert(pixels[centre] > 0.99 and pixels[centre + 1] < 0.01 and pixels[centre + 3] > 0.99)
+    # Just inside the hard core stays full; past the radius nothing.
+    assert(pixels[(159 * 600 + 250) * 4 + 3] > 0.99)
+    assert(pixels[(175 * 600 + 250) * 4 + 3] == 0.0)
+    assert(pixels[(150 * 600 + 500) * 4 + 3] == 0.0)
+    # Erasing half the opacity over the middle leaves half the alpha there.
+    brush.erase = true
+    brush.opacity = 0.5
+    var eraser = try Stroke.begin(&painter, &document, layer, brush, 250.0, 150.0)
+    eraser.finish()
+    try tiles.read(pixels)
+    assert(pixels[centre + 3] > 0.45 and pixels[centre + 3] < 0.55 and pixels[centre] > 0.99)
+    assert(pixels[(150 * 600 + 100) * 4 + 3] > 0.99)

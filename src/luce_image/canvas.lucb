@@ -13,6 +13,7 @@ from luce_image.image import Image, Pixel
 from luce_image.tiles import Tiles, tile_size, tile_columns
 from luce_image.document import Document, box_document, unbox_document
 from luce_image.composite import Composer, box_composer, unbox_composer
+from luce_image.brush import Brush, Painter, Stroke, begin_boxed, finish_boxed
 from luce_image.half import from_half
 from luce_image.errors import invalid, limit
 
@@ -33,6 +34,13 @@ pub struct Canvas:
     var device: gpu.Device?
     var document: Document*?
     var composer: Composer*?
+    var painter: Painter?
+    var brush: Brush
+    var stroke: Stroke*?
+    var history: Snapshot[]
+    var history_count: usize
+    var future: Snapshot[]
+    var future_count: usize
     var closed: bool
 
     ## An empty `width` by `height` document with no layers.
@@ -48,6 +56,14 @@ pub struct Canvas:
         self.device = none
         self.document = none
         self.composer = none
+        self.painter = none
+        self.brush = Brush()
+        self.stroke = none
+        var no_history: Snapshot[]
+        self.history = no_history
+        self.history_count = 0
+        self.future = no_history
+        self.future_count = 0
         self.closed = false
 
     ## A document the size of the picture at `path`, holding it as one layer.
@@ -164,6 +180,92 @@ pub struct Canvas:
     pub func layer_opacity(index: i64) -> f64!:
         return (try self.record(index)).opacity
 
+    # mark: Painting =========================================================================
+
+    ## Set the brush every following stroke paints with.
+    pub mutating func set_brush(diameter: f64, hardness: f64, opacity: f64, flow: f64, red: f64, green: f64, blue: f64, erase: bool) -> !:
+        let brush = Brush(diameter = diameter, hardness = hardness, opacity = opacity, flow = flow, color = gpu.Color(red, green, blue, 1.0), erase = erase)
+        try brush.check()
+        try gpu_check_color(brush.color)
+        self.brush = brush
+
+    ## Start painting on `layer` at a document point. The document must have
+    ## been drawn once, so its pixels are on a device. The layer's pixels before
+    ## the stroke go on the history.
+    pub mutating func begin_stroke(layer: i64, x: f64, y: f64) -> !:
+        try self.require_open()
+        if self.stroke != none:
+            error(invalid, "a stroke is already in progress")
+        let document = self.document else error(invalid, "draw the document once before painting")
+        var painter = self.painter else error(invalid, "draw the document once before painting")
+        let stroke = try begin_boxed(&painter, document, (u64)layer, self.brush, x, y)
+        errdefer finish_boxed(stroke)
+        try self.remember((u64)layer, try stroke.original().clone())
+        self.stroke = stroke
+
+    ## Continue the stroke to a document point.
+    pub mutating func extend_stroke(x: f64, y: f64) -> !:
+        try self.require_open()
+        let stroke = self.stroke else error(invalid, "no stroke is in progress")
+        let document = self.document else trap("stroke without a document")
+        var painter = self.painter else trap("stroke without a painter")
+        try stroke.extend(&painter, document, x, y)
+
+    ## End the stroke, keeping what it painted.
+    pub mutating func end_stroke() -> !:
+        try self.require_open()
+        let stroke = self.stroke else error(invalid, "no stroke is in progress")
+        self.stroke = none
+        finish_boxed(stroke)
+
+    pub func painting() -> bool:
+        return self.stroke != none
+
+    pub func can_undo() -> bool:
+        return self.history_count > 0
+
+    pub func can_redo() -> bool:
+        return self.future_count > 0
+
+    ## Put back the pixels a layer had before its last stroke.
+    pub mutating func undo() -> !:
+        try self.require_open()
+        if self.stroke != none:
+            error(invalid, "finish the stroke first")
+        if self.history_count == 0:
+            error(invalid, "nothing to undo")
+        let document = self.document else trap("history without a document")
+        let entry = self.history[self.history_count - 1]
+        self.history_count -= 1
+        let current = try document.take_tiles(entry.layer, entry.tiles)
+        try push(&self.future, &self.future_count, Snapshot(layer = entry.layer, tiles = current))
+
+    ## Redo the last undone stroke.
+    pub mutating func redo() -> !:
+        try self.require_open()
+        if self.stroke != none:
+            error(invalid, "finish the stroke first")
+        if self.future_count == 0:
+            error(invalid, "nothing to redo")
+        let document = self.document else trap("history without a document")
+        let entry = self.future[self.future_count - 1]
+        self.future_count -= 1
+        let current = try document.take_tiles(entry.layer, entry.tiles)
+        try push(&self.history, &self.history_count, Snapshot(layer = entry.layer, tiles = current))
+
+    ## Record a layer's pixels before a change, dropping the redo trail and the
+    ## oldest entries past the limit.
+    mutating func remember(layer: u64, tiles: Tiles) -> !:
+        var owned = tiles
+        errdefer owned.destroy()
+        clear_snapshots(&self.future, &self.future_count)
+        if self.history_count == 64:
+            self.history[0].tiles.destroy()
+            for index in 1..<self.history_count:
+                self.history[index - 1] = self.history[index]
+            self.history_count -= 1
+        try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = tiles))
+
     ## Write the flattened document to `path` as an 8-bit RGBA picture in the
     ## format its extension names. Needs the document drawn at least once.
     pub mutating func save(path: str) -> !:
@@ -243,7 +345,7 @@ pub struct Canvas:
             if failure.code == gpu.unavailable:
                 return
             error(failure.code, failure.message)
-        var binding = Binding(device = acquired, document = none, composer = none)
+        var binding = Binding(device = acquired, document = none, composer = none, painter = none)
         errdefer unwind(&binding)
         let device = binding.device else trap("bound")
         var document = try Document.create(device, self.extent_x, self.extent_y)
@@ -256,10 +358,12 @@ pub struct Canvas:
         var composer = try Composer.create(device)
         errdefer composer.destroy()
         binding.composer = try box_composer(composer)
+        binding.painter = try Painter.create(device)
         self.device = binding.device
+        self.painter = binding.painter
         self.document = binding.document
         self.composer = binding.composer
-        binding = Binding(device = none, document = none, composer = none)
+        binding = Binding(device = none, document = none, composer = none, painter = none)
         for index in 0..<self.count:
             if let picture = self.records[index].picture:
                 self.records[index].picture = none
@@ -286,10 +390,20 @@ pub struct Canvas:
         if self.closed:
             return
         self.closed = true
-        var binding = Binding(device = self.device, document = self.document, composer = self.composer)
+        if let stroke = self.stroke:
+            self.stroke = none
+            finish_boxed(stroke)
+        clear_snapshots(&self.history, &self.history_count)
+        clear_snapshots(&self.future, &self.future_count)
+        if self.history.length > 0:
+            free(self.history) in memory.heap
+        if self.future.length > 0:
+            free(self.future) in memory.heap
+        var binding = Binding(device = self.device, document = self.document, composer = self.composer, painter = self.painter)
         self.device = none
         self.document = none
         self.composer = none
+        self.painter = none
         unwind(&binding)
         for index in 0..<self.count:
             strings.release(self.records[index].name)
@@ -311,8 +425,38 @@ struct Binding:
     var device: gpu.Device?
     var document: Document*?
     var composer: Composer*?
+    var painter: Painter?
+
+## A layer's pixels at one moment, shared with whatever else holds them.
+struct Snapshot:
+    var layer: u64
+    var tiles: Tiles
+
+func push(list: Snapshot[]*, count: usize*, entry: Snapshot) -> !:
+    if *count == list.length:
+        let capacity = 16 if list.length == 0 else list.length * 2
+        let grown = try alloc Snapshot[capacity] in memory.heap
+        if *count > 0:
+            memory.copy(grown, *list, *count)
+        if list.length > 0:
+            free(*list) in memory.heap
+        *list = grown
+    (*list)[*count] = entry
+    *count += 1
+
+func clear_snapshots(list: Snapshot[]*, count: usize*):
+    for index in 0..<*count:
+        (*list)[index].tiles.destroy()
+    *count = 0
+
+func gpu_check_color(color: gpu.Color) -> !:
+    if not (color.red >= 0.0 and color.red <= 1.0 and color.green >= 0.0 and color.green <= 1.0 and color.blue >= 0.0 and color.blue <= 1.0):
+        error(invalid, "brush colour components must be in 0..1")
 
 func unwind(binding: Binding*):
+    if let painter = binding.painter:
+        var owned = painter
+        owned.destroy()
     if let composer = binding.composer:
         unbox_composer(composer)
     if let document = binding.document:
@@ -320,7 +464,7 @@ func unwind(binding: Binding*):
     if let device = binding.device:
         var owned = device
         owned.destroy()
-    *binding = Binding(device = none, document = none, composer = none)
+    *binding = Binding(device = none, document = none, composer = none, painter = none)
 
 func min(a: u32, b: u32) -> u32:
     return a if a < b else b
@@ -379,3 +523,54 @@ test "canvas builds cold, binds on draw, composes layers, saves and reopens":
     defer check.release()
     let sample = try check.value().getpixel(20, 15)
     assert(sample.r == 255.0 and sample.g == 0.0 and sample.a == 255.0)
+
+test "canvas strokes paint the selected layer and undo restores it":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var rejected = false
+    canvas.begin_stroke(layer, 10.0, 10.0) catch failure:
+        assert(failure.code == invalid)
+        rejected = true
+    assert(rejected)
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    let frame = try target.frame()
+    defer frame.release()
+    let root = try frame.value().target()
+    defer root.release()
+    try canvas.draw(root, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
+    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, false)
+    try canvas.begin_stroke(layer, 8.0, 32.0)
+    assert(canvas.painting())
+    try canvas.extend_stroke(56.0, 32.0)
+    try canvas.end_stroke()
+    assert(canvas.can_undo() and not canvas.can_redo())
+    let second = try target.frame()
+    defer second.release()
+    let again = try second.value().target()
+    defer again.release()
+    try canvas.draw(again, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
+    discard(try second.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    var pixel: u8[4]
+    try target.read(pixel, gpu.Region(32, 32, 1, 1))
+    assert(pixel[1] == 255 and pixel[0] == 0)
+    try target.read(pixel, gpu.Region(32, 5, 1, 1))
+    assert(pixel[1] == 0)
+    try canvas.undo()
+    assert(not canvas.can_undo() and canvas.can_redo())
+    let third = try target.frame()
+    defer third.release()
+    let once_more = try third.value().target()
+    defer once_more.release()
+    try canvas.draw(once_more, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
+    discard(try third.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    try target.read(pixel, gpu.Region(32, 32, 1, 1))
+    assert(pixel[1] == 0)
+    try canvas.redo()
+    assert(canvas.can_undo() and not canvas.can_redo())
