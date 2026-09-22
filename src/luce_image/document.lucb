@@ -48,6 +48,21 @@ pub struct Layer:
     pub func layers() -> Layer*[]:
         return self.children[..<self.child_count]
 
+    ## Replace the pixels outright (geometry changes), destroying the old ones.
+    pub mutating func replace_tiles(tiles: Tiles) -> !:
+        let holder = try box(tiles)
+        if let previous = self.pixels:
+            unbox(previous)
+        self.pixels = holder
+        self.revision += 1
+
+    pub mutating func replace_mask(tiles: Tiles) -> !:
+        let holder = try box(tiles)
+        if let previous = self.mask:
+            unbox(previous)
+        self.mask = holder
+        self.revision += 1
+
 func layer_destroy(layer: Layer*):
     for child in layer.children[..<layer.child_count]:
         layer_destroy(child)
@@ -236,6 +251,13 @@ pub struct Document:
         let taken = *previous
         free(previous) in memory.heap
         return taken
+
+    ## Adopt new extents after every layer has been rebuilt for them.
+    pub mutating func set_extent(width: u32, height: u32):
+        self.extent_x = width
+        self.extent_y = height
+        self.selection = Selection()
+        self.revision += 1
 
     ## Select a rectangle, clamped to the document; an empty one deselects.
     pub mutating func select(x: i64, y: i64, width: i64, height: i64):

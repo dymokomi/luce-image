@@ -17,6 +17,7 @@ from luce_image.brush import Brush, Painter, Stroke, begin_boxed, finish_boxed, 
 from luce_image.adjust import Adjuster, adjustment_count
 from luce_image.filter import Filters
 from luce_image.transform import translate
+from luce_image.geometry import resize_canvas, resize_image
 from luce_image.half import from_half
 from luce_image.errors import invalid, limit
 
@@ -450,6 +451,43 @@ pub struct Canvas:
         let tiles = layer.tiles() else error(invalid, "a group cannot be filtered")
         try self.remember((u64)id, try tiles.clone())
         try filters.gaussian_blur(document, (u64)id, radius)
+
+    ## Change the canvas size, keeping the pixels with their top-left at the
+    ## offset. Not undoable: the history is dropped.
+    pub mutating func resize_canvas(width: i64, height: i64, offset_x: i64, offset_y: i64) -> !:
+        try self.require_open()
+        if self.stroke != none:
+            error(invalid, "finish the stroke first")
+        if width < 1 or height < 1 or width > 65536 or height > 65536:
+            error(invalid, "canvas dimensions must be in 1..65536")
+        let document = self.document else error(invalid, "draw the document once before resizing")
+        try resize_canvas(document, (u32)width, (u32)height, offset_x, offset_y)
+        self.adopt_extent((u32)width, (u32)height)
+
+    ## Crop the canvas to the selection.
+    pub mutating func crop() -> !:
+        if not self.has_selection():
+            error(invalid, "nothing is selected")
+        try self.resize_canvas(self.sel_width, self.sel_height, -self.sel_x, -self.sel_y)
+
+    ## Resample the whole image to a new size. Not undoable: the history is dropped.
+    pub mutating func resize_image(width: i64, height: i64) -> !:
+        try self.require_open()
+        if self.stroke != none:
+            error(invalid, "finish the stroke first")
+        if width < 1 or height < 1 or width > 65536 or height > 65536:
+            error(invalid, "image dimensions must be in 1..65536")
+        let document = self.document else error(invalid, "draw the document once before resizing")
+        try resize_image(document, (u32)width, (u32)height)
+        self.adopt_extent((u32)width, (u32)height)
+
+    mutating func adopt_extent(width: u32, height: u32):
+        self.extent_x = width
+        self.extent_y = height
+        self.sel_width = 0
+        self.sel_height = 0
+        clear_snapshots(&self.history, &self.history_count)
+        clear_snapshots(&self.future, &self.future_count)
 
     ## Move a layer's pixels (or its mask while editing it) by whole pixels. Undoable.
     pub mutating func move_layer(id: i64, dx: i64, dy: i64) -> !:
@@ -945,3 +983,8 @@ test "canvas strokes paint the selected layer and undo restores it":
     try canvas.reorder_layer(twin, 1)
     try canvas.merge_down(twin)
     assert(canvas.layer_count() == 1 and (try canvas.layer_id(0)) == layer and not canvas.can_undo())
+    try canvas.select(8, 8, 16, 16)
+    try canvas.crop()
+    assert(canvas.width() == 16 and canvas.height() == 16 and not canvas.has_selection())
+    try canvas.resize_image(32, 8)
+    assert(canvas.width() == 32 and canvas.height() == 8)
