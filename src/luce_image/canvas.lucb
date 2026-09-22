@@ -3,7 +3,7 @@
 ## drawing at any zoom and offset onto a render target. GPU storage is bound to
 ## the device of the first target it is drawn on; until then layers and their
 ## pictures wait on the CPU, so a document can be built before it is shown.
-import c
+import c as c_api
 import files
 import gpu
 import interop
@@ -1367,7 +1367,7 @@ func open_psd(path: str) -> interop.Reference[Canvas]!:
     with memory.heap:
         name = try strings.copy(path)
     defer strings.release(name)
-    let data = try files.read((c.str)name)
+    let data = try files.read((c_api.str)name)
     defer free(data) in memory.heap
     var parsed = try psd.parse(data)
     defer parsed.close()
