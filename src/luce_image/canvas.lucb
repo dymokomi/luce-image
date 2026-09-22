@@ -203,8 +203,9 @@ pub struct Canvas:
         if rectangle.width <= 0.0 or rectangle.height <= 0.0:
             return
         try self.bind(checked)
-        let document = self.document else trap("bound without a document")
-        let composer = self.composer else trap("bound without a composer")
+        # A standalone frame has no device; it records nothing.
+        let document = self.document else return
+        let composer = self.composer else return
         let clipped = try checked.clipped(rectangle)
         defer clipped.release()
         let area = clipped.value()
@@ -238,7 +239,11 @@ pub struct Canvas:
     mutating func bind(target: const gpu.RenderTarget*) -> !:
         if self.document != none:
             return
-        var binding = Binding(device = try gpu.device_of(target), document = none, composer = none)
+        let acquired = gpu.device_of(target) catch failure:
+            if failure.code == gpu.unavailable:
+                return
+            error(failure.code, failure.message)
+        var binding = Binding(device = acquired, document = none, composer = none)
         errdefer unwind(&binding)
         let device = binding.device else trap("bound")
         var document = try Document.create(device, self.extent_x, self.extent_y)
