@@ -1,0 +1,105 @@
+## Text set into a layer's pixels: the platform's monospace face rasterised
+## by `std.fonts` and drawn, in a colour, over the tiles it touches. Like
+## Photoshop's rasterised type, the result is pixels; the caller keeps the
+## tiles from before for undo.
+import gpu
+import fonts
+import math
+from luce_image.tiles import Tiles, tile_size
+from luce_image.document import Document
+from luce_image.errors import invalid
+
+## The face for `size` pixels: sizes past the face's 64-point limit come from
+## rasterising a smaller face at a scale; the scale to use is returned too.
+func face_for(size: f64) -> (fonts.Face, f64)!:
+    if not math.is_finite(size) or size < 8.0 or size > 256.0:
+        error(invalid, "text sizes are 8..256 pixels")
+    let points = math.min(size, 64.0)
+    let face = try fonts.Face(points)
+    return (face, size / points)
+
+## The width in pixels `text` takes at `size`.
+pub func measure_text(text: str, size: f64) -> f64!:
+    let (face, scale) = try face_for(size)
+    var owned = face
+    defer owned.close()
+    return (try face.measure(text)) * scale
+
+## The line height in pixels of text at `size`.
+pub func text_height(size: f64) -> f64!:
+    let (face, scale) = try face_for(size)
+    var owned = face
+    defer owned.close()
+    return (face.ascent + face.descent) * scale
+
+## Draw `text` with its top-left at (`x`, `y`) on `layer`, `size` pixels tall, in `color`.
+pub func draw_text(document: Document*, layer: u64, x: f64, y: f64, text: str, size: f64, color: gpu.Color) -> !:
+    if text.length == 0:
+        error(invalid, "nothing to set")
+    if not math.is_finite(x) or not math.is_finite(y):
+        error(invalid, "the text position must be finite")
+    let target = document.find(layer) else error(invalid, "no such layer")
+    let tiles = target.tiles() else error(invalid, "a group cannot take text")
+    let (face, scale) = try face_for(size)
+    var owned = face
+    defer owned.close()
+    var bitmap = try face.rasterize(text, scale)
+    defer bitmap.close()
+    # The bitmap's pixels are document pixels; the padding shifts its origin back.
+    let left = x - bitmap.padding
+    let top = y - bitmap.padding
+    let right = left + (f64)bitmap.width
+    let bottom = top + (f64)bitmap.height
+    for row in 0..<tiles.rows():
+        for column in 0..<tiles.columns():
+            let tile_left = (f64)(column * tile_size)
+            let tile_top = (f64)(row * tile_size)
+            if right <= tile_left or bottom <= tile_top or left >= tile_left + (f64)tile_size or top >= tile_top + (f64)tile_size:
+                continue
+            var fresh = try tiles.blank()
+            errdefer fresh.destroy()
+            let frame = try fresh.frame()
+            defer frame.release()
+            let area = try frame.value().target()
+            defer area.release()
+            if let existing = tiles.texture(column, row):
+                let region = tiles.region(column, row)
+                try gpu.draw_image(area.value(), existing, gpu.Rect(0.0, 0.0, (f64)region.width, (f64)region.height), region, 1.0, gpu.Filter.nearest)
+            try area.value().mask(bitmap.pixels, bitmap.width, bitmap.height, gpu.Rect(left - tile_left, top - tile_top, (f64)bitmap.width, (f64)bitmap.height), color)
+            discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+            try tiles.set(column, row, fresh)
+    target.revision += 1
+
+test "text lands on the layer in its colour and measures":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var document = try Document.create(device, 300, 100)
+    defer document.destroy()
+    let layer = try document.add_layer("Type")
+    var tiles = try Tiles.create(device, 300, 100)
+    try document.set_tiles(layer, tiles)
+    let width = measure_text("Hello", 48.0) catch failure:
+        assert(failure.code == fonts.failed)
+        return
+    assert(width > 60.0 and (try text_height(48.0)) > 30.0)
+    try draw_text(&document, layer, 20.0, 20.0, "Hello", 48.0, gpu.Color(1.0, 0.0, 0.0, 1.0))
+    let current = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
+    let count = (usize)300 * 100 * 4
+    var pixels: f32[300 * 100 * 4]
+    try current.read(pixels)
+    # Some pixel inside the first glyph's box is red; the far right stays empty.
+    var found = false
+    for y in 20..<(usize)70:
+        for x in 20..<(usize)60:
+            let index = (y * 300 + x) * 4
+            if pixels[index + 3] > 0.5 and pixels[index] > 0.9 and pixels[index + 1] < 0.1:
+                found = true
+    assert(found)
+    assert(pixels[(50 * 300 + 290) * 4 + 3] == 0.0)
+    var rejected = false
+    draw_text(&document, layer, 0.0, 0.0, "", 48.0, gpu.Color(1.0, 1.0, 1.0, 1.0)) catch failure:
+        assert(failure.code == invalid)
+        rejected = true
+    assert(rejected)
