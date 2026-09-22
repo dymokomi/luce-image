@@ -17,7 +17,7 @@ from luce_image.image import Image, Pixel
 from luce_image.tiles import Tiles, tile_size, tile_columns
 from luce_image.document import Style, Document, box_document, unbox_document, blend_mode_count
 from luce_image.composite import Composer, box_composer, unbox_composer
-from luce_image.brush import Brush, Painter, Stroke, begin_boxed, finish_boxed, fill_selection
+from luce_image.brush import Brush, Painter, Stroke, begin_boxed, finish_boxed, fill_selection, fill_gradient
 from luce_image.adjust import Adjuster, adjustment_count, curves
 from luce_image.curves import Curves, lut_size
 from luce_image.filter import Filters
@@ -778,6 +778,24 @@ pub struct Canvas:
         let document = self.document else trap("preview without a document")
         let transformer = self.transformer else trap("preview without a transformer")
         try transformer.apply(document, layer, scale_x, scale_y, angle * math.pi / 180.0, dx, dy)
+
+    ## Lay a linear gradient over layer `id` from one colour at (`x0`, `y0`) to
+    ## another at (`x1`, `y1`), straight alpha in linear light, inside the
+    ## selection. Undoable.
+    pub mutating func fill_gradient(id: i64, x0: f64, y0: f64, x1: f64, y1: f64, r0: f64, g0: f64, b0: f64, a0: f64, r1: f64, g1: f64, b1: f64, a1: f64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        let document = self.document else error(invalid, "draw the document once before filling")
+        var painter = self.painter else error(invalid, "draw the document once before filling")
+        let from_color = gpu.Color(r0, g0, b0, a0)
+        let to_color = gpu.Color(r1, g1, b1, a1)
+        try gpu_check_color(from_color)
+        try gpu_check_color(to_color)
+        if a0 < 0.0 or a0 > 1.0 or a1 < 0.0 or a1 > 1.0:
+            error(invalid, "gradient alphas must be in 0..1")
+        var before = try fill_gradient(&painter, document, (u64)id, x0, y0, x1, y1, from_color, to_color)
+        errdefer before.destroy()
+        try self.remember((u64)id, before)
 
     ## The eyedropper: read the flattened document's colour at a pixel into
     ## `picked_red` and friends (linear light, straight alpha).
@@ -1748,6 +1766,12 @@ test "previews show edits on the original pixels and end kept or dropped":
     try canvas.end_preview(true)
     assert(canvas.can_undo())
     assert((try shown_centre(&canvas, &target, pixels)) == inverted)
+    try canvas.undo()
+    assert((try shown_centre(&canvas, &target, pixels)) == base)
+    # A white-to-transparent gradient across the canvas: the left edge lights, the right stays.
+    try canvas.fill_gradient(layer, 0.0, 0.0, 32.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0)
+    discard(try shown_centre(&canvas, &target, pixels))
+    assert(pixels[(0 * 32 + 0) * 4] > 200 and pixels[(0 * 32 + 31) * 4] < 40)
     try canvas.undo()
     assert((try shown_centre(&canvas, &target, pixels)) == base)
     # The eyedropper reads the dot's grey back, and nothing at a bare corner.
