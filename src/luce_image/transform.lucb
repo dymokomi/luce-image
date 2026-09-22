@@ -1,0 +1,93 @@
+## Destructive geometry: a layer's pixels moved by a whole number of pixels.
+## Each output tile is drawn from the up to four input tiles it overlaps;
+## pixels pushed off the document are lost, as in Photoshop.
+import gpu
+import interop
+import math
+import memory
+from luce_image.tiles import Tiles, tile_size
+from luce_image.document import Document
+from luce_image.errors import invalid
+
+## Move `layer`'s pixels (or its mask) by (`dx`, `dy`); returns the tiles from before.
+pub func translate(document: Document*, layer: u64, dx: i64, dy: i64, on_mask: bool = false) -> Tiles!:
+    let target = document.find(layer) else error(invalid, "no such layer")
+    let tiles = (target.mask_tiles() else error(invalid, "the layer has no mask")) if on_mask else (target.tiles() else error(invalid, "a group cannot be moved"))
+    if dx < -65536 or dx > 65536 or dy < -65536 or dy > 65536:
+        error(invalid, "moves are limited to 65536 pixels")
+    var before = try tiles.clone()
+    errdefer before.destroy()
+    for row in 0..<tiles.rows():
+        for column in 0..<tiles.columns():
+            let left = (i64)(column * tile_size) - dx
+            let top = (i64)(row * tile_size) - dy
+            # Source cells overlapping this cell's origin window.
+            var any = false
+            var fresh = gpu.Texture()
+            var opened = false
+            var frame_holder: interop.Reference[gpu.Frame]? = none
+            for sy in 0..<(i64)2:
+                for sx in 0..<(i64)2:
+                    let cell_x = floor_div(left, (i64)tile_size) + sx
+                    let cell_y = floor_div(top, (i64)tile_size) + sy
+                    if cell_x < 0 or cell_y < 0 or cell_x >= (i64)before.columns() or cell_y >= (i64)before.rows():
+                        continue
+                    let texture = before.texture((u32)cell_x, (u32)cell_y) else continue
+                    let area = before.region((u32)cell_x, (u32)cell_y)
+                    # Where this source tile lands within the output tile.
+                    let offset_x = (f64)(cell_x * (i64)tile_size - left)
+                    let offset_y = (f64)(cell_y * (i64)tile_size - top)
+                    if offset_x >= (f64)tile_size or offset_y >= (f64)tile_size or offset_x + (f64)area.width <= 0.0 or offset_y + (f64)area.height <= 0.0:
+                        continue
+                    if not opened:
+                        fresh = try tiles.blank()
+                        opened = true
+                    any = true
+                    let frame = frame_holder else try fresh.frame()
+                    frame_holder = frame
+                    let whole = try frame.value().target()
+                    defer whole.release()
+                    try gpu.draw_image(whole.value(), texture, gpu.Rect(offset_x, offset_y, (f64)area.width, (f64)area.height), area, 1.0, gpu.Filter.nearest)
+            if let frame = frame_holder:
+                discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+                frame.release()
+            if any:
+                try tiles.set(column, row, fresh)
+            else:
+                if opened:
+                    fresh.destroy()
+                try tiles.clear(column, row)
+    target.revision += 1
+    return before
+
+func floor_div(a: i64, b: i64) -> i64:
+    return (a - math.mod_floor(a, b)) // b
+
+test "translating a layer moves its pixels across tiles and drops what leaves":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var document = try Document.create(device, 300, 40)
+    defer document.destroy()
+    let layer = try document.add_layer("Dot")
+    let count = (usize)300 * 40 * 4
+    let pixels = try alloc f32[count] in memory.heap
+    defer free(pixels) in memory.heap
+    for index in 0..<count:
+        pixels[index] = 0.0
+    pixels[(10 * 300 + 250) * 4 + 1] = 1.0
+    pixels[(10 * 300 + 250) * 4 + 3] = 1.0
+    var tiles = try Tiles.create(device, 300, 40)
+    try tiles.write(pixels)
+    try document.set_tiles(layer, tiles)
+    var before = try translate(&document, layer, 20, 5)
+    before.destroy()
+    let current = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
+    try current.read(pixels)
+    assert(pixels[(15 * 300 + 270) * 4 + 1] > 0.99 and pixels[(10 * 300 + 250) * 4 + 3] == 0.0)
+    assert(current.texture(1, 0) != none)
+    var again = try translate(&document, layer, 100, 0)
+    again.destroy()
+    try current.read(pixels)
+    assert(pixels[(15 * 300 + 270) * 4 + 3] == 0.0)

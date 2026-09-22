@@ -15,6 +15,8 @@ from luce_image.document import Document, box_document, unbox_document, blend_mo
 from luce_image.composite import Composer, box_composer, unbox_composer
 from luce_image.brush import Brush, Painter, Stroke, begin_boxed, finish_boxed, fill_selection
 from luce_image.adjust import Adjuster, adjustment_count
+from luce_image.filter import Filters
+from luce_image.transform import translate
 from luce_image.half import from_half
 from luce_image.errors import invalid, limit
 
@@ -40,6 +42,7 @@ pub struct Canvas:
     var composer: Composer*?
     var painter: Painter?
     var adjuster: Adjuster?
+    var filters: Filters?
     var brush: Brush
     var stroke: Stroke*?
     var mask_editing: bool
@@ -68,6 +71,7 @@ pub struct Canvas:
         self.composer = none
         self.painter = none
         self.adjuster = none
+        self.filters = none
         self.brush = Brush()
         self.stroke = none
         self.mask_editing = false
@@ -371,6 +375,31 @@ pub struct Canvas:
     pub static func adjustment_count() -> i64:
         return (i64)adjustment_count
 
+    ## Blur a layer's pixels with a Gaussian of `radius` pixels (0.5..250). Undoable.
+    pub mutating func blur_layer(id: i64, radius: f64) -> !:
+        try self.require_open()
+        if self.stroke != none:
+            error(invalid, "finish the stroke first")
+        let document = self.document else error(invalid, "draw the document once before filtering")
+        let filters = self.filters else error(invalid, "draw the document once before filtering")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = layer.tiles() else error(invalid, "a group cannot be filtered")
+        try self.remember((u64)id, try tiles.clone())
+        try filters.gaussian_blur(document, (u64)id, radius)
+
+    ## Move a layer's pixels (or its mask while editing it) by whole pixels. Undoable.
+    pub mutating func move_layer(id: i64, dx: i64, dy: i64) -> !:
+        try self.require_open()
+        if self.stroke != none:
+            error(invalid, "finish the stroke first")
+        if dx == 0 and dy == 0:
+            return
+        let document = self.document else error(invalid, "draw the document once before moving")
+        let index = try self.index((u64)id)
+        let on_mask = self.mask_editing and self.records[index].masked
+        let before = try translate(document, (u64)id, dx, dy, on_mask)
+        try self.remember((u64)id, before, on_mask)
+
     pub func can_undo() -> bool:
         return self.history_count > 0
 
@@ -516,7 +545,7 @@ pub struct Canvas:
             if failure.code == gpu.unavailable:
                 return
             error(failure.code, failure.message)
-        var binding = Binding(device = acquired, document = none, composer = none, painter = none, adjuster = none)
+        var binding = Binding(device = acquired, document = none, composer = none, painter = none, adjuster = none, filters = none)
         errdefer unwind(&binding)
         let device = binding.device else trap("bound")
         var document = try Document.create(device, self.extent_x, self.extent_y)
@@ -535,13 +564,15 @@ pub struct Canvas:
         binding.composer = try box_composer(composer)
         binding.painter = try Painter.create(device)
         binding.adjuster = try Adjuster.create(device)
+        binding.filters = try Filters.create(device)
         self.device = binding.device
         self.painter = binding.painter
         self.adjuster = binding.adjuster
+        self.filters = binding.filters
         document.select(self.sel_x, self.sel_y, self.sel_width, self.sel_height)
         self.document = binding.document
         self.composer = binding.composer
-        binding = Binding(device = none, document = none, composer = none, painter = none, adjuster = none)
+        binding = Binding(device = none, document = none, composer = none, painter = none, adjuster = none, filters = none)
         for index in 0..<self.count:
             if let picture = self.records[index].picture:
                 self.records[index].picture = none
@@ -577,12 +608,13 @@ pub struct Canvas:
             free(self.history) in memory.heap
         if self.future.length > 0:
             free(self.future) in memory.heap
-        var binding = Binding(device = self.device, document = self.document, composer = self.composer, painter = self.painter, adjuster = self.adjuster)
+        var binding = Binding(device = self.device, document = self.document, composer = self.composer, painter = self.painter, adjuster = self.adjuster, filters = self.filters)
         self.device = none
         self.document = none
         self.composer = none
         self.painter = none
         self.adjuster = none
+        self.filters = none
         unwind(&binding)
         for index in 0..<self.count:
             strings.release(self.records[index].name)
@@ -610,6 +642,7 @@ struct Binding:
     var composer: Composer*?
     var painter: Painter?
     var adjuster: Adjuster?
+    var filters: Filters?
 
 ## A layer's pixels at one moment, shared with whatever else holds them.
 struct Snapshot:
@@ -639,6 +672,9 @@ func gpu_check_color(color: gpu.Color) -> !:
         error(invalid, "brush colour components must be in 0..1")
 
 func unwind(binding: Binding*):
+    if let filters = binding.filters:
+        var owned = filters
+        owned.destroy()
     if let adjuster = binding.adjuster:
         var owned = adjuster
         owned.destroy()
@@ -652,7 +688,7 @@ func unwind(binding: Binding*):
     if let device = binding.device:
         var owned = device
         owned.destroy()
-    *binding = Binding(device = none, document = none, composer = none, painter = none, adjuster = none)
+    *binding = Binding(device = none, document = none, composer = none, painter = none, adjuster = none, filters = none)
 
 func min(a: u32, b: u32) -> u32:
     return a if a < b else b
@@ -822,3 +858,18 @@ test "canvas strokes paint the selected layer and undo restores it":
     assert(pixel[0] == 0)
     try canvas.deselect()
     assert(not canvas.has_selection())
+    # Moving the layer right by 40 pushes the red fill out of the first column.
+    try canvas.move_layer(layer, 40, 0)
+    let eighth = try target.frame()
+    defer eighth.release()
+    let moved = try eighth.value().target()
+    defer moved.release()
+    try canvas.draw(moved, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
+    discard(try eighth.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    try target.read(pixel, gpu.Region(5, 5, 1, 1))
+    assert(pixel[0] == 0)
+    try target.read(pixel, gpu.Region(45, 5, 1, 1))
+    assert(pixel[0] == 255)
+    try canvas.undo()
+    try canvas.blur_layer(layer, 2.0)
+    assert(canvas.can_undo())

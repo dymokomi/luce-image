@@ -1,0 +1,120 @@
+## Destructive filters over a layer's tiles. A Gaussian blur is two separable
+## passes; each output tile samples its own input tile and the two neighbours
+## along the pass, so the radius is limited to one tile (256 pixels).
+import gpu
+import memory
+import math
+from luce_image.tiles import Tiles, tile_size, box, unbox
+from luce_image.document import Document
+from luce_image.shaders import blur_frag_words, blur_frag_msl
+from luce_image.errors import invalid
+
+pub struct Filters:
+    var owner: gpu.Device
+    var blur_shader: gpu.Shader
+    var blur: gpu.Pipeline
+    var blank: gpu.Texture
+
+    pub static func create(device: gpu.Device) -> Filters!:
+        var blur_shader = try gpu.Shader.create(device, blur_frag_words, blur_frag_msl)
+        errdefer blur_shader.destroy()
+        var blur = try gpu.Pipeline.create(device, blur_shader, gpu.Blend.replace, gpu.Format.rgba16_float)
+        errdefer blur.destroy()
+        var blank = try gpu.Texture.create(device, tile_size, tile_size, gpu.Format.rgba16_float)
+        errdefer blank.destroy()
+        let zeros = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+        defer free(zeros) in memory.heap
+        for index in 0..<zeros.length:
+            zeros[index] = 0
+        try blank.upload(zeros)
+        return Filters(owner = device, blur_shader = blur_shader, blur = blur, blank = blank)
+
+    ## Blur `layer` with a Gaussian of `radius` pixels (0.5..250; taps reach
+    ## three sigma, at most one tile).
+    pub func gaussian_blur(document: Document*, layer: u64, radius: f64) -> !:
+        if not math.is_finite(radius) or radius < 0.5 or radius > 250.0:
+            error(invalid, "blur radius must be 0.5..250 pixels")
+        let target = document.find(layer) else error(invalid, "no such layer")
+        let tiles = target.tiles() else error(invalid, "a group cannot be blurred")
+        let sigma = radius
+        let taps = math.min(255.0, math.ceil(sigma * 3.0))
+        try self.pass(tiles, taps, sigma, true)
+        try self.pass(tiles, taps, sigma, false)
+        target.revision += 1
+
+    ## One direction over every tile that has pixels or a neighbour with pixels
+    ## within reach; tiles that stay empty stay `none`.
+    func pass(tiles: Tiles*, taps: f64, sigma: f64, horizontal: bool) -> !:
+        var source = try tiles.clone()
+        defer source.destroy()
+        for row in 0..<tiles.rows():
+            for column in 0..<tiles.columns():
+                let middle = source.texture(column, row)
+                var before: gpu.Texture? = none
+                var after: gpu.Texture? = none
+                if horizontal:
+                    if column > 0:
+                        before = source.texture(column - 1, row)
+                    if column + 1 < tiles.columns():
+                        after = source.texture(column + 1, row)
+                else:
+                    if row > 0:
+                        before = source.texture(column, row - 1)
+                    if row + 1 < tiles.rows():
+                        after = source.texture(column, row + 1)
+                if middle == none and before == none and after == none:
+                    continue
+                let area = tiles.region(column, row)
+                var params: f32[4] = [(f32)taps, (f32)sigma, 1.0 if horizontal else 0.0, (f32)(area.width if horizontal else area.height)]
+                var fresh = try tiles.blank()
+                errdefer fresh.destroy()
+                let frame = try fresh.frame()
+                defer frame.release()
+                let whole = try frame.value().target()
+                defer whole.release()
+                try gpu.shade(whole.value(), self.blur, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 16),
+                              [before else self.blank, middle else self.blank, after else self.blank], gpu.Filter.nearest)
+                discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+                try tiles.set(column, row, fresh)
+
+    pub mutating func destroy():
+        self.blank.destroy()
+        self.blur.destroy()
+        self.blur_shader.destroy()
+
+test "a gaussian blur spreads across tile edges and keeps alpha weight":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var document = try Document.create(device, 512, 64)
+    defer document.destroy()
+    let layer = try document.add_layer("Dot")
+    let count = (usize)512 * 64 * 4
+    let pixels = try alloc f32[count] in memory.heap
+    defer free(pixels) in memory.heap
+    for index in 0..<count:
+        pixels[index] = 0.0
+    # An opaque red bar on the left tile, ending exactly at the tile edge.
+    for y in 0..<(usize)64:
+        for x in 200..<(usize)256:
+            pixels[(y * 512 + x) * 4] = 1.0
+            pixels[(y * 512 + x) * 4 + 3] = 1.0
+    var tiles = try Tiles.create(device, 512, 64)
+    try tiles.write(pixels)
+    try document.set_tiles(layer, tiles)
+    var filters = try Filters.create(device)
+    defer filters.destroy()
+    try filters.gaussian_blur(&document, layer, 4.0)
+    let current = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
+    try current.read(pixels)
+    # The bar bleeds into the right tile; colour stays pure red where it bleeds.
+    let past = (32 * 512 + 258) * 4
+    assert(pixels[past + 3] > 0.05 and pixels[past + 3] < 0.6 and pixels[past] > 0.99)
+    assert(pixels[(32 * 512 + 228) * 4 + 3] > 0.99)
+    assert(pixels[(32 * 512 + 300) * 4 + 3] == 0.0)
+    var rejected = false
+    filters.gaussian_blur(&document, layer, 0.0) catch failure:
+        assert(failure.code == invalid)
+        rejected = true
+    assert(rejected)
