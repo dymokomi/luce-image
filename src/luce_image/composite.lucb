@@ -10,6 +10,7 @@ import gpu
 import memory
 from luce_image.tiles import Tiles, Tile, tile_size
 from luce_image.document import Document, Layer
+from luce_image.style import Styler
 from luce_image.errors import invalid, limit
 from luce_image.half import from_half
 from luce_image.shaders import composite_frag_words, composite_frag_msl
@@ -19,6 +20,16 @@ struct Entry:
     var texture: gpu.Texture
     var used: u64
     var live: bool
+
+## A styled layer's rendered effects, kept while its pixels and style stand.
+struct Effects:
+    var key: u64
+    var tiles: Tiles
+    var used: u64
+    var live: bool
+
+## How many styled layers keep their effects rendered at once.
+let effects_budget: usize = 8
 
 pub struct Composer:
     var owner: gpu.Device
@@ -30,6 +41,8 @@ pub struct Composer:
     var pipeline: gpu.Pipeline
     var blank: gpu.Texture
     var white: gpu.Texture
+    var styler: Styler
+    var effects: Effects[8]
     ## How many tiles were rendered rather than found, for tests and tuning.
     pub var renders: u64
 
@@ -56,7 +69,12 @@ pub struct Composer:
         errdefer white.destroy()
         # 1.0 as a half is 0x3c00.
         try white.upload([(u8)0, (u8)0x3c, (u8)0, (u8)0x3c, (u8)0, (u8)0x3c, (u8)0, (u8)0x3c])
-        return Composer(owner = device, entries = entries, count = 0, budget = budget, tick = 0, shader = shader, pipeline = pipeline, blank = blank, white = white, renders = 0)
+        var styler = try Styler.create(device)
+        errdefer styler.destroy()
+        var effects: Effects[8]
+        for index in 0..<effects_budget:
+            effects[index] = Effects(key = 0, tiles = Tiles(), used = 0, live = false)
+        return Composer(owner = device, entries = entries, count = 0, budget = budget, tick = 0, shader = shader, pipeline = pipeline, blank = blank, white = white, styler = styler, effects = effects, renders = 0)
 
     ## The flattened tile at `column`, `row` of pyramid `level`, borrowed until
     ## the next call. Straight-alpha rgba16_float, transparent where nothing is.
@@ -129,7 +147,6 @@ pub struct Composer:
             if not layer.clipped:
                 base = tiles.texture(column, row)
                 base_missing = base == none
-            let texture = tiles.texture(column, row) else continue
             let area = tiles.region(column, row)
             var clip = self.blank if layer.clipped and base_missing else (base else self.blank)
             if not layer.clipped:
@@ -138,19 +155,52 @@ pub struct Composer:
             if let mask_tiles = layer.mask_tiles():
                 if let mask_texture = mask_tiles.texture(column, row):
                     mask = mask_texture
-            var params: f32[6] = [0.0, 0.0, (f32)area.width, (f32)area.height, (f32)effective, (f32)layer.blend]
-            var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
-            errdefer fresh.destroy()
-            let frame = try fresh.frame()
-            defer frame.release()
-            let target = try frame.value().target()
-            defer target.release()
-            try gpu.shade(target.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 24), [*backdrop, texture, mask, clip], gpu.Filter.nearest)
-            discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
-            if *owned:
-                backdrop.destroy()
-            *backdrop = fresh
-            *owned = true
+            # The layer's effects go under it, with its opacity and mask, blended normally.
+            if layer.style.any():
+                let effects = try self.effects_for(layer)
+                if let effect = effects.texture(column, row):
+                    try self.pass(backdrop, owned, effect, mask, clip, area, effective, 0)
+            let texture = tiles.texture(column, row) else continue
+            try self.pass(backdrop, owned, texture, mask, clip, area, effective, layer.blend)
+
+    ## One layer (or effects) tile composited over the backdrop so far.
+    mutating func pass(backdrop: gpu.Texture*, owned: bool*, texture: gpu.Texture, mask: gpu.Texture, clip: gpu.Texture, area: gpu.Region, opacity: f64, blend: u32) -> !:
+        var params: f32[6] = [0.0, 0.0, (f32)area.width, (f32)area.height, (f32)opacity, (f32)blend]
+        var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        errdefer fresh.destroy()
+        let frame = try fresh.frame()
+        defer frame.release()
+        let target = try frame.value().target()
+        defer target.release()
+        try gpu.shade(target.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 24), [*backdrop, texture, mask, clip], gpu.Filter.nearest)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        if *owned:
+            backdrop.destroy()
+        *backdrop = fresh
+        *owned = true
+
+    ## The effects tiles for a styled layer, rendered once per pixels-and-style state.
+    mutating func effects_for(layer: const Layer*) -> const Tiles*!:
+        var key = fnv_start()
+        key = fnv_mix(key, layer.id)
+        key = fnv_mix(key, layer.revision)
+        key = fnv_mix(key, layer.style.digest())
+        for index in 0..<effects_budget:
+            if self.effects[index].live and self.effects[index].key == key:
+                self.effects[index].used = self.tick
+                return &self.effects[index].tiles
+        var rendered = try self.styler.render(layer)
+        errdefer rendered.destroy()
+        var slot: usize = 0
+        for index in 1..<effects_budget:
+            if not self.effects[index].live and self.effects[slot].live:
+                slot = index
+            elif self.effects[index].live == self.effects[slot].live and self.effects[index].used < self.effects[slot].used:
+                slot = index
+        if self.effects[slot].live:
+            self.effects[slot].tiles.destroy()
+        self.effects[slot] = Effects(key = key, tiles = rendered, used = self.tick, live = true)
+        return &self.effects[slot].tiles
 
     ## A coarser tile: the four tiles of the level below, each drawn at half size.
     mutating func halve(document: const Document*, column: u32, row: u32, level: u32) -> gpu.Texture!:
@@ -238,6 +288,10 @@ pub struct Composer:
                 self.entries[index].texture.destroy()
                 self.entries[index].live = false
         self.count = 0
+        for index in 0..<effects_budget:
+            if self.effects[index].live:
+                self.effects[index].tiles.destroy()
+                self.effects[index].live = false
 
     pub mutating func destroy():
         self.clear()
@@ -246,6 +300,7 @@ pub struct Composer:
         var empty: Entry[]
         self.entries = empty
         self.budget = 0
+        self.styler.destroy()
         self.blank.destroy()
         self.white.destroy()
         self.pipeline.destroy()
@@ -254,7 +309,8 @@ pub struct Composer:
 ## Move a compositor onto the heap, for holders that keep a pointer.
 pub func box_composer(composer: Composer) -> Composer*!:
     return try new Composer(owner = composer.owner, entries = composer.entries, count = composer.count, budget = composer.budget, tick = composer.tick,
-                            shader = composer.shader, pipeline = composer.pipeline, blank = composer.blank, white = composer.white, renders = composer.renders) in memory.heap
+                            shader = composer.shader, pipeline = composer.pipeline, blank = composer.blank, white = composer.white,
+                            styler = composer.styler, effects = composer.effects, renders = composer.renders) in memory.heap
 
 ## Destroy a boxed compositor and free the box.
 pub func unbox_composer(composer: Composer*):
@@ -284,6 +340,8 @@ func hash_layers(seed: u64, layers: Layer*[], opacity: f64, first_column: u32, f
         digest = fnv_mix(digest, effective.bits())
         digest = fnv_mix(digest, (u64)layer.blend)
         digest = fnv_mix(digest, 1 if layer.clipped else 0)
+        if layer.style.any():
+            digest = fnv_mix(digest, layer.style.digest())
     return digest
 
 func drop_owned(texture: gpu.Texture*, owned: bool):
@@ -403,3 +461,38 @@ test "composite flattens layers with opacity, caches by identity and scales leve
         rejected = true
         recover coarse)
     assert(rejected)
+
+test "a styled layer's glow is composited under it":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var document = try Document.create(device, 64, 64)
+    defer document.destroy()
+    let count = (usize)64 * 64 * 4
+    let pixels = try alloc f32[count] in memory.heap
+    defer free(pixels) in memory.heap
+    for index in 0..<count:
+        pixels[index] = 0.0
+    for y in 24..<(usize)40:
+        for x in 24..<(usize)40:
+            pixels[(y * 64 + x) * 4] = 1.0
+            pixels[(y * 64 + x) * 4 + 3] = 1.0
+    let id = try document.add_layer("Square")
+    var tiles = try Tiles.create(device, 64, 64)
+    try tiles.write(pixels)
+    try document.set_tiles(id, tiles)
+    var composer = try Composer.create(device, 4)
+    defer composer.destroy()
+    var plain = try composer.tile(&document, 0, 0, 0)
+    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    defer free(bytes) in memory.heap
+    try plain.read(bytes)
+    assert(bytes[(32 * 256 + 12) * 8 + 7] == 0)
+    (document.find(id) else trap("layer")).style.glow = true
+    (document.find(id) else trap("layer")).style.glow_size = 10.0
+    var glowing = try composer.tile(&document, 0, 0, 0)
+    try glowing.read(bytes)
+    # The half at byte 6..7 is alpha; a glow beside the square makes it nonzero.
+    assert(bytes[(32 * 256 + 20) * 8 + 7] != 0)
+    assert(composer.renders == 2)

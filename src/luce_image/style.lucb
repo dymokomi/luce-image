@@ -1,0 +1,167 @@
+## Layer styles: the effects a layer's `Style` asks for, rendered under it by
+## the compositor. The layer is flattened into one document-sized texture,
+## its alpha blurred (shadow, glow) and dilated (stroke) in separable passes
+## over that texture, and `style.frag` writes one effects tile per cell.
+import gpu
+import math
+import memory
+from luce_image.tiles import Tiles, tile_size
+from luce_image.document import Document, Layer, Style
+from luce_image.shaders import spread_frag_words, spread_frag_msl, style_frag_words, style_frag_msl
+from luce_image.errors import invalid, limit
+
+## The most pixels a styled layer's document may have: four whole-document textures are held while rendering.
+pub let style_pixel_limit: usize = 4096 * 4096
+
+pub struct Styler:
+    var spread_shader: gpu.Shader
+    var spread: gpu.Pipeline
+    var style_shader: gpu.Shader
+    var style: gpu.Pipeline
+
+    pub static func create(device: gpu.Device) -> Styler!:
+        var spread_shader = try gpu.Shader.create(device, spread_frag_words, spread_frag_msl)
+        errdefer spread_shader.destroy()
+        var spread = try gpu.Pipeline.create(device, spread_shader, gpu.Blend.replace, gpu.Format.rgba16_float)
+        errdefer spread.destroy()
+        var style_shader = try gpu.Shader.create(device, style_frag_words, style_frag_msl)
+        errdefer style_shader.destroy()
+        var style = try gpu.Pipeline.create(device, style_shader, gpu.Blend.replace, gpu.Format.rgba16_float)
+        errdefer style.destroy()
+        return Styler(spread_shader = spread_shader, spread = spread, style_shader = style_shader, style = style)
+
+    ## The effects tiles for `layer`, freshly rendered; the caller owns them.
+    pub func render(layer: const Layer*) -> Tiles!:
+        let tiles = layer.tiles() else error(invalid, "a group has no pixels to style")
+        let style = layer.style
+        let width = tiles.width()
+        let height = tiles.height()
+        if (usize)width * (usize)height > style_pixel_limit:
+            error(limit, "layer styles work on documents up to 4096 by 4096 pixels")
+        # The layer as one texture; every texture here lives on the tiles' device.
+        let device = tiles.device()
+        var flat = try self.flatten(device, tiles)
+        defer flat.destroy()
+        var shadow = try self.spread_alpha(device, flat, width, height, style.shadow_blur if style.shadow else 0.0, false)
+        defer shadow.destroy()
+        var stroke = try self.spread_alpha(device, flat, width, height, style.stroke_size if style.stroke else 0.0, true)
+        defer stroke.destroy()
+        var glow = try self.spread_alpha(device, flat, width, height, style.glow_size * 0.5 if style.glow else 0.0, false)
+        defer glow.destroy()
+        var params: f32[21] = [0.0, 0.0, (f32)width, (f32)height,
+                               1.0 if style.shadow else 0.0, (f32)style.shadow_dx, (f32)style.shadow_dy, (f32)style.shadow_red, (f32)style.shadow_green, (f32)style.shadow_blue, (f32)style.shadow_opacity,
+                               1.0 if style.stroke else 0.0, (f32)style.stroke_red, (f32)style.stroke_green, (f32)style.stroke_blue, (f32)style.stroke_opacity,
+                               1.0 if style.glow else 0.0, (f32)style.glow_red, (f32)style.glow_green, (f32)style.glow_blue, (f32)style.glow_opacity]
+        var effects = try Tiles.create(device, width, height)
+        errdefer effects.destroy()
+        for row in 0..<effects.rows():
+            for column in 0..<effects.columns():
+                params[0] = (f32)(column * tile_size)
+                params[1] = (f32)(row * tile_size)
+                var fresh = try effects.blank()
+                errdefer fresh.destroy()
+                let frame = try fresh.frame()
+                defer frame.release()
+                let target = try frame.value().target()
+                defer target.release()
+                try gpu.shade(target.value(), self.style, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 84), [flat, shadow, stroke, glow], gpu.Filter.nearest)
+                discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+                try effects.set(column, row, fresh)
+        return effects
+
+    ## Every tile drawn into one document-sized texture.
+    func flatten(device: gpu.Device, tiles: const Tiles*) -> gpu.Texture!:
+        var flat = try gpu.Texture.create(device, tiles.width(), tiles.height(), gpu.Format.rgba16_float)
+        errdefer flat.destroy()
+        let frame = try flat.frame()
+        defer frame.release()
+        let whole = try frame.value().target()
+        defer whole.release()
+        for row in 0..<tiles.rows():
+            for column in 0..<tiles.columns():
+                let texture = tiles.texture(column, row) else continue
+                let area = tiles.region(column, row)
+                try gpu.draw_image(whole.value(), texture, gpu.Rect((f64)(column * tile_size), (f64)(row * tile_size), (f64)area.width, (f64)area.height), area, 1.0, gpu.Filter.nearest)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        return flat
+
+    ## `source`'s alpha spread by `amount` pixels in both axes: a Gaussian of
+    ## that sigma, or a dilation when `widen`. Zero amount copies the alpha.
+    func spread_alpha(device: gpu.Device, source: gpu.Texture, width: u32, height: u32, amount: f64, widen: bool) -> gpu.Texture!:
+        let clamped = math.clamp(amount, 0.0, 250.0)
+        let taps = math.ceil(clamped) if widen else math.min(255.0, math.ceil(clamped * 3.0))
+        var horizontal = try self.pass(device, source, width, height, taps, clamped, true, widen)
+        errdefer horizontal.destroy()
+        var vertical = try self.pass(device, horizontal, width, height, taps, clamped, false, widen)
+        horizontal.destroy()
+        return vertical
+
+    func pass(device: gpu.Device, source: gpu.Texture, width: u32, height: u32, taps: f64, sigma: f64, horizontal: bool, widen: bool) -> gpu.Texture!:
+        var output = try gpu.Texture.create(device, width, height, gpu.Format.rgba16_float)
+        errdefer output.destroy()
+        var params: f32[6] = [(f32)taps, (f32)math.max(sigma, 0.001), 1.0 if horizontal else 0.0, 1.0 if widen else 0.0, (f32)width, (f32)height]
+        let frame = try output.frame()
+        defer frame.release()
+        let target = try frame.value().target()
+        defer target.release()
+        try gpu.shade(target.value(), self.spread, gpu.Rect(width = (f64)width, height = (f64)height), u8[]((u8*)&params[0], 24), [source], gpu.Filter.nearest)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        return output
+
+    pub mutating func destroy():
+        self.style.destroy()
+        self.style_shader.destroy()
+        self.spread.destroy()
+        self.spread_shader.destroy()
+
+test "a drop shadow, glow and stroke appear around a layer's pixels":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    let count = (usize)128 * 128 * 4
+    let pixels = try alloc f32[count] in memory.heap
+    defer free(pixels) in memory.heap
+    for index in 0..<count:
+        pixels[index] = 0.0
+    for y in 40..<(usize)88:
+        for x in 40..<(usize)88:
+            pixels[(y * 128 + x) * 4] = 1.0
+            pixels[(y * 128 + x) * 4 + 3] = 1.0
+    var document = try Document.create(device, 128, 128)
+    defer document.destroy()
+    let id = try document.add_layer("Square")
+    var tiles = try Tiles.create(device, 128, 128)
+    try tiles.write(pixels)
+    try document.set_tiles(id, tiles)
+    let layer = document.find(id) else trap("layer")
+    var styler = try Styler.create(device)
+    defer styler.destroy()
+    layer.style.shadow = true
+    layer.style.shadow_dx = 10.0
+    layer.style.shadow_dy = 10.0
+    layer.style.shadow_blur = 2.0
+    var effects = try styler.render(layer)
+    try effects.read(pixels)
+    # Black shadow shows past the square's bottom-right; nothing at the top-left.
+    let shadowed = (94 * 128 + 94) * 4
+    assert(pixels[shadowed + 3] > 0.5 and pixels[shadowed] < 0.05)
+    assert(pixels[(30 * 128 + 30) * 4 + 3] == 0.0)
+    effects.destroy()
+    layer.style.shadow = false
+    layer.style.stroke = true
+    layer.style.stroke_size = 4.0
+    layer.style.stroke_green = 1.0
+    effects = try styler.render(layer)
+    try effects.read(pixels)
+    # A green stroke just outside the square, none inside or far away.
+    assert(pixels[(64 * 128 + 90) * 4 + 3] > 0.9 and pixels[(64 * 128 + 90) * 4 + 1] > 0.9)
+    assert(pixels[(64 * 128 + 64) * 4 + 3] == 0.0 and pixels[(64 * 128 + 100) * 4 + 3] == 0.0)
+    effects.destroy()
+    layer.style.stroke = false
+    layer.style.glow = true
+    layer.style.glow_size = 12.0
+    effects = try styler.render(layer)
+    try effects.read(pixels)
+    assert(pixels[(64 * 128 + 92) * 4 + 3] > 0.1 and pixels[(64 * 128 + 92) * 4] > 0.9)
+    effects.destroy()

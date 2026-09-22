@@ -13,6 +13,45 @@ from luce_image.errors import invalid, limit
 
 pub let blend_mode_count: u32 = 26
 
+## A layer's styles, Photoshop's layer effects drawn under its pixels by the
+## compositor and kept with the layer; none is on by default. Colours are
+## linear light, 0..1; sizes and offsets in document pixels.
+pub struct Style:
+    pub var shadow: bool = false
+    pub var shadow_dx: f64 = 4.0
+    pub var shadow_dy: f64 = 4.0
+    pub var shadow_blur: f64 = 4.0
+    pub var shadow_red: f64 = 0.0
+    pub var shadow_green: f64 = 0.0
+    pub var shadow_blue: f64 = 0.0
+    pub var shadow_opacity: f64 = 0.75
+    pub var stroke: bool = false
+    pub var stroke_size: f64 = 3.0
+    pub var stroke_red: f64 = 0.0
+    pub var stroke_green: f64 = 0.0
+    pub var stroke_blue: f64 = 0.0
+    pub var stroke_opacity: f64 = 1.0
+    pub var glow: bool = false
+    pub var glow_size: f64 = 8.0
+    pub var glow_red: f64 = 1.0
+    pub var glow_green: f64 = 1.0
+    pub var glow_blue: f64 = 1.0
+    pub var glow_opacity: f64 = 0.75
+
+    ## Whether any effect is on.
+    pub func any() -> bool:
+        return self.shadow or self.stroke or self.glow
+
+    ## A digest of every setting, for caches.
+    pub func digest() -> u64:
+        var mixed: u64 = 0xcbf29ce484222325
+        for value in [self.shadow_dx, self.shadow_dy, self.shadow_blur, self.shadow_red, self.shadow_green, self.shadow_blue, self.shadow_opacity,
+                      self.stroke_size, self.stroke_red, self.stroke_green, self.stroke_blue, self.stroke_opacity,
+                      self.glow_size, self.glow_red, self.glow_green, self.glow_blue, self.glow_opacity]:
+            mixed = (mixed ^ value.bits()) *% 0x100000001b3
+        let flags: u64 = (1 if self.shadow else 0) | (2 if self.stroke else 0) | (4 if self.glow else 0)
+        return (mixed ^ flags) *% 0x100000001b3
+
 pub struct Layer:
     pub var id: u64
     pub var name: str
@@ -29,6 +68,7 @@ pub struct Layer:
     ## clipping mask.
     pub var clipped: bool
     pub var group: bool
+    pub var style: Style = Style()
     var pixels: Tiles*?
     ## The layer mask: red reveals, a missing tile reveals fully.
     var mask: Tiles*?

@@ -14,7 +14,7 @@ import prism
 import strings
 from luce_image.image import Image, Pixel
 from luce_image.tiles import Tiles, tile_size, tile_columns
-from luce_image.document import Document, box_document, unbox_document, blend_mode_count
+from luce_image.document import Style, Document, box_document, unbox_document, blend_mode_count
 from luce_image.composite import Composer, box_composer, unbox_composer
 from luce_image.brush import Brush, Painter, Stroke, begin_boxed, finish_boxed, fill_selection
 from luce_image.adjust import Adjuster, adjustment_count, curves
@@ -35,6 +35,7 @@ struct Record:
     var blend: i64
     var masked: bool
     var clipped: bool
+    var style: Style = Style()
     ## A picture waiting to become tiles once a device is bound, and a mask likewise.
     var picture: interop.Reference[Image]?
     var mask_picture: interop.Reference[Image]?
@@ -241,6 +242,7 @@ pub struct Canvas:
         self.records[copy].opacity = self.records[index].opacity
         self.records[copy].blend = self.records[index].blend
         self.records[copy].clipped = self.records[index].clipped
+        self.records[copy].style = self.records[index].style
         self.records[copy].masked = self.records[index].masked
         if let document = self.document:
             # The GPU copy carries the pixels; the record added above is replaced by it.
@@ -475,6 +477,68 @@ pub struct Canvas:
         if let document = self.document:
             try document.set_clipped((u64)id, clipped)
         self.records[index].clipped = clipped
+
+    ## Layer styles, drawn under the layer by the compositor and kept with the
+    ## document. Colours are linear 0..1; sizes and offsets in pixels.
+    pub mutating func set_shadow(id: i64, on: bool, dx: f64, dy: f64, blur: f64, red: f64, green: f64, blue: f64, opacity: f64) -> !:
+        var style = try self.style_of(id)
+        style.shadow = on
+        style.shadow_dx = dx
+        style.shadow_dy = dy
+        style.shadow_blur = blur
+        style.shadow_red = red
+        style.shadow_green = green
+        style.shadow_blue = blue
+        style.shadow_opacity = opacity
+        try self.set_style(id, style)
+
+    pub mutating func set_stroke(id: i64, on: bool, size: f64, red: f64, green: f64, blue: f64, opacity: f64) -> !:
+        var style = try self.style_of(id)
+        style.stroke = on
+        style.stroke_size = size
+        style.stroke_red = red
+        style.stroke_green = green
+        style.stroke_blue = blue
+        style.stroke_opacity = opacity
+        try self.set_style(id, style)
+
+    pub mutating func set_glow(id: i64, on: bool, size: f64, red: f64, green: f64, blue: f64, opacity: f64) -> !:
+        var style = try self.style_of(id)
+        style.glow = on
+        style.glow_size = size
+        style.glow_red = red
+        style.glow_green = green
+        style.glow_blue = blue
+        style.glow_opacity = opacity
+        try self.set_style(id, style)
+
+    ## Whether the layer at `index` has any style on.
+    pub func layer_styled(index: i64) -> bool!:
+        return (try self.record(index)).style.any()
+
+    ## One style setting of the layer at `index`, by field: 0 shadow on, 1 dx,
+    ## 2 dy, 3 blur, 4..6 colour, 7 opacity; 8 stroke on, 9 size, 10..12
+    ## colour, 13 opacity; 14 glow on, 15 size, 16..18 colour, 19 opacity.
+    pub func style_value(index: i64, field: i64) -> f64!:
+        let style = (try self.record(index)).style
+        return style_field(style, field) else error(invalid, "style fields are 0..19")
+
+    func style_of(id: i64) -> Style!:
+        try self.require_open()
+        let index = try self.index((u64)id)
+        return self.records[index].style
+
+    mutating func set_style(id: i64, style: Style) -> !:
+        for value in [style.shadow_dx, style.shadow_dy, style.shadow_blur, style.shadow_opacity, style.stroke_size, style.stroke_opacity, style.glow_size, style.glow_opacity,
+                      style.shadow_red, style.shadow_green, style.shadow_blue, style.stroke_red, style.stroke_green, style.stroke_blue, style.glow_red, style.glow_green, style.glow_blue]:
+            if not math.is_finite(value):
+                error(invalid, "style settings must be finite")
+        if style.shadow_blur < 0.0 or style.shadow_blur > 250.0 or style.stroke_size < 0.0 or style.stroke_size > 250.0 or style.glow_size < 0.0 or style.glow_size > 250.0:
+            error(invalid, "style sizes are 0..250 pixels")
+        let index = try self.index((u64)id)
+        if let document = self.document:
+            (document.find((u64)id) else error(invalid, "no such layer")).style = style
+        self.records[index].style = style
 
     pub func layer_clipped(index: i64) -> bool!:
         return (try self.record(index)).clipped
@@ -833,6 +897,11 @@ pub struct Canvas:
             try set_integer(manifest.value(), element, "blend", record.blend)
             try set_integer(manifest.value(), element, "clipped", 1 if record.clipped else 0)
             try set_integer(manifest.value(), element, "mask", 1 if record.masked else 0)
+            if record.style.any():
+                for field in 0..<(i64)20:
+                    let number = try prism.Value.number(style_field(record.style, field) else trap("style field"))
+                    defer number.release()
+                    try manifest.value().set(element, style_names[(usize)field], number)
             let layer = document.find(record.id) else error(invalid, "a layer is missing")
             var file_buffer: u8[64]
             let tiles = layer.tiles() else error(invalid, "a layer has no pixels")
@@ -1000,6 +1069,8 @@ pub struct Canvas:
             try document.set_appearance(record.id, record.visible, record.opacity, (u32)record.blend)
             if record.masked:
                 try document.set_mask(record.id, true)
+            if record.style.any():
+                (document.find(record.id) else trap("bound layer")).style = record.style
             if record.clipped:
                 try document.set_clipped(record.id, true)
         binding.document = try box_document(document)
@@ -1131,6 +1202,34 @@ func ends_with(text: str, suffix: str) -> bool:
         return false
     return (str)text.bytes[text.length - suffix.length..] == suffix
 
+## The `.l2d` names of the style fields, in `style_value` order.
+let style_names: str[20] = ["shadow", "shadow_dx", "shadow_dy", "shadow_blur", "shadow_red", "shadow_green", "shadow_blue", "shadow_opacity",
+                            "stroke", "stroke_size", "stroke_red", "stroke_green", "stroke_blue", "stroke_opacity",
+                            "glow", "glow_size", "glow_red", "glow_green", "glow_blue", "glow_opacity"]
+
+func style_field(style: Style, field: i64) -> f64?:
+    if field == 0: return 1.0 if style.shadow else 0.0
+    if field == 1: return style.shadow_dx
+    if field == 2: return style.shadow_dy
+    if field == 3: return style.shadow_blur
+    if field == 4: return style.shadow_red
+    if field == 5: return style.shadow_green
+    if field == 6: return style.shadow_blue
+    if field == 7: return style.shadow_opacity
+    if field == 8: return 1.0 if style.stroke else 0.0
+    if field == 9: return style.stroke_size
+    if field == 10: return style.stroke_red
+    if field == 11: return style.stroke_green
+    if field == 12: return style.stroke_blue
+    if field == 13: return style.stroke_opacity
+    if field == 14: return 1.0 if style.glow else 0.0
+    if field == 15: return style.glow_size
+    if field == 16: return style.glow_red
+    if field == 17: return style.glow_green
+    if field == 18: return style.glow_blue
+    if field == 19: return style.glow_opacity
+    return none
+
 func set_integer(doc: prism.Document*, path: str, name: str, value: i64) -> !:
     let holder = try prism.Value.integer(value)
     defer holder.release()
@@ -1212,6 +1311,17 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
         let blend = try get_integer(doc, element, "blend")
         try native.set_layer(id, visible, opacity, blend)
         try native.set_clipped(id, (try get_integer(doc, element, "clipped")) != 0)
+        # Older documents have no style fields; a missing first one means none.
+        let styled = get_number(doc, element, "shadow") catch failure:
+            discard(failure)
+            recover -1.0
+        if styled >= 0.0:
+            var values: f64[20]
+            for field in 0..<(usize)20:
+                values[field] = try get_number(doc, element, style_names[field])
+            try native.set_shadow(id, values[0] != 0.0, values[1], values[2], values[3], values[4], values[5], values[6], values[7])
+            try native.set_stroke(id, values[8] != 0.0, values[9], values[10], values[11], values[12], values[13])
+            try native.set_glow(id, values[14] != 0.0, values[15], values[16], values[17], values[18], values[19])
         var file_buffer: u8[64]
         let picture = try Image.open(try paths.join(layers_dir, try format_file(file_buffer, "layer", index, ".png")))
         try native.place((u64)id, picture)
@@ -1555,6 +1665,16 @@ test "previews show edits on the original pixels and end kept or dropped":
     assert((try shown_centre(&canvas, &target, pixels)) == inverted)
     try canvas.undo()
     assert((try shown_centre(&canvas, &target, pixels)) == base)
+    # A white glow lights the transparent surround of the dot; off again, it is dark.
+    assert((try shown_centre(&canvas, &target, pixels)) == base)
+    try canvas.set_glow(layer, true, 6.0, 1.0, 1.0, 1.0, 1.0)
+    assert(try canvas.layer_styled(0))
+    discard(try shown_centre(&canvas, &target, pixels))
+    # The 40-pixel dot leaves only the corners bare; the glow reaches them.
+    let lit = pixels[0]
+    try canvas.set_glow(layer, false, 6.0, 1.0, 1.0, 1.0, 1.0)
+    discard(try shown_centre(&canvas, &target, pixels))
+    assert(lit > 20 and pixels[0] == 0 and not (try canvas.layer_styled(0)))
     # A previewed transform is shown, then cancelled back to the original.
     try canvas.begin_preview(layer)
     try canvas.preview_transform(0.25, 0.25, 45.0, 0.0, 0.0)
