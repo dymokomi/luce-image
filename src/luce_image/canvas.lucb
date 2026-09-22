@@ -3,6 +3,7 @@
 ## drawing at any zoom and offset onto a render target. GPU storage is bound to
 ## the device of the first target it is drawn on; until then layers and their
 ## pictures wait on the CPU, so a document can be built before it is shown.
+import c
 import files
 import gpu
 import interop
@@ -22,6 +23,7 @@ from luce_image.curves import Curves, lut_size
 from luce_image.filter import Filters
 from luce_image.transform import translate, Transformer
 from luce_image.text import draw_text, measure_text, text_height
+import luce_image.psd as psd
 from luce_image.geometry import resize_canvas, resize_image
 from luce_image.selection import Selection, Mode
 from luce_image.shaders import ants_frag_words, ants_frag_msl
@@ -113,6 +115,8 @@ pub struct Canvas:
     pub static func open(path: str) -> interop.Reference[Canvas]!:
         if ends_with(path, ".l2d"):
             return try open_package(path)
+        if ends_with(path, ".psd") or ends_with(path, ".PSD"):
+            return try open_psd(path)
         let picture = try Image.open(path)
         errdefer picture.release()
         let width = try picture.value().width()
@@ -1353,6 +1357,34 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
             let mask = try Image.open(try paths.join(layers_dir, try format_file(file_buffer, "layer", index, ".mask.png")))
             let slot = try native.index((u64)id)
             native.records[slot].mask_picture = mask
+    return reservation.publish(native, memory.heap)
+
+## A Photoshop document: its raster layers, bottom-most first, with their
+## names, visibility, opacity, blend mode and clipping; group markers are
+## passed over so their layers arrive flat.
+func open_psd(path: str) -> interop.Reference[Canvas]!:
+    var name: str = ""
+    with memory.heap:
+        name = try strings.copy(path)
+    defer strings.release(name)
+    let data = try files.read((c.str)name)
+    defer free(data) in memory.heap
+    var parsed = try psd.parse(data)
+    defer parsed.close()
+    var reservation = try interop.Reservation[Canvas](canvas_type)
+    errdefer reservation.cancel()
+    let native = try new Canvas((i64)parsed.width, (i64)parsed.height) in memory.heap
+    errdefer native.close()
+    for index in 0..<parsed.count:
+        let layer = &parsed.layers[index]
+        let picture = layer.picture else continue
+        let id = try native.add_layer((str)layer.name if layer.name.length > 0 else "Layer")
+        try native.set_layer(id, layer.visible, layer.opacity, (i64)layer.blend)
+        try native.set_clipped(id, layer.clipped)
+        try native.place((u64)id, picture)
+        layer.picture = none
+    if native.count == 0:
+        discard(try native.add_layer("Background"))
     return reservation.publish(native, memory.heap)
 
 ## What binding creates, released in reverse on failure or close.

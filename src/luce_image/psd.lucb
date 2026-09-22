@@ -1,0 +1,357 @@
+## Photoshop documents read as layers: the header, then each layer record and
+## its channel data (raw or PackBits), 8-bit RGB or grayscale, into one RGBA
+## picture per raster layer at the document's size. Group markers are passed
+## over so their layers come through flat; names come from the Unicode block
+## when there is one. The composite image at the end is not needed.
+import interop
+import memory
+from luce_image.image import Image
+from luce_image.errors import invalid, limit
+
+## One raster layer read from a document, bottom-most first.
+pub struct PsdLayer:
+    pub var name: u8[]
+    ## The pixels, or none for a group marker.
+    pub var picture: interop.Reference[Image]?
+    pub var visible: bool
+    pub var opacity: f64
+    ## The blend by luce-image's numbering (see `Layer.blend`).
+    pub var blend: u32
+    pub var clipped: bool
+
+    pub mutating func close():
+        if self.name.length > 0:
+            free(self.name) in memory.heap
+        if let picture = self.picture:
+            picture.release()
+            self.picture = none
+
+pub struct Psd:
+    pub var width: u32
+    pub var height: u32
+    pub var layers: PsdLayer[]
+    pub var count: usize
+
+    pub mutating func close():
+        for index in 0..<self.count:
+            self.layers[index].close()
+        if self.layers.length > 0:
+            free(self.layers) in memory.heap
+        self.count = 0
+
+struct Reader:
+    var data: const u8[]
+    var at: usize
+
+    mutating func need(count: usize) -> !:
+        if self.at + count > self.data.length:
+            error(invalid, "the PSD file ends early")
+
+    mutating func byte() -> u8!:
+        try self.need(1)
+        self.at += 1
+        return self.data[self.at - 1]
+
+    mutating func word() -> u16!:
+        try self.need(2)
+        let value = ((u16)self.data[self.at] << 8) | (u16)self.data[self.at + 1]
+        self.at += 2
+        return value
+
+    mutating func dword() -> u32!:
+        try self.need(4)
+        let value = ((u32)self.data[self.at] << 24) | ((u32)self.data[self.at + 1] << 16) | ((u32)self.data[self.at + 2] << 8) | (u32)self.data[self.at + 3]
+        self.at += 4
+        return value
+
+    mutating func sdword() -> i64!:
+        return (i64)(i32)(try self.dword())
+
+    mutating func skip(count: usize) -> !:
+        try self.need(count)
+        self.at += count
+
+    mutating func tag() -> u32!:
+        return try self.dword()
+
+## The four-character blend keys as luce-image blend numbers.
+func blend_of(key: u32) -> u32:
+    let keys: u32[26] = [0x6e6f726d, 0x6461726b, 0x6d756c20, 0x69646976, 0x6c62726e, 0x6c697465, 0x7363726e, 0x64697620, 0x6c646467, 0x6f766572,
+                         0x734c6974, 0x684c6974, 0x764c6974, 0x6c4c6974, 0x704c6974, 0x684d6978, 0x64696666, 0x736d7564, 0x66737562, 0x66646976,
+                         0x68756520, 0x73617420, 0x636f6c72, 0x6c756d20, 0x646b436c, 0x6c67436c]
+    for index in 0..<(usize)26:
+        if keys[index] == key:
+            return (u32)index
+    return 0
+
+struct ChannelInfo:
+    var id: i64
+    var length: usize
+
+## Parse `data`, a whole PSD file.
+pub func parse(data: const u8[]) -> Psd!:
+    var reader = Reader(data = data, at = 0)
+    if (try reader.tag()) != 0x38425053:
+        error(invalid, "not a Photoshop document (no 8BPS signature)")
+    if (try reader.word()) != 1:
+        error(invalid, "only PSD version 1 is read (not PSB)")
+    try reader.skip(6)
+    let channels = (usize)(try reader.word())
+    let height = try reader.dword()
+    let width = try reader.dword()
+    let depth = try reader.word()
+    let mode = try reader.word()
+    if width == 0 or height == 0 or width > 30000 or height > 30000:
+        error(invalid, "the PSD dimensions are out of range")
+    if depth != 8:
+        error(invalid, "only 8-bit PSD files are read")
+    if mode != 3 and mode != 1:
+        error(invalid, "only RGB and grayscale PSD files are read")
+    if (usize)width * (usize)height > 268435456:
+        error(limit, "the PSD is too large")
+    discard(channels)
+    try reader.skip((usize)(try reader.dword()))
+    try reader.skip((usize)(try reader.dword()))
+    var psd = Psd(width = width, height = height, count = 0)
+    errdefer psd.close()
+    let mask_info_length = (usize)(try reader.dword())
+    if mask_info_length == 0:
+        return psd
+    let layer_info_length = (usize)(try reader.dword())
+    if layer_info_length == 0:
+        return psd
+    let signed = (i64)(i16)(try reader.word())
+    let count = (usize)(signed if signed >= 0 else -signed)
+    if count > 4096:
+        error(limit, "too many layers")
+    psd.layers = try alloc PsdLayer[count] in memory.heap
+    # Layer records first, then every layer's channel data in the same order.
+    var rects = try alloc i64[count * 4] in memory.heap
+    defer free(rects) in memory.heap
+    var infos = try alloc ChannelInfo[count * 8] in memory.heap
+    defer free(infos) in memory.heap
+    var channel_counts = try alloc usize[count] in memory.heap
+    defer free(channel_counts) in memory.heap
+    var groups = try alloc bool[count] in memory.heap
+    defer free(groups) in memory.heap
+    for index in 0..<count:
+        rects[index * 4] = try reader.sdword()
+        rects[index * 4 + 1] = try reader.sdword()
+        rects[index * 4 + 2] = try reader.sdword()
+        rects[index * 4 + 3] = try reader.sdword()
+        let channel_count = (usize)(try reader.word())
+        if channel_count > 8:
+            error(invalid, "a layer has more than eight channels")
+        channel_counts[index] = channel_count
+        for channel in 0..<channel_count:
+            let id = (i64)(i16)(try reader.word())
+            let length = (usize)(try reader.dword())
+            infos[index * 8 + channel] = ChannelInfo(id = id, length = length)
+        if (try reader.tag()) != 0x3842494d:
+            error(invalid, "a layer record lacks its 8BIM signature")
+        let blend = blend_of(try reader.tag())
+        let opacity = (f64)(try reader.byte()) / 255.0
+        let clipping = try reader.byte()
+        let flags = try reader.byte()
+        discard(try reader.byte())
+        let extra_length = (usize)(try reader.dword())
+        let extra_end = reader.at + extra_length
+        try reader.need(extra_length)
+        try reader.skip((usize)(try reader.dword()))
+        try reader.skip((usize)(try reader.dword()))
+        let name_length = (usize)(try reader.byte())
+        let name_start = reader.at
+        try reader.skip(name_length)
+        # The Pascal name is padded so the record is a multiple of four bytes.
+        try reader.skip((4 - (name_length + 1) % 4) % 4)
+        var name = try alloc u8[name_length] in memory.heap
+        memory.copy(name, data[name_start..], name_length)
+        var is_group = false
+        while reader.at + 12 <= extra_end:
+            let signature = try reader.tag()
+            if signature != 0x3842494d and signature != 0x38423634:
+                break
+            let key = try reader.tag()
+            let length = (usize)(try reader.dword())
+            let block_end = reader.at + length
+            if block_end > extra_end:
+                break
+            if key == 0x6c756e69 and length >= 4:
+                # luni: a UTF-16BE name; the plain characters read as bytes.
+                let characters = (usize)(try reader.dword())
+                if characters * 2 + 4 <= length:
+                    free(name) in memory.heap
+                    name = try alloc u8[characters] in memory.heap
+                    for character in 0..<characters:
+                        let code = try reader.word()
+                        name[character] = (u8)code if code < 128 else 63
+            elif key == 0x6c736374 and length >= 4:
+                # lsct: a section divider; its layer holds no pixels.
+                let kind = try reader.dword()
+                is_group = kind == 1 or kind == 2 or kind == 3
+            reader.at = block_end + (length % 2)
+        reader.at = extra_end
+        groups[index] = is_group
+        psd.layers[index] = PsdLayer(name = name, picture = none, visible = (flags & 2) == 0, opacity = opacity, blend = blend, clipped = clipping != 0)
+        psd.count = index + 1
+    # Channel data.
+    let pixels = try alloc u8[(usize)width * (usize)height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    for index in 0..<count:
+        let top = rects[index * 4]
+        let left = rects[index * 4 + 1]
+        let bottom = rects[index * 4 + 2]
+        let right = rects[index * 4 + 3]
+        let layer_width = (usize)(right - left) if right > left else 0
+        let layer_height = (usize)(bottom - top) if bottom > top else 0
+        for pixel in 0..<pixels.length:
+            pixels[pixel] = 0
+        # Opaque unless an alpha channel says otherwise.
+        var has_alpha = false
+        for channel in 0..<channel_counts[index]:
+            if infos[index * 8 + channel].id == -1:
+                has_alpha = true
+        let plane = try alloc u8[layer_width * layer_height if layer_width * layer_height > 0 else 1] in memory.heap
+        defer free(plane) in memory.heap
+        for channel in 0..<channel_counts[index]:
+            let info = infos[index * 8 + channel]
+            let channel_end = reader.at + info.length
+            try reader.need(info.length)
+            let id = info.id
+            let wanted = (id >= 0 and id <= 2) or id == -1
+            if not wanted or layer_width * layer_height == 0 or groups[index]:
+                reader.at = channel_end
+                continue
+            let compression = try reader.word()
+            if compression == 0:
+                try reader.need(layer_width * layer_height)
+                memory.copy(plane, data[reader.at..], layer_width * layer_height)
+                reader.at += layer_width * layer_height
+            elif compression == 1:
+                try unpack_rle(&reader, plane, layer_width, layer_height)
+            else:
+                error(invalid, "a PSD layer uses an unsupported compression")
+            let target: usize = (usize)id if id >= 0 else 3
+            for y in 0..<layer_height:
+                let document_y = top + (i64)y
+                if document_y < 0 or document_y >= (i64)height:
+                    continue
+                for x in 0..<layer_width:
+                    let document_x = left + (i64)x
+                    if document_x < 0 or document_x >= (i64)width:
+                        continue
+                    let value = plane[y * layer_width + x]
+                    let offset = ((usize)document_y * (usize)width + (usize)document_x) * 4
+                    if mode == 1 and id == 0:
+                        pixels[offset] = value
+                        pixels[offset + 1] = value
+                        pixels[offset + 2] = value
+                    else:
+                        pixels[offset + target] = value
+            reader.at = channel_end
+        if not has_alpha:
+            for y in 0..<layer_height:
+                let document_y = top + (i64)y
+                if document_y < 0 or document_y >= (i64)height:
+                    continue
+                for x in 0..<layer_width:
+                    let document_x = left + (i64)x
+                    if document_x < 0 or document_x >= (i64)width:
+                        continue
+                    pixels[((usize)document_y * (usize)width + (usize)document_x) * 4 + 3] = 255
+        if not groups[index]:
+            psd.layers[index].picture = try Image.from_rgba8((usize)width, (usize)height, pixels)
+    return psd
+
+## PackBits rows: a byte count per row, then runs.
+func unpack_rle(reader: Reader*, plane: u8[], width: usize, height: usize) -> !:
+    let counts_start = reader.at
+    try reader.skip(height * 2)
+    var offset: usize = 0
+    for row in 0..<height:
+        let row_length = ((usize)reader.data[counts_start + row * 2] << 8) | (usize)reader.data[counts_start + row * 2 + 1]
+        let row_end = reader.at + row_length
+        try reader.need(row_length)
+        var written: usize = 0
+        while reader.at < row_end and written < width:
+            let header = (i64)(i8)(try reader.byte())
+            if header >= 0:
+                let run = (usize)header + 1
+                try reader.need(run)
+                for index in 0..<run:
+                    if written < width:
+                        plane[offset + written] = reader.data[reader.at + index]
+                        written += 1
+                reader.at += run
+            elif header != -128:
+                let run = (usize)(1 - header)
+                let value = try reader.byte()
+                for _ in 0..<run:
+                    if written < width:
+                        plane[offset + written] = value
+                        written += 1
+        reader.at = row_end
+        offset += width
+
+## Append `values` to `bytes` at `*at`, for tests.
+func put(bytes: u8[], at: usize*, values: const u8[]):
+    for value in values:
+        bytes[*at] = value
+        *at += 1
+
+test "a two-layer PSD with raw and RLE channels parses into positioned pictures":
+    # A 4×3 RGB document: a red opaque layer over all of it, then a 2×1 green
+    # layer with alpha at (1, 1), RLE-compressed, hidden, multiply.
+    var bytes: u8[512]
+    var at: usize = 0
+    put(bytes, &at, [0x38, 0x42, 0x50, 0x53, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0, 4, 0, 8, 0, 3])
+    put(bytes, &at, [0, 0, 0, 0, 0, 0, 0, 0])
+    let mask_info_at = at
+    put(bytes, &at, [0, 0, 0, 0, 0, 0, 0, 0, 0, 2])
+    # Layer 1: red, rect 0,0,3,4, three channels of 12 raw bytes (+2 for compression).
+    put(bytes, &at, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 4, 0, 3])
+    put(bytes, &at, [0, 0, 0, 0, 0, 14, 0, 1, 0, 0, 0, 14, 0, 2, 0, 0, 0, 14])
+    put(bytes, &at, [0x38, 0x42, 0x49, 0x4d, 0x6e, 0x6f, 0x72, 0x6d, 255, 0, 0, 0])
+    put(bytes, &at, [0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0x52, 0x65, 0x64])
+    # Layer 2: green with alpha, rect 1,1,2,3; channels -1, 0, 1, 2 RLE (2 + 2 + 3 bytes each).
+    put(bytes, &at, [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 4])
+    put(bytes, &at, [0xff, 0xff, 0, 0, 0, 7, 0, 0, 0, 0, 0, 7, 0, 1, 0, 0, 0, 7, 0, 2, 0, 0, 0, 7])
+    put(bytes, &at, [0x38, 0x42, 0x49, 0x4d, 0x6d, 0x75, 0x6c, 0x20, 128, 1, 2, 0])
+    put(bytes, &at, [0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0x44, 0x6f, 0x74])
+    # Channel data: layer 1 raw planes.
+    for channel in 0..<(usize)3:
+        put(bytes, &at, [0, 0])
+        for _ in 0..<(usize)12:
+            put(bytes, &at, [255 if channel == 0 else 0])
+    # Layer 2 RLE: one row of two pixels, "literal run of 2".
+    for channel in 0..<(usize)4:
+        put(bytes, &at, [0, 1, 0, 3, 1])
+        let value: u8 = 255 if channel == 0 or channel == 2 else 0
+        put(bytes, &at, [value, value])
+    let total = at - mask_info_at - 4
+    bytes[mask_info_at] = (u8)(total >> 24)
+    bytes[mask_info_at + 1] = (u8)(total >> 16)
+    bytes[mask_info_at + 2] = (u8)(total >> 8)
+    bytes[mask_info_at + 3] = (u8)total
+    let inner = total - 4
+    bytes[mask_info_at + 4] = (u8)(inner >> 24)
+    bytes[mask_info_at + 5] = (u8)(inner >> 16)
+    bytes[mask_info_at + 6] = (u8)(inner >> 8)
+    bytes[mask_info_at + 7] = (u8)inner
+    var psd = try parse(bytes[..<at])
+    defer psd.close()
+    assert(psd.width == 4 and psd.height == 3 and psd.count == 2)
+    assert((str)psd.layers[0].name == "Red" and psd.layers[0].visible and psd.layers[0].blend == 0)
+    assert((str)psd.layers[1].name == "Dot" and not psd.layers[1].visible and psd.layers[1].blend == 2 and psd.layers[1].clipped)
+    let red = try (psd.layers[0].picture else trap("picture")).value().getpixel(3, 2)
+    assert(red.r == 255.0 and red.g == 0.0 and red.a == 255.0)
+    let dot = try (psd.layers[1].picture else trap("picture")).value().getpixel(1, 1)
+    assert(dot.g == 255.0 and dot.r == 0.0 and dot.a == 255.0)
+    let outside = try (psd.layers[1].picture else trap("picture")).value().getpixel(0, 0)
+    assert(outside.a == 0.0)
+    var rejected = false
+    discard(parse(bytes[..<10]) catch failure:
+        assert(failure.code == invalid)
+        rejected = true
+        recover Psd(width = 0, height = 0, count = 0))
+    assert(rejected)

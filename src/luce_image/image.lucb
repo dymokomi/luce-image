@@ -393,6 +393,17 @@ pub struct Image:
             target.raster.pixels[index * 4 + 3] = math.floor(math.clamp((f64)pixels[index * 4 + 3], 0.0, 1.0) * 255.0 + 0.5)
         return image
 
+    ## An 8-bit RGBA image from `width * height * 4` sRGB-encoded bytes. Base only.
+    pub static func from_rgba8(width: usize, height: usize, bytes: const u8[]) -> interop.Reference[Image]!:
+        if bytes.length != width * height * 4:
+            error(invalid, "pixel data must hold width * height RGBA bytes")
+        let image = try Image.create("RGBA", width, height)
+        errdefer image.release()
+        let target = image.value()
+        for index in 0..<bytes.length:
+            target.raster.pixels[index] = (f64)bytes[index]
+        return image
+
     pub mutating func copy() -> interop.Reference[Image]!:
         return try self.crop(0, 0, try self.width(), try self.height())
 
