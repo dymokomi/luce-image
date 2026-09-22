@@ -39,6 +39,12 @@ vec3 hsl_to_rgb(vec3 h) {
 }
 void main() {
     vec4 o = texture(tile, gl_FragCoord.xy / 256.0);
+    // Fully transparent texels carry no colour worth adjusting; leaving them
+    // alone keeps edges from picking up a hue where nothing is.
+    if (o.a <= 0.0) {
+        fragment_color = o;
+        return;
+    }
     // Adjustments act on the encoded values, as Photoshop's do.
     vec3 c = to_srgb(clamp(o.rgb, 0.0, 1.0));
     int kind = int(params.kind + 0.5);
