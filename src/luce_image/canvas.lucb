@@ -173,6 +173,47 @@ pub struct Canvas:
             error(invalid, "the picture must match the document's size")
         try self.place((u64)id, picture)
 
+    ## Put the picture at `path`, of any size, on layer `id` centred on document
+    ## pixel (`center_x`, `center_y`): what falls outside the document is cut off
+    ## and the rest of the layer is transparent. Dropping a file on a document
+    ## does this. The document must have been drawn once.
+    pub mutating func place_layer(id: i64, path: str, center_x: i64, center_y: i64) -> !:
+        try self.require_open()
+        let document = self.document else error(invalid, "draw the document once before placing a picture")
+        discard(try self.index((u64)id))
+        let picture = try Image.open(path)
+        defer picture.release()
+        let width = try picture.value().width()
+        let height = try picture.value().height()
+        let source = try alloc f32[width * height * 4] in memory.heap
+        defer free(source) in memory.heap
+        try picture.value().linear_rgba(source)
+        let x = center_x - (i64)width // 2
+        let y = center_y - (i64)height // 2
+        let columns = (usize)self.extent_x
+        let rows = (usize)self.extent_y
+        let pixels = try alloc f32[columns * rows * 4] in memory.heap
+        defer free(pixels) in memory.heap
+        for index in 0..<pixels.length:
+            pixels[index] = 0.0
+        for row in 0..<height:
+            let target_y = y + (i64)row
+            if target_y < 0 or target_y >= (i64)self.extent_y:
+                continue
+            for column in 0..<width:
+                let target_x = x + (i64)column
+                if target_x < 0 or target_x >= (i64)self.extent_x:
+                    continue
+                let from_index = (row * width + column) * 4
+                let to_index = ((usize)target_y * columns + (usize)target_x) * 4
+                for channel in 0..<(usize)4:
+                    pixels[to_index + channel] = source[from_index + channel]
+        let device = self.device else error(invalid, "the document is not bound to a device")
+        var tiles = try Tiles.create(device, self.extent_x, self.extent_y)
+        errdefer tiles.destroy()
+        try tiles.write(pixels)
+        try document.set_tiles((u64)id, tiles)
+
     mutating func place(id: u64, picture: interop.Reference[Image]) -> !:
         let index = try self.index(id)
         if let document = self.document:
