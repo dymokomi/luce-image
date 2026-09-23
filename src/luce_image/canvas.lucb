@@ -596,11 +596,61 @@ pub struct Canvas:
 
     # mark: Painting =========================================================================
 
-    ## Set the brush every following stroke paints with.
+    ## Set the brush every following stroke paints with: its size, edge, colour
+    ## and strength. The tip shape, dynamics and texture set separately stay.
     pub mutating func set_brush(diameter: f64, hardness: f64, opacity: f64, flow: f64, red: f64, green: f64, blue: f64, erase: bool) -> !:
-        let brush = Brush(diameter = diameter, hardness = hardness, opacity = opacity, flow = flow, color = gpu.Color(red, green, blue, 1.0), erase = erase)
+        var brush = self.brush
+        brush.diameter = diameter
+        brush.hardness = hardness
+        brush.opacity = opacity
+        brush.flow = flow
+        brush.color = gpu.Color(red, green, blue, 1.0)
+        brush.erase = erase
         try brush.check()
         try gpu_check_color(brush.color)
+        self.brush = brush
+
+    ## The tip's shape: dab spacing as a fraction of the diameter (Photoshop's
+    ## 25 % is 0.25), angle in degrees, roundness 0.05..1, and the smoothing
+    ## string in document pixels.
+    pub mutating func set_brush_shape(spacing: f64, angle: f64, roundness: f64, smoothing: f64) -> !:
+        var brush = self.brush
+        brush.spacing = spacing
+        brush.angle = angle
+        brush.roundness = roundness
+        brush.smoothing = smoothing
+        try brush.check()
+        self.brush = brush
+
+    ## The brush's dynamics, each jitter 0..1: size, angle and roundness
+    ## (shape), scatter as a fraction of the diameter with the dabs per step,
+    ## flow (transfer), hue, saturation and brightness (colour), and whether
+    ## stylus pressure drives size and flow.
+    pub mutating func set_brush_dynamics(size_jitter: f64, angle_jitter: f64, roundness_jitter: f64, scatter: f64, scatter_count: i64,
+                                         flow_jitter: f64, hue_jitter: f64, saturation_jitter: f64, brightness_jitter: f64, pressure_size: bool, pressure_flow: bool) -> !:
+        var brush = self.brush
+        brush.size_jitter = size_jitter
+        brush.angle_jitter = angle_jitter
+        brush.roundness_jitter = roundness_jitter
+        brush.scatter = scatter
+        brush.scatter_count = scatter_count
+        brush.flow_jitter = flow_jitter
+        brush.hue_jitter = hue_jitter
+        brush.saturation_jitter = saturation_jitter
+        brush.brightness_jitter = brightness_jitter
+        brush.pressure_size = pressure_size
+        brush.pressure_flow = pressure_flow
+        try brush.check()
+        self.brush = brush
+
+    ## The tip's texture: 0 none, 1 grain, 2 canvas weave, 3 dots, at `scale`
+    ## (0.1..10) and `depth` 0..1 (how much of it shows through).
+    pub mutating func set_brush_texture(kind: i64, scale: f64, depth: f64) -> !:
+        var brush = self.brush
+        brush.texture = kind
+        brush.texture_scale = scale
+        brush.texture_depth = depth
+        try brush.check()
         self.brush = brush
 
     ## Start painting on `layer` at a document point. The document must have

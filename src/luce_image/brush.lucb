@@ -1,20 +1,23 @@
 ## Painting: a stroke is a polyline in document pixels applied to one raster
-## layer as it is drawn. Each segment is rendered `over` into a coverage tile
-## for every tile it reaches, and the layer's tile is rebuilt from the tile it
-## had before the stroke plus that coverage. Tiles the stroke never reaches are
-## untouched; the ones it does are replaced, which the compositor's digest
-## notices. Ending a stroke drops the coverage; the tiles before it are the
-## caller's to keep for undo.
+## layer as it is drawn, as a run of dabs — the tip stamped every `spacing`
+## of its diameter, each dab jittered in size, angle, roundness, position,
+## flow and colour as the brush's dynamics say, through a procedural texture.
+## Dabs accumulate `over` into a paint tile (premultiplied colour) for every
+## tile they reach, and the layer's tile is rebuilt from the tile it had before
+## the stroke plus that paint, capped by the stroke's opacity. Tiles the stroke
+## never reaches are untouched; the ones it does are replaced, which the
+## compositor's digest notices. Ending a stroke drops the paint; the tiles
+## before it are the caller's to keep for undo.
 import gpu
 import memory
 import math
 from luce_image.tiles import Tiles, tile_size
 from luce_image.document import Document, Layer
 from luce_image.selection import Mode
-from luce_image.shaders import segment_frag_words, segment_frag_msl, paint_frag_words, paint_frag_msl, gradient_frag_words, gradient_frag_msl
+from luce_image.shaders import dab_frag_words, dab_frag_msl, paint_frag_words, paint_frag_msl, gradient_frag_words, gradient_frag_msl
 from raster_errors import invalid, limit
 
-## How a stroke paints.
+## How a stroke paints: Photoshop's brush settings, in its units where it has them.
 pub struct Brush:
     ## Tip diameter in document pixels, 1..4096.
     pub var diameter: f64 = 32.0
@@ -22,23 +25,58 @@ pub struct Brush:
     pub var hardness: f64 = 0.75
     ## 0..1: caps the stroke's coverage.
     pub var opacity: f64 = 1.0
-    ## 0..1: how much each segment adds where it lands.
+    ## 0..1: how much each dab adds where it lands.
     pub var flow: f64 = 1.0
     ## Straight-alpha paint colour in linear light; alpha is ignored.
     pub var color: gpu.Color = gpu.Color(0.0, 0.0, 0.0, 1.0)
     ## Erase instead of paint.
     pub var erase: bool
+    # -- Tip shape.
+    ## The distance between dabs as a fraction of the diameter, 0.01..5 (Photoshop's 25 %).
+    pub var spacing: f64 = 0.25
+    ## The tip's rotation in degrees.
+    pub var angle: f64 = 0.0
+    ## The tip's minor axis over its major, 0.05..1.
+    pub var roundness: f64 = 1.0
+    ## The string the brush trails the pointer on, in document pixels; 0 follows exactly.
+    pub var smoothing: f64 = 0.0
+    # -- Shape dynamics, each 0..1: the fraction of the range a dab may vary by.
+    pub var size_jitter: f64 = 0.0
+    pub var angle_jitter: f64 = 0.0
+    pub var roundness_jitter: f64 = 0.0
+    ## Stylus pressure scales the size (and the flow) when set.
+    pub var pressure_size: bool = true
+    pub var pressure_flow: bool = false
+    # -- Scattering: how far a dab may stray, as a fraction of the diameter (0..10), and how many land per step (1..16).
+    pub var scatter: f64 = 0.0
+    pub var scatter_count: i64 = 1
+    # -- Transfer and colour dynamics, each 0..1.
+    pub var flow_jitter: f64 = 0.0
+    pub var hue_jitter: f64 = 0.0
+    pub var saturation_jitter: f64 = 0.0
+    pub var brightness_jitter: f64 = 0.0
+    # -- Texture: 0 none, 1 grain, 2 canvas weave, 3 dots; its scale (0.1..10) and depth (0..1).
+    pub var texture: i64 = 0
+    pub var texture_scale: f64 = 1.0
+    pub var texture_depth: f64 = 0.5
 
     pub func check() -> !:
         if not (self.diameter >= 1.0 and self.diameter <= 4096.0) or not (self.hardness >= 0.0 and self.hardness <= 1.0) or not (self.opacity >= 0.0 and self.opacity <= 1.0) or not (self.flow >= 0.0 and self.flow <= 1.0):
             error(invalid, "brush diameter must be 1..4096 and hardness, opacity and flow 0..1")
+        if not (self.spacing >= 0.01 and self.spacing <= 5.0) or not math.is_finite(self.angle) or not (self.roundness >= 0.05 and self.roundness <= 1.0) or not (self.smoothing >= 0.0 and self.smoothing <= 4096.0):
+            error(invalid, "brush spacing must be 0.01..5, roundness 0.05..1, smoothing 0..4096 and the angle finite")
+        for fraction in [self.size_jitter, self.angle_jitter, self.roundness_jitter, self.flow_jitter, self.hue_jitter, self.saturation_jitter, self.brightness_jitter, self.texture_depth]:
+            if not (fraction >= 0.0 and fraction <= 1.0):
+                error(invalid, "brush jitters and texture depth must be 0..1")
+        if not (self.scatter >= 0.0 and self.scatter <= 10.0) or self.scatter_count < 1 or self.scatter_count > 16 or self.texture < 0 or self.texture > 3 or not (self.texture_scale >= 0.1 and self.texture_scale <= 10.0):
+            error(invalid, "brush scatter must be 0..10 with 1..16 dabs, texture 0..3 at scale 0.1..10")
 
 ## The shader pipelines a device needs to paint, built on first use.
 pub struct Painter:
     var owner: gpu.Device
-    var segment_shader: gpu.Shader
+    var dab_shader: gpu.Shader
     var paint_shader: gpu.Shader
-    var segment: gpu.Pipeline
+    var dab: gpu.Pipeline
     var paint: gpu.Pipeline
     var gradient_shader: gpu.Shader
     var gradient: gpu.Pipeline
@@ -47,12 +85,12 @@ pub struct Painter:
     pub var black: gpu.Texture
 
     pub static func create(device: gpu.Device) -> Painter!:
-        var segment_shader = try gpu.Shader.create(device, segment_frag_words, segment_frag_msl)
-        errdefer segment_shader.destroy()
+        var dab_shader = try gpu.Shader.create(device, dab_frag_words, dab_frag_msl)
+        errdefer dab_shader.destroy()
         var paint_shader = try gpu.Shader.create(device, paint_frag_words, paint_frag_msl)
         errdefer paint_shader.destroy()
-        var segment = try gpu.Pipeline.create(device, segment_shader, gpu.Blend.over, gpu.Format.r8)
-        errdefer segment.destroy()
+        var dab = try gpu.Pipeline.create(device, dab_shader, gpu.Blend.over, gpu.Format.rgba16_float)
+        errdefer dab.destroy()
         var paint = try gpu.Pipeline.create(device, paint_shader, gpu.Blend.replace, gpu.Format.rgba16_float)
         errdefer paint.destroy()
         var gradient_shader = try gpu.Shader.create(device, gradient_frag_words, gradient_frag_msl)
@@ -65,7 +103,7 @@ pub struct Painter:
         var black = try gpu.Texture.create(device, 1, 1, gpu.Format.rgba8_linear)
         errdefer black.destroy()
         try black.upload([(u8)0, (u8)0, (u8)0, (u8)255])
-        return Painter(owner = device, segment_shader = segment_shader, paint_shader = paint_shader, segment = segment, paint = paint, white = white, black = black, gradient_shader = gradient_shader, gradient = gradient)
+        return Painter(owner = device, dab_shader = dab_shader, paint_shader = paint_shader, dab = dab, paint = paint, white = white, black = black, gradient_shader = gradient_shader, gradient = gradient)
 
     pub mutating func destroy():
         self.black.destroy()
@@ -73,15 +111,30 @@ pub struct Painter:
         self.paint.destroy()
         self.gradient.destroy()
         self.gradient_shader.destroy()
-        self.segment.destroy()
+        self.dab.destroy()
         self.paint_shader.destroy()
-        self.segment_shader.destroy()
+        self.dab_shader.destroy()
 
-## One tile a stroke has reached and its coverage so far.
+## One tile a stroke has reached and the paint laid on it so far (premultiplied).
 struct Touched:
     var column: u32
     var row: u32
     var coverage: gpu.Texture
+
+## One dab, ready to stamp: where, how big, how turned, how much, what colour.
+struct Dab:
+    var x: f64
+    var y: f64
+    var radius: f64
+    var angle: f64
+    var roundness: f64
+    var flow: f64
+    var color: gpu.Color
+    var seed: f64
+
+## The most dabs one segment stamps before the rest wait for the next; a
+## segment longer than that is unusual at any sane spacing.
+let dab_limit: usize = 256
 
 ## A stroke in progress on one layer.
 ## A pressure as a diameter factor: unknown (zero or not finite) and full press both paint at full size.
@@ -109,6 +162,13 @@ pub struct Stroke:
     var on_mask: bool
     ## The document's selection tiles when the stroke began; painting stays inside it.
     var selection: Tiles*?
+    ## How far past the last dab the stroke has travelled without stamping.
+    var debt: f64 = 0.0
+    ## The jitters' random state, seeded from the first point.
+    var random: u64 = 0x9E3779B97F4A7C15
+    ## The dabs of the segment being stamped, `dab_limit` slots on the heap.
+    var dabs: Dab[]
+    var dab_count: usize = 0
 
     ## Begin at a point on `layer`'s pixels, or on its mask, painting the first
     ## dab there. A mask's missing cells count as white (revealing).
@@ -122,20 +182,93 @@ pub struct Stroke:
         var stroke = Stroke(layer = layer, brush = brush, last_x = x, last_y = y, before = try tiles.clone(), empty = none, fill = fill, active = true, on_mask = on_mask,
                             selection = try document.selection_tiles(), pressure = pressure_scale(pressure))
         errdefer stroke.destroy()
-        try stroke.segment(painter, document, x, y, x, y)
+        stroke.random = 0x9E3779B97F4A7C15 ^ ((u64)(i64)(x * 977.0) << 17) ^ (u64)(i64)(y * 331.0)
+        stroke.debt = 0.0
+        stroke.dab_count = 0
+        stroke.dabs = try alloc Dab[dab_limit] in memory.heap
+        try stroke.place(x, y)
+        try stroke.stamp(painter, document)
         return stroke
 
-    ## Continue to a point, painting the segment from the last one; `pressure`
-    ## (0..1, or 1 for a mouse) scales the brush's diameter along it.
+    ## Continue towards a point, stamping dabs every spacing along the way;
+    ## `pressure` (0..1, or 1 for a mouse) scales the size and flow the brush
+    ## lets it. With smoothing the brush trails the pointer on a string.
     pub mutating func extend(painter: Painter*, document: Document*, x: f64, y: f64, pressure: f64 = 1.0) -> !:
         if not self.active:
             error(invalid, "the stroke has ended")
         if not math.is_finite(x) or not math.is_finite(y):
             error(invalid, "stroke coordinates must be finite")
         self.pressure = pressure_scale(pressure)
-        try self.segment(painter, document, self.last_x, self.last_y, x, y)
+        var target_x = x
+        var target_y = y
+        if self.brush.smoothing > 0.0:
+            let dx = x - self.last_x
+            let dy = y - self.last_y
+            let length = math.sqrt(dx * dx + dy * dy)
+            if length <= self.brush.smoothing:
+                return
+            let pull = (length - self.brush.smoothing) / length
+            target_x = self.last_x + dx * pull
+            target_y = self.last_y + dy * pull
+        try self.advance(painter, document, target_x, target_y)
+
+    ## Walk from the last point to (x, y), placing a dab every spacing and
+    ## carrying the remainder into the next segment, then stamp them.
+    mutating func advance(painter: Painter*, document: Document*, x: f64, y: f64) -> !:
+        let dx = x - self.last_x
+        let dy = y - self.last_y
+        let length = math.sqrt(dx * dx + dy * dy)
+        let step = math.max(0.5, self.brush.diameter * self.size_scale() * self.brush.spacing)
+        var along = step - self.debt
+        self.dab_count = 0
+        while along <= length and self.dab_count + (usize)self.brush.scatter_count <= dab_limit:
+            let t = along / length
+            try self.place(self.last_x + dx * t, self.last_y + dy * t)
+            along += step
+        self.debt = length - (along - step)
+        if self.dab_count > 0:
+            try self.stamp(painter, document)
         self.last_x = x
         self.last_y = y
+
+    ## The diameter factor pressure applies, when the brush lets it.
+    func size_scale() -> f64:
+        return self.pressure if self.brush.pressure_size else 1.0
+
+    ## A number in 0..1 from the stroke's generator (xorshift64*).
+    mutating func next_random() -> f64:
+        var state = self.random
+        state ^= state >> 12
+        state ^= state << 25
+        state ^= state >> 27
+        self.random = state
+        return (f64)((state *% 0x2545F4914F6CDD1D) >> 11) / 9007199254740992.0
+
+    ## A number in -1..1.
+    mutating func next_signed() -> f64:
+        return self.next_random() * 2.0 - 1.0
+
+    ## Queue the dabs for one step at (x, y): one per scatter count, each with
+    ## its own jitter of size, angle, roundness, flow, colour and position.
+    mutating func place(x: f64, y: f64) -> !:
+        let brush = self.brush
+        for _ in 0..<(usize)brush.scatter_count:
+            if self.dab_count >= dab_limit:
+                return
+            let radius = brush.diameter * 0.5 * self.size_scale() * (1.0 - brush.size_jitter * self.next_random())
+            let angle = brush.angle + brush.angle_jitter * 180.0 * self.next_signed()
+            let roundness = math.clamp(brush.roundness * (1.0 - brush.roundness_jitter * self.next_random()), 0.05, 1.0)
+            var flow = brush.flow * (1.0 - brush.flow_jitter * self.next_random())
+            if brush.pressure_flow:
+                flow *= self.pressure
+            let reach = brush.scatter * brush.diameter
+            let sx = x + reach * self.next_signed()
+            let sy = y + reach * self.next_signed()
+            var color = brush.color
+            if brush.hue_jitter > 0.0 or brush.saturation_jitter > 0.0 or brush.brightness_jitter > 0.0:
+                color = jitter_color(color, brush.hue_jitter * 180.0 * self.next_signed(), brush.saturation_jitter * self.next_signed(), brush.brightness_jitter * self.next_signed())
+            self.dabs[self.dab_count] = Dab(x = sx, y = sy, radius = math.max(0.5, radius), angle = angle, roundness = roundness, flow = math.clamp(flow, 0.0, 1.0), color = color, seed = self.next_random() * 1000.0)
+            self.dab_count += 1
 
     ## The tiles touched so far, for callers that track damage.
     pub func touched_count() -> usize:
@@ -150,35 +283,53 @@ pub struct Stroke:
         self.active = false
         self.destroy()
 
-    mutating func segment(painter: Painter*, document: Document*, x0: f64, y0: f64, x1: f64, y1: f64) -> !:
+    ## Stamp the queued dabs: every tile any of them reaches gets one pass that
+    ## draws the paint so far back and each dab over it, then is rebuilt.
+    mutating func stamp(painter: Painter*, document: Document*) -> !:
         let target = document.find(self.layer) else error(invalid, "the painted layer is gone")
         let tiles = (target.mask_tiles() else error(invalid, "the painted mask is gone")) if self.on_mask else (target.tiles() else error(invalid, "the painted layer has no pixels"))
-        let reach = self.brush.diameter * self.pressure * 0.5 + 1.0
-        let left = math.max(0.0, math.floor((math.min(x0, x1) - reach) / (f64)tile_size))
-        let top = math.max(0.0, math.floor((math.min(y0, y1) - reach) / (f64)tile_size))
-        let right = math.min((f64)(tiles.columns() - 1), math.floor((math.max(x0, x1) + reach) / (f64)tile_size))
-        let bottom = math.min((f64)(tiles.rows() - 1), math.floor((math.max(y0, y1) + reach) / (f64)tile_size))
+        var min_x = 1.0e18
+        var min_y = 1.0e18
+        var max_x = -1.0e18
+        var max_y = -1.0e18
+        for index in 0..<self.dab_count:
+            let dab = self.dabs[index]
+            min_x = math.min(min_x, dab.x - dab.radius - 1.0)
+            min_y = math.min(min_y, dab.y - dab.radius - 1.0)
+            max_x = math.max(max_x, dab.x + dab.radius + 1.0)
+            max_y = math.max(max_y, dab.y + dab.radius + 1.0)
+        let left = math.max(0.0, math.floor(min_x / (f64)tile_size))
+        let top = math.max(0.0, math.floor(min_y / (f64)tile_size))
+        let right = math.min((f64)(tiles.columns() - 1), math.floor(max_x / (f64)tile_size))
+        let bottom = math.min((f64)(tiles.rows() - 1), math.floor(max_y / (f64)tile_size))
         if right < left or bottom < top:
+            self.dab_count = 0
             return
         var row = (u32)top
         while row <= (u32)bottom:
             var column = (u32)left
             while column <= (u32)right:
-                try self.touch(painter, tiles, column, row, x0, y0, x1, y1)
+                try self.touch(painter, tiles, column, row)
                 column += 1
             row += 1
+        self.dab_count = 0
         target.revision += 1
 
-    ## Add a segment's coverage to one tile and rebuild that tile. A texture
-    ## frame clears its target, so the coverage grows by ping-pong: the new
-    ## coverage is the old one drawn back plus the segment over it.
-    mutating func touch(painter: Painter*, tiles: Tiles*, column: u32, row: u32, x0: f64, y0: f64, x1: f64, y1: f64) -> !:
-        let index = try self.reach(painter, column, row)
+    ## Add the queued dabs that reach one tile to its paint and rebuild that
+    ## tile. A texture frame clears its target, so the paint grows by ping-pong:
+    ## the new paint is the old one drawn back plus the dabs over it.
+    mutating func touch(painter: Painter*, tiles: Tiles*, column: u32, row: u32) -> !:
         let origin_x = (f64)(column * tile_size)
         let origin_y = (f64)(row * tile_size)
-        var segment: f32[9] = [0.0, 0.0, (f32)(x0 - origin_x), (f32)(y0 - origin_y), (f32)(x1 - origin_x), (f32)(y1 - origin_y),
-                               (f32)(self.brush.diameter * self.pressure * 0.5), (f32)self.brush.hardness, (f32)self.brush.flow]
-        var grown = try gpu.Texture.create(painter.owner, tile_size, tile_size, gpu.Format.r8)
+        var reaching = false
+        for index in 0..<self.dab_count:
+            let dab = self.dabs[index]
+            if dab.x + dab.radius + 1.0 >= origin_x and dab.x - dab.radius - 1.0 < origin_x + (f64)tile_size and dab.y + dab.radius + 1.0 >= origin_y and dab.y - dab.radius - 1.0 < origin_y + (f64)tile_size:
+                reaching = true
+        if not reaching:
+            return
+        let index = try self.reach(painter, column, row)
+        var grown = try gpu.Texture.create(painter.owner, tile_size, tile_size, gpu.Format.rgba16_float)
         errdefer grown.destroy()
         let frame = try grown.frame()
         defer frame.release()
@@ -186,7 +337,18 @@ pub struct Stroke:
         defer target.release()
         let whole = gpu.Rect(width = (f64)tile_size, height = (f64)tile_size)
         try gpu.draw_image(target.value(), self.touched[index].coverage, whole, none, 1.0, gpu.Filter.nearest)
-        try gpu.shade(target.value(), painter.segment, whole, u8[]((u8*)&segment[0], 36))
+        for which in 0..<self.dab_count:
+            let dab = self.dabs[which]
+            if not (dab.x + dab.radius + 1.0 >= origin_x and dab.x - dab.radius - 1.0 < origin_x + (f64)tile_size and dab.y + dab.radius + 1.0 >= origin_y and dab.y - dab.radius - 1.0 < origin_y + (f64)tile_size):
+                continue
+            let radians = dab.angle * math.pi / 180.0
+            var params: f32[20] = [0.0, 0.0, (f32)(dab.x - origin_x), (f32)(dab.y - origin_y), (f32)origin_x, (f32)origin_y, (f32)math.cos(radians), (f32)math.sin(radians),
+                                   (f32)dab.radius, (f32)self.brush.hardness, (f32)dab.flow, (f32)dab.roundness,
+                                   (f32)dab.color.red, (f32)dab.color.green, (f32)dab.color.blue, 0.0, 0.0, 0.0, 0.0, 0.0]
+            let bounds = gpu.Rect(math.max(0.0, dab.x - origin_x - dab.radius - 1.0), math.max(0.0, dab.y - origin_y - dab.radius - 1.0), 0.0, 0.0)
+            let right = math.min((f64)tile_size, dab.x - origin_x + dab.radius + 1.0)
+            let bottom = math.min((f64)tile_size, dab.y - origin_y + dab.radius + 1.0)
+            try gpu.shade(target.value(), painter.dab, gpu.Rect(bounds.x, bounds.y, right - bounds.x, bottom - bounds.y), u8[]((u8*)&params[0], 80))
         discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         self.touched[index].coverage.destroy()
         self.touched[index].coverage = grown
@@ -197,8 +359,10 @@ pub struct Stroke:
         let entry = self.touched[index]
         var fresh = try tiles.blank()
         errdefer fresh.destroy()
-        var params: f32[8] = [(f32)self.brush.color.red, (f32)self.brush.color.green, (f32)self.brush.color.blue, 1.0,
-                              (f32)self.brush.opacity, 1.0 if self.brush.erase else 0.0, 0.0, 0.0]
+        var params: f32[16] = [(f32)self.brush.color.red, (f32)self.brush.color.green, (f32)self.brush.color.blue, 1.0,
+                               (f32)self.brush.opacity, 1.0 if self.brush.erase else 0.0, 0.0, 0.0,
+                               (f32)(entry.column * tile_size), (f32)(entry.row * tile_size), (f32)self.brush.texture, (f32)self.brush.texture_scale,
+                               (f32)self.brush.texture_depth, 0.0, 0.0, 0.0]
         var clip = painter.white
         if let selected = self.selection:
             params[7] = 1.0
@@ -208,7 +372,7 @@ pub struct Stroke:
         let target = try frame.value().target()
         defer target.release()
         let original = self.before.texture(entry.column, entry.row) else try self.blank_tile(tiles)
-        try gpu.shade(target.value(), painter.paint, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 32), [original, entry.coverage, clip], gpu.Filter.nearest)
+        try gpu.shade(target.value(), painter.paint, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 64), [original, entry.coverage, clip], gpu.Filter.nearest)
         discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         try tiles.set(entry.column, entry.row, fresh)
 
@@ -238,13 +402,11 @@ pub struct Stroke:
             if self.touched.length > 0:
                 free(self.touched) in memory.heap
             self.touched = grown
-        var coverage = try gpu.Texture.create(painter.owner, tile_size, tile_size, gpu.Format.r8)
+        var coverage = try gpu.Texture.create(painter.owner, tile_size, tile_size, gpu.Format.rgba16_float)
         errdefer coverage.destroy()
-        let zeros = try alloc u8[(usize)tile_size * (usize)tile_size] in memory.heap
-        defer free(zeros) in memory.heap
-        for index in 0..<zeros.length:
-            zeros[index] = 0
-        try coverage.upload(zeros)
+        let cleared = try coverage.frame()
+        defer cleared.release()
+        discard(try cleared.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         self.touched[self.count] = Touched(column = column, row = row, coverage = coverage)
         self.count += 1
         return self.count - 1
@@ -261,7 +423,47 @@ pub struct Stroke:
             var owned = blank
             owned.destroy()
             self.empty = none
+        if self.dabs.length > 0:
+            free(self.dabs) in memory.heap
+        var no_dabs: Dab[]
+        self.dabs = no_dabs
         self.before.destroy()
+
+## `color` shifted by `hue` degrees and by `saturation` and `brightness`
+## fractions (each -1..1), through HSV over the linear components.
+func jitter_color(color: gpu.Color, hue: f64, saturation: f64, brightness: f64) -> gpu.Color:
+    let top = math.max(color.red, math.max(color.green, color.blue))
+    let bottom = math.min(color.red, math.min(color.green, color.blue))
+    let delta = top - bottom
+    var h = 0.0
+    if delta > 0.0:
+        if top == color.red:
+            h = (color.green - color.blue) / delta
+        elif top == color.green:
+            h = 2.0 + (color.blue - color.red) / delta
+        else:
+            h = 4.0 + (color.red - color.green) / delta
+        h *= 60.0
+    h += hue
+    h -= math.floor(h / 360.0) * 360.0
+    let s = math.clamp((0.0 if top <= 0.0 else delta / top) + saturation, 0.0, 1.0)
+    let v = math.clamp(top + brightness, 0.0, 1.0)
+    let sector = (i64)math.floor(h / 60.0)
+    let f = h / 60.0 - (f64)sector
+    let p = v * (1.0 - s)
+    let q = v * (1.0 - s * f)
+    let t = v * (1.0 - s * (1.0 - f))
+    if sector == 0:
+        return gpu.Color(v, t, p, 1.0)
+    if sector == 1:
+        return gpu.Color(q, v, p, 1.0)
+    if sector == 2:
+        return gpu.Color(p, v, t, 1.0)
+    if sector == 3:
+        return gpu.Color(p, q, v, 1.0)
+    if sector == 4:
+        return gpu.Color(t, p, v, 1.0)
+    return gpu.Color(v, p, q, 1.0)
 
 ## Fill the selection on `layer`'s pixels (or its mask) with `brush`'s colour at
 ## its opacity, or erase it when the brush erases; the whole layer when nothing
@@ -284,7 +486,8 @@ pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brus
     for row in 0..<tiles.rows():
         for column in 0..<tiles.columns():
             var clip = painter.white
-            var params: f32[8] = [(f32)brush.color.red, (f32)brush.color.green, (f32)brush.color.blue, 1.0, (f32)brush.opacity, 1.0 if brush.erase else 0.0, 1.0, 0.0]
+            var params: f32[16] = [(f32)brush.color.red, (f32)brush.color.green, (f32)brush.color.blue, 1.0, (f32)brush.opacity, 1.0 if brush.erase else 0.0, 1.0, 0.0,
+                                   0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
             if let selected = selection:
                 # A selection cell with no tile selects nothing there.
                 clip = selected.texture(column, row) else continue
@@ -307,13 +510,12 @@ pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brus
             defer frame.release()
             let area = try frame.value().target()
             defer area.release()
-            try gpu.shade(area.value(), painter.paint, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 32),
+            try gpu.shade(area.value(), painter.paint, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 64),
                           [source, coverage, clip], gpu.Filter.nearest)
             discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
             try tiles.set(column, row, fresh)
     target.revision += 1
     return before
-
 
 ## Lay a linear gradient from `from_color` at (`x0`, `y0`) to `to_color` at
 ## (`x1`, `y1`) over `layer`, within the selection; the tiles from before.
@@ -365,7 +567,7 @@ pub func begin_boxed(painter: Painter*, document: Document*, layer: u64, brush: 
     errdefer stroke.destroy()
     return try new Stroke(layer = stroke.layer, brush = stroke.brush, last_x = stroke.last_x, last_y = stroke.last_y, touched = stroke.touched,
                           count = stroke.count, before = stroke.before, empty = stroke.empty, fill = stroke.fill, active = stroke.active, on_mask = stroke.on_mask,
-                          selection = stroke.selection, pressure = stroke.pressure) in memory.heap
+                          selection = stroke.selection, pressure = stroke.pressure, debt = stroke.debt, random = stroke.random, dabs = stroke.dabs, dab_count = 0) in memory.heap
 
 ## End a boxed stroke and free the box.
 pub func finish_boxed(stroke: Stroke*):
