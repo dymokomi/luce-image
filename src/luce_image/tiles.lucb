@@ -97,7 +97,7 @@ pub struct Tiles:
     ## cell, replacing what was there. Other holders keep the old tile.
     pub mutating func set(column: u32, row: u32, texture: gpu.Texture) -> !:
         let index = try self.index(column, row)
-        if (try texture.width()) != tile_size or (try texture.height()) != tile_size or (try texture.format()) != gpu.Format.rgba16_float:
+        if (try texture.width()) != tile_size or (try texture.height()) != tile_size or (try texture.pixel_format()) != gpu.Format.rgba16_float:
             error(invalid, "a tile is a 256 by 256 rgba16_float texture")
         let tile = try new Tile(texture = texture, references = 1) in memory.heap
         if let previous = self.cells[index]:

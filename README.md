@@ -110,6 +110,10 @@ It does not build into, modify, or update the language repositories. Supply
 `--base /path/to/luce-base --luce /path/to/luce` to the test runner to test other
 compiler versions instead. See [testing](docs/TESTING.md) for dependencies and CI.
 
+The GPU shaders are GLSL under `src/luce_image/shaders/`; after changing one, regenerate
+`src/luce_image/shaders.lucb` with luce-gpu's generator (needs `glslc` and `spirv-cross`):
+`python3 ../luce-gpu/tools/embed_shaders.py src/luce_image/shaders.lucb src/luce_image/shaders/dab.frag src/luce_image/shaders/paint.frag src/luce_image/shaders/composite.frag src/luce_image/shaders/adjust.frag src/luce_image/shaders/blur.frag src/luce_image/shaders/ants.frag src/luce_image/shaders/warp.frag src/luce_image/shaders/spread.frag src/luce_image/shaders/style.frag src/luce_image/shaders/gradient.frag` (this order keeps the generated file stable).
+
 Documentation: [API](docs/API.md), [formats](docs/FORMATS.md),
 [design and limits](docs/DESIGN.md), [upstream attribution](THIRD_PARTY.md).
 [Measured thread scaling](docs/BENCHMARK.md) records the initial benchmark.
