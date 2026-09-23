@@ -65,7 +65,7 @@ Luce-facing `Canvas` object:
 - Per-pixel selections (rectangle, ellipse, polygon/lasso, magic wand; add,
   subtract, intersect, invert, expand, contract, feather) that painting, fills
   and crops respect, drawn as marching ants.
-- GPU brush and eraser strokes as spaced dabs with Photoshop's controls — tip angle and roundness, spacing, smoothing, size/angle/roundness/flow/colour jitter with pressure, scattering, procedural tip textures (`set_brush_shape`, `set_brush_dynamics`, `set_brush_texture`); destructive adjustments
+- GPU brush and eraser strokes as spaced dabs with Photoshop's controls — tip angle and roundness, spacing, smoothing, size/angle/roundness/flow/color jitter with pressure, scattering, procedural tip textures (`set_brush_shape`, `set_brush_dynamics`, `set_brush_texture`); destructive adjustments
   (brightness/contrast, hue/saturation/lightness, invert, levels, curves,
   desaturate, threshold, posterize), Gaussian blur, free transform, move,
   canvas and image resize, text from `std.fonts`; each undoable, and each

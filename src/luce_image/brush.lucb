@@ -1,8 +1,8 @@
 ## Painting: a stroke is a polyline in document pixels applied to one raster
 ## layer as it is drawn, as a run of dabs — the tip stamped every `spacing`
 ## of its diameter, each dab jittered in size, angle, roundness, position,
-## flow and colour as the brush's dynamics say, through a procedural texture.
-## Dabs accumulate `over` into a paint tile (premultiplied colour) for every
+## flow and color as the brush's dynamics say, through a procedural texture.
+## Dabs accumulate `over` into a paint tile (premultiplied color) for every
 ## tile they reach, and the layer's tile is rebuilt from the tile it had before
 ## the stroke plus that paint, capped by the stroke's opacity. Tiles the stroke
 ## never reaches are untouched; the ones it does are replaced, which the
@@ -27,7 +27,7 @@ pub struct Brush:
     pub var opacity: f64 = 1.0
     ## 0..1: how much each dab adds where it lands.
     pub var flow: f64 = 1.0
-    ## Straight-alpha paint colour in linear light; alpha is ignored.
+    ## Straight-alpha paint color in linear light; alpha is ignored.
     pub var color: gpu.Color = gpu.Color(0.0, 0.0, 0.0, 1.0)
     ## Erase instead of paint.
     pub var erase: bool
@@ -50,7 +50,7 @@ pub struct Brush:
     # -- Scattering: how far a dab may stray, as a fraction of the diameter (0..10), and how many land per step (1..16).
     pub var scatter: f64 = 0.0
     pub var scatter_count: i64 = 1
-    # -- Transfer and colour dynamics, each 0..1.
+    # -- Transfer and color dynamics, each 0..1.
     pub var flow_jitter: f64 = 0.0
     pub var hue_jitter: f64 = 0.0
     pub var saturation_jitter: f64 = 0.0
@@ -121,7 +121,7 @@ struct Touched:
     var row: u32
     var coverage: gpu.Texture
 
-## One dab, ready to stamp: where, how big, how turned, how much, what colour.
+## One dab, ready to stamp: where, how big, how turned, how much, what color.
 struct Dab:
     var x: f64
     var y: f64
@@ -249,7 +249,7 @@ pub struct Stroke:
         return self.next_random() * 2.0 - 1.0
 
     ## Queue the dabs for one step at (x, y): one per scatter count, each with
-    ## its own jitter of size, angle, roundness, flow, colour and position.
+    ## its own jitter of size, angle, roundness, flow, color and position.
     mutating func place(x: f64, y: f64) -> !:
         let brush = self.brush
         for _ in 0..<(usize)brush.scatter_count:
@@ -376,7 +376,7 @@ pub struct Stroke:
         discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         try tiles.set(entry.column, entry.row, fresh)
 
-    ## One tile of the fill colour standing in for cells the layer had nothing at.
+    ## One tile of the fill color standing in for cells the layer had nothing at.
     mutating func blank_tile(tiles: Tiles*) -> gpu.Texture!:
         if let existing = self.empty:
             return existing
@@ -465,7 +465,7 @@ func jitter_color(color: gpu.Color, hue: f64, saturation: f64, brightness: f64) 
         return gpu.Color(t, p, v, 1.0)
     return gpu.Color(v, p, q, 1.0)
 
-## Fill the selection on `layer`'s pixels (or its mask) with `brush`'s colour at
+## Fill the selection on `layer`'s pixels (or its mask) with `brush`'s color at
 ## its opacity, or erase it when the brush erases; the whole layer when nothing
 ## is selected. Returns the tiles from before, for history.
 pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brush: Brush, on_mask: bool = false) -> Tiles!:

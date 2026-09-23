@@ -14,7 +14,7 @@ from raster_errors import invalid, limit
 pub let blend_mode_count: u32 = 26
 
 ## A layer's styles, Photoshop's layer effects drawn under its pixels by the
-## compositor and kept with the layer; none is on by default. Colours are
+## compositor and kept with the layer; none is on by default. Colors are
 ## linear light, 0..1; sizes and offsets in document pixels.
 pub struct Style:
     pub var shadow: bool = false

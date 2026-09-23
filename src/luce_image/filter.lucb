@@ -108,7 +108,7 @@ test "a gaussian blur spreads across tile edges and keeps alpha weight":
     try filters.gaussian_blur(&document, layer, 4.0)
     let current = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
     try current.read(pixels)
-    # The bar bleeds into the right tile; colour stays pure red where it bleeds.
+    # The bar bleeds into the right tile; color stays pure red where it bleeds.
     let past = (32 * 512 + 258) * 4
     assert(pixels[past + 3] > 0.05 and pixels[past + 3] < 0.6 and pixels[past] > 0.99)
     assert(pixels[(32 * 512 + 228) * 4 + 3] > 0.99)

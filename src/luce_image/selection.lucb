@@ -175,7 +175,7 @@ pub struct Selection:
         self.finish()
 
     ## The magic wand: every pixel of `pixels` (RGBA straight-alpha linear
-    ## samples, this selection's size) whose colour is within `tolerance`
+    ## samples, this selection's size) whose color is within `tolerance`
     ## (0..255, in sRGB, alpha included) of the one at (`x`, `y`), reachable
     ## through such pixels when `contiguous`, combined by `mode`.
     pub mutating func wand(pixels: const f32[], x: i64, y: i64, tolerance: f64, contiguous: bool, mode: Mode) -> !:
@@ -190,7 +190,7 @@ pub struct Selection:
         if mode == Mode.replace:
             for index in 0..<self.coverage.length:
                 self.coverage[index] = 0
-        # Colours compared as 8-bit sRGB, the way the tolerance is stated.
+        # Colors compared as 8-bit sRGB, the way the tolerance is stated.
         let bytes = try alloc u8[width * height * 4] in memory.heap
         defer free(bytes) in memory.heap
         for index in 0..<(width * height):
@@ -420,7 +420,7 @@ test "selection shapes combine, invert, grow and feather":
     selection.clear()
     assert(selection.is_empty())
 
-test "the wand selects like colours, contiguously or not":
+test "the wand selects like colors, contiguously or not":
     var selection = try Selection.create(8, 4)
     defer selection.destroy()
     # Two red patches split by a blue column; the rest transparent.

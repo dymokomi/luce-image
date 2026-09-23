@@ -1,6 +1,6 @@
 // A linear gradient over a layer tile: image 1 is the original tile (straight
 // alpha), image 2 the selection's coverage (red). The gradient runs from
-// `a` to `b` in document pixels, colour `from` to colour `to` (straight
+// `a` to `b` in document pixels, color `from` to color `to` (straight
 // alpha, linear light), and is laid over the original where selected.
 #version 450
 layout(location = 0) in vec4 vertex_color;

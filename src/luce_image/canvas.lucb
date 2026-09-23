@@ -61,7 +61,7 @@ pub struct Canvas:
     var preview: Snapshot?
     var curves: Curves
     var table: gpu.Texture?
-    ## The last colour the eyedropper read, straight alpha, linear light.
+    ## The last color the eyedropper read, straight alpha, linear light.
     var picked: f64[4]
     var mask_editing: bool
     ## The selection lives on the CPU here and is copied into the GPU document at bind.
@@ -75,6 +75,11 @@ pub struct Canvas:
     var future: Snapshot[]
     var future_count: usize
     var closed: bool
+    ## Pixels per inch, for print sizes and rulers in physical units.
+    var dpi: f64
+    ## The color profile the pixels are in, by luce-color's space name.
+    var profile_name: u8[64]
+    var profile_length: usize
 
     ## An empty `width` by `height` document with no layers.
     pub func init(width: i64, height: i64) -> !:
@@ -113,6 +118,34 @@ pub struct Canvas:
         self.future = no_history
         self.future_count = 0
         self.closed = false
+        self.dpi = 72.0
+        var no_name: u8[64]
+        self.profile_name = no_name
+        self.profile_length = 0
+        self.set_profile("sRGB")
+
+    # mark: Document settings =================================================================
+
+    ## Pixels per inch: how big the document prints, and what a ruler in
+    ## millimeters or inches measures. 72 unless set.
+    pub func resolution() -> f64:
+        return self.dpi
+
+    pub mutating func set_resolution(dpi: f64) -> !:
+        if not math.is_finite(dpi) or dpi < 1.0 or dpi > 100000.0:
+            error(invalid, "a resolution must be 1..100000 pixels per inch")
+        self.dpi = dpi
+
+    ## The color profile the document's pixels are in, as luce-color names spaces
+    ## ("sRGB", "Display P3", "Adobe RGB (1998)", …). sRGB unless set.
+    pub func profile() -> interop.Owned[str]!:
+        return try interop.copy_text((str)self.profile_name[..<self.profile_length])
+
+    pub mutating func set_profile(name: str):
+        let length = name.length if name.length < self.profile_name.length else self.profile_name.length
+        for index in 0..<length:
+            self.profile_name[index] = name.bytes[index]
+        self.profile_length = length
 
     ## A document from `path`: an `.l2d` package with its layers, or a picture
     ## of any supported format as one layer.
@@ -345,7 +378,7 @@ pub struct Canvas:
         self.live().ellipse(x, y, width, height, try selection_mode(mode))
 
     ## The magic wand on layer `id`: select the pixels within `tolerance`
-    ## (0..255, sRGB, alpha included) of the colour at (`x`, `y`), only those
+    ## (0..255, sRGB, alpha included) of the color at (`x`, `y`), only those
     ## reachable through such pixels when `contiguous`, combined by `mode`.
     pub mutating func select_wand(id: i64, x: i64, y: i64, tolerance: f64, contiguous: bool, mode: i64 = 0) -> !:
         try self.require_open()
@@ -482,7 +515,7 @@ pub struct Canvas:
             return &document.selection
         return &self.selection
 
-    ## Fill the selection (or the whole layer) on `layer` with the brush colour
+    ## Fill the selection (or the whole layer) on `layer` with the brush color
     ## at its opacity, or clear it when `erase`. Undoable.
     pub mutating func fill(layer: i64, erase: bool) -> !:
         try self.require_open()
@@ -545,7 +578,7 @@ pub struct Canvas:
         self.records[index].name = copied
 
     ## Layer styles, drawn under the layer by the compositor and kept with the
-    ## document. Colours are linear 0..1; sizes and offsets in pixels.
+    ## document. Colors are linear 0..1; sizes and offsets in pixels.
     pub mutating func set_shadow(id: i64, on: bool, dx: f64, dy: f64, blur: f64, red: f64, green: f64, blue: f64, opacity: f64) -> !:
         var style = try self.style_of(id)
         style.shadow = on
@@ -583,8 +616,8 @@ pub struct Canvas:
         return (try self.record(index)).style.any()
 
     ## One style setting of the layer at `index`, by field: 0 shadow on, 1 dx,
-    ## 2 dy, 3 blur, 4..6 colour, 7 opacity; 8 stroke on, 9 size, 10..12
-    ## colour, 13 opacity; 14 glow on, 15 size, 16..18 colour, 19 opacity.
+    ## 2 dy, 3 blur, 4..6 color, 7 opacity; 8 stroke on, 9 size, 10..12
+    ## color, 13 opacity; 14 glow on, 15 size, 16..18 color, 19 opacity.
     pub func style_value(index: i64, field: i64) -> f64!:
         let style = (try self.record(index)).style
         return style_field(style, field) else error(invalid, "style fields are 0..19")
@@ -637,7 +670,7 @@ pub struct Canvas:
 
     # mark: Painting =========================================================================
 
-    ## Set the brush every following stroke paints with: its size, edge, colour
+    ## Set the brush every following stroke paints with: its size, edge, color
     ## and strength. The tip shape, dynamics and texture set separately stay.
     pub mutating func set_brush(diameter: f64, hardness: f64, opacity: f64, flow: f64, red: f64, green: f64, blue: f64, erase: bool) -> !:
         var brush = self.brush
@@ -665,7 +698,7 @@ pub struct Canvas:
 
     ## The brush's dynamics, each jitter 0..1: size, angle and roundness
     ## (shape), scatter as a fraction of the diameter with the dabs per step,
-    ## flow (transfer), hue, saturation and brightness (colour), and whether
+    ## flow (transfer), hue, saturation and brightness (color), and whether
     ## stylus pressure drives size and flow.
     pub mutating func set_brush_dynamics(size_jitter: f64, angle_jitter: f64, roundness_jitter: f64, scatter: f64, scatter_count: i64,
                                          flow_jitter: f64, hue_jitter: f64, saturation_jitter: f64, brightness_jitter: f64, pressure_size: bool, pressure_flow: bool) -> !:
@@ -886,7 +919,7 @@ pub struct Canvas:
         let transformer = self.transformer else trap("preview without a transformer")
         try transformer.apply(document, layer, scale_x, scale_y, angle * math.pi / 180.0, dx, dy)
 
-    ## Lay a linear gradient over layer `id` from one colour at (`x0`, `y0`) to
+    ## Lay a linear gradient over layer `id` from one color at (`x0`, `y0`) to
     ## another at (`x1`, `y1`), straight alpha in linear light, inside the
     ## selection. Undoable.
     pub mutating func fill_gradient(id: i64, x0: f64, y0: f64, x1: f64, y1: f64, r0: f64, g0: f64, b0: f64, a0: f64, r1: f64, g1: f64, b1: f64, a1: f64) -> !:
@@ -904,7 +937,7 @@ pub struct Canvas:
         errdefer before.destroy()
         try self.remember((u64)id, before)
 
-    ## The eyedropper: read the flattened document's colour at a pixel into
+    ## The eyedropper: read the flattened document's color at a pixel into
     ## `picked_red` and friends (linear light, straight alpha).
     pub mutating func pick(x: i64, y: i64) -> !:
         try self.require_open()
@@ -931,7 +964,7 @@ pub struct Canvas:
         return self.picked[3]
 
     ## Set `text` into a layer's pixels with its top-left at (`x`, `y`), `size`
-    ## pixels tall (8..256), in a linear colour. Rasterised type, as Photoshop
+    ## pixels tall (8..256), in a linear color. Rasterised type, as Photoshop
     ## does when it flattens; undoable.
     pub mutating func draw_text(id: i64, x: f64, y: f64, text: str, size: f64, red: f64, green: f64, blue: f64) -> !:
         try self.require_open()
@@ -1060,6 +1093,12 @@ pub struct Canvas:
         try manifest.value().add("/document", "document")
         try set_integer(manifest.value(), "/document", "width", (i64)self.extent_x)
         try set_integer(manifest.value(), "/document", "height", (i64)self.extent_y)
+        let resolution = try prism.Value.number(self.dpi)
+        defer resolution.release()
+        try manifest.value().set("/document", "resolution", resolution)
+        let profile = try prism.Value.text((str)self.profile_name[..<self.profile_length])
+        defer profile.release()
+        try manifest.value().set("/document", "profile", profile)
         try manifest.value().add("/layers", "layers")
         let count = (usize)self.extent_x * (usize)self.extent_y * 4
         let pixels = try alloc f32[count] in memory.heap
@@ -1482,6 +1521,14 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
     errdefer reservation.cancel()
     let native = try new Canvas(width, height) in memory.heap
     errdefer native.close()
+    # Packages from before resolution and profile keep the defaults.
+    let resolution = get_number(doc, "/document", "resolution") catch _:
+        recover 72.0
+    try native.set_resolution(resolution)
+    let profile_value = doc.get("/document", "profile") catch _:
+        recover try prism.Value.text("sRGB")
+    defer profile_value.release()
+    native.set_profile(try profile_value.value().text_at())
     let layers_dir = try paths.join(path, "layers")
     for index in 0..<doc.child_count("/layers"):
         let element = doc.child_at("/layers", index) else error(invalid, "a layer element is missing")
@@ -1578,7 +1625,7 @@ func clear_snapshots(list: Snapshot[]*, count: usize*):
 
 func gpu_check_color(color: gpu.Color) -> !:
     if not (color.red >= 0.0 and color.red <= 1.0 and color.green >= 0.0 and color.green <= 1.0 and color.blue >= 0.0 and color.blue <= 1.0):
-        error(invalid, "brush colour components must be in 0..1")
+        error(invalid, "brush color components must be in 0..1")
 
 func unwind(binding: Binding*):
     if let transformer = binding.transformer:
@@ -1924,3 +1971,21 @@ test "previews show edits on the original pixels and end kept or dropped":
     assert((try canvas.curve_point_count(0)) == 2)
     try canvas.undo()
     assert((try shown_centre(&canvas, &target, pixels)) == base)
+
+test "a document keeps its resolution and color profile":
+    var canvas = try Canvas(40, 30)
+    defer canvas.close()
+    assert(canvas.resolution() == 72.0)
+    let initial = try canvas.profile()
+    defer initial.release()
+    assert(initial.value == "sRGB")
+    try canvas.set_resolution(300.0)
+    canvas.set_profile("Display P3")
+    let changed = try canvas.profile()
+    defer changed.release()
+    assert(canvas.resolution() == 300.0 and changed.value == "Display P3")
+    var rejected = false
+    canvas.set_resolution(0.0) catch failure:
+        assert(failure.code == invalid)
+        rejected = true
+    assert(rejected and canvas.resolution() == 300.0)

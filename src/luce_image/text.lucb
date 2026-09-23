@@ -1,5 +1,5 @@
 ## Text set into a layer's pixels: the platform's monospace face rasterised
-## by `std.fonts` and drawn, in a colour, over the tiles it touches. Like
+## by `std.fonts` and drawn, in a color, over the tiles it touches. Like
 ## Photoshop's rasterised type, the result is pixels; the caller keeps the
 ## tiles from before for undo.
 import gpu
@@ -70,7 +70,7 @@ pub func draw_text(document: Document*, layer: u64, x: f64, y: f64, text: str, s
             try tiles.set(column, row, fresh)
     target.revision += 1
 
-test "text lands on the layer in its colour and measures":
+test "text lands on the layer in its color and measures":
     var device = gpu.Device.open() catch failure:
         assert(failure.code == gpu.unavailable)
         return

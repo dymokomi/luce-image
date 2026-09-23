@@ -73,7 +73,7 @@ test "adjustments rewrite a layer's tiles":
     defer device.destroy()
     var document = try Document.create(device, 300, 40)
     defer document.destroy()
-    let layer = try document.add_layer("Colour")
+    let layer = try document.add_layer("Color")
     let count = (usize)300 * 40 * 4
     let pixels = try alloc f32[count] in memory.heap
     defer free(pixels) in memory.heap

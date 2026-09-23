@@ -1,5 +1,5 @@
 // The layer tile after a stroke: the original tile (image 1, straight alpha)
-// with the stroke's paint (image 2, premultiplied: dabs' colour and coverage)
+// with the stroke's paint (image 2, premultiplied: dabs' color and coverage)
 // applied as paint or as erasure, the coverage capped by the stroke opacity
 // and, for a textured brush, modulated by a procedural pattern in document
 // space, as Photoshop textures a whole stroke rather than each dab.
@@ -8,7 +8,7 @@
 layout(location = 0) in vec4 vertex_color;
 layout(location = 0) out vec4 fragment_color;
 layout(push_constant) uniform Params {
-    vec4 color;       // straight alpha paint colour, linear light
+    vec4 color;       // straight alpha paint color, linear light
     float opacity;    // stroke opacity, caps the coverage
     float erase;      // 1 erases instead of painting
     float fill;       // 1 ignores the coverage and paints the whole selection

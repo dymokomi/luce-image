@@ -21,7 +21,7 @@ float alpha_of(sampler2D image, ivec2 p) {
     return texelFetch(image, p, 0).a;
 }
 vec4 over(vec4 under, vec3 color, float a) {
-    // Premultiplied "over": the new layer of colour goes on top of what is there.
+    // Premultiplied "over": the new layer of color goes on top of what is there.
     return vec4(color * a + under.rgb * (1.0 - a), a + under.a * (1.0 - a));
 }
 void main() {
