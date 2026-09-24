@@ -108,7 +108,7 @@ test "canvas strokes paint the selected layer and undo restores it":
     try canvas.redo()
     assert(canvas.can_undo() and not canvas.can_redo())
     # Inverting the painted layer turns its green stroke magenta, undoably.
-    try canvas.adjust_layer(layer, 2, 0.0, 0.0, 0.0, 0.0, 0.0)
+    try canvas.adjust_layer(layer, 2)
     let fourth = try target.frame()
     defer fourth.release()
     let last = try fourth.value().target()
@@ -246,11 +246,12 @@ test "previews show edits on the original pixels and end kept or dropped":
     assert(base > 5 and base < 25)
     try canvas.begin_preview(layer)
     assert(canvas.previewing())
-    try canvas.preview_adjust(2, 0.0, 0.0, 0.0, 0.0, 0.0)
+    try canvas.preview_adjust(2)
     let inverted = try shown_centre(&canvas, &target, pixels)
     assert(inverted > base + 40)
     # A second preview applies to the original, not to the inverted pixels.
-    try canvas.preview_adjust(0, 0.3, 0.0, 0.0, 0.0, 0.0)
+    try canvas.set_adjustment(0, 0.3)
+    try canvas.preview_adjust(0)
     let brighter = try shown_centre(&canvas, &target, pixels)
     assert(brighter > base and brighter < inverted)
     var rejected = false
@@ -262,7 +263,7 @@ test "previews show edits on the original pixels and end kept or dropped":
     assert(not canvas.previewing())
     assert((try shown_centre(&canvas, &target, pixels)) == base)
     try canvas.begin_preview(layer)
-    try canvas.preview_adjust(2, 0.0, 0.0, 0.0, 0.0, 0.0)
+    try canvas.preview_adjust(2)
     try canvas.end_preview(true)
     assert(canvas.can_undo())
     assert((try shown_centre(&canvas, &target, pixels)) == inverted)
@@ -308,7 +309,7 @@ test "previews show edits on the original pixels and end kept or dropped":
     # Curves: lifting the midtones brightens the dark grey; resetting restores identity.
     try canvas.add_curve_point(0, 0.25, 0.6)
     assert((try canvas.curve_point_count(0)) == 3 and (try canvas.curve_value(0, 0.25)) > 0.59)
-    try canvas.adjust_layer(layer, 7, 0.0, 0.0, 0.0, 0.0, 0.0)
+    try canvas.adjust_layer(layer, 7)
     let lifted = try shown_centre(&canvas, &target, pixels)
     assert(lifted > base + 40)
     try canvas.reset_curve(0)
@@ -374,14 +375,14 @@ test "selected pixels move or copy with their selection, and edits keep inside i
     assert((try shown_at(&canvas, &target, 12, 12))[0] == 255 and (try shown_at(&canvas, &target, 12, 36))[0] == 255)
     # An inversion with the top band selected changes only the top square.
     try canvas.select_rectangle(0, 0, 64, 20, 0)
-    try canvas.adjust_layer(layer, 2, 0.0, 0.0, 0.0, 0.0, 0.0)
+    try canvas.adjust_layer(layer, 2)
     let top = try shown_at(&canvas, &target, 12, 12)
     let below = try shown_at(&canvas, &target, 12, 36)
     assert(top[0] == 0 and top[1] == 255 and top[2] == 255)
     assert(below[0] == 255 and below[1] == 0)
     # A previewed inversion is kept inside the selection too, then dropped.
     try canvas.begin_preview(layer)
-    try canvas.preview_adjust(2, 0.0, 0.0, 0.0, 0.0, 0.0)
+    try canvas.preview_adjust(2)
     assert((try shown_at(&canvas, &target, 12, 12))[0] == 255 and (try shown_at(&canvas, &target, 12, 36))[0] == 255)
     try canvas.end_preview(false)
     assert((try shown_at(&canvas, &target, 12, 12))[0] == 0)
@@ -495,6 +496,9 @@ test "groups hold layers, move and save with them; masks fill, disable and load 
     try canvas.select_rectangle(40, 40, 16, 16, 0)
     try canvas.fill(green, false)
     try canvas.deselect()
+    # The red square's 256 pixels count at full red and no green; transparency is not counted.
+    try canvas.measure_histogram(red)
+    assert((try canvas.histogram(1, 255)) == 256 and (try canvas.histogram(2, 0)) == 256 and (try canvas.histogram(1, 0)) == 0)
     # Both go into a group: listed below it, one deep.
     let folder = try canvas.add_group("Folder")
     try canvas.move_into(red, folder, -1)
@@ -553,3 +557,63 @@ test "groups hold layers, move and save with them; masks fill, disable and load 
     # Removing the group takes what it holds.
     try canvas.remove_layer(folder)
     assert(canvas.layer_count() == 1 and (try canvas.layer_id(0)) == loose)
+
+test "adjustment layers change what is below them live, leave the pixels alone, and save":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    let red = try canvas.add_layer("Red")
+    let green = try canvas.add_layer("Green")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(8, 8, 16, 16, 0)
+    try canvas.fill(red, false)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, false)
+    try canvas.select_rectangle(40, 40, 16, 16, 0)
+    try canvas.fill(green, false)
+    try canvas.deselect()
+    # A hue turn of a third, as a layer between the two: red below turns green, green above stays.
+    canvas.clear_adjustments()
+    try canvas.set_adjustment(0, 1.0 / 3.0)
+    let turn = try canvas.add_adjustment_layer("Hue", 1)
+    try canvas.reorder_layer(turn, -1)
+    assert((try canvas.layer_adjustment(1)) == 1 and (try canvas.layer_adjustment(0)) == -1 and (try canvas.adjustment_value(1, 0)) > 0.33)
+    var shown = try shown_at(&canvas, &target, 12, 12)
+    assert(shown[0] < 5 and shown[1] > 250)
+    shown = try shown_at(&canvas, &target, 44, 44)
+    assert(shown[1] > 250 and shown[2] < 5)
+    # Edited live: two thirds make it blue; the red layer's own pixels never changed.
+    try canvas.set_adjustment(0, 2.0 / 3.0)
+    try canvas.update_adjustment_layer(turn)
+    shown = try shown_at(&canvas, &target, 12, 12)
+    assert(shown[2] > 250 and shown[0] < 5)
+    try canvas.set_layer(turn, false, 1.0)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] > 250)
+    # Half opacity mixes halfway; a mask hiding all takes it away.
+    try canvas.set_layer(turn, true, 0.5)
+    shown = try shown_at(&canvas, &target, 12, 12)
+    assert(shown[0] > 110 and shown[0] < 145 and shown[2] > 110 and shown[2] < 145)
+    try canvas.set_mask(turn, true, 1)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] > 250)
+    try canvas.set_mask(turn, false)
+    try canvas.set_layer(turn, true, 1.0)
+    # It has no pixels to paint on or merge.
+    var refused = false
+    canvas.merge_down(turn) catch failure:
+        assert(failure.code == invalid)
+        refused = true
+    assert(refused)
+    # The package keeps it, and it shows the same.
+    try canvas.save_package("build/canvas-adjustments.l2d")
+    let restored = try Canvas.open("build/canvas-adjustments.l2d")
+    defer restored.release()
+    let copy = restored.value()
+    assert(copy.layer_count() == 3 and (try copy.layer_adjustment(1)) == 1 and (try copy.adjustment_value(1, 0)) > 0.66)
+    discard(try shown_at(copy, &target, 0, 0))
+    shown = try shown_at(copy, &target, 12, 12)
+    assert(shown[2] > 250 and shown[0] < 5)

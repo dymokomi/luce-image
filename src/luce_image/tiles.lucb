@@ -226,8 +226,10 @@ pub struct Tiles:
 
 ## Move `tiles` onto the heap, for holders that keep a pointer.
 pub func box(tiles: Tiles) -> Tiles*!:
-    return try new Tiles(owner = tiles.owner, extent_x = tiles.extent_x, extent_y = tiles.extent_y,
-                         cell_columns = tiles.cell_columns, cell_rows = tiles.cell_rows, cells = tiles.cells) in memory.heap
+    # The whole value at once, so no field is forgotten.
+    let boxed = try new Tiles in memory.heap
+    *boxed = tiles
+    return boxed
 
 ## Destroy boxed tiles and free the box.
 pub func unbox(tiles: Tiles*):

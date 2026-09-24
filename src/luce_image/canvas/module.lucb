@@ -41,9 +41,10 @@ from luce_image.tiles import Tiles, Bounds, tile_size, tile_columns, min_u32
 from luce_image.document import Style, Document, Layer, box_document, unbox_document, blend_mode_count
 from luce_image.composite import Composer, box_composer, unbox_composer
 from luce_image.brush import Brush, Painter, Stroke, begin_boxed, finish_boxed, fill_selection, fill_gradient
-from luce_image.adjust import Adjuster, adjustment_count, curves
+from luce_image.adjust import Adjuster, adjustment_count, parameter_count, curves
 from luce_image.curves import Curves, lut_size
 from luce_image.filter import Filters
+import luce_image.filter as filtering
 from luce_image.transform import translate, Transformer
 from luce_image.selection_passes import SelectionPasses
 from luce_image.text import draw_text, measure_text, text_height
@@ -63,6 +64,9 @@ struct Record:
     var parent: u64 = 0
     ## A disabled mask is kept but hides nothing.
     var mask_enabled: bool = true
+    ## An adjustment layer's kind and parameters (no pixels), or -1.
+    var adjustment: i64 = -1
+    var adjustment_values: f64[23]
     var visible: bool
     var opacity: f64
     var blend: i64
@@ -115,6 +119,11 @@ pub struct Canvas:
     var content: Bounds
     ## The next edit joins the one before it in the history (`join_next_edit`).
     var joining: bool
+    ## The parameters the next adjustment takes (`set_adjustment`).
+    var adjustment: f64[23]
+    ## What `measure_histogram` counted: luminosity, red, green and blue, 256
+    ## bins each of the encoded values.
+    var histogram_counts: u64[1024]
 
     # mark: Lifecycle and document settings =======================================================
 
@@ -162,6 +171,11 @@ pub struct Canvas:
         self.profile_length = 0
         self.content = Bounds(left = 0, top = 0, right = 0, bottom = 0)
         self.joining = false
+        var no_values: f64[23]
+        self.adjustment = no_values
+        var no_counts: u64[1024]
+        self.histogram_counts = no_counts
+        self.clear_adjustments()
         self.set_profile("sRGB")
 
     ## Pixels per inch: how big the document prints, and what a ruler in
@@ -232,6 +246,8 @@ pub struct Canvas:
             let record = self.records[index]
             if record.group:
                 discard(try document.add_group(record.name))
+            elif record.adjustment >= 0:
+                discard(try document.add_adjustment(record.name, record.adjustment, record.adjustment_values[..<parameter_count]))
             else:
                 discard(try document.add_layer(record.name))
             try document.set_appearance(record.id, record.visible, record.opacity, (u32)record.blend)
@@ -353,6 +369,45 @@ pub struct Canvas:
 
     ## Add a transparent layer on top; returns its id.
     pub mutating func add_layer(name: str) -> i64!:
+        return try self.add_record(name, false, -1)
+
+    ## Add an empty group on top; returns its id. Layers go in with `move_into`.
+    pub mutating func add_group(name: str) -> i64!:
+        return try self.add_record(name, true, -1)
+
+    ## Add an adjustment layer of `kind` on top, with the staged parameters
+    ## (`set_adjustment`); returns its id. It has no pixels: it adjusts what
+    ## is below it live, through its mask, clipped to the layer below when
+    ## clipped — the non-destructive twin of `adjust_layer`. Any kind but
+    ## curves.
+    pub mutating func add_adjustment_layer(name: str, kind: i64) -> i64!:
+        if kind < 0 or kind >= (i64)adjustment_count or kind == (i64)curves:
+            error(invalid, "no such adjustment for a layer")
+        return try self.add_record(name, false, kind)
+
+    ## Give adjustment layer `id` the staged parameters: editing it, live.
+    pub mutating func update_adjustment_layer(id: i64) -> !:
+        try self.require_open()
+        let index = try self.index((u64)id)
+        let kind = self.records[index].adjustment
+        if kind < 0:
+            error(invalid, "not an adjustment layer")
+        self.records[index].adjustment_values = self.adjustment
+        if let document = self.document:
+            try document.set_adjustment((u64)id, kind, self.adjustment[..<parameter_count])
+
+    ## The adjustment kind of the layer at `index`, or -1 for a layer with pixels or a group.
+    pub func layer_adjustment(index: i64) -> i64!:
+        return (try self.record(index)).adjustment
+
+    ## Parameter `parameter` of the adjustment layer at `index`, for editing it.
+    pub func adjustment_value(index: i64, parameter: i64) -> f64!:
+        if parameter < 0 or parameter >= (i64)parameter_count:
+            error(invalid, "adjustments take parameters 0..22")
+        return (try self.record(index)).adjustment_values[(usize)parameter]
+
+    ## A layer, a group or an adjustment layer on top, its record and (bound) its tree node.
+    mutating func add_record(name: str, group: bool, adjustment: i64) -> i64!:
         try self.require_open()
         if self.count == self.records.length:
             let capacity = 8 if self.records.length == 0 else self.records.length * 2
@@ -368,27 +423,20 @@ pub struct Canvas:
         errdefer strings.release(copied)
         let id = self.next_id
         if let document = self.document:
-            let created = try document.add_layer(name)
+            var created: u64 = 0
+            if group:
+                created = try document.add_group(name)
+            elif adjustment >= 0:
+                created = try document.add_adjustment(name, adjustment, self.adjustment[..<parameter_count])
+            else:
+                created = try document.add_layer(name)
             assert(created == id)
-        self.records[self.count] = Record(id = id, name = copied, visible = true, opacity = 1.0, blend = 0, masked = false, clipped = false, picture = none, mask_picture = none)
+        self.records[self.count] = Record(id = id, name = copied, group = group, adjustment = adjustment, visible = true, opacity = 1.0, blend = 0, masked = false, clipped = false, picture = none, mask_picture = none)
+        if adjustment >= 0:
+            self.records[self.count].adjustment_values = self.adjustment
         self.count += 1
         self.next_id += 1
         return (i64)id
-
-    ## Add an empty group on top; returns its id. Layers go in with `move_into`.
-    pub mutating func add_group(name: str) -> i64!:
-        let id = try self.add_layer(name)
-        let index = try self.index((u64)id)
-        self.records[index].group = true
-        if let document = self.document:
-            # The record's layer becomes a group in the tree, keeping its id.
-            try document.remove((u64)id)
-            let created = try document.add_group(name)
-            assert(created == (u64)id + 1)
-            self.records[index].id = created
-            self.next_id = created + 1
-            return (i64)created
-        return id
 
     ## Move a layer — a group with everything in it — into group `parent` (0
     ## the top level) at `position` among its layers, 0 the bottom, or on top
@@ -570,6 +618,8 @@ pub struct Canvas:
         let index = try self.index((u64)id)
         if index == 0:
             error(invalid, "nothing below to merge into")
+        if self.records[index].adjustment >= 0 or self.records[index - 1].adjustment >= 0:
+            error(invalid, "adjustment layers do not merge yet")
         try composer.merge_down(document, (u64)id)
         strings.release(self.records[index].name)
         if let picture = self.records[index].picture:
@@ -1209,13 +1259,25 @@ pub struct Canvas:
 
     # mark: Adjustments, filters and previews =====================================================
 
-    ## Rewrite a layer's pixels with a destructive adjustment: 0 brightness/
-    ## contrast (a, b in -1..1), 1 hue/saturation/lightness (a in turns, b, c
-    ## in -1..1), 2 invert, 3 levels (a input black, b input white, c gamma,
-    ## d output black, e output white, all 0..1 but gamma), 4 desaturate,
-    ## 5 threshold (a), 6 posterize (a levels), 7 curves (the curves set with
-    ## `add_curve_point`). Undoable.
-    pub mutating func adjust_layer(id: i64, kind: i64, a: f64, b: f64, c: f64, d: f64, e: f64) -> !:
+    ## Stage parameter `index` (0..22) of the next adjustment, as adjust.frag
+    ## lists them for each kind; `clear_adjustments` sets them all to 0.
+    pub mutating func set_adjustment(index: i64, value: f64) -> !:
+        if index < 0 or index >= (i64)parameter_count:
+            error(invalid, "adjustments take parameters 0..22")
+        if not math.is_finite(value):
+            error(invalid, "adjustment parameters must be finite")
+        self.adjustment[(usize)index] = value
+
+    pub mutating func clear_adjustments():
+        for index in 0..<parameter_count:
+            self.adjustment[index] = 0.0
+
+    ## Rewrite a layer's pixels with destructive adjustment `kind` and the
+    ## staged parameters: 0 brightness/contrast, 1 hue/saturation/lightness,
+    ## 2 invert, 3 levels, 4 desaturate, 5 threshold, 6 posterize, 7 curves
+    ## (the curves set with `add_curve_point`), 8 exposure, 9 black & white,
+    ## 10 color balance, 11 gradient map. Undoable.
+    pub mutating func adjust_layer(id: i64, kind: i64) -> !:
         try self.require_open()
         try self.require_idle()
         if kind < 0 or kind >= (i64)adjustment_count:
@@ -1226,7 +1288,7 @@ pub struct Canvas:
         let tiles = layer.tiles() else error(invalid, "a group cannot be adjusted")
         let table = try self.curve_table((u32)kind)
         try self.remember((u64)id, try tiles.clone())
-        try adjuster.apply(document, (u64)id, (u32)kind, a, b, c, d, e, table)
+        try adjuster.apply(document, (u64)id, (u32)kind, self.adjustment[..<parameter_count], table)
         try self.restrict_to_selection((u64)id, &self.history[self.history_count - 1].tiles)
 
     pub static func adjustment_count() -> i64:
@@ -1292,14 +1354,14 @@ pub struct Canvas:
         return self.preview != none
 
     ## Show adjustment `kind` (as `adjust_layer`) applied to the layer as it was when the preview began.
-    pub mutating func preview_adjust(kind: i64, a: f64, b: f64, c: f64, d: f64, e: f64) -> !:
+    pub mutating func preview_adjust(kind: i64) -> !:
         if kind < 0 or kind >= (i64)adjustment_count:
             error(invalid, "no such adjustment")
         let table = try self.curve_table((u32)kind)
         let layer = try self.restore_preview()
         let document = self.document else trap("preview without a document")
         let adjuster = self.adjuster else trap("preview without an adjuster")
-        try adjuster.apply(document, layer, (u32)kind, a, b, c, d, e, table)
+        try adjuster.apply(document, layer, (u32)kind, self.adjustment[..<parameter_count], table)
         try self.restrict_preview(layer)
 
     ## Show a Gaussian blur of `radius` applied to the layer as it was when the preview began.
@@ -1332,6 +1394,55 @@ pub struct Canvas:
         return preview.layer
 
     ## Blur a layer's pixels with a Gaussian of `radius` pixels (0.5..250). Undoable.
+    ## Filter › Noise › Add Noise, made once: Gaussian grain of deviation
+    ## `amount` (0..1), alike in every channel when `monochrome`; the same
+    ## `seed` makes the same grain. Undoable.
+    pub mutating func add_noise(id: i64, amount: f64, monochrome: bool, seed: i64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        let document = self.document else error(invalid, "draw the document once before filtering")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = layer.tiles() else error(invalid, "a group cannot be filtered")
+        try self.remember((u64)id, try tiles.clone())
+        try filtering.add_noise(document, (u64)id, amount, monochrome, (u64)seed)
+        try self.restrict_to_selection((u64)id, &self.history[self.history_count - 1].tiles)
+
+    ## Show the noise `add_noise` would make on the layer as it was when the preview began.
+    pub mutating func preview_noise(amount: f64, monochrome: bool, seed: i64) -> !:
+        let layer = try self.restore_preview()
+        let document = self.document else trap("preview without a document")
+        try filtering.add_noise(document, layer, amount, monochrome, (u64)seed)
+        try self.restrict_preview(layer)
+
+    ## Count layer `id`'s visible pixels by their encoded values for
+    ## `histogram`: Auto levels and the Levels dialog read it.
+    pub mutating func measure_histogram(id: i64) -> !:
+        try self.require_open()
+        let document = self.document else error(invalid, "draw the document once before measuring")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = layer.tiles() else error(invalid, "a group has no pixels to count")
+        let count = (usize)self.extent_x * (usize)self.extent_y
+        let pixels = try alloc f32[count * 4] in memory.heap
+        defer free(pixels) in memory.heap
+        try tiles.read(pixels)
+        for slot in 0..<(usize)1024:
+            self.histogram_counts[slot] = 0
+        for at in 0..<count:
+            if pixels[at * 4 + 3] <= 0.0:
+                continue
+            var encoded: f64[3]
+            for channel in 0..<(usize)3:
+                encoded[channel] = srgb_encode((f64)pixels[at * 4 + channel])
+                self.histogram_counts[(channel + 1) * 256 + bin_of(encoded[channel])] += 1
+            self.histogram_counts[bin_of(encoded[0] * 0.3 + encoded[1] * 0.59 + encoded[2] * 0.11)] += 1
+
+    ## How many pixels `measure_histogram` counted in bin `slot` (0..255) of
+    ## `channel`: 0 luminosity, 1 red, 2 green, 3 blue.
+    pub func histogram(channel: i64, slot: i64) -> i64!:
+        if channel < 0 or channel > 3 or slot < 0 or slot > 255:
+            error(invalid, "a histogram has channels 0..3 and bins 0..255")
+        return (i64)self.histogram_counts[(usize)(channel * 256 + slot)]
+
     pub mutating func blur_layer(id: i64, radius: f64) -> !:
         try self.require_open()
         try self.require_idle()

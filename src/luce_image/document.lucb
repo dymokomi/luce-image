@@ -74,6 +74,10 @@ pub struct Layer:
     var mask: Tiles*?
     ## A disabled mask is kept but hides nothing, as Photoshop's Shift-click.
     pub var mask_enabled: bool = true
+    ## An adjustment layer's kind (adjust.lucb's numbers) and parameters, or -1:
+    ## it has no pixels and adjusts what is below it, live, through its mask.
+    pub var adjustment: i64 = -1
+    pub var adjustment_values: f64[23]
     var children: Layer*[]
     var child_count: usize
     ## Bumps whenever the pixels are replaced.
@@ -166,6 +170,26 @@ pub struct Document:
     pub mutating func add_layer(name: str, parent: u64? = none) -> u64!:
         let tiles = try Tiles.create(self.owner, self.extent_x, self.extent_y)
         return try self.add(name, parent, false, tiles)
+
+    ## Add an adjustment layer of `kind` with `values` (at most 23) on top of
+    ## `parent` (the root by default).
+    pub mutating func add_adjustment(name: str, kind: i64, values: const f64[], parent: u64? = none) -> u64!:
+        let id = try self.add(name, parent, false, none)
+        try self.set_adjustment(id, kind, values)
+        return id
+
+    ## Give adjustment layer `id` its kind and parameters anew.
+    pub mutating func set_adjustment(id: u64, kind: i64, values: const f64[]) -> !:
+        let layer = self.find(id) else error(invalid, "no such layer")
+        if layer.group or layer.pixels != none:
+            error(invalid, "only an adjustment layer takes adjustment settings")
+        if values.length > 23:
+            error(invalid, "an adjustment takes at most 23 parameters")
+        layer.adjustment = kind
+        for index in 0..<(usize)23:
+            layer.adjustment_values[index] = values[index] if index < values.length else 0.0
+        layer.revision += 1
+        self.revision += 1
 
     ## Add an empty group on top of `parent` (the root by default).
     pub mutating func add_group(name: str, parent: u64? = none) -> u64!:
@@ -417,6 +441,7 @@ func release_tiles(holder: Tiles*?*):
 
 ## Move a document onto the heap, for holders that keep a pointer.
 pub func box_document(document: Document) -> Document*!:
+    # Not zeroable, so field by field: a new field must be added here too.
     return try new Document(owner = document.owner, extent_x = document.extent_x, extent_y = document.extent_y, selection = document.selection,
                             root = document.root, next_id = document.next_id, revision = document.revision) in memory.heap
 

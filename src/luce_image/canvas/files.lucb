@@ -84,35 +84,51 @@ func save_canvas_package(canvas: Canvas*, path: str) -> !:
         if record.parent != 0:
             parent = (i64)(try canvas.index(record.parent)) + 1
         try set_integer(manifest.value(), element, "parent", parent)
+        # An adjustment layer is its kind and parameters, no picture.
+        try set_integer(manifest.value(), element, "adjustment", record.adjustment)
+        if record.adjustment >= 0:
+            for parameter in 0..<parameter_count:
+                var key_buffer: u8[32]
+                let number = try prism.Value.number(record.adjustment_values[parameter])
+                defer number.release()
+                try manifest.value().set(element, try format_file(key_buffer, "a", parameter, ""), number)
         if record.style.any():
             for field in 0..<(i64)20:
                 let number = try prism.Value.number(style_field(record.style, field) else trap("style field"))
                 defer number.release()
                 try manifest.value().set(element, style_names[(usize)field], number)
-        if record.group:
-            continue
         let layer = document.find(record.id) else error(invalid, "a layer is missing")
+        if record.group or record.adjustment >= 0:
+            # No picture; an adjustment layer's mask still has one.
+            try write_mask(canvas, layer, layers_dir, index, pixels)
+            continue
         var file_buffer: u8[64]
         let tiles = layer.tiles() else error(invalid, "a layer has no pixels")
         try tiles.read(pixels)
         try write_picture(layers_dir, try format_file(file_buffer, "layer", index, ".png"), canvas.extent_x, canvas.extent_y, pixels)
-        if let mask = layer.mask_tiles():
-            try mask.read(pixels)
-            # A mask cell the layer never painted reveals everything: write it white.
-            for row in 0..<mask.rows():
-                for column in 0..<mask.columns():
-                    if mask.texture(column, row) != none:
-                        continue
-                    let area = mask.region(column, row)
-                    for y in 0..<(usize)area.height:
-                        for x in 0..<(usize)area.width:
-                            let at = (((usize)row * (usize)tile_size + y) * (usize)canvas.extent_x + (usize)column * (usize)tile_size + x) * 4
-                            pixels[at] = 1.0
-                            pixels[at + 1] = 1.0
-                            pixels[at + 2] = 1.0
-                            pixels[at + 3] = 1.0
-            try write_picture(layers_dir, try format_file(file_buffer, "layer", index, ".mask.png"), canvas.extent_x, canvas.extent_y, pixels)
+        try write_mask(canvas, layer, layers_dir, index, pixels)
     try manifest.value().save(try paths.join(path, "document.prisma"), prism.Encoding.text)
+
+## Layer `index`'s mask, if it has one, as `layerN.mask.png` in `layers_dir`;
+## `pixels` is scratch for the whole document.
+func write_mask(canvas: Canvas*, layer: Layer*, layers_dir: str, index: usize, pixels: f32[]) -> !:
+    let mask = layer.mask_tiles() else return
+    try mask.read(pixels)
+    # A mask cell the layer never painted reveals everything: write it white.
+    for row in 0..<mask.rows():
+        for column in 0..<mask.columns():
+            if mask.texture(column, row) != none:
+                continue
+            let area = mask.region(column, row)
+            for y in 0..<(usize)area.height:
+                for x in 0..<(usize)area.width:
+                    let at = (((usize)row * (usize)tile_size + y) * (usize)canvas.extent_x + (usize)column * (usize)tile_size + x) * 4
+                    pixels[at] = 1.0
+                    pixels[at + 1] = 1.0
+                    pixels[at + 2] = 1.0
+                    pixels[at + 3] = 1.0
+    var file_buffer: u8[64]
+    try write_picture(layers_dir, try format_file(file_buffer, "layer", index, ".mask.png"), canvas.extent_x, canvas.extent_y, pixels)
 
 ## `Canvas.place_layer`: the picture at `path` on layer `id`, centred on a document point.
 func place_picture(canvas: Canvas*, id: i64, path: str, center_x: i64, center_y: i64) -> !:
@@ -304,7 +320,19 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
         defer name_value.release()
         let group = (get_integer(doc, element, "group") catch _:
             recover 0) != 0
-        let id = try native.add_group(try name_value.value().text_at()) if group else try native.add_layer(try name_value.value().text_at())
+        let adjustment = get_integer(doc, element, "adjustment") catch _:
+            recover -1
+        var id: i64 = 0
+        if adjustment >= 0:
+            for parameter in 0..<parameter_count:
+                var key_buffer: u8[32]
+                try native.set_adjustment((i64)parameter, try get_number(doc, element, try format_file(key_buffer, "a", parameter, "")))
+            id = try native.add_adjustment_layer(try name_value.value().text_at(), adjustment)
+            native.clear_adjustments()
+        elif group:
+            id = try native.add_group(try name_value.value().text_at())
+        else:
+            id = try native.add_layer(try name_value.value().text_at())
         ids[index] = id
         let visible = (try get_integer(doc, element, "visible")) != 0
         let opacity = try get_number(doc, element, "opacity")
@@ -322,11 +350,10 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
             try native.set_shadow(id, values[0] != 0.0, values[1], values[2], values[3], values[4], values[5], values[6], values[7])
             try native.set_stroke(id, values[8] != 0.0, values[9], values[10], values[11], values[12], values[13])
             try native.set_glow(id, values[14] != 0.0, values[15], values[16], values[17], values[18], values[19])
-        if group:
-            continue
         var file_buffer: u8[64]
-        let picture = try Image.open(try paths.join(layers_dir, try format_file(file_buffer, "layer", index, ".png")))
-        try native.place((u64)id, picture)
+        if not group and adjustment < 0:
+            let picture = try Image.open(try paths.join(layers_dir, try format_file(file_buffer, "layer", index, ".png")))
+            try native.place((u64)id, picture)
         if (try get_integer(doc, element, "mask")) != 0:
             try native.set_mask(id, true)
             let mask = try Image.open(try paths.join(layers_dir, try format_file(file_buffer, "layer", index, ".mask.png")))

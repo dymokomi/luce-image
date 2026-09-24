@@ -13,7 +13,8 @@ from luce_image.document import Document, Layer, fnv_start, fnv_mix
 from luce_image.style import Styler
 from raster_errors import invalid, limit
 from luce_image.half import from_half
-from luce_image.shaders import composite_frag_words, composite_frag_msl
+from luce_image.shaders import composite_frag_words, composite_frag_msl, adjust_mix_frag_words, adjust_mix_frag_msl
+from luce_image.adjust import Adjuster
 
 struct Entry:
     var digest: u64
@@ -42,6 +43,10 @@ pub struct Composer:
     var blank: gpu.Texture
     var white: gpu.Texture
     var styler: Styler
+    ## Adjustment layers: the adjust pass over the backdrop, and the mix back by mask and opacity.
+    var adjuster: Adjuster
+    var mix_shader: gpu.Shader
+    var mix: gpu.Pipeline
     var effects: Effects[8]
     ## How many tiles were rendered rather than found, for tests and tuning.
     pub var renders: u64
@@ -71,10 +76,17 @@ pub struct Composer:
         try white.upload([(u8)0, (u8)0x3c, (u8)0, (u8)0x3c, (u8)0, (u8)0x3c, (u8)0, (u8)0x3c])
         var styler = try Styler.create(device)
         errdefer styler.destroy()
+        var adjuster = try Adjuster.create(device)
+        errdefer adjuster.destroy()
+        var mix_shader = try gpu.Shader.create(device, adjust_mix_frag_words, adjust_mix_frag_msl)
+        errdefer mix_shader.destroy()
+        var mix = try gpu.Pipeline.create(device, mix_shader, gpu.Blend.replace, gpu.Format.rgba16_float)
+        errdefer mix.destroy()
         var effects: Effects[8]
         for index in 0..<effects_budget:
             effects[index] = Effects(key = 0, tiles = Tiles(), used = 0, live = false)
-        return Composer(owner = device, entries = entries, count = 0, budget = budget, tick = 0, shader = shader, pipeline = pipeline, blank = blank, white = white, styler = styler, effects = effects, renders = 0)
+        return Composer(owner = device, entries = entries, count = 0, budget = budget, tick = 0, shader = shader, pipeline = pipeline, blank = blank, white = white, styler = styler,
+                        adjuster = adjuster, mix_shader = mix_shader, mix = mix, effects = effects, renders = 0)
 
     ## The flattened tile at `column`, `row` of pyramid `level`, borrowed until
     ## the next call. Straight-alpha rgba16_float, transparent where nothing is.
@@ -143,6 +155,18 @@ pub struct Composer:
                 base = none
                 base_missing = false
                 continue
+            if layer.adjustment >= 0:
+                # Live: what is below, adjusted, mixed back by opacity, mask and
+                # (clipped) the base's alpha. It is never a clipping base itself.
+                var mask = self.white
+                if let mask_tiles = layer.active_mask():
+                    if let mask_texture = mask_tiles.texture(column, row):
+                        mask = mask_texture
+                var clip = self.white
+                if layer.clipped:
+                    clip = self.blank if base_missing else (base else self.blank)
+                try self.adjust(backdrop, owned, layer, mask, clip, effective)
+                continue
             let tiles = layer.tiles() else continue
             if not layer.clipped:
                 base = tiles.texture(column, row)
@@ -178,6 +202,24 @@ pub struct Composer:
             backdrop.destroy()
         *backdrop = fresh
         *owned = true
+
+    ## An adjustment layer applied to the backdrop so far; nothing below, nothing to adjust.
+    mutating func adjust(backdrop: gpu.Texture*, owned: bool*, layer: const Layer*, mask: gpu.Texture, clip: gpu.Texture, opacity: f64) -> !:
+        if not *owned:
+            return
+        var adjusted = try self.adjuster.adjusted(*backdrop, (u32)layer.adjustment, layer.adjustment_values[..<23])
+        defer adjusted.destroy()
+        var params: f32[1] = [(f32)opacity]
+        var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        errdefer fresh.destroy()
+        let frame = try fresh.frame()
+        defer frame.release()
+        let target = try frame.value().target()
+        defer target.release()
+        try gpu.shade(target.value(), self.mix, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 4), [*backdrop, adjusted, mask, clip], gpu.Filter.nearest)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        backdrop.destroy()
+        *backdrop = fresh
 
     ## The effects tiles for a styled layer, rendered once per pixels-and-style state.
     mutating func effects_for(layer: const Layer*) -> const Tiles*!:
@@ -301,6 +343,9 @@ pub struct Composer:
         self.entries = empty
         self.budget = 0
         self.styler.destroy()
+        self.mix.destroy()
+        self.mix_shader.destroy()
+        self.adjuster.destroy()
         self.blank.destroy()
         self.white.destroy()
         self.pipeline.destroy()
@@ -308,9 +353,10 @@ pub struct Composer:
 
 ## Move a compositor onto the heap, for holders that keep a pointer.
 pub func box_composer(composer: Composer) -> Composer*!:
-    return try new Composer(owner = composer.owner, entries = composer.entries, count = composer.count, budget = composer.budget, tick = composer.tick,
-                            shader = composer.shader, pipeline = composer.pipeline, blank = composer.blank, white = composer.white,
-                            styler = composer.styler, effects = composer.effects, renders = composer.renders) in memory.heap
+    # The whole value at once: a field-by-field copy left new fields zero.
+    let boxed = try new Composer in memory.heap
+    *boxed = composer
+    return boxed
 
 ## Destroy a boxed compositor and free the box.
 pub func unbox_composer(composer: Composer*):
@@ -326,6 +372,14 @@ func hash_layers(seed: u64, layers: Layer*[], opacity: f64, first_column: u32, f
         let effective = opacity * layer.opacity
         if layer.group:
             digest = hash_layers(digest, layer.layers(), effective, first_column, first_row, span)
+            continue
+        if layer.adjustment >= 0:
+            # It touches every tile; its revision moves with its settings and mask.
+            digest = fnv_mix(digest, layer.id)
+            digest = fnv_mix(digest, layer.revision)
+            digest = fnv_mix(digest, effective.bits())
+            digest = fnv_mix(digest, 1 if layer.clipped else 0)
+            digest = fnv_mix(digest, 1 if layer.mask_enabled else 0)
             continue
         let tiles = layer.tiles() else continue
         var touches = false

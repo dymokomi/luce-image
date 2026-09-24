@@ -18,9 +18,27 @@ pub let desaturate: u32 = 4
 pub let threshold: u32 = 5
 pub let posterize: u32 = 6
 pub let curves: u32 = 7
-pub let adjustment_count: u32 = 8
+pub let exposure: u32 = 8
+pub let black_white: u32 = 9
+pub let color_balance: u32 = 10
+pub let gradient_map: u32 = 11
+pub let adjustment_count: u32 = 12
+## How many parameters an adjustment takes at most.
+pub let parameter_count: usize = 23
 
 ## The pipeline a device needs to adjust, built once.
+## Whether `kind` and `values` make an adjustment.
+func check(kind: u32, values: const f64[], table: gpu.Texture?) -> !:
+    if kind >= adjustment_count:
+        error(invalid, "no such adjustment")
+    if kind == curves and table == none:
+        error(invalid, "curves need their table")
+    if values.length > parameter_count:
+        error(invalid, "too many adjustment parameters")
+    for value in values:
+        if not math.is_finite(value):
+            error(invalid, "adjustment parameters must be finite")
+
 pub struct Adjuster:
     var owner: gpu.Device
     var shader: gpu.Shader
@@ -33,34 +51,44 @@ pub struct Adjuster:
         errdefer pipeline.destroy()
         return Adjuster(owner = device, shader = shader, pipeline = pipeline)
 
-    ## Rewrite every tile of `layer` with adjustment `kind` and its parameters;
-    ## `curves` reads its 256×1 table from `table`.
-    pub func apply(document: Document*, layer: u64, kind: u32, a: f64, b: f64, c: f64, d: f64, e: f64, table: gpu.Texture? = none) -> !:
-        if kind >= adjustment_count:
-            error(invalid, "no such adjustment")
-        if kind == curves and table == none:
-            error(invalid, "curves need their table")
-        for value in [a, b, c, d, e]:
-            if not math.is_finite(value):
-                error(invalid, "adjustment parameters must be finite")
+    ## Rewrite every tile of `layer` with adjustment `kind` and its parameters,
+    ## at most `parameter_count`, as `adjust.frag` lists them (the rest are 0);
+    ## `curves` reads its 256×1 table from `table`. This is the destructive
+    ## path: the pixels change once.
+    pub func apply(document: Document*, layer: u64, kind: u32, values: const f64[], table: gpu.Texture? = none) -> !:
+        try check(kind, values, table)
         let target = document.find(layer) else error(invalid, "no such layer")
-        let tiles = target.tiles() else error(invalid, "a group cannot be adjusted")
-        var params: f32[6] = [(f32)kind, (f32)a, (f32)b, (f32)c, (f32)d, (f32)e]
+        let tiles = target.tiles() else error(invalid, "this layer has no pixels to adjust")
         for row in 0..<tiles.rows():
             for column in 0..<tiles.columns():
                 let source = tiles.texture(column, row) else continue
-                # Binding 2 is read only by curves; the others get the tile again.
-                let images: gpu.Texture[2] = [source, table else source]
-                var fresh = try tiles.blank()
+                var fresh = try self.adjusted(source, kind, values, table)
                 errdefer fresh.destroy()
-                let frame = try fresh.frame()
-                defer frame.release()
-                let area = try frame.value().target()
-                defer area.release()
-                try gpu.shade(area.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 24), images, gpu.Filter.nearest)
-                discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
                 try tiles.set(column, row, fresh)
         target.revision += 1
+
+    ## A new tile holding `source` adjusted: the destructive path's pass, and
+    ## how the compositor evaluates an adjustment layer over what is below it.
+    pub func adjusted(source: gpu.Texture, kind: u32, values: const f64[], table: gpu.Texture? = none) -> gpu.Texture!:
+        try check(kind, values, table)
+        # The kind, then the parameters.
+        var params: f32[24]
+        for index in 0..<(usize)24:
+            params[index] = 0.0
+        params[0] = (f32)kind
+        for index in 0..<values.length:
+            params[index + 1] = (f32)values[index]
+        # Binding 2 is read only by curves; the others get the tile again.
+        let images: gpu.Texture[2] = [source, table else source]
+        var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        errdefer fresh.destroy()
+        let frame = try fresh.frame()
+        defer frame.release()
+        let area = try frame.value().target()
+        defer area.release()
+        try gpu.shade(area.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 96), images, gpu.Filter.nearest)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        return fresh
 
     pub mutating func destroy():
         self.pipeline.destroy()
@@ -89,18 +117,84 @@ test "adjustments rewrite a layer's tiles":
     try document.set_tiles(layer, tiles)
     var adjuster = try Adjuster.create(device)
     defer adjuster.destroy()
-    try adjuster.apply(&document, layer, invert, 0.0, 0.0, 0.0, 0.0, 0.0)
+    var no_values: f64[]
+    try adjuster.apply(&document, layer, invert, no_values)
     let current = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
     try current.read(pixels)
     # Inverted red is cyan; the empty right tile stays empty; alpha is kept.
     assert(pixels[(20 * 300 + 100) * 4] < 0.01 and pixels[(20 * 300 + 100) * 4 + 1] > 0.99 and pixels[(20 * 300 + 100) * 4 + 3] == 1.0)
     assert(current.texture(1, 0) == none)
-    try adjuster.apply(&document, layer, desaturate, 0.0, 0.0, 0.0, 0.0, 0.0)
+    try adjuster.apply(&document, layer, desaturate, no_values)
     try current.read(pixels)
     let grey = pixels[(20 * 300 + 100) * 4]
     assert(grey > 0.3 and grey < 0.6 and math.abs((f64)grey - (f64)pixels[(20 * 300 + 100) * 4 + 2]) < 0.01)
     var rejected = false
-    adjuster.apply(&document, layer, 99, 0.0, 0.0, 0.0, 0.0, 0.0) catch failure:
+    adjuster.apply(&document, layer, 99, no_values) catch failure:
         assert(failure.code == invalid)
         rejected = true
     assert(rejected)
+
+## One adjustment of a strip of four pixels — red, green, blue and mid grey,
+## opaque, linear light — read back.
+func adjusted(device: gpu.Device, adjuster: Adjuster*, kind: u32, values: const f64[], pixels: f32[]) -> !:
+    var document = try Document.create(device, 4, 1)
+    defer document.destroy()
+    let layer = try document.add_layer("Strip")
+    for index in 0..<(usize)16:
+        pixels[index] = 0.0
+    pixels[0] = 1.0
+    pixels[5] = 1.0
+    pixels[10] = 1.0
+    pixels[12] = 0.2140
+    pixels[13] = 0.2140
+    pixels[14] = 0.2140
+    for at in 0..<(usize)4:
+        pixels[at * 4 + 3] = 1.0
+    var tiles = try Tiles.create(device, 4, 1)
+    try tiles.write(pixels)
+    try document.set_tiles(layer, tiles)
+    try adjuster.apply(&document, layer, kind, values)
+    let current = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
+    try current.read(pixels)
+
+func near(a: f32, b: f64, tolerance: f64 = 0.02) -> bool:
+    return math.abs((f64)a - b) < tolerance
+
+test "the wider adjustments: levels by channel, hue ranges, exposure, black and white, balance, gradient map":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var adjuster = try Adjuster.create(device)
+    defer adjuster.destroy()
+    let pixels = try alloc f32[16] in memory.heap
+    defer free(pixels) in memory.heap
+    # Levels on the red channel alone: output white 0.5 halves red's encoded value; green and blue keep theirs.
+    try adjusted(device, &adjuster, levels, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.5], pixels)
+    assert(near(pixels[0], 0.2140) and near(pixels[5], 1.0) and near(pixels[10], 1.0))
+    # A reds-only hue turn of a third makes red green and leaves green alone.
+    var hue: f64[23]
+    for index in 0..<(usize)23:
+        hue[index] = 0.0
+    hue[3] = 1.0 / 3.0
+    try adjusted(device, &adjuster, hue_saturation, hue[..<23], pixels)
+    assert(near(pixels[0], 0.0) and near(pixels[1], 1.0) and near(pixels[5], 1.0) and near(pixels[4], 0.0))
+    # Colorize: everything takes the master's hue (blue) and saturation.
+    hue[3] = 0.0
+    hue[0] = 2.0 / 3.0
+    hue[1] = 1.0
+    hue[21] = 1.0
+    try adjusted(device, &adjuster, hue_saturation, hue[..<23], pixels)
+    assert(pixels[2] > pixels[0] and pixels[6] > pixels[5] and pixels[14] > pixels[12])
+    # One stop more exposure doubles light.
+    try adjusted(device, &adjuster, exposure, [1.0, 0.0, 1.0], pixels)
+    assert(near(pixels[12], 0.4280) and near(pixels[0], 1.0))
+    # Black and white: red counted fully, green not at all.
+    try adjusted(device, &adjuster, black_white, [1.0, 0.6, 0.0, 0.6, 0.2, 0.8, 0.0, 0.0, 0.0], pixels)
+    assert(near(pixels[0], 1.0) and near(pixels[1], 1.0) and near(pixels[4], 0.0) and near(pixels[6], 0.0))
+    # Color balance: midtones toward red warm the grey and keep it with luminosity preserved... roughly.
+    try adjusted(device, &adjuster, color_balance, [0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], pixels)
+    assert(pixels[12] > 0.3 and near(pixels[13], 0.2140))
+    # Gradient map from black to red: the grey becomes a darker red.
+    try adjusted(device, &adjuster, gradient_map, [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0], pixels)
+    assert(pixels[12] > 0.0 and near(pixels[13], 0.0) and near(pixels[14], 0.0) and near(pixels[1], 0.0))
