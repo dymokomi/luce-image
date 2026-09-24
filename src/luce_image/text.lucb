@@ -56,9 +56,11 @@ pub func draw_text(document: Document*, layer: u64, x: f64, y: f64, text: str, s
             let tile_top = (f64)(row * tile_size)
             if right <= tile_left or bottom <= tile_top or left >= tile_left + (f64)tile_size or top >= tile_top + (f64)tile_size:
                 continue
-            var fresh = try tiles.blank()
-            errdefer fresh.destroy()
-            let frame = try fresh.frame()
+            # The glyphs composite over the tile in a premultiplied scratch tile,
+            # as every GPU drawing does; the layer keeps the result straight.
+            var scratch = try tiles.blank()
+            defer scratch.destroy()
+            let frame = try scratch.frame()
             defer frame.release()
             let area = try frame.value().target()
             defer area.release()
@@ -67,6 +69,14 @@ pub func draw_text(document: Document*, layer: u64, x: f64, y: f64, text: str, s
                 try gpu.draw_image(area.value(), existing, gpu.Rect(0.0, 0.0, (f64)region.width, (f64)region.height), region, 1.0, gpu.Filter.nearest)
             try area.value().mask(bitmap.pixels, bitmap.width, bitmap.height, gpu.Rect(left - tile_left, top - tile_top, (f64)bitmap.width, (f64)bitmap.height), color)
             discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+            var fresh = try tiles.blank()
+            errdefer fresh.destroy()
+            let stored = try fresh.frame()
+            defer stored.release()
+            let whole = try stored.value().target()
+            defer whole.release()
+            try gpu.copy_image(whole.value(), scratch, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), straighten = true)
+            discard(try stored.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
             try tiles.set(column, row, fresh)
     target.revision += 1
 
@@ -98,6 +108,20 @@ test "text lands on the layer in its color and measures":
                 found = true
     assert(found)
     assert(pixels[(50 * 300 + 290) * 4 + 3] == 0.0)
+    # White type keeps white edges: partly covered texels are white, not grey.
+    let white = try document.add_layer("White")
+    var blank = try Tiles.create(device, 300, 100)
+    try document.set_tiles(white, blank)
+    try draw_text(&document, white, 20.0, 20.0, "Hello", 48.0, gpu.Color(1.0, 1.0, 1.0, 1.0))
+    try ((document.find(white) else trap("layer")).tiles() else trap("tiles")).read(pixels)
+    var soft = 0
+    for y in 20..<(usize)80:
+        for x in 20..<(usize)200:
+            let index = (y * 300 + x) * 4
+            if pixels[index + 3] > 0.05 and pixels[index + 3] < 0.95:
+                soft += 1
+                assert(pixels[index] > 0.97 and pixels[index + 1] > 0.97 and pixels[index + 2] > 0.97)
+    assert(soft > 10)
     var rejected = false
     draw_text(&document, layer, 0.0, 0.0, "", 48.0, gpu.Color(1.0, 1.0, 1.0, 1.0)) catch failure:
         assert(failure.code == invalid)

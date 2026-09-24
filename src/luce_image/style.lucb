@@ -81,7 +81,7 @@ pub struct Styler:
             for column in 0..<tiles.columns():
                 let texture = tiles.texture(column, row) else continue
                 let area = tiles.region(column, row)
-                try gpu.draw_image(whole.value(), texture, gpu.Rect((f64)(column * tile_size), (f64)(row * tile_size), (f64)area.width, (f64)area.height), area, 1.0, gpu.Filter.nearest)
+                try gpu.copy_image(whole.value(), texture, gpu.Rect((f64)(column * tile_size), (f64)(row * tile_size), (f64)area.width, (f64)area.height), area)
         discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         return flat
 

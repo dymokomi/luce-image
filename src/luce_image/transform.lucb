@@ -48,7 +48,7 @@ pub func translate(document: Document*, layer: u64, dx: i64, dy: i64, on_mask: b
                     frame_holder = frame
                     let whole = try frame.value().target()
                     defer whole.release()
-                    try gpu.draw_image(whole.value(), texture, gpu.Rect(offset_x, offset_y, (f64)area.width, (f64)area.height), area, 1.0, gpu.Filter.nearest)
+                    try gpu.copy_image(whole.value(), texture, gpu.Rect(offset_x, offset_y, (f64)area.width, (f64)area.height), area)
             if let frame = frame_holder:
                 discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
                 frame.release()
@@ -122,7 +122,7 @@ pub struct Transformer:
             for column in 0..<tiles.columns():
                 let texture = tiles.texture(column, row) else continue
                 let area = tiles.region(column, row)
-                try gpu.draw_image(whole.value(), texture, gpu.Rect((f64)(column * tile_size), (f64)(row * tile_size), (f64)area.width, (f64)area.height), area, 1.0, gpu.Filter.nearest)
+                try gpu.copy_image(whole.value(), texture, gpu.Rect((f64)(column * tile_size), (f64)(row * tile_size), (f64)area.width, (f64)area.height), area)
         discard(try flat_frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         # Forward: p' = R S (p - c) + c + d. Inverse: p = S⁻¹ R⁻¹ (p' - c - d) + c.
         let cos = math.cos(angle)
@@ -234,6 +234,10 @@ test "translating a layer moves its pixels across tiles and drops what leaves":
         pixels[index] = 0.0
     pixels[(10 * 300 + 250) * 4 + 1] = 1.0
     pixels[(10 * 300 + 250) * 4 + 3] = 1.0
+    # A soft white texel: moving must not darken what is partly covered.
+    for channel in 0..<(usize)3:
+        pixels[(10 * 300 + 20) * 4 + channel] = 1.0
+    pixels[(10 * 300 + 20) * 4 + 3] = 0.5
     var tiles = try Tiles.create(device, 300, 40)
     try tiles.write(pixels)
     try document.set_tiles(layer, tiles)
@@ -242,6 +246,8 @@ test "translating a layer moves its pixels across tiles and drops what leaves":
     let current = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
     try current.read(pixels)
     assert(pixels[(15 * 300 + 270) * 4 + 1] > 0.99 and pixels[(10 * 300 + 250) * 4 + 3] == 0.0)
+    let soft = (15 * 300 + 40) * 4
+    assert(pixels[soft] > 0.99 and pixels[soft + 1] > 0.99 and pixels[soft + 2] > 0.99 and pixels[soft + 3] > 0.49 and pixels[soft + 3] < 0.51)
     assert(current.texture(1, 0) != none)
     var again = try translate(&document, layer, 100, 0)
     again.destroy()

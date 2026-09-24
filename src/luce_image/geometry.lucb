@@ -41,7 +41,7 @@ func rebuilt(device: gpu.Device, tiles: Tiles*, width: u32, height: u32, scale_x
                     holder = frame
                     let target = try frame.value().target()
                     defer target.release()
-                    try gpu.draw_image(target.value(), source, gpu.Rect(x, y, w, h), area, 1.0, gpu.Filter.linear if smooth else gpu.Filter.nearest)
+                    try gpu.copy_image(target.value(), source, gpu.Rect(x, y, w, h), area, gpu.Filter.linear if smooth else gpu.Filter.nearest)
                     drew = true
             if let frame = holder:
                 discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))

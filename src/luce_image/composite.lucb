@@ -233,7 +233,7 @@ pub struct Composer:
         let target = try frame.value().target()
         defer target.release()
         for index in 0..<count:
-            try gpu.draw_image(target.value(), parts[index], positions[index], regions[index], 1.0, gpu.Filter.linear)
+            try gpu.copy_image(target.value(), parts[index], positions[index], regions[index], gpu.Filter.linear)
         discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         return texture
 

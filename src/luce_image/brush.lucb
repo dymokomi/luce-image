@@ -336,7 +336,10 @@ pub struct Stroke:
         let target = try frame.value().target()
         defer target.release()
         let whole = gpu.Rect(width = (f64)tile_size, height = (f64)tile_size)
-        try gpu.draw_image(target.value(), self.touched[index].coverage, whole, none, 1.0, gpu.Filter.nearest)
+        # The paint so far, copied as stored: it is premultiplied, and draw_image
+        # would premultiply it again, darkening every partially covered texel a
+        # little more with each flush of dabs (a dark rim around light strokes).
+        try gpu.copy_image(target.value(), self.touched[index].coverage, whole)
         for which in 0..<self.dab_count:
             let dab = self.dabs[which]
             if not (dab.x + dab.radius + 1.0 >= origin_x and dab.x - dab.radius - 1.0 < origin_x + (f64)tile_size and dab.y + dab.radius + 1.0 >= origin_y and dab.y - dab.radius - 1.0 < origin_y + (f64)tile_size):
@@ -573,6 +576,35 @@ pub func begin_boxed(painter: Painter*, document: Document*, layer: u64, brush: 
 pub func finish_boxed(stroke: Stroke*):
     stroke.finish()
     free(stroke) in memory.heap
+
+test "a light stroke keeps its color where it is soft, however many flushes built it":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var document = try Document.create(device, 300, 300)
+    defer document.destroy()
+    let layer = try document.add_layer("Paint")
+    var painter = try Painter.create(device)
+    defer painter.destroy()
+    let brush = Brush(diameter = 60.0, hardness = 0.0, color = gpu.Color(1.0, 1.0, 1.0, 1.0))
+    # A mouse sends many small moves: each one flushes its dabs into the paint.
+    var stroke = try Stroke.begin(&painter, &document, layer, brush, 40.0, 150.0)
+    for step in 1..<40:
+        try stroke.extend(&painter, &document, 40.0 + (f64)step * 5.0, 150.0)
+    stroke.finish()
+    let tiles = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
+    let pixels = try alloc f32[(usize)300 * 300 * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    try tiles.read(pixels)
+    # Down the soft edge, partial coverage is white paint, never darker.
+    var partial = 0
+    for y in 150..<190:
+        let texel = (y * 300 + 150) * 4
+        if pixels[texel + 3] > 0.02 and pixels[texel + 3] < 0.98:
+            partial += 1
+            assert(pixels[texel] > 0.97 and pixels[texel + 1] > 0.97 and pixels[texel + 2] > 0.97)
+    assert(partial > 4)
 
 test "a stroke paints and erases only the tiles it reaches":
     var device = gpu.Device.open() catch failure:
