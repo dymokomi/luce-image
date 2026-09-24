@@ -89,6 +89,7 @@ pub struct Image:
         try probe(&raster)
         return try Image.own(raster, threads)
 
+    ## As `open`, from encoded bytes held in memory; the bytes are copied.
     pub static func open_bytes(data: const u8[], threads: usize = 4, frame: usize = 0, max_bytes: usize = 1073741824, max_pixels: usize = 268435456) -> interop.Reference[Image]!:
         if threads < 1 or threads > 64 or data.length > max_bytes:
             error(invalid, "invalid threads or encoded byte limit")
@@ -99,6 +100,8 @@ pub struct Image:
         try probe(&raster)
         return try Image.own(raster, threads)
 
+    ## A new image in a Pillow mode ("L", "LA", "RGB", "RGBA", "I;16", "I", "F",
+    ## "RGBF", "RGBAF"), every pixel `color` or opaque black.
     pub static func create(mode: str, width: usize, height: usize, color: Pixel? = none, max_bytes: usize = 1073741824) -> interop.Reference[Image]!:
         var raster = model.Raster(width = width, height = height, max_bytes = max_bytes)
         errdefer raster.close()
@@ -128,22 +131,27 @@ pub struct Image:
         try self.ensure_open()
         return self.raster.height
 
+    ## (width, height).
     pub func size() -> (usize, usize)!:
         try self.ensure_open()
         return (self.raster.width, self.raster.height)
 
+    ## The data window's top-left: EXR's offset, zero for other formats.
     pub func origin() -> (i64, i64)!:
         try self.ensure_open()
         return (self.raster.xmin, self.raster.ymin)
 
+    ## The format the image was read from: "PNG", "JPEG", "TIFF" or "EXR"; empty when created.
     pub func file_format() -> str!:
         try self.ensure_open()
         return self.raster.file_format
 
+    ## How many frames (TIFF pages, EXR parts) the file holds.
     pub func n_frames() -> usize!:
         try self.ensure_open()
         return self.raster.frames
 
+    ## The frame now selected; `seek` changes it.
     pub func tell() -> usize!:
         try self.ensure_open()
         return self.raster.frame
@@ -164,10 +172,13 @@ pub struct Image:
             error(invalid, "channel index out of range")
         return self.raster.channels[index].kind
 
+    ## The index of the channel named `name`; an error when there is none.
     pub func channel_index(name: str) -> usize!:
         try self.ensure_open()
         return try self.raster.find_channel(name)
 
+    ## The Pillow mode the channels make, or "MULTI" when they fit none (named
+    ## AOV channels, mixed sample types).
     pub func mode() -> str!:
         try self.ensure_open()
         let channels = self.raster.channels
@@ -185,12 +196,15 @@ pub struct Image:
             return "RGBA" if kind == .uint8 else "RGBAF" if kind == .float32 else "MULTI"
         return "MULTI"
 
+    ## Whether the pixels are decoded; most reads decode them on first use.
     pub func is_loaded() -> bool:
         return not self.closed and self.raster.pixels.length > 0
 
+    ## How many threads the last decode used.
     pub func workers_used() -> usize:
         return self.active_workers
 
+    ## Decode the pixels now, in parallel for TIFF and EXR.
     pub mutating func load() -> !:
         try self.ensure_open()
         if self.is_loaded():
@@ -215,6 +229,7 @@ pub struct Image:
         self.raster.pixels = empty
         self.active_workers = 0
 
+    ## Select frame `frame` of the file, as Pillow's seek; the pixels decode again on use.
     pub mutating func seek(frame: usize) -> !:
         try self.ensure_open()
         if frame == self.raster.frame:
@@ -235,14 +250,18 @@ pub struct Image:
             error(invalid, "pixel or channel index out of range")
         return (y * self.raster.width + x) * self.raster.channels.length + channel
 
+    ## One raw sample of one channel, in the channel's own range.
     pub mutating func get_sample(x: usize, y: usize, channel: usize = 0) -> f64!:
         try self.load()
         return self.raster.pixels[try self.offset(x, y, channel)]
 
+    ## Set one raw sample of one channel.
     pub mutating func put_sample(x: usize, y: usize, channel: usize, value: f64) -> !:
         try self.load()
         self.raster.pixels[try self.offset(x, y, channel)] = value
 
+    ## The color at a pixel from its Y or R, G, B and A channels, in the samples'
+    ## own range; alpha is the maximum when there is no A channel.
     pub mutating func getpixel(x: usize, y: usize) -> Pixel!:
         try self.load()
         discard(try self.offset(x, y, 0))
@@ -267,6 +286,7 @@ pub struct Image:
                 a = value
         return Pixel(r, g, b, a)
 
+    ## Set a pixel's color channels; named non-color channels take `put_sample`.
     pub mutating func putpixel(x: usize, y: usize, pixel: Pixel) -> !:
         try self.load()
         discard(try self.offset(x, y, 0))
@@ -288,6 +308,7 @@ pub struct Image:
             error(invalid, "metadata index out of range")
         return self.raster.attributes[index].name
 
+    ## A string attribute's value, or empty when there is none; typed ones take `metadata_bytes`.
     pub func metadata(name: str) -> str!:
         try self.ensure_open()
         for entry in self.raster.attributes:
@@ -297,6 +318,7 @@ pub struct Image:
                 return (str)entry.data
         return ""
 
+    ## An attribute's type name as the file stores it ("string", EXR's "v2f"…), or empty.
     pub func metadata_type(name: str) -> str!:
         try self.ensure_open()
         for entry in self.raster.attributes:
@@ -304,6 +326,7 @@ pub struct Image:
                 return entry.type_name
         return ""
 
+    ## An attribute's raw bytes, whatever its type, or empty.
     pub func metadata_bytes(name: str) -> const u8[]!:
         try self.ensure_open()
         for entry in self.raster.attributes:
@@ -311,6 +334,7 @@ pub struct Image:
                 return entry.data
         return b""
 
+    ## Move the data window's top-left, as EXR stores it.
     pub mutating func set_origin(x: i64, y: i64) -> !:
         try self.ensure_open()
         if x < -2147483648 or y < -2147483648 or x > 2147483647 - (i64)self.raster.width + 1 or y > 2147483647 - (i64)self.raster.height + 1:
@@ -318,6 +342,7 @@ pub struct Image:
         self.raster.xmin = x
         self.raster.ymin = y
 
+    ## The path the image was opened from, or empty.
     pub func source_path() -> str!:
         try self.ensure_open()
         return self.raster.path
@@ -328,6 +353,9 @@ pub struct Image:
             error(invalid, "metadata name contains NUL")
         try self.raster.attribute(name, "string", value.bytes)
 
+    ## Encode and write atomically to `path`: the format from `file_format` or the
+    ## extension; `compression` and `tile` for TIFF and EXR, `quality` (1..100) for
+    ## JPEG, `bigtiff` for TIFF.
     pub mutating func save(path: str, file_format: str = "", compression: str = "zip", quality: i64 = 90, tile: usize = 0, bigtiff: bool = false) -> !:
         try check_path(path)
         # Managed Luce text is a byte view, not necessarily NUL-terminated.
@@ -404,9 +432,11 @@ pub struct Image:
             target.raster.pixels[index] = (f64)bytes[index]
         return image
 
+    ## A new image with the same channels, pixels and attributes.
     pub mutating func copy() -> interop.Reference[Image]!:
         return try self.crop(0, 0, try self.width(), try self.height())
 
+    ## The pixels from (`left`, `top`) up to but not including (`right`, `bottom`).
     pub mutating func crop(left: usize, top: usize, right: usize, bottom: usize) -> interop.Reference[Image]!:
         try self.load()
         if left >= right or top >= bottom or right > self.raster.width or bottom > self.raster.height:
@@ -425,6 +455,7 @@ pub struct Image:
                     raster.pixels[(y * raster.width + x) * nc + c] = self.raster.pixels[((top + y) * self.raster.width + left + x) * nc + c]
         return try Image.own(raster, self.threads)
 
+    ## Channel `name` alone, as a one-channel "Y" image.
     pub mutating func get_channel(name: str) -> interop.Reference[Image]!:
         try self.load()
         let channel = try self.raster.find_channel(name)
@@ -436,6 +467,7 @@ pub struct Image:
             raster.pixels[i] = self.raster.pixels[i * self.raster.channels.length + channel]
         return try Image.own(raster, self.threads)
 
+    ## The image in another Pillow mode; grey comes from Rec. 601 luma.
     pub mutating func convert(mode: str) -> interop.Reference[Image]!:
         try self.load()
         let out = try Image.create(mode, self.raster.width, self.raster.height, max_bytes = self.raster.max_bytes)

@@ -136,13 +136,14 @@ struct Dab:
 ## segment longer than that is unusual at any sane spacing.
 let dab_limit: usize = 256
 
-## A stroke in progress on one layer.
 ## A pressure as a diameter factor: unknown (zero or not finite) and full press both paint at full size.
 func pressure_scale(pressure: f64) -> f64:
     if not math.is_finite(pressure) or pressure <= 0.0 or pressure >= 1.0:
         return 1.0
     return math.max(0.05, pressure)
 
+## A stroke in progress on one layer: its dabs so far, and each tile it has
+## reached with the paint laid on it and the tile as it was before.
 pub struct Stroke:
     var layer: u64
     var brush: Brush

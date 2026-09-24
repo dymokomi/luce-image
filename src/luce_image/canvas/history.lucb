@@ -1,0 +1,30 @@
+#==============================================================================================
+#
+#   canvas/history - The undo and redo snapshots
+#
+#==============================================================================================
+
+## A layer's pixels at one moment, shared with whatever else holds them.
+struct Snapshot:
+    var layer: u64
+    var tiles: Tiles
+    var mask: bool
+
+## Append `entry` to a snapshot list, growing it.
+func push(list: Snapshot[]*, count: usize*, entry: Snapshot) -> !:
+    if *count == list.length:
+        let capacity = 16 if list.length == 0 else list.length * 2
+        let grown = try alloc Snapshot[capacity] in memory.heap
+        if *count > 0:
+            memory.copy(grown, *list, *count)
+        if list.length > 0:
+            free(*list) in memory.heap
+        *list = grown
+    (*list)[*count] = entry
+    *count += 1
+
+## Destroy every snapshot in a list and empty it.
+func clear_snapshots(list: Snapshot[]*, count: usize*):
+    for index in 0..<*count:
+        (*list)[index].tiles.destroy()
+    *count = 0

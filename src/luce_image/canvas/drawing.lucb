@@ -1,0 +1,134 @@
+#==============================================================================================
+#
+#   canvas/drawing - Drawing the document onto a target
+#
+#==============================================================================================
+
+## `Canvas.draw`: the flattened document's tiles at the pyramid level for `zoom`.
+func draw_canvas(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64) -> !:
+    try canvas.require_open()
+    if not math.is_finite(zoom) or zoom <= 0.0 or zoom > 256.0 or not math.is_finite(offset_x) or not math.is_finite(offset_y):
+        error(invalid, "zoom must be in 0..256 and offsets finite")
+    let checked = try target.get()
+    if rectangle.width <= 0.0 or rectangle.height <= 0.0:
+        return
+    try canvas.bind(checked)
+    # A standalone frame has no device; it records nothing.
+    let document = canvas.document else return
+    let composer = canvas.composer else return
+    let clipped = try checked.clipped(rectangle)
+    defer clipped.release()
+    let area = clipped.value()
+    # The pyramid level whose tiles are at most one texel per point.
+    var level: u32 = 0
+    while level < 16 and zoom * (f64)(1u32 << (level + 1)) <= 1.0:
+        level += 1
+    let span = 1u32 << level
+    let tile_points = (f64)tile_size * (f64)span * zoom
+    let origin_x = rectangle.x + offset_x
+    let origin_y = rectangle.y + offset_y
+    let columns = (tile_columns(canvas.extent_x) + span - 1) // span
+    let rows = (tile_columns(canvas.extent_y) + span - 1) // span
+    for row in 0..<rows:
+        let top = origin_y + (f64)row * tile_points
+        if top >= rectangle.y + rectangle.height or top + tile_points <= rectangle.y:
+            continue
+        for column in 0..<columns:
+            let left = origin_x + (f64)column * tile_points
+            if left >= rectangle.x + rectangle.width or left + tile_points <= rectangle.x:
+                continue
+            let texture = try composer.tile(document, column, row, level)
+            # The texels the document covers in this tile, and their extent in points.
+            let covered_x = min_u32(tile_size, (canvas.extent_x - column * span * tile_size + span - 1) // span)
+            let covered_y = min_u32(tile_size, (canvas.extent_y - row * span * tile_size + span - 1) // span)
+            let destination = gpu.Rect(left, top, (f64)covered_x * (f64)span * zoom, (f64)covered_y * (f64)span * zoom)
+            try gpu.draw_image(area, texture, destination, gpu.Region(0, 0, covered_x, covered_y), 1.0,
+                               gpu.Filter.nearest if zoom >= 1.0 else gpu.Filter.linear)
+
+## `Canvas.draw_layer`: one layer's own pixels, or its mask, scaled into `rectangle`.
+func draw_one_layer(canvas: Canvas*, target: interop.View[gpu.RenderTarget], index: i64, rectangle: gpu.Rect, mask: bool) -> !:
+    try canvas.require_open()
+    let record = try canvas.record(index)
+    if rectangle.width <= 0.0 or rectangle.height <= 0.0:
+        return
+    let checked = try target.get()
+    let document = canvas.document else return
+    let layer = document.find(record.id) else return
+    let tiles = (layer.mask_tiles() else return) if mask else (layer.tiles() else return)
+    let scale_x = rectangle.width / (f64)canvas.extent_x
+    let scale_y = rectangle.height / (f64)canvas.extent_y
+    for row in 0..<tiles.rows():
+        for column in 0..<tiles.columns():
+            let texture = tiles.texture(column, row) else continue
+            let area = tiles.region(column, row)
+            let destination = gpu.Rect(rectangle.x + (f64)(column * tile_size) * scale_x, rectangle.y + (f64)(row * tile_size) * scale_y,
+                                       (f64)area.width * scale_x, (f64)area.height * scale_y)
+            try gpu.draw_image(checked, texture, destination, area, 1.0, gpu.Filter.linear)
+
+## `Canvas.draw_moving`: the document with layer `id` shown moved by (`dx`, `dy`).
+func draw_canvas_moving(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, id: i64, dx: f64, dy: f64) -> !:
+    try canvas.require_open()
+    let index = try canvas.index((u64)id)
+    if canvas.document == none:
+        try canvas.draw(target, rectangle, zoom, offset_x, offset_y)
+        return
+    let document = canvas.document else trap("checked")
+    let layer = document.find((u64)id) else error(invalid, "no such layer")
+    let shown = layer.visible
+    layer.visible = false
+    document.revision += 1
+    try canvas.draw(target, rectangle, zoom, offset_x, offset_y)
+    layer.visible = shown
+    document.revision += 1
+    if not shown or rectangle.width <= 0.0 or rectangle.height <= 0.0:
+        return
+    let checked = try target.get()
+    let clipped = try checked.clipped(rectangle)
+    defer clipped.release()
+    let tiles = layer.tiles() else return
+    for row in 0..<tiles.rows():
+        for column in 0..<tiles.columns():
+            let texture = tiles.texture(column, row) else continue
+            let area = tiles.region(column, row)
+            let destination = gpu.Rect(rectangle.x + offset_x + ((f64)(column * tile_size) + dx) * zoom, rectangle.y + offset_y + ((f64)(row * tile_size) + dy) * zoom,
+                                       (f64)area.width * zoom, (f64)area.height * zoom)
+            try gpu.draw_image(clipped.value(), texture, destination, area, canvas.records[index].opacity, gpu.Filter.nearest if zoom >= 1.0 else gpu.Filter.linear)
+
+## `Canvas.draw_selection`: marching ants along the selection's edge at screen resolution.
+func draw_canvas_selection(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, phase: f64) -> !:
+    try canvas.require_open()
+    if not canvas.has_selection() or rectangle.width <= 0.0 or rectangle.height <= 0.0:
+        return
+    if not math.is_finite(zoom) or zoom <= 0.0 or not math.is_finite(phase):
+        error(invalid, "zoom must be positive and the phase finite")
+    let checked = try target.get()
+    let document = canvas.document else return
+    let tiles = (try document.selection_tiles()) else return
+    let pipeline = try canvas.ants_pipeline()
+    let clipped = try checked.clipped(rectangle)
+    defer clipped.release()
+    let area = clipped.value()
+    let size = try checked.size()
+    let scale = size.pixel_width / size.width if size.width > 0.0 else 1.0
+    # gl_FragCoord counts from the frame's corner, not this target's.
+    let placement = try checked.placement()
+    for row in 0..<tiles.rows():
+        for column in 0..<tiles.columns():
+            let texture = tiles.texture(column, row) else continue
+            let covered = tiles.region(column, row)
+            let left = rectangle.x + offset_x + (f64)(column * tile_size) * zoom
+            let top = rectangle.y + offset_y + (f64)(row * tile_size) * zoom
+            let width = (f64)covered.width * zoom
+            let height = (f64)covered.height * zoom
+            if left >= rectangle.x + rectangle.width or top >= rectangle.y + rectangle.height or left + width <= rectangle.x or top + height <= rectangle.y:
+                continue
+            let right_tile = tiles.texture(column + 1, row) else composer_blank(canvas)
+            let below_tile = tiles.texture(column, row + 1) else composer_blank(canvas)
+            let limit_x = (f64)canvas.extent_x - (f64)(column * tile_size)
+            let limit_y = (f64)canvas.extent_y - (f64)(row * tile_size)
+            var params: f32[8] = [(f32)((placement.x + left) * scale), (f32)((placement.y + top) * scale), (f32)(zoom * scale), (f32)phase, (f32)covered.width, (f32)covered.height, (f32)limit_x, (f32)limit_y]
+            try gpu.shade(area, pipeline, gpu.Rect(left, top, width, height), u8[]((u8*)&params[0], 32), [texture, right_tile, below_tile], gpu.Filter.nearest)
+
+## A transparent texel for absent neighbor tiles.
+func composer_blank(canvas: Canvas*) -> gpu.Texture:
+    return (canvas.painter else trap("bound")).black

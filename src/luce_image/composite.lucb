@@ -8,8 +8,8 @@
 ## one way to produce pixels; export asks for level-0 tiles like the screen.
 import gpu
 import memory
-from luce_image.tiles import Tiles, Tile, tile_size
-from luce_image.document import Document, Layer
+from luce_image.tiles import Tiles, Tile, tile_size, min_u32
+from luce_image.document import Document, Layer, fnv_start, fnv_mix
 from luce_image.style import Styler
 from raster_errors import invalid, limit
 from luce_image.half import from_half
@@ -222,8 +222,8 @@ pub struct Composer:
                     continue
                 let source = try self.tile(document, fine_column, fine_row, level - 1)
                 # The finer tile covers this many texels of the document at its level.
-                let covered_x = min(tile_size, (document.width() - fine_column * below * tile_size + below - 1) // below)
-                let covered_y = min(tile_size, (document.height() - fine_row * below * tile_size + below - 1) // below)
+                let covered_x = min_u32(tile_size, (document.width() - fine_column * below * tile_size + below - 1) // below)
+                let covered_y = min_u32(tile_size, (document.height() - fine_row * below * tile_size + below - 1) // below)
                 parts[count] = source
                 positions[count] = gpu.Rect(x = (f64)dx * half, y = (f64)dy * half, width = (f64)covered_x * 0.5, height = (f64)covered_y * 0.5)
                 regions[count] = gpu.Region(0, 0, covered_x, covered_y)
@@ -329,8 +329,8 @@ func hash_layers(seed: u64, layers: Layer*[], opacity: f64, first_column: u32, f
             continue
         let tiles = layer.tiles() else continue
         var touches = false
-        for row in first_row..<min(first_row + span, tiles.rows()):
-            for column in first_column..<min(first_column + span, tiles.columns()):
+        for row in first_row..<min_u32(first_row + span, tiles.rows()):
+            for column in first_column..<min_u32(first_column + span, tiles.columns()):
                 if tiles.tile(column, row) != none:
                     touches = true
         if not touches:
@@ -348,17 +348,6 @@ func drop_owned(texture: gpu.Texture*, owned: bool):
     if owned:
         texture.destroy()
 
-func min(a: u32, b: u32) -> u32:
-    return a if a < b else b
-
-func fnv_start() -> u64:
-    return 14695981039346656037
-
-func fnv_mix(digest: u64, value: u64) -> u64:
-    var mixed = digest
-    for shift in 0..<(u64)8:
-        mixed = (mixed ^ ((value >> (shift * 8)) & 0xff)) *% 1099511628211
-    return mixed
 
 test "composite flattens layers with opacity, caches by identity and scales levels":
     var device = gpu.Device.open() catch failure:

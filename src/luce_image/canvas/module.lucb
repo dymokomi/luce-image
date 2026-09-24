@@ -1,0 +1,1195 @@
+#==============================================================================================
+#
+#   canvas - The editor's document
+#
+#   DESCRIPTION:
+#       The Canvas is the one Luce-facing object an editor drives: the layer stack, the
+#       brush, selections, adjustments, previews, history, files and drawing. Its methods
+#       are small and delegate to the engine (Document, Composer, Painter, Adjuster,
+#       Filters, Transformer); the larger ones' bodies live in the fragment for their
+#       concern. Getters that read a layer take its stack index; setters take its id.
+#       Fragments, in ORDER:
+#
+#       module.lucb    the Canvas and its per-layer Record
+#       drawing.lucb   drawing the document, a layer, a move and the selection onto a target
+#       files.lucb     opening and saving pictures, Photoshop files and .l2d packages
+#       history.lucb   the undo and redo snapshots
+#       support.lucb   device binding, blend and style names, small checks
+#       tests.lucb     the canvas tests
+#
+#==============================================================================================
+
+## The editor's document as one Luce-owned object: layers with names,
+## visibility and opacity, pixels loaded from files, a flattened save, and
+## drawing at any zoom and offset onto a render target. GPU storage is bound to
+## the device of the first target it is drawn on; until then layers and their
+## pictures wait on the CPU, so a document can be built before it is shown.
+import c as c_api
+import files
+import gpu
+import interop
+import math
+import memory
+import ownership
+import paths
+import prism
+import strings
+from luce_image.image import Image, Pixel
+from luce_image.tiles import Tiles, tile_size, tile_columns, min_u32
+from luce_image.document import Style, Document, box_document, unbox_document, blend_mode_count
+from luce_image.composite import Composer, box_composer, unbox_composer
+from luce_image.brush import Brush, Painter, Stroke, begin_boxed, finish_boxed, fill_selection, fill_gradient
+from luce_image.adjust import Adjuster, adjustment_count, curves
+from luce_image.curves import Curves, lut_size
+from luce_image.filter import Filters
+from luce_image.transform import translate, Transformer
+from luce_image.text import draw_text, measure_text, text_height
+import psd
+from luce_image.geometry import resize_canvas, resize_image
+from luce_image.selection import Selection, Mode
+from luce_image.shaders import ants_frag_words, ants_frag_msl
+from luce_image.half import from_half
+from raster_errors import invalid, limit
+
+struct Record:
+    var id: u64
+    var name: str
+    var visible: bool
+    var opacity: f64
+    var blend: i64
+    var masked: bool
+    var clipped: bool
+    var style: Style = Style()
+    ## A picture waiting to become tiles once a device is bound, and a mask likewise.
+    var picture: interop.Reference[Image]?
+    var mask_picture: interop.Reference[Image]?
+
+pub struct Canvas:
+    var extent_x: u32
+    var extent_y: u32
+    var records: Record[]
+    var count: usize
+    var next_id: u64
+    var device: gpu.Device?
+    var document: Document*?
+    var composer: Composer*?
+    var painter: Painter?
+    var adjuster: Adjuster?
+    var filters: Filters?
+    var transformer: Transformer?
+    var brush: Brush
+    var stroke: Stroke*?
+    var preview: Snapshot?
+    var curves: Curves
+    var table: gpu.Texture?
+    ## The last color the eyedropper read, straight alpha, linear light.
+    var picked: f64[4]
+    var mask_editing: bool
+    ## The selection lives on the CPU here and is copied into the GPU document at bind.
+    var selection: Selection
+    var polygon: f64[]
+    var polygon_count: usize
+    var ants_shader: gpu.Shader?
+    var ants: gpu.Pipeline?
+    var history: Snapshot[]
+    var history_count: usize
+    var future: Snapshot[]
+    var future_count: usize
+    var closed: bool
+    ## Pixels per inch, for print sizes and rulers in physical units.
+    var dpi: f64
+    ## The color profile the pixels are in, by luce-color's space name.
+    var profile_name: u8[64]
+    var profile_length: usize
+
+    # mark: Lifecycle and document settings =======================================================
+
+    ## An empty `width` by `height` document with no layers.
+    pub func init(width: i64, height: i64) -> !:
+        if width < 1 or height < 1 or width > 65536 or height > 65536:
+            error(invalid, "document dimensions must be in 1..65536")
+        self.extent_x = (u32)width
+        self.extent_y = (u32)height
+        var empty: Record[]
+        self.records = empty
+        self.count = 0
+        self.next_id = 1
+        self.device = none
+        self.document = none
+        self.composer = none
+        self.painter = none
+        self.adjuster = none
+        self.filters = none
+        self.transformer = none
+        self.brush = Brush()
+        self.stroke = none
+        self.preview = none
+        self.curves = Curves.identity()
+        self.table = none
+        var nothing: f64[4]
+        self.picked = nothing
+        self.mask_editing = false
+        self.selection = try Selection.create((u32)width, (u32)height)
+        var no_points: f64[]
+        self.polygon = no_points
+        self.polygon_count = 0
+        self.ants_shader = none
+        self.ants = none
+        var no_history: Snapshot[]
+        self.history = no_history
+        self.history_count = 0
+        self.future = no_history
+        self.future_count = 0
+        self.closed = false
+        self.dpi = 72.0
+        var no_name: u8[64]
+        self.profile_name = no_name
+        self.profile_length = 0
+        self.set_profile("sRGB")
+
+    ## Pixels per inch: how big the document prints, and what a ruler in
+    ## millimeters or inches measures. 72 unless set.
+    pub func resolution() -> f64:
+        return self.dpi
+
+    pub mutating func set_resolution(dpi: f64) -> !:
+        if not math.is_finite(dpi) or dpi < 1.0 or dpi > 100000.0:
+            error(invalid, "a resolution must be 1..100000 pixels per inch")
+        self.dpi = dpi
+
+    ## The color profile the document's pixels are in, as luce-color names spaces
+    ## ("sRGB", "Display P3", "Adobe RGB (1998)", …). sRGB unless set.
+    pub func profile() -> interop.Owned[str]!:
+        return try interop.copy_text((str)self.profile_name[..<self.profile_length])
+
+    pub mutating func set_profile(name: str):
+        let length = name.length if name.length < self.profile_name.length else self.profile_name.length
+        for index in 0..<length:
+            self.profile_name[index] = name.bytes[index]
+        self.profile_length = length
+
+    ## A document from `path`: an `.l2d` package with its layers, or a picture
+    ## of any supported format as one layer.
+    pub static func open(path: str) -> interop.Reference[Canvas]!:
+        return try open_canvas(path)
+
+    pub func width() -> i64:
+        return (i64)self.extent_x
+
+    pub func height() -> i64:
+        return (i64)self.extent_y
+
+    ## The selection being edited: the document's once bound, the cold one before.
+    mutating func live() -> Selection*:
+        if let document = self.document:
+            return &document.selection
+        return &self.selection
+
+    func current() -> const Selection*:
+        if let document = self.document:
+            return &document.selection
+        return &self.selection
+
+    ## No stroke and no preview may be in progress for edits and history.
+    func require_idle() -> !:
+        if self.stroke != none:
+            error(invalid, "finish the stroke first")
+        if self.preview != none:
+            error(invalid, "finish the preview first")
+
+    ## Create the GPU document on the target's device and move waiting pictures in.
+    mutating func bind(target: const gpu.RenderTarget*) -> !:
+        if self.document != none:
+            return
+        let acquired = gpu.device_of(target) catch failure:
+            if failure.code == gpu.unavailable:
+                return
+            error(failure.code, failure.message)
+        var binding = Binding(device = acquired)
+        errdefer unwind(&binding)
+        let device = binding.device else trap("bound")
+        var document = try Document.create(device, self.extent_x, self.extent_y)
+        errdefer document.destroy()
+        for index in 0..<self.count:
+            let record = self.records[index]
+            discard(try document.add_layer(record.name))
+            try document.set_appearance(record.id, record.visible, record.opacity, (u32)record.blend)
+            if record.masked:
+                try document.set_mask(record.id, true)
+            if record.style.any():
+                (document.find(record.id) else trap("bound layer")).style = record.style
+            if record.clipped:
+                try document.set_clipped(record.id, true)
+        binding.document = try box_document(document)
+        var composer = try Composer.create(device)
+        errdefer composer.destroy()
+        binding.composer = try box_composer(composer)
+        binding.painter = try Painter.create(device)
+        binding.adjuster = try Adjuster.create(device)
+        binding.filters = try Filters.create(device)
+        binding.transformer = try Transformer.create(device)
+        self.device = binding.device
+        self.painter = binding.painter
+        self.adjuster = binding.adjuster
+        self.filters = binding.filters
+        self.transformer = binding.transformer
+        # The cold selection moves into the boxed document; a fresh empty one takes its place here.
+        let bound = binding.document else trap("boxed")
+        bound.selection.destroy()
+        bound.selection = self.selection
+        self.selection = try Selection.create(self.extent_x, self.extent_y)
+        self.document = binding.document
+        self.composer = binding.composer
+        binding = Binding()
+        for index in 0..<self.count:
+            if let picture = self.records[index].picture:
+                self.records[index].picture = none
+                defer picture.release()
+                let tiles = try self.tiles_of(picture)
+                try (self.document else trap("bound")).set_tiles(self.records[index].id, tiles)
+            if let picture = self.records[index].mask_picture:
+                self.records[index].mask_picture = none
+                defer picture.release()
+                let tiles = try self.tiles_of(picture)
+                var old = try (self.document else trap("bound")).take_mask(self.records[index].id, tiles)
+                old.destroy()
+
+    func require_open() -> !:
+        if self.closed:
+            error(invalid, "the document is closed")
+
+    pub mutating func close():
+        if self.closed:
+            return
+        self.closed = true
+        if let stroke = self.stroke:
+            self.stroke = none
+            finish_boxed(stroke)
+        if let preview = self.preview:
+            var owned = preview.tiles
+            owned.destroy()
+            self.preview = none
+        if let table = self.table:
+            var owned = table
+            owned.destroy()
+            self.table = none
+        if let pipeline = self.ants:
+            var owned = pipeline
+            owned.destroy()
+            self.ants = none
+        if let shader = self.ants_shader:
+            var owned = shader
+            owned.destroy()
+            self.ants_shader = none
+        self.selection.destroy()
+        if self.polygon.length > 0:
+            free(self.polygon) in memory.heap
+        clear_snapshots(&self.history, &self.history_count)
+        clear_snapshots(&self.future, &self.future_count)
+        if self.history.length > 0:
+            free(self.history) in memory.heap
+        if self.future.length > 0:
+            free(self.future) in memory.heap
+        var binding = Binding(device = self.device, document = self.document, composer = self.composer, painter = self.painter, adjuster = self.adjuster, filters = self.filters, transformer = self.transformer)
+        self.device = none
+        self.document = none
+        self.composer = none
+        self.painter = none
+        self.adjuster = none
+        self.filters = none
+        self.transformer = none
+        unwind(&binding)
+        for index in 0..<self.count:
+            strings.release(self.records[index].name)
+            if let picture = self.records[index].picture:
+                picture.release()
+            if let picture = self.records[index].mask_picture:
+                picture.release()
+        if self.records.length > 0:
+            free(self.records) in memory.heap
+        var empty: Record[]
+        self.records = empty
+        self.count = 0
+
+    func trace(visit: func(ownership.Object*, void*) -> unit, context: void*):
+        for index in 0..<self.count:
+            if let picture = self.records[index].picture:
+                picture.trace(visit, context)
+            if let picture = self.records[index].mask_picture:
+                picture.trace(visit, context)
+
+    # mark: Layers ================================================================================
+
+    ## Add a transparent layer on top; returns its id.
+    pub mutating func add_layer(name: str) -> i64!:
+        try self.require_open()
+        if self.count == self.records.length:
+            let capacity = 8 if self.records.length == 0 else self.records.length * 2
+            let grown = try alloc Record[capacity] in memory.heap
+            if self.count > 0:
+                memory.copy(grown, self.records, self.count)
+            if self.records.length > 0:
+                free(self.records) in memory.heap
+            self.records = grown
+        var copied: str = ""
+        with memory.heap:
+            copied = try strings.copy(name)
+        errdefer strings.release(copied)
+        let id = self.next_id
+        if let document = self.document:
+            let created = try document.add_layer(name)
+            assert(created == id)
+        self.records[self.count] = Record(id = id, name = copied, visible = true, opacity = 1.0, blend = 0, masked = false, clipped = false, picture = none, mask_picture = none)
+        self.count += 1
+        self.next_id += 1
+        return (i64)id
+
+    ## Replace a layer's pixels with the picture at `path`, which must be the
+    ## document's size.
+    pub mutating func load_layer(id: i64, path: str) -> !:
+        try self.require_open()
+        let picture = try Image.open(path)
+        errdefer picture.release()
+        if (try picture.value().width()) != (usize)self.extent_x or (try picture.value().height()) != (usize)self.extent_y:
+            error(invalid, "the picture must match the document's size")
+        try self.place((u64)id, picture)
+
+    ## Put the picture at `path`, of any size, on layer `id` centred on document
+    ## pixel (`center_x`, `center_y`): what falls outside the document is cut off
+    ## and the rest of the layer is transparent. Dropping a file on a document
+    ## does this. The document must have been drawn once.
+    pub mutating func place_layer(id: i64, path: str, center_x: i64, center_y: i64) -> !:
+        try place_picture(&self, id, path, center_x, center_y)
+
+    mutating func place(id: u64, picture: interop.Reference[Image]) -> !:
+        let index = try self.index(id)
+        if let document = self.document:
+            try document.set_tiles(id, try self.tiles_of(picture))
+            picture.release()
+            return
+        if let previous = self.records[index].picture:
+            previous.release()
+        self.records[index].picture = picture
+
+    ## Tiles on the bound device holding `picture`'s pixels.
+    mutating func tiles_of(picture: interop.Reference[Image]) -> Tiles!:
+        let device = self.device else error(invalid, "the document is not bound to a device")
+        let count = (usize)self.extent_x * (usize)self.extent_y * 4
+        let pixels = try alloc f32[count] in memory.heap
+        defer free(pixels) in memory.heap
+        try picture.value().linear_rgba(pixels)
+        var tiles = try Tiles.create(device, self.extent_x, self.extent_y)
+        errdefer tiles.destroy()
+        try tiles.write(pixels)
+        return tiles
+
+    pub mutating func remove_layer(id: i64) -> !:
+        try self.require_open()
+        let index = try self.index((u64)id)
+        if let document = self.document:
+            try document.remove((u64)id)
+        strings.release(self.records[index].name)
+        if let picture = self.records[index].picture:
+            picture.release()
+        if let picture = self.records[index].mask_picture:
+            picture.release()
+        for shift in index..<(self.count - 1):
+            self.records[shift] = self.records[shift + 1]
+        self.count -= 1
+
+    ## Set a layer's visibility, opacity and blend mode (Photoshop's, by number;
+    ## `blend_mode_name` lists them).
+    pub mutating func set_layer(id: i64, visible: bool, opacity: f64, blend: i64 = 0) -> !:
+        try self.require_open()
+        if not math.is_finite(opacity) or opacity < 0.0 or opacity > 1.0:
+            error(invalid, "opacity must be in 0..1")
+        if blend < 0 or blend >= (i64)blend_mode_count:
+            error(invalid, "no such blend mode")
+        let index = try self.index((u64)id)
+        if let document = self.document:
+            try document.set_appearance((u64)id, visible, opacity, (u32)blend)
+        self.records[index].visible = visible
+        self.records[index].opacity = opacity
+        self.records[index].blend = blend
+
+    pub func layer_blend(index: i64) -> i64!:
+        return (try self.record(index)).blend
+
+    ## Move a layer one step up (1) or down (-1) in the stack.
+    pub mutating func reorder_layer(id: i64, step: i64) -> !:
+        try self.require_open()
+        let index = try self.index((u64)id)
+        let target = (i64)index + step
+        if target < 0 or target >= (i64)self.count:
+            return
+        if let document = self.document:
+            try document.reorder((u64)id, step)
+        let moved = self.records[index]
+        self.records[index] = self.records[(usize)target]
+        self.records[(usize)target] = moved
+
+    ## Copy a layer with its mask and appearance just above it; returns the copy's id.
+    pub mutating func duplicate_layer(id: i64, name: str) -> i64!:
+        try self.require_open()
+        try self.require_idle()
+        let index = try self.index((u64)id)
+        let created = try self.add_layer(name)
+        let copy = try self.index((u64)created)
+        self.records[copy].visible = self.records[index].visible
+        self.records[copy].opacity = self.records[index].opacity
+        self.records[copy].blend = self.records[index].blend
+        self.records[copy].clipped = self.records[index].clipped
+        self.records[copy].style = self.records[index].style
+        self.records[copy].masked = self.records[index].masked
+        if let document = self.document:
+            # The GPU copy carries the pixels; the record added above is replaced by it.
+            try document.remove((u64)created)
+            let actual = try document.duplicate((u64)id, name)
+            self.records[copy].id = actual
+            self.next_id = actual + 1
+        elif let picture = self.records[index].picture:
+            self.records[copy].picture = picture.clone()
+        # Place the copy right above the source.
+        var at = copy
+        while at > index + 1:
+            let swap = self.records[at]
+            self.records[at] = self.records[at - 1]
+            self.records[at - 1] = swap
+            at -= 1
+        return (i64)self.records[index + 1].id
+
+    ## Merge a layer into the one below it. Not undoable: history entries for
+    ## both layers are dropped.
+    pub mutating func merge_down(id: i64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        let document = self.document else error(invalid, "draw the document once before merging")
+        let composer = self.composer else error(invalid, "draw the document once before merging")
+        let index = try self.index((u64)id)
+        if index == 0:
+            error(invalid, "nothing below to merge into")
+        try composer.merge_down(document, (u64)id)
+        strings.release(self.records[index].name)
+        if let picture = self.records[index].picture:
+            picture.release()
+        for shift in index..<(self.count - 1):
+            self.records[shift] = self.records[shift + 1]
+        self.count -= 1
+        clear_snapshots(&self.history, &self.history_count)
+        clear_snapshots(&self.future, &self.future_count)
+
+    ## Give layer `id` a new name.
+    pub mutating func rename_layer(id: i64, name: str) -> !:
+        try self.require_open()
+        if name.length == 0 or name.length > 256:
+            error(invalid, "a layer name is 1..256 bytes")
+        let index = try self.index((u64)id)
+        var copied: str = ""
+        with memory.heap:
+            copied = try strings.copy(name)
+        if let document = self.document:
+            document.rename((u64)id, name) catch failure:
+                strings.release(copied)
+                error(failure.code, failure.message)
+        strings.release(self.records[index].name)
+        self.records[index].name = copied
+
+    ## How many blend modes there are.
+    pub static func blend_mode_count() -> i64:
+        return (i64)blend_mode_count
+
+    ## The name of a blend mode.
+    pub static func blend_mode_name(mode: i64) -> str!:
+        if mode < 0 or mode >= (i64)blend_mode_count:
+            error(invalid, "no such blend mode")
+        return blend_names[(usize)mode]
+
+    ## Layers from the bottom up.
+    pub func layer_count() -> i64:
+        return (i64)self.count
+
+    pub func layer_id(index: i64) -> i64!:
+        return (i64)(try self.record(index)).id
+
+    pub func layer_name(index: i64) -> str!:
+        return (try self.record(index)).name
+
+    pub func layer_visible(index: i64) -> bool!:
+        return (try self.record(index)).visible
+
+    pub func layer_opacity(index: i64) -> f64!:
+        return (try self.record(index)).opacity
+
+    mutating func adopt_extent(width: u32, height: u32) -> !:
+        self.extent_x = width
+        self.extent_y = height
+        var replacement = try Selection.create(width, height)
+        self.selection.destroy()
+        self.selection = replacement
+        clear_snapshots(&self.history, &self.history_count)
+        clear_snapshots(&self.future, &self.future_count)
+
+    func index(id: u64) -> usize!:
+        for index in 0..<self.count:
+            if self.records[index].id == id:
+                return index
+        error(invalid, "no such layer")
+
+    func record(index: i64) -> Record!:
+        if index < 0 or index >= (i64)self.count:
+            error(invalid, "layer index out of range")
+        return self.records[(usize)index]
+
+    # mark: Masks, clipping and styles ============================================================
+
+    ## Give a layer a mask that reveals everything, or remove its mask.
+    pub mutating func set_mask(id: i64, present: bool) -> !:
+        try self.require_open()
+        try self.require_idle()
+        let index = try self.index((u64)id)
+        if let document = self.document:
+            try document.set_mask((u64)id, present)
+        self.records[index].masked = present
+        if not present and self.mask_editing:
+            self.mask_editing = false
+
+    pub func layer_masked(index: i64) -> bool!:
+        return (try self.record(index)).masked
+
+    ## Route strokes to the selected layer's mask instead of its pixels: white
+    ## reveals, black hides.
+    pub mutating func edit_mask(enabled: bool):
+        self.mask_editing = enabled
+
+    pub func editing_mask() -> bool:
+        return self.mask_editing
+
+    ## Clip a layer to the nearest unclipped layer below it, or unclip it.
+    pub mutating func set_clipped(id: i64, clipped: bool) -> !:
+        try self.require_open()
+        let index = try self.index((u64)id)
+        if let document = self.document:
+            try document.set_clipped((u64)id, clipped)
+        self.records[index].clipped = clipped
+
+    ## Layer styles, drawn under the layer by the compositor and kept with the
+    ## document. Colors are linear 0..1; sizes and offsets in pixels.
+    pub mutating func set_shadow(id: i64, on: bool, dx: f64, dy: f64, blur: f64, red: f64, green: f64, blue: f64, opacity: f64) -> !:
+        var style = try self.style_of(id)
+        style.shadow = on
+        style.shadow_dx = dx
+        style.shadow_dy = dy
+        style.shadow_blur = blur
+        style.shadow_red = red
+        style.shadow_green = green
+        style.shadow_blue = blue
+        style.shadow_opacity = opacity
+        try self.set_style(id, style)
+
+    pub mutating func set_stroke(id: i64, on: bool, size: f64, red: f64, green: f64, blue: f64, opacity: f64) -> !:
+        var style = try self.style_of(id)
+        style.stroke = on
+        style.stroke_size = size
+        style.stroke_red = red
+        style.stroke_green = green
+        style.stroke_blue = blue
+        style.stroke_opacity = opacity
+        try self.set_style(id, style)
+
+    pub mutating func set_glow(id: i64, on: bool, size: f64, red: f64, green: f64, blue: f64, opacity: f64) -> !:
+        var style = try self.style_of(id)
+        style.glow = on
+        style.glow_size = size
+        style.glow_red = red
+        style.glow_green = green
+        style.glow_blue = blue
+        style.glow_opacity = opacity
+        try self.set_style(id, style)
+
+    ## Whether the layer at `index` has any style on.
+    pub func layer_styled(index: i64) -> bool!:
+        return (try self.record(index)).style.any()
+
+    ## One style setting of the layer at `index`, by field: 0 shadow on, 1 dx,
+    ## 2 dy, 3 blur, 4..6 color, 7 opacity; 8 stroke on, 9 size, 10..12
+    ## color, 13 opacity; 14 glow on, 15 size, 16..18 color, 19 opacity.
+    pub func style_value(index: i64, field: i64) -> f64!:
+        let style = (try self.record(index)).style
+        return style_field(style, field) else error(invalid, "style fields are 0..19")
+
+    func style_of(id: i64) -> Style!:
+        try self.require_open()
+        let index = try self.index((u64)id)
+        return self.records[index].style
+
+    mutating func set_style(id: i64, style: Style) -> !:
+        for value in [style.shadow_dx, style.shadow_dy, style.shadow_blur, style.shadow_opacity, style.stroke_size, style.stroke_opacity, style.glow_size, style.glow_opacity,
+                      style.shadow_red, style.shadow_green, style.shadow_blue, style.stroke_red, style.stroke_green, style.stroke_blue, style.glow_red, style.glow_green, style.glow_blue]:
+            if not math.is_finite(value):
+                error(invalid, "style settings must be finite")
+        if style.shadow_blur < 0.0 or style.shadow_blur > 250.0 or style.stroke_size < 0.0 or style.stroke_size > 250.0 or style.glow_size < 0.0 or style.glow_size > 250.0:
+            error(invalid, "style sizes are 0..250 pixels")
+        let index = try self.index((u64)id)
+        if let document = self.document:
+            (document.find((u64)id) else error(invalid, "no such layer")).style = style
+        self.records[index].style = style
+
+    pub func layer_clipped(index: i64) -> bool!:
+        return (try self.record(index)).clipped
+
+    # mark: Selection =============================================================================
+
+    ## Select a rectangle, combined with the selection by `mode` (0 replace,
+    ## 1 add, 2 subtract, 3 intersect).
+    pub mutating func select_rectangle(x: i64, y: i64, width: i64, height: i64, mode: i64 = 0) -> !:
+        try self.require_open()
+        self.live().rectangle(x, y, width, height, try selection_mode(mode))
+
+    ## Select an ellipse inscribed in a rectangle, combined by `mode`.
+    pub mutating func select_ellipse(x: i64, y: i64, width: i64, height: i64, mode: i64 = 0) -> !:
+        try self.require_open()
+        self.live().ellipse(x, y, width, height, try selection_mode(mode))
+
+    ## The magic wand on layer `id`: select the pixels within `tolerance`
+    ## (0..255, sRGB, alpha included) of the color at (`x`, `y`), only those
+    ## reachable through such pixels when `contiguous`, combined by `mode`.
+    pub mutating func select_wand(id: i64, x: i64, y: i64, tolerance: f64, contiguous: bool, mode: i64 = 0) -> !:
+        try self.require_open()
+        let document = self.document else error(invalid, "draw the document once before using the wand")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = layer.tiles() else error(invalid, "a group has no pixels to sample")
+        let count = (usize)self.extent_x * (usize)self.extent_y * 4
+        let pixels = try alloc f32[count] in memory.heap
+        defer free(pixels) in memory.heap
+        try tiles.read(pixels)
+        try self.live().wand(pixels, x, y, tolerance, contiguous, try selection_mode(mode))
+
+    ## Collect a polygon point for `select_polygon`.
+    pub mutating func add_point(x: f64, y: f64) -> !:
+        try self.require_open()
+        if not math.is_finite(x) or not math.is_finite(y):
+            error(invalid, "polygon points must be finite")
+        if self.polygon_count + 2 > self.polygon.length:
+            let capacity = 64 if self.polygon.length == 0 else self.polygon.length * 2
+            let grown = try alloc f64[capacity] in memory.heap
+            if self.polygon_count > 0:
+                memory.copy(grown, self.polygon, self.polygon_count)
+            if self.polygon.length > 0:
+                free(self.polygon) in memory.heap
+            self.polygon = grown
+        self.polygon[self.polygon_count] = x
+        self.polygon[self.polygon_count + 1] = y
+        self.polygon_count += 2
+
+    pub mutating func clear_points():
+        self.polygon_count = 0
+
+    ## Select the polygon of the collected points, combined by `mode`, and forget them.
+    pub mutating func select_polygon(mode: i64 = 0) -> !:
+        try self.require_open()
+        if self.polygon_count < 6:
+            self.polygon_count = 0
+            error(invalid, "a polygon needs at least three points")
+        try self.live().polygon(self.polygon[..<self.polygon_count], try selection_mode(mode))
+        self.polygon_count = 0
+
+    pub mutating func select_all() -> !:
+        try self.require_open()
+        self.live().select_all()
+
+    pub mutating func deselect() -> !:
+        try self.require_open()
+        self.live().clear()
+
+    pub mutating func invert_selection() -> !:
+        try self.require_open()
+        self.live().invert()
+
+    ## Grow (positive) or shrink (negative) the selection and feather its edge.
+    pub mutating func adjust_selection(pixels: i64, feather: i64) -> !:
+        try self.require_open()
+        try self.live().adjust(pixels, feather)
+
+    pub func has_selection() -> bool:
+        return not self.current().is_empty()
+
+    ## The selection's bounding box, in document pixels.
+    pub func selection_left() -> i64:
+        return self.current().left if self.has_selection() else 0
+
+    pub func selection_top() -> i64:
+        return self.current().top if self.has_selection() else 0
+
+    pub func selection_width() -> i64:
+        return (self.current().right - self.current().left) if self.has_selection() else 0
+
+    pub func selection_height() -> i64:
+        return (self.current().bottom - self.current().top) if self.has_selection() else 0
+
+    ## Coverage 0..255 at a document pixel.
+    pub func selected_at(x: i64, y: i64) -> i64:
+        return (i64)self.current().at(x, y)
+
+    ## Draw the selection's marching ants over the document as drawn by `draw`
+    ## with the same rectangle, zoom and offset; `phase` animates the dashes.
+    pub mutating func draw_selection(target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, phase: f64) -> !:
+        try draw_canvas_selection(&self, target, rectangle, zoom, offset_x, offset_y, phase)
+
+    mutating func ants_pipeline() -> gpu.Pipeline!:
+        if let existing = self.ants:
+            return existing
+        let device = self.device else error(invalid, "draw the document once first")
+        var shader = try gpu.Shader.create(device, ants_frag_words, ants_frag_msl)
+        errdefer shader.destroy()
+        let pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.over)
+        self.ants_shader = shader
+        self.ants = pipeline
+        return pipeline
+
+    # mark: Painting ==============================================================================
+
+    ## Fill the selection (or the whole layer) on `layer` with the brush color
+    ## at its opacity, or clear it when `erase`. Undoable.
+    pub mutating func fill(layer: i64, erase: bool) -> !:
+        try self.require_open()
+        try self.require_idle()
+        let document = self.document else error(invalid, "draw the document once before filling")
+        var painter = self.painter else error(invalid, "draw the document once before filling")
+        let index = try self.index((u64)layer)
+        let on_mask = self.mask_editing and self.records[index].masked
+        var brush = self.brush
+        brush.erase = erase
+        let before = try fill_selection(&painter, document, (u64)layer, brush, on_mask)
+        try self.remember((u64)layer, before, on_mask)
+
+    ## Set the brush every following stroke paints with: its size, edge, color
+    ## and strength. The tip shape, dynamics and texture set separately stay.
+    pub mutating func set_brush(diameter: f64, hardness: f64, opacity: f64, flow: f64, red: f64, green: f64, blue: f64, erase: bool) -> !:
+        var brush = self.brush
+        brush.diameter = diameter
+        brush.hardness = hardness
+        brush.opacity = opacity
+        brush.flow = flow
+        brush.color = gpu.Color(red, green, blue, 1.0)
+        brush.erase = erase
+        try brush.check()
+        try gpu_check_color(brush.color)
+        self.brush = brush
+
+    ## The tip's shape: dab spacing as a fraction of the diameter (Photoshop's
+    ## 25 % is 0.25), angle in degrees, roundness 0.05..1, and the smoothing
+    ## string in document pixels.
+    pub mutating func set_brush_shape(spacing: f64, angle: f64, roundness: f64, smoothing: f64) -> !:
+        var brush = self.brush
+        brush.spacing = spacing
+        brush.angle = angle
+        brush.roundness = roundness
+        brush.smoothing = smoothing
+        try brush.check()
+        self.brush = brush
+
+    ## The brush's dynamics, each jitter 0..1: size, angle and roundness
+    ## (shape), scatter as a fraction of the diameter with the dabs per step,
+    ## flow (transfer), hue, saturation and brightness (color), and whether
+    ## stylus pressure drives size and flow.
+    pub mutating func set_brush_dynamics(size_jitter: f64, angle_jitter: f64, roundness_jitter: f64, scatter: f64, scatter_count: i64,
+                                         flow_jitter: f64, hue_jitter: f64, saturation_jitter: f64, brightness_jitter: f64, pressure_size: bool, pressure_flow: bool) -> !:
+        var brush = self.brush
+        brush.size_jitter = size_jitter
+        brush.angle_jitter = angle_jitter
+        brush.roundness_jitter = roundness_jitter
+        brush.scatter = scatter
+        brush.scatter_count = scatter_count
+        brush.flow_jitter = flow_jitter
+        brush.hue_jitter = hue_jitter
+        brush.saturation_jitter = saturation_jitter
+        brush.brightness_jitter = brightness_jitter
+        brush.pressure_size = pressure_size
+        brush.pressure_flow = pressure_flow
+        try brush.check()
+        self.brush = brush
+
+    ## The tip's texture: 0 none, 1 grain, 2 canvas weave, 3 dots, at `scale`
+    ## (0.1..10) and `depth` 0..1 (how much of it shows through).
+    pub mutating func set_brush_texture(kind: i64, scale: f64, depth: f64) -> !:
+        var brush = self.brush
+        brush.texture = kind
+        brush.texture_scale = scale
+        brush.texture_depth = depth
+        try brush.check()
+        self.brush = brush
+
+    ## Start painting on `layer` at a document point. The document must have
+    ## been drawn once, so its pixels are on a device. The layer's pixels before
+    ## the stroke go on the history.
+    pub mutating func begin_stroke(layer: i64, x: f64, y: f64, pressure: f64 = 1.0) -> !:
+        try self.require_open()
+        if self.stroke != none:
+            error(invalid, "a stroke is already in progress")
+        if self.preview != none:
+            error(invalid, "finish the preview first")
+        let document = self.document else error(invalid, "draw the document once before painting")
+        var painter = self.painter else error(invalid, "draw the document once before painting")
+        let index = try self.index((u64)layer)
+        let on_mask = self.mask_editing and self.records[index].masked
+        let stroke = try begin_boxed(&painter, document, (u64)layer, self.brush, x, y, on_mask, pressure)
+        errdefer finish_boxed(stroke)
+        try self.remember((u64)layer, try stroke.original().clone(), on_mask)
+        self.stroke = stroke
+
+    ## Continue the stroke to a document point.
+    pub mutating func extend_stroke(x: f64, y: f64, pressure: f64 = 1.0) -> !:
+        try self.require_open()
+        let stroke = self.stroke else error(invalid, "no stroke is in progress")
+        let document = self.document else trap("stroke without a document")
+        var painter = self.painter else trap("stroke without a painter")
+        try stroke.extend(&painter, document, x, y, pressure)
+
+    ## End the stroke, keeping what it painted.
+    pub mutating func end_stroke() -> !:
+        try self.require_open()
+        let stroke = self.stroke else error(invalid, "no stroke is in progress")
+        self.stroke = none
+        finish_boxed(stroke)
+
+    pub func painting() -> bool:
+        return self.stroke != none
+
+    ## Lay a linear gradient over layer `id` from one color at (`x0`, `y0`) to
+    ## another at (`x1`, `y1`), straight alpha in linear light, inside the
+    ## selection. Undoable.
+    pub mutating func fill_gradient(id: i64, x0: f64, y0: f64, x1: f64, y1: f64, r0: f64, g0: f64, b0: f64, a0: f64, r1: f64, g1: f64, b1: f64, a1: f64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        let document = self.document else error(invalid, "draw the document once before filling")
+        var painter = self.painter else error(invalid, "draw the document once before filling")
+        let from_color = gpu.Color(r0, g0, b0, a0)
+        let to_color = gpu.Color(r1, g1, b1, a1)
+        try gpu_check_color(from_color)
+        try gpu_check_color(to_color)
+        if a0 < 0.0 or a0 > 1.0 or a1 < 0.0 or a1 > 1.0:
+            error(invalid, "gradient alphas must be in 0..1")
+        var before = try fill_gradient(&painter, document, (u64)id, x0, y0, x1, y1, from_color, to_color)
+        errdefer before.destroy()
+        try self.remember((u64)id, before)
+
+    ## The eyedropper: read the flattened document's color at a pixel into
+    ## `picked_red` and friends (linear light, straight alpha).
+    pub mutating func pick(x: i64, y: i64) -> !:
+        try self.require_open()
+        if x < 0 or y < 0 or x >= (i64)self.extent_x or y >= (i64)self.extent_y:
+            error(invalid, "the picked pixel lies outside the document")
+        let document = self.document else error(invalid, "draw the document once before picking")
+        let composer = self.composer else error(invalid, "draw the document once before picking")
+        let texture = try composer.tile(document, (u32)(x // (i64)tile_size), (u32)(y // (i64)tile_size), 0)
+        var bytes: u8[8]
+        try texture.read(bytes, gpu.Region((u32)(x % (i64)tile_size), (u32)(y % (i64)tile_size), 1, 1))
+        for channel in 0..<(usize)4:
+            self.picked[channel] = (f64)from_half((u16)bytes[channel * 2] | ((u16)bytes[channel * 2 + 1] << 8))
+
+    pub func picked_red() -> f64:
+        return self.picked[0]
+
+    pub func picked_green() -> f64:
+        return self.picked[1]
+
+    pub func picked_blue() -> f64:
+        return self.picked[2]
+
+    pub func picked_alpha() -> f64:
+        return self.picked[3]
+
+    ## Set `text` into a layer's pixels with its top-left at (`x`, `y`), `size`
+    ## pixels tall (8..256), in a linear color. Rasterised type, as Photoshop
+    ## does when it flattens; undoable.
+    pub mutating func draw_text(id: i64, x: f64, y: f64, text: str, size: f64, red: f64, green: f64, blue: f64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        let document = self.document else error(invalid, "draw the document once before setting text")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = layer.tiles() else error(invalid, "a group cannot take text")
+        let color = gpu.Color(red, green, blue, 1.0)
+        try gpu_check_color(color)
+        try self.remember((u64)id, try tiles.clone())
+        try draw_text(document, (u64)id, x, y, text, size, color)
+
+    ## The width in pixels `text` takes at `size`.
+    pub static func measure_text(text: str, size: f64) -> f64!:
+        return try measure_text(text, size)
+
+    ## The height in pixels of a line of text at `size`.
+    pub static func text_height(size: f64) -> f64!:
+        return try text_height(size)
+
+    ## Move a layer's pixels (or its mask while editing it) by whole pixels. Undoable.
+    pub mutating func move_layer(id: i64, dx: i64, dy: i64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        if dx == 0 and dy == 0:
+            return
+        let document = self.document else error(invalid, "draw the document once before moving")
+        let index = try self.index((u64)id)
+        let on_mask = self.mask_editing and self.records[index].masked
+        let before = try translate(document, (u64)id, dx, dy, on_mask)
+        try self.remember((u64)id, before, on_mask)
+
+    # mark: Adjustments, filters and previews =====================================================
+
+    ## Rewrite a layer's pixels with a destructive adjustment: 0 brightness/
+    ## contrast (a, b in -1..1), 1 hue/saturation/lightness (a in turns, b, c
+    ## in -1..1), 2 invert, 3 levels (a input black, b input white, c gamma,
+    ## d output black, e output white, all 0..1 but gamma), 4 desaturate,
+    ## 5 threshold (a), 6 posterize (a levels), 7 curves (the curves set with
+    ## `add_curve_point`). Undoable.
+    pub mutating func adjust_layer(id: i64, kind: i64, a: f64, b: f64, c: f64, d: f64, e: f64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        if kind < 0 or kind >= (i64)adjustment_count:
+            error(invalid, "no such adjustment")
+        let document = self.document else error(invalid, "draw the document once before adjusting")
+        let adjuster = self.adjuster else error(invalid, "draw the document once before adjusting")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = layer.tiles() else error(invalid, "a group cannot be adjusted")
+        let table = try self.curve_table((u32)kind)
+        try self.remember((u64)id, try tiles.clone())
+        try adjuster.apply(document, (u64)id, (u32)kind, a, b, c, d, e, table)
+
+    pub static func adjustment_count() -> i64:
+        return (i64)adjustment_count
+
+    ## Add a control point to a curve for the `curves` adjustment (kind 7):
+    ## channel 0 is RGB, applied after 1 red, 2 green and 3 blue; x and y in
+    ## 0..1; a point at an existing x replaces it; at most 16 per channel.
+    pub mutating func add_curve_point(channel: i64, x: f64, y: f64) -> !:
+        try self.curves.add(try curve_channel(channel), x, y)
+
+    ## Reset a channel's curve to the identity.
+    pub mutating func reset_curve(channel: i64) -> !:
+        let index = try curve_channel(channel)
+        try self.curves.clear(index)
+        try self.curves.add(index, 0.0, 0.0)
+        try self.curves.add(index, 1.0, 1.0)
+
+    pub func curve_point_count(channel: i64) -> i64!:
+        return (i64)(try self.curves.channel(try curve_channel(channel))).length()
+
+    pub func curve_point_x(channel: i64, index: i64) -> f64!:
+        let curve = try self.curves.channel(try curve_channel(channel))
+        if index < 0 or index >= (i64)curve.length():
+            error(invalid, "no such curve point")
+        return curve.x((usize)index)
+
+    pub func curve_point_y(channel: i64, index: i64) -> f64!:
+        let curve = try self.curves.channel(try curve_channel(channel))
+        if index < 0 or index >= (i64)curve.length():
+            error(invalid, "no such curve point")
+        return curve.y((usize)index)
+
+    ## The curve's output for `x` on `channel`, for drawing it.
+    pub func curve_value(channel: i64, x: f64) -> f64!:
+        return (try self.curves.channel(try curve_channel(channel))).evaluate(x)
+
+    ## The 256×1 table the curves adjustment samples, refreshed from the
+    ## curves; none for other kinds.
+    mutating func curve_table(kind: u32) -> gpu.Texture?!:
+        if kind != curves:
+            return none
+        let device = self.device else error(invalid, "draw the document once before adjusting")
+        var table = self.table else try gpu.Texture.create(device, (u32)lut_size, 1, gpu.Format.rgba8_linear)
+        self.table = table
+        var bytes: u8[1024]
+        try self.curves.fill(bytes)
+        try table.upload(bytes)
+        return table
+
+    ## Start previewing edits to a layer: until `end_preview`, each
+    ## `preview_adjust`, `preview_blur` or `preview_transform` shows its effect on the layer's
+    ## pixels from before the preview began, not on the previous preview.
+    pub mutating func begin_preview(id: i64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        let document = self.document else error(invalid, "draw the document once before previewing")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = layer.tiles() else error(invalid, "a group cannot be previewed")
+        self.preview = Snapshot(layer = (u64)id, tiles = try tiles.clone(), mask = false)
+
+    pub func previewing() -> bool:
+        return self.preview != none
+
+    ## Show adjustment `kind` (as `adjust_layer`) applied to the layer as it was when the preview began.
+    pub mutating func preview_adjust(kind: i64, a: f64, b: f64, c: f64, d: f64, e: f64) -> !:
+        if kind < 0 or kind >= (i64)adjustment_count:
+            error(invalid, "no such adjustment")
+        let table = try self.curve_table((u32)kind)
+        let layer = try self.restore_preview()
+        let document = self.document else trap("preview without a document")
+        let adjuster = self.adjuster else trap("preview without an adjuster")
+        try adjuster.apply(document, layer, (u32)kind, a, b, c, d, e, table)
+
+    ## Show a Gaussian blur of `radius` applied to the layer as it was when the preview began.
+    pub mutating func preview_blur(radius: f64) -> !:
+        let layer = try self.restore_preview()
+        let document = self.document else trap("preview without a document")
+        let filters = self.filters else trap("preview without filters")
+        try filters.gaussian_blur(document, layer, radius)
+
+    ## Finish the preview: keep what it shows as one undoable edit, or put the
+    ## layer's pixels back as they were.
+    pub mutating func end_preview(keep: bool) -> !:
+        try self.require_open()
+        let preview = self.preview else error(invalid, "no preview is in progress")
+        self.preview = none
+        let document = self.document else trap("preview without a document")
+        if keep:
+            try self.remember(preview.layer, preview.tiles)
+        else:
+            var shown = try document.take_tiles(preview.layer, preview.tiles)
+            shown.destroy()
+
+    ## Put the previewed layer's original pixels back; the layer's id.
+    mutating func restore_preview() -> u64!:
+        try self.require_open()
+        let preview = self.preview else error(invalid, "no preview is in progress")
+        let document = self.document else trap("preview without a document")
+        try document.set_tiles(preview.layer, try preview.tiles.clone())
+        return preview.layer
+
+    ## Blur a layer's pixels with a Gaussian of `radius` pixels (0.5..250). Undoable.
+    pub mutating func blur_layer(id: i64, radius: f64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        let document = self.document else error(invalid, "draw the document once before filtering")
+        let filters = self.filters else error(invalid, "draw the document once before filtering")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = layer.tiles() else error(invalid, "a group cannot be filtered")
+        try self.remember((u64)id, try tiles.clone())
+        try filters.gaussian_blur(document, (u64)id, radius)
+
+    ## Free transform: scale a layer's pixels by (`scale_x`, `scale_y`) and turn
+    ## them `angle` degrees about the centre of what the layer has, then move
+    ## them by (`dx`, `dy`) pixels; what leaves the document is lost. Undoable.
+    pub mutating func transform_layer(id: i64, scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        let document = self.document else error(invalid, "draw the document once before transforming")
+        let transformer = self.transformer else error(invalid, "draw the document once before transforming")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = layer.tiles() else error(invalid, "a group cannot be transformed")
+        try self.remember((u64)id, try tiles.clone())
+        try transformer.apply(document, (u64)id, scale_x, scale_y, angle * math.pi / 180.0, dx, dy)
+
+    ## Show a free transform (as `transform_layer`) of the previewed layer's original pixels.
+    pub mutating func preview_transform(scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64) -> !:
+        let layer = try self.restore_preview()
+        let document = self.document else trap("preview without a document")
+        let transformer = self.transformer else trap("preview without a transformer")
+        try transformer.apply(document, layer, scale_x, scale_y, angle * math.pi / 180.0, dx, dy)
+
+    # mark: Canvas and image size =================================================================
+
+    ## Change the canvas size, keeping the pixels with their top-left at the
+    ## offset. Not undoable: the history is dropped.
+    pub mutating func resize_canvas(width: i64, height: i64, offset_x: i64, offset_y: i64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        if width < 1 or height < 1 or width > 65536 or height > 65536:
+            error(invalid, "canvas dimensions must be in 1..65536")
+        let document = self.document else error(invalid, "draw the document once before resizing")
+        try resize_canvas(document, (u32)width, (u32)height, offset_x, offset_y)
+        try self.adopt_extent((u32)width, (u32)height)
+
+    ## Crop the canvas to the selection's bounding box.
+    pub mutating func crop() -> !:
+        if not self.has_selection():
+            error(invalid, "nothing is selected")
+        try self.resize_canvas(self.selection_width(), self.selection_height(), -self.selection_left(), -self.selection_top())
+
+    ## Resample the whole image to a new size. Not undoable: the history is dropped.
+    pub mutating func resize_image(width: i64, height: i64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        if width < 1 or height < 1 or width > 65536 or height > 65536:
+            error(invalid, "image dimensions must be in 1..65536")
+        let document = self.document else error(invalid, "draw the document once before resizing")
+        try resize_image(document, (u32)width, (u32)height)
+        try self.adopt_extent((u32)width, (u32)height)
+
+    # mark: History ===============================================================================
+
+    pub func can_undo() -> bool:
+        return self.history_count > 0
+
+    pub func can_redo() -> bool:
+        return self.future_count > 0
+
+    ## Put back the pixels a layer (or its mask) had before the last edit.
+    pub mutating func undo() -> !:
+        try self.require_open()
+        try self.require_idle()
+        if self.history_count == 0:
+            error(invalid, "nothing to undo")
+        let document = self.document else trap("history without a document")
+        let entry = self.history[self.history_count - 1]
+        self.history_count -= 1
+        let current = try (document.take_mask(entry.layer, entry.tiles) if entry.mask else document.take_tiles(entry.layer, entry.tiles))
+        try push(&self.future, &self.future_count, Snapshot(layer = entry.layer, tiles = current, mask = entry.mask))
+
+    ## Redo the last undone edit.
+    pub mutating func redo() -> !:
+        try self.require_open()
+        try self.require_idle()
+        if self.future_count == 0:
+            error(invalid, "nothing to redo")
+        let document = self.document else trap("history without a document")
+        let entry = self.future[self.future_count - 1]
+        self.future_count -= 1
+        let current = try (document.take_mask(entry.layer, entry.tiles) if entry.mask else document.take_tiles(entry.layer, entry.tiles))
+        try push(&self.history, &self.history_count, Snapshot(layer = entry.layer, tiles = current, mask = entry.mask))
+
+    ## Record a layer's pixels before a change, dropping the redo trail and the
+    ## oldest entries past the limit.
+    mutating func remember(layer: u64, tiles: Tiles, mask: bool = false) -> !:
+        var owned = tiles
+        errdefer owned.destroy()
+        clear_snapshots(&self.future, &self.future_count)
+        if self.history_count == 64:
+            self.history[0].tiles.destroy()
+            for index in 1..<self.history_count:
+                self.history[index - 1] = self.history[index]
+            self.history_count -= 1
+        try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = tiles, mask = mask))
+
+    # mark: Files and drawing =====================================================================
+
+    ## Write the document with all its layers to `path`, an `.l2d` directory
+    ## package: `document.prisma` and one PNG per layer and mask. Needs the
+    ## document drawn once.
+    pub mutating func save_package(path: str) -> !:
+        try save_canvas_package(&self, path)
+
+    ## Write the flattened document to `path` as an 8-bit RGBA picture in the
+    ## format its extension names. Needs the document drawn at least once.
+    pub mutating func save(path: str) -> !:
+        try save_flattened(&self, path)
+
+    ## Draw the document onto `target`, clipped to `rectangle` (in the target's
+    ## points), with its top-left corner at `rectangle`'s origin plus `offset`,
+    ## scaled by `zoom` (document pixels to points). Binds the device on first
+    ## use. Pixels are crisp at and above 100% and filtered below it.
+    pub mutating func draw(target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64) -> !:
+        try draw_canvas(&self, target, rectangle, zoom, offset_x, offset_y)
+
+    ## Draw one layer's own pixels (or its mask when `mask` is set) scaled into
+    ## `rectangle` of `target`, for thumbnails. Needs the document bound.
+    pub mutating func draw_layer(target: interop.View[gpu.RenderTarget], index: i64, rectangle: gpu.Rect, mask: bool = false) -> !:
+        try draw_one_layer(&self, target, index, rectangle, mask)
+
+    ## Draw the document as `draw` does, but with layer `id` shown displaced by
+    ## (`dx`, `dy`) document pixels without touching its pixels: the live
+    ## preview of a move. The displaced layer is drawn on top of the rest in
+    ## normal blending at its opacity.
+    pub mutating func draw_moving(target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64,
+                                  id: i64, dx: f64, dy: f64) -> !:
+        try draw_canvas_moving(&self, target, rectangle, zoom, offset_x, offset_y, id, dx, dy)
+
+pub let canvas_type: interop.Type[Canvas] = interop.Type[Canvas]("Canvas", Canvas.close, Canvas.trace, closeable = true, main_thread = true)

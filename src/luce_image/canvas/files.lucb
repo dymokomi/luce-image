@@ -1,0 +1,334 @@
+#==============================================================================================
+#
+#   canvas/files - Opening and saving pictures, Photoshop files and .l2d packages
+#
+#==============================================================================================
+
+## `Canvas.save`: the flattened document as a picture, the format from `path`'s extension.
+func save_flattened(canvas: Canvas*, path: str) -> !:
+    try canvas.require_open()
+    let document = canvas.document else error(invalid, "draw the document once before saving")
+    let composer = canvas.composer else error(invalid, "draw the document once before saving")
+    let count = (usize)canvas.extent_x * (usize)canvas.extent_y * 4
+    let pixels = try alloc f32[count] in memory.heap
+    defer free(pixels) in memory.heap
+    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    defer free(bytes) in memory.heap
+    for row in 0..<tile_columns(canvas.extent_y):
+        for column in 0..<tile_columns(canvas.extent_x):
+            let texture = try composer.tile(document, column, row, 0)
+            let width = min_u32(tile_size, canvas.extent_x - column * tile_size)
+            let height = min_u32(tile_size, canvas.extent_y - row * tile_size)
+            try texture.read(bytes[..<((usize)width * (usize)height * 8)], gpu.Region(0, 0, width, height))
+            for y in 0..<(usize)height:
+                for x in 0..<(usize)width:
+                    let source = (y * (usize)width + x) * 8
+                    let destination = (((usize)row * (usize)tile_size + y) * (usize)canvas.extent_x + (usize)column * (usize)tile_size + x) * 4
+                    for channel in 0..<(usize)4:
+                        pixels[destination + channel] = from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8))
+    let picture = try Image.from_linear_rgba((usize)canvas.extent_x, (usize)canvas.extent_y, pixels)
+    defer picture.release()
+    try picture.value().save(path)
+
+## `Canvas.save_package`: an `.l2d` package, a directory of the manifest and each layer's pictures.
+func save_canvas_package(canvas: Canvas*, path: str) -> !:
+    try canvas.require_open()
+    if not ends_with(path, ".l2d"):
+        error(invalid, "a document package is a directory named *.l2d")
+    let document = canvas.document else error(invalid, "draw the document once before saving")
+    try files.ensure_directory(path)
+    let layers_dir = try paths.join(path, "layers")
+    try files.ensure_directory(layers_dir)
+    let native = try new prism.Document() in memory.heap
+    let manifest = try interop.Reference[prism.Document].adopt(native, prism.document_type, memory.heap)
+    defer manifest.release()
+    try manifest.value().add("/document", "document")
+    try set_integer(manifest.value(), "/document", "width", (i64)canvas.extent_x)
+    try set_integer(manifest.value(), "/document", "height", (i64)canvas.extent_y)
+    let resolution = try prism.Value.number(canvas.dpi)
+    defer resolution.release()
+    try manifest.value().set("/document", "resolution", resolution)
+    let profile = try prism.Value.text((str)canvas.profile_name[..<canvas.profile_length])
+    defer profile.release()
+    try manifest.value().set("/document", "profile", profile)
+    try manifest.value().add("/layers", "layers")
+    let count = (usize)canvas.extent_x * (usize)canvas.extent_y * 4
+    let pixels = try alloc f32[count] in memory.heap
+    defer free(pixels) in memory.heap
+    for index in 0..<canvas.count:
+        let record = canvas.records[index]
+        var name_buffer: u8[64]
+        let element = try format_path(name_buffer, "/layers/layer", index)
+        try manifest.value().add(element, "layer")
+        let text = try prism.Value.text(record.name)
+        defer text.release()
+        try manifest.value().set(element, "name", text)
+        try set_integer(manifest.value(), element, "visible", 1 if record.visible else 0)
+        let opacity = try prism.Value.number(record.opacity)
+        defer opacity.release()
+        try manifest.value().set(element, "opacity", opacity)
+        try set_integer(manifest.value(), element, "blend", record.blend)
+        try set_integer(manifest.value(), element, "clipped", 1 if record.clipped else 0)
+        try set_integer(manifest.value(), element, "mask", 1 if record.masked else 0)
+        if record.style.any():
+            for field in 0..<(i64)20:
+                let number = try prism.Value.number(style_field(record.style, field) else trap("style field"))
+                defer number.release()
+                try manifest.value().set(element, style_names[(usize)field], number)
+        let layer = document.find(record.id) else error(invalid, "a layer is missing")
+        var file_buffer: u8[64]
+        let tiles = layer.tiles() else error(invalid, "a layer has no pixels")
+        try tiles.read(pixels)
+        try write_picture(layers_dir, try format_file(file_buffer, "layer", index, ".png"), canvas.extent_x, canvas.extent_y, pixels)
+        if let mask = layer.mask_tiles():
+            try mask.read(pixels)
+            # A mask cell the layer never painted reveals everything: write it white.
+            for row in 0..<mask.rows():
+                for column in 0..<mask.columns():
+                    if mask.texture(column, row) != none:
+                        continue
+                    let area = mask.region(column, row)
+                    for y in 0..<(usize)area.height:
+                        for x in 0..<(usize)area.width:
+                            let at = (((usize)row * (usize)tile_size + y) * (usize)canvas.extent_x + (usize)column * (usize)tile_size + x) * 4
+                            pixels[at] = 1.0
+                            pixels[at + 1] = 1.0
+                            pixels[at + 2] = 1.0
+                            pixels[at + 3] = 1.0
+            try write_picture(layers_dir, try format_file(file_buffer, "layer", index, ".mask.png"), canvas.extent_x, canvas.extent_y, pixels)
+    try manifest.value().save(try paths.join(path, "document.prisma"), prism.Encoding.text)
+
+## `Canvas.place_layer`: the picture at `path` on layer `id`, centred on a document point.
+func place_picture(canvas: Canvas*, id: i64, path: str, center_x: i64, center_y: i64) -> !:
+    try canvas.require_open()
+    let document = canvas.document else error(invalid, "draw the document once before placing a picture")
+    discard(try canvas.index((u64)id))
+    let picture = try Image.open(path)
+    defer picture.release()
+    let width = try picture.value().width()
+    let height = try picture.value().height()
+    let source = try alloc f32[width * height * 4] in memory.heap
+    defer free(source) in memory.heap
+    try picture.value().linear_rgba(source)
+    let x = center_x - (i64)width // 2
+    let y = center_y - (i64)height // 2
+    let columns = (usize)canvas.extent_x
+    let rows = (usize)canvas.extent_y
+    let pixels = try alloc f32[columns * rows * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    for index in 0..<pixels.length:
+        pixels[index] = 0.0
+    for row in 0..<height:
+        let target_y = y + (i64)row
+        if target_y < 0 or target_y >= (i64)canvas.extent_y:
+            continue
+        for column in 0..<width:
+            let target_x = x + (i64)column
+            if target_x < 0 or target_x >= (i64)canvas.extent_x:
+                continue
+            let from_index = (row * width + column) * 4
+            let to_index = ((usize)target_y * columns + (usize)target_x) * 4
+            for channel in 0..<(usize)4:
+                pixels[to_index + channel] = source[from_index + channel]
+    let device = canvas.device else error(invalid, "the document is not bound to a device")
+    var tiles = try Tiles.create(device, canvas.extent_x, canvas.extent_y)
+    errdefer tiles.destroy()
+    try tiles.write(pixels)
+    try document.set_tiles((u64)id, tiles)
+
+## `Canvas.open`: a picture, a Photoshop document or an `.l2d` package, by extension.
+func open_canvas(path: str) -> interop.Reference[Canvas]!:
+    if ends_with(path, ".l2d"):
+        return try open_package(path)
+    if ends_with(path, ".psd") or ends_with(path, ".PSD"):
+        return try open_psd(path)
+    let picture = try Image.open(path)
+    errdefer picture.release()
+    let width = try picture.value().width()
+    let height = try picture.value().height()
+    var reservation = try interop.Reservation[Canvas](canvas_type)
+    errdefer reservation.cancel()
+    let native = try new Canvas((i64)width, (i64)height) in memory.heap
+    errdefer native.close()
+    let id = try native.add_layer("Background")
+    try native.place((u64)id, picture)
+    return reservation.publish(native, memory.heap)
+
+## Whether `text` ends with `suffix`, byte for byte.
+func ends_with(text: str, suffix: str) -> bool:
+    if text.length < suffix.length:
+        return false
+    return (str)text.bytes[text.length - suffix.length..] == suffix
+
+## The `.l2d` names of the style fields, in `style_value` order.
+let style_names: str[20] = ["shadow", "shadow_dx", "shadow_dy", "shadow_blur", "shadow_red", "shadow_green", "shadow_blue", "shadow_opacity",
+                            "stroke", "stroke_size", "stroke_red", "stroke_green", "stroke_blue", "stroke_opacity",
+                            "glow", "glow_size", "glow_red", "glow_green", "glow_blue", "glow_opacity"]
+
+## Style field `field` (see `style_names`) of `style`, or none past the end.
+func style_field(style: Style, field: i64) -> f64?:
+    if field == 0: return 1.0 if style.shadow else 0.0
+    if field == 1: return style.shadow_dx
+    if field == 2: return style.shadow_dy
+    if field == 3: return style.shadow_blur
+    if field == 4: return style.shadow_red
+    if field == 5: return style.shadow_green
+    if field == 6: return style.shadow_blue
+    if field == 7: return style.shadow_opacity
+    if field == 8: return 1.0 if style.stroke else 0.0
+    if field == 9: return style.stroke_size
+    if field == 10: return style.stroke_red
+    if field == 11: return style.stroke_green
+    if field == 12: return style.stroke_blue
+    if field == 13: return style.stroke_opacity
+    if field == 14: return 1.0 if style.glow else 0.0
+    if field == 15: return style.glow_size
+    if field == 16: return style.glow_red
+    if field == 17: return style.glow_green
+    if field == 18: return style.glow_blue
+    if field == 19: return style.glow_opacity
+    return none
+
+## Manifest helpers: an integer or number at `path`.`name`.
+func set_integer(doc: prism.Document*, path: str, name: str, value: i64) -> !:
+    let holder = try prism.Value.integer(value)
+    defer holder.release()
+    try doc.set(path, name, holder)
+
+func get_integer(doc: prism.Document*, path: str, name: str) -> i64!:
+    let holder = try doc.get(path, name)
+    defer holder.release()
+    return try holder.value().integer_at()
+
+func get_number(doc: prism.Document*, path: str, name: str) -> f64!:
+    let holder = try doc.get(path, name)
+    defer holder.release()
+    return try holder.value().number_at()
+
+## Decimal digits of `value` into `buffer` at `at`; returns where they end.
+func format_digits(buffer: u8[], at: usize, value: usize) -> usize:
+    var digits: u8[24]
+    var count: usize = 0
+    var remaining = value
+    if remaining == 0:
+        digits[0] = '0'
+        count = 1
+    while remaining > 0:
+        digits[count] = (u8)('0' + (u8)(remaining % 10))
+        remaining //= 10
+        count += 1
+    var position = at
+    while count > 0:
+        count -= 1
+        buffer[position] = digits[count]
+        position += 1
+    return position
+
+## `prefix` followed by `index`, as a package member's name.
+func format_path(buffer: u8[], prefix: str, index: usize) -> str!:
+    if prefix.length + 24 > buffer.length:
+        error(invalid, "path too long")
+    memory.copy(buffer, prefix.bytes, prefix.length)
+    let end = format_digits(buffer, prefix.length, index)
+    return (str)buffer[..<end]
+
+## `prefix`, `index` and `suffix`, as a package member's file name.
+func format_file(buffer: u8[], prefix: str, index: usize, suffix: str) -> str!:
+    if prefix.length + suffix.length + 24 > buffer.length:
+        error(invalid, "file name too long")
+    memory.copy(buffer, prefix.bytes, prefix.length)
+    var end = format_digits(buffer, prefix.length, index)
+    memory.copy(buffer[end..], suffix.bytes, suffix.length)
+    end += suffix.length
+    return (str)buffer[..<end]
+
+## Write linear float pixels to `directory`/`name` as a package picture.
+func write_picture(directory: str, name: str, width: u32, height: u32, pixels: const f32[]) -> !:
+    let picture = try Image.from_linear_rgba((usize)width, (usize)height, pixels)
+    defer picture.release()
+    let target = try paths.join(directory, name)
+    try picture.value().save(target)
+
+## A canvas from an `.l2d` package: the manifest's layers, their pictures
+## waiting to be bound.
+func open_package(path: str) -> interop.Reference[Canvas]!:
+    let manifest_path = try paths.join(path, "document.prisma")
+    let text = try files.read_text(manifest_path)
+    defer text.release()
+    let manifest = try prism.Document.decode(text.value.bytes)
+    defer manifest.release()
+    let doc = manifest.value()
+    let width = try get_integer(doc, "/document", "width")
+    let height = try get_integer(doc, "/document", "height")
+    var reservation = try interop.Reservation[Canvas](canvas_type)
+    errdefer reservation.cancel()
+    let native = try new Canvas(width, height) in memory.heap
+    errdefer native.close()
+    # Packages from before resolution and profile keep the defaults.
+    let resolution = get_number(doc, "/document", "resolution") catch _:
+        recover 72.0
+    try native.set_resolution(resolution)
+    let profile_value = doc.get("/document", "profile") catch _:
+        recover try prism.Value.text("sRGB")
+    defer profile_value.release()
+    native.set_profile(try profile_value.value().text_at())
+    let layers_dir = try paths.join(path, "layers")
+    for index in 0..<doc.child_count("/layers"):
+        let element = doc.child_at("/layers", index) else error(invalid, "a layer element is missing")
+        let name_value = try doc.get(element, "name")
+        defer name_value.release()
+        let id = try native.add_layer(try name_value.value().text_at())
+        let visible = (try get_integer(doc, element, "visible")) != 0
+        let opacity = try get_number(doc, element, "opacity")
+        let blend = try get_integer(doc, element, "blend")
+        try native.set_layer(id, visible, opacity, blend)
+        try native.set_clipped(id, (try get_integer(doc, element, "clipped")) != 0)
+        # Older documents have no style fields; a missing first one means none.
+        let styled = get_number(doc, element, "shadow") catch failure:
+            discard(failure)
+            recover -1.0
+        if styled >= 0.0:
+            var values: f64[20]
+            for field in 0..<(usize)20:
+                values[field] = try get_number(doc, element, style_names[field])
+            try native.set_shadow(id, values[0] != 0.0, values[1], values[2], values[3], values[4], values[5], values[6], values[7])
+            try native.set_stroke(id, values[8] != 0.0, values[9], values[10], values[11], values[12], values[13])
+            try native.set_glow(id, values[14] != 0.0, values[15], values[16], values[17], values[18], values[19])
+        var file_buffer: u8[64]
+        let picture = try Image.open(try paths.join(layers_dir, try format_file(file_buffer, "layer", index, ".png")))
+        try native.place((u64)id, picture)
+        if (try get_integer(doc, element, "mask")) != 0:
+            try native.set_mask(id, true)
+            let mask = try Image.open(try paths.join(layers_dir, try format_file(file_buffer, "layer", index, ".mask.png")))
+            let slot = try native.index((u64)id)
+            native.records[slot].mask_picture = mask
+    return reservation.publish(native, memory.heap)
+
+## A Photoshop document: its raster layers, bottom-most first, with their
+## names, visibility, opacity, blend mode and clipping; group markers are
+## passed over so their layers arrive flat.
+func open_psd(path: str) -> interop.Reference[Canvas]!:
+    var name: str = ""
+    with memory.heap:
+        name = try strings.copy(path)
+    defer strings.release(name)
+    let data = try files.read((c_api.str)name)
+    defer free(data) in memory.heap
+    var parsed = try psd.parse(data)
+    defer parsed.close()
+    var reservation = try interop.Reservation[Canvas](canvas_type)
+    errdefer reservation.cancel()
+    let native = try new Canvas((i64)parsed.width, (i64)parsed.height) in memory.heap
+    errdefer native.close()
+    for index in 0..<parsed.count:
+        let layer = &parsed.layers[index]
+        if layer.pixels.length == 0:
+            continue
+        let picture = try Image.from_rgba8((usize)parsed.width, (usize)parsed.height, layer.pixels)
+        let id = try native.add_layer((str)layer.name if layer.name.length > 0 else "Layer")
+        try native.set_layer(id, layer.visible, layer.opacity, (i64)layer.blend)
+        try native.set_clipped(id, layer.clipped)
+        try native.place((u64)id, picture)
+    if native.count == 0:
+        discard(try native.add_layer("Background"))
+    return reservation.publish(native, memory.heap)

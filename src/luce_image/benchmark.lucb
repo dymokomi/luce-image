@@ -1,3 +1,5 @@
+## A timing program for tools/benchmark.py: open, decode and report how long a
+## picture takes with a given number of decoding threads.
 import image
 import strings
 import time

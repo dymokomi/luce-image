@@ -5,7 +5,7 @@ import gpu
 import interop
 import math
 import memory
-from luce_image.tiles import Tiles, tile_size
+from luce_image.tiles import Tiles, tile_size, min_u32, max_u32, flatten
 from luce_image.document import Document
 from luce_image.shaders import warp_frag_words, warp_frag_msl
 from raster_errors import invalid
@@ -112,18 +112,8 @@ pub struct Transformer:
         let cx = (box_left + box_right) * 0.5
         let cy = (box_top + box_bottom) * 0.5
         # Flatten the layer into one texture the shader can sample anywhere.
-        var flat = try gpu.Texture.create(self.owner, width, height, gpu.Format.rgba16_float)
+        var flat = try flatten(self.owner, tiles)
         defer flat.destroy()
-        let flat_frame = try flat.frame()
-        defer flat_frame.release()
-        let whole = try flat_frame.value().target()
-        defer whole.release()
-        for row in 0..<tiles.rows():
-            for column in 0..<tiles.columns():
-                let texture = tiles.texture(column, row) else continue
-                let area = tiles.region(column, row)
-                try gpu.copy_image(whole.value(), texture, gpu.Rect((f64)(column * tile_size), (f64)(row * tile_size), (f64)area.width, (f64)area.height), area)
-        discard(try flat_frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         # Forward: p' = R S (p - c) + c + d. Inverse: p = S⁻¹ R⁻¹ (p' - c - d) + c.
         let cos = math.cos(angle)
         let sin = math.sin(angle)
@@ -174,11 +164,7 @@ pub struct Transformer:
         self.pipeline.destroy()
         self.shader.destroy()
 
-func min_u32(a: u32, b: u32) -> u32:
-    return a if a < b else b
 
-func max_u32(a: u32, b: u32) -> u32:
-    return a if a > b else b
 
 test "a free transform scales a layer about its content and rotates it":
     var device = gpu.Device.open() catch failure:

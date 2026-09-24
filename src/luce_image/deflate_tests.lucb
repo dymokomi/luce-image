@@ -1,3 +1,5 @@
+## The deflate regression driver tests/run.py builds in every compiler mode: it
+## inflates a packed file and checks it against the raw one.
 import files
 import memory
 import c

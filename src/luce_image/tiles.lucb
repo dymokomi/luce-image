@@ -73,7 +73,7 @@ pub struct Tiles:
     pub func region(column: u32, row: u32) -> gpu.Region:
         let x = column * tile_size
         let y = row * tile_size
-        return gpu.Region(0, 0, min(tile_size, self.extent_x - x), min(tile_size, self.extent_y - y))
+        return gpu.Region(0, 0, min_u32(tile_size, self.extent_x - x), min_u32(tile_size, self.extent_y - y))
 
     ## The tile at a cell, borrowed, or `none` when transparent.
     pub func tile(column: u32, row: u32) -> Tile*?:
@@ -205,8 +205,29 @@ func try_index(tiles: const Tiles*, column: u32, row: u32) -> usize?:
         return none
     return (usize)row * (usize)tiles.cell_columns + (usize)column
 
-func min(a: u32, b: u32) -> u32:
+## The smaller of two unsigned sizes.
+pub func min_u32(a: u32, b: u32) -> u32:
     return a if a < b else b
+
+## The larger of two unsigned sizes.
+pub func max_u32(a: u32, b: u32) -> u32:
+    return a if a > b else b
+
+## Every tile of `tiles` drawn into one texture of the whole extent, as stored.
+pub func flatten(device: gpu.Device, tiles: const Tiles*) -> gpu.Texture!:
+    var flat = try gpu.Texture.create(device, tiles.width(), tiles.height(), gpu.Format.rgba16_float)
+    errdefer flat.destroy()
+    let frame = try flat.frame()
+    defer frame.release()
+    let whole = try frame.value().target()
+    defer whole.release()
+    for row in 0..<tiles.rows():
+        for column in 0..<tiles.columns():
+            let texture = tiles.texture(column, row) else continue
+            let area = tiles.region(column, row)
+            try gpu.copy_image(whole.value(), texture, gpu.Rect((f64)(column * tile_size), (f64)(row * tile_size), (f64)area.width, (f64)area.height), area)
+    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+    return flat
 
 test "tiles share, replace, write and read on a device":
     var device = gpu.Device.open() catch failure:

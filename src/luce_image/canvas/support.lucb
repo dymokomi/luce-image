@@ -1,0 +1,63 @@
+#==============================================================================================
+#
+#   canvas/support - Device binding, blend and style names, small checks
+#
+#==============================================================================================
+
+## Photoshop's blend modes, in the order the compositor numbers them.
+let blend_names: str[26] = ["Normal", "Darken", "Multiply", "Color Burn", "Linear Burn", "Lighten", "Screen", "Color Dodge", "Linear Dodge",
+                            "Overlay", "Soft Light", "Hard Light", "Vivid Light", "Linear Light", "Pin Light", "Hard Mix", "Difference", "Exclusion",
+                            "Subtract", "Divide", "Hue", "Saturation", "Color", "Luminosity", "Darker Color", "Lighter Color"]
+
+## The selection mode a caller's number names.
+func selection_mode(mode: i64) -> Mode!:
+    if mode == 0: return Mode.replace
+    if mode == 1: return Mode.add
+    if mode == 2: return Mode.subtract
+    if mode == 3: return Mode.intersect
+    error(invalid, "selection modes are 0 replace, 1 add, 2 subtract, 3 intersect")
+
+## What binding creates, released in reverse on failure or close.
+struct Binding:
+    var device: gpu.Device? = none
+    var document: Document*? = none
+    var composer: Composer*? = none
+    var painter: Painter? = none
+    var adjuster: Adjuster? = none
+    var filters: Filters? = none
+    var transformer: Transformer? = none
+
+## A color the brush, a fill, a gradient or text paints in: components in 0..1.
+func gpu_check_color(color: gpu.Color) -> !:
+    if not (color.red >= 0.0 and color.red <= 1.0 and color.green >= 0.0 and color.green <= 1.0 and color.blue >= 0.0 and color.blue <= 1.0):
+        error(invalid, "color components must be in 0..1")
+
+## Destroy what `binding` holds, in reverse order of creation, and empty it.
+func unwind(binding: Binding*):
+    if let transformer = binding.transformer:
+        var owned = transformer
+        owned.destroy()
+    if let filters = binding.filters:
+        var owned = filters
+        owned.destroy()
+    if let adjuster = binding.adjuster:
+        var owned = adjuster
+        owned.destroy()
+    if let painter = binding.painter:
+        var owned = painter
+        owned.destroy()
+    if let composer = binding.composer:
+        unbox_composer(composer)
+    if let document = binding.document:
+        unbox_document(document)
+    if let device = binding.device:
+        var owned = device
+        owned.destroy()
+    *binding = Binding()
+
+## The curve channel a caller's number names: 0 RGB, 1 red, 2 green, 3 blue.
+func curve_channel(channel: i64) -> usize!:
+    if channel < 0 or channel > 3:
+        error(invalid, "curve channels are 0 (RGB), 1 (red), 2 (green) and 3 (blue)")
+    return (usize)channel
+

@@ -5,7 +5,7 @@
 import gpu
 import math
 import memory
-from luce_image.tiles import Tiles, tile_size
+from luce_image.tiles import Tiles, tile_size, flatten
 from luce_image.document import Document, Layer, Style
 from luce_image.shaders import spread_frag_words, spread_frag_msl, style_frag_words, style_frag_msl
 from raster_errors import invalid, limit
@@ -40,7 +40,7 @@ pub struct Styler:
             error(limit, "layer styles work on documents up to 4096 by 4096 pixels")
         # The layer as one texture; every texture here lives on the tiles' device.
         let device = tiles.device()
-        var flat = try self.flatten(device, tiles)
+        var flat = try flatten(device, tiles)
         defer flat.destroy()
         var shadow = try self.spread_alpha(device, flat, width, height, style.shadow_blur if style.shadow else 0.0, false)
         defer shadow.destroy()
@@ -68,22 +68,6 @@ pub struct Styler:
                 discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
                 try effects.set(column, row, fresh)
         return effects
-
-    ## Every tile drawn into one document-sized texture.
-    func flatten(device: gpu.Device, tiles: const Tiles*) -> gpu.Texture!:
-        var flat = try gpu.Texture.create(device, tiles.width(), tiles.height(), gpu.Format.rgba16_float)
-        errdefer flat.destroy()
-        let frame = try flat.frame()
-        defer frame.release()
-        let whole = try frame.value().target()
-        defer whole.release()
-        for row in 0..<tiles.rows():
-            for column in 0..<tiles.columns():
-                let texture = tiles.texture(column, row) else continue
-                let area = tiles.region(column, row)
-                try gpu.copy_image(whole.value(), texture, gpu.Rect((f64)(column * tile_size), (f64)(row * tile_size), (f64)area.width, (f64)area.height), area)
-        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
-        return flat
 
     ## `source`'s alpha spread by `amount` pixels in both axes: a Gaussian of
     ## that sigma, or a dilation when `widen`. Zero amount copies the alpha.

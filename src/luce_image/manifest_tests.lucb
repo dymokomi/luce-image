@@ -1,3 +1,4 @@
+## The manifest and Cryptomatte hash tests, run by tests/run.py with `luce-base test`.
 import interop
 import memory
 from luce_image.manifest import Manifest

@@ -44,13 +44,13 @@ pub struct Style:
 
     ## A digest of every setting, for caches.
     pub func digest() -> u64:
-        var mixed: u64 = 0xcbf29ce484222325
+        var mixed = fnv_start()
         for value in [self.shadow_dx, self.shadow_dy, self.shadow_blur, self.shadow_red, self.shadow_green, self.shadow_blue, self.shadow_opacity,
                       self.stroke_size, self.stroke_red, self.stroke_green, self.stroke_blue, self.stroke_opacity,
                       self.glow_size, self.glow_red, self.glow_green, self.glow_blue, self.glow_opacity]:
-            mixed = (mixed ^ value.bits()) *% 0x100000001b3
+            mixed = fnv_mix(mixed, value.bits())
         let flags: u64 = (1 if self.shadow else 0) | (2 if self.stroke else 0) | (4 if self.glow else 0)
-        return (mixed ^ flags) *% 0x100000001b3
+        return fnv_mix(mixed, flags)
 
 pub struct Layer:
     pub var id: u64
@@ -404,6 +404,16 @@ func remove_in(layer: Layer*, id: u64) -> bool:
         if remove_in(child, id):
             return true
     return false
+
+## FNV-1a over 64-bit words, byte by byte: the digests the compositor's caches key on.
+pub func fnv_start() -> u64:
+    return 14695981039346656037
+
+pub func fnv_mix(digest: u64, value: u64) -> u64:
+    var mixed = digest
+    for shift in 0..<(u64)8:
+        mixed = (mixed ^ ((value >> (shift * 8)) & 0xff)) *% 1099511628211
+    return mixed
 
 test "document layers, groups, removal and appearance":
     var device = gpu.Device.open() catch failure:
