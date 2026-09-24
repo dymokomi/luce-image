@@ -5,12 +5,27 @@
 #==============================================================================================
 
 ## `Canvas.save`: the flattened document as a picture, the format from `path`'s extension.
-func save_flattened(canvas: Canvas*, path: str) -> !:
+func save_flattened(canvas: Canvas*, path: str, quality: i64, matte_red: f64, matte_green: f64, matte_blue: f64) -> !:
     let pixels = try flattened_pixels(canvas)
     defer free(pixels) in memory.heap
+    # Under a matte (linear light; a negative red means none) the picture comes out
+    # opaque: what JPEG, without alpha, needs.
+    if matte_red >= 0.0:
+        let matte: f32[3] = [(f32)matte_red, (f32)matte_green, (f32)matte_blue]
+        for at in 0..<pixels.length // 4:
+            let alpha = pixels[at * 4 + 3]
+            for channel in 0..<(usize)3:
+                pixels[at * 4 + channel] = pixels[at * 4 + channel] * alpha + matte[channel] * (1.0 - alpha)
+            pixels[at * 4 + 3] = 1.0
     let picture = try Image.from_linear_rgba((usize)canvas.extent_x, (usize)canvas.extent_y, pixels)
     defer picture.release()
-    try picture.value().save(path)
+    if matte_red >= 0.0:
+        # Opaque now: RGB, which every format takes (JPEG takes nothing else).
+        let opaque = try picture.value().convert("RGB")
+        defer opaque.release()
+        try opaque.value().save(path, quality = quality)
+        return
+    try picture.value().save(path, quality = quality)
 
 ## The flattened document as straight-alpha linear RGBA f32 samples, top-down,
 ## four per pixel: heap storage the caller frees.

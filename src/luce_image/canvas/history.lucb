@@ -31,6 +31,8 @@ struct Snapshot:
     var joined: bool = false
     var state: DocumentState*? = none
     var name: str = "Edit"
+    ## Which step this is, for telling whether the document is as saved.
+    var serial: u64 = 0
 
 ## Free what a snapshot holds.
 func drop_snapshot(entry: Snapshot*):

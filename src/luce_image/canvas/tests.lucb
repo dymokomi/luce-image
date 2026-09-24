@@ -767,3 +767,42 @@ test "everything undoes: layers, properties, styles, masks, selections and the c
     assert(canvas.layer_count() == 3 and (try canvas.layer_parent(0)) == folder)
     try canvas.undo()
     assert((try canvas.layer_parent(0)) == 0 and canvas.undo_name() == "New Group")
+
+test "the document knows whether it is as saved; exports leave that alone":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(32, 32)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 32, 32, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    assert(not canvas.modified())
+    try canvas.set_layer(layer, true, 0.5)
+    assert(canvas.modified())
+    try canvas.save_package("build/canvas-saved.l2d")
+    assert(not canvas.modified())
+    # A change after saving is its own step, even the same kind on the same layer.
+    try canvas.set_layer(layer, true, 0.25)
+    assert(canvas.modified())
+    try canvas.undo()
+    assert(not canvas.modified() and math.abs((try canvas.layer_opacity(0)) - 0.5) < 0.001)
+    # An export under a white matte writes an opaque JPEG and changes nothing.
+    try canvas.set_layer(layer, true, 0.75)
+    try canvas.save("build/canvas-export.jpg", 80, 1.0, 1.0, 1.0)
+    assert(canvas.modified())
+
+test "a canvas binds headless, without a window, and edits with history":
+    var canvas = try Canvas(40, 30)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try canvas.bind_headless()
+    try canvas.set_layer(layer, true, 0.5)
+    assert(canvas.modified() and canvas.can_undo())
+    try canvas.undo()
+    assert(not canvas.modified() and math.abs((try canvas.layer_opacity(0)) - 1.0) < 0.001)

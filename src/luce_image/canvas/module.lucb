@@ -142,6 +142,9 @@ pub struct Canvas:
     var edit_depth: i64
     ## What a kept preview is called in the history.
     var preview_name: str
+    ## The last step's serial handed out, and the step the document was saved at (0: none).
+    var serial: u64
+    var saved_version: u64
     ## What `measure_histogram` counted: luminosity, red, green and blue, 256
     ## bins each of the encoded values.
     var histogram_counts: u64[1024]
@@ -206,6 +209,8 @@ pub struct Canvas:
         self.heal_opacity = 1.0
         self.edit_depth = 0
         self.preview_name = "Adjustment"
+        self.serial = 0
+        self.saved_version = 0
         var no_values: f64[23]
         self.adjustment = no_values
         var no_counts: u64[1024]
@@ -271,6 +276,19 @@ pub struct Canvas:
             if failure.code == gpu.unavailable:
                 return
             error(failure.code, failure.message)
+        try self.bind_device(acquired)
+
+    ## Bind to a GPU device of the canvas's own, with no window or drawing:
+    ## what scripts and tests run headless use before editing. Nothing when
+    ## already bound; fails when there is no GPU.
+    pub mutating func bind_headless() -> !:
+        try self.require_open()
+        if self.document != none:
+            return
+        try self.bind_device(try gpu.Device.open())
+
+    ## Bind to `acquired`, which the canvas owns from here (on failure too).
+    mutating func bind_device(acquired: gpu.Device) -> !:
         var binding = Binding(device = acquired)
         errdefer unwind(&binding)
         let device = binding.device else trap("bound")
@@ -1769,7 +1787,8 @@ pub struct Canvas:
         self.make_room()
         let join = joined or (self.joining and self.history_count > 0)
         self.joining = false
-        try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = tiles, mask = mask, joined = join, name = name))
+        self.serial += 1
+        try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = tiles, mask = mask, joined = join, name = name, serial = self.serial))
 
     ## Record the whole document before a change to what it is made of, as
     ## step `name`. The same change to the same layer again (`layer` non-zero)
@@ -1782,7 +1801,8 @@ pub struct Canvas:
             return
         if self.edit_depth == 0 and layer != 0 and self.future_count == 0 and self.history_count > 0:
             let top = self.history[self.history_count - 1]
-            if top.state != none and top.layer == layer and top.name == name:
+            # Not into the step the document was saved at: the change after saving is its own.
+            if top.state != none and top.layer == layer and top.name == name and top.serial != self.saved_version:
                 return
         var tree = try document.capture()
         errdefer tree.destroy()
@@ -1793,7 +1813,8 @@ pub struct Canvas:
         self.make_room()
         let join = self.joining and self.history_count > 0
         self.joining = false
-        try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = Tiles(), mask = false, joined = join, state = state, name = name))
+        self.serial += 1
+        try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = Tiles(), mask = false, joined = join, state = state, name = name, serial = self.serial))
 
     ## Drop the redo trail and, at the limit, the oldest step.
     mutating func make_room():
@@ -1824,7 +1845,7 @@ pub struct Canvas:
             self.extent_y = document.height()
             return entry
         let current = try (document.take_mask(entry.layer, entry.tiles) if entry.mask else document.take_tiles(entry.layer, entry.tiles))
-        return Snapshot(layer = entry.layer, tiles = current, mask = entry.mask, joined = entry.joined, name = entry.name)
+        return Snapshot(layer = entry.layer, tiles = current, mask = entry.mask, joined = entry.joined, name = entry.name, serial = entry.serial)
 
     ## Make everything until `end_edit` one step named `name`: a layer grouped
     ## with others, a picture placed.
@@ -1837,6 +1858,16 @@ pub struct Canvas:
     pub mutating func end_edit():
         if self.edit_depth > 0:
             self.edit_depth -= 1
+
+    ## Whether the document differs from when it was last saved (or opened):
+    ## undoing back to that point counts as unchanged.
+    pub func modified() -> bool:
+        let version = self.history[self.history_count - 1].serial if self.history_count > 0 else 0
+        return version != self.saved_version
+
+    ## The document is as saved now.
+    pub mutating func mark_saved():
+        self.saved_version = self.history[self.history_count - 1].serial if self.history_count > 0 else 0
 
     ## The step Undo would take back, or "" when there is none; `redo_name` likewise.
     pub func undo_name() -> str:
@@ -1852,11 +1883,12 @@ pub struct Canvas:
     ## document drawn once.
     pub mutating func save_package(path: str) -> !:
         try save_canvas_package(&self, path)
+        self.mark_saved()
 
     ## Write the flattened document to `path` as an 8-bit RGBA picture in the
     ## format its extension names. Needs the document drawn at least once.
-    pub mutating func save(path: str) -> !:
-        try save_flattened(&self, path)
+    pub mutating func save(path: str, quality: i64 = 90, matte_red: f64 = -1.0, matte_green: f64 = 0.0, matte_blue: f64 = 0.0) -> !:
+        try save_flattened(&self, path, quality, matte_red, matte_green, matte_blue)
 
     ## Draw the document onto `target`, clipped to `rectangle` (in the target's
     ## points), with its top-left corner at `rectangle`'s origin plus `offset`,
