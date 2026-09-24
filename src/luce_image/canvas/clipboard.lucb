@@ -1,0 +1,102 @@
+#==============================================================================================
+#
+#   canvas/clipboard - Copy, cut and paste, and layers via copy
+#
+#   DESCRIPTION:
+#       Photoshop's Edit menu pixel commands: the selected pixels of a layer (or of the
+#       flattened document, Copy Merged) go to the system clipboard as PNG, cropped to the
+#       selection and faded by its coverage; a pasted image becomes a new layer. Layer via
+#       Copy and via Cut make that layer directly, without the clipboard.
+#
+#==============================================================================================
+
+## `Canvas.copy_selection`: the selected pixels of layer `id`, or of the flattened
+## document when `merged`, to the clipboard; with `cut` they also leave the layer.
+## Without a selection the whole layer (or document) goes.
+func copy_to_clipboard(canvas: Canvas*, id: i64, merged: bool, cut: bool) -> !:
+    try canvas.require_open()
+    try canvas.require_idle()
+    let document = canvas.document else error(invalid, "draw the document once before copying")
+    let selection = canvas.current()
+    if cut and (merged or selection.is_empty()):
+        error(invalid, "cut takes a selection of one layer")
+    let whole = selection.is_empty()
+    let left = 0 if whole else selection.left
+    let top = 0 if whole else selection.top
+    let right = (i64)canvas.extent_x if whole else selection.right
+    let bottom = (i64)canvas.extent_y if whole else selection.bottom
+    let width = (usize)(right - left)
+    let height = (usize)(bottom - top)
+    var pixels: f32[]
+    if merged:
+        pixels = try flattened_pixels(canvas)
+    else:
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = layer.tiles() else error(invalid, "a group has no pixels to copy")
+        pixels = try alloc f32[(usize)canvas.extent_x * (usize)canvas.extent_y * 4] in memory.heap
+        errdefer free(pixels) in memory.heap
+        try tiles.read(pixels)
+    defer free(pixels) in memory.heap
+    let cropped = try alloc f32[width * height * 4] in memory.heap
+    defer free(cropped) in memory.heap
+    for y in 0..<height:
+        for x in 0..<width:
+            let source = (((usize)top + y) * (usize)canvas.extent_x + (usize)left + x) * 4
+            let target = (y * width + x) * 4
+            let cover = (f32)selection.at(left + (i64)x, top + (i64)y) / 255.0
+            cropped[target] = pixels[source]
+            cropped[target + 1] = pixels[source + 1]
+            cropped[target + 2] = pixels[source + 2]
+            cropped[target + 3] = pixels[source + 3] * cover
+    let picture = try Image.from_linear_rgba(width, height, cropped)
+    defer picture.release()
+    let png = try picture.value().encode("png")
+    defer free(png) in memory.heap
+    let rgba = try picture.value().rgba8()
+    defer free(rgba) in memory.heap
+    try clipboard.write_image(png, (u32)width, (u32)height, rgba)
+    if cut:
+        try erase_selected(canvas, (u64)id)
+
+## `Canvas.paste`: the clipboard's image on a new top layer named "Pasted",
+## centred on a document point; the new layer's id.
+func paste_from_clipboard(canvas: Canvas*, center_x: i64, center_y: i64) -> i64!:
+    try canvas.require_open()
+    try canvas.require_idle()
+    let found = try clipboard.read_image() else error(invalid, "the clipboard holds no image")
+    var image = found
+    defer image.destroy()
+    let picture = try Image.open_bytes(image.encoded) if image.encoded.length > 0 else try Image.from_rgba8((usize)image.width, (usize)image.height, image.rgba)
+    defer picture.release()
+    let id = try canvas.add_layer("Pasted")
+    try place_image_at(canvas, id, picture, center_x, center_y)
+    return id
+
+## `Canvas.layer_via_copy`: a new layer holding the selected pixels of layer
+## `id` (all of them without a selection); with `cut` they leave `id`. Its id.
+func layer_from_selection(canvas: Canvas*, id: i64, cut: bool) -> i64!:
+    try canvas.require_open()
+    try canvas.require_idle()
+    let document = canvas.document else error(invalid, "draw the document once before copying a layer")
+    let passes = canvas.passes else trap("bound without selection passes")
+    let copy = try canvas.duplicate_layer(id, "Layer via Cut" if cut else "Layer via Copy")
+    let mask = try document.selection_tiles() else return copy
+    # Nothing before, the copy after: mixed by coverage, the copy keeps only the selection.
+    let device = canvas.device else trap("bound without a device")
+    var nothing = try Tiles.create(device, canvas.extent_x, canvas.extent_y)
+    defer nothing.destroy()
+    try passes.restrict(document, (u64)copy, &nothing, mask)
+    if cut:
+        try erase_selected(canvas, (u64)id)
+    return copy
+
+## Erase the selected pixels of `layer` at full strength, undoably.
+func erase_selected(canvas: Canvas*, layer: u64) -> !:
+    let document = canvas.document else error(invalid, "draw the document once before erasing")
+    var painter = canvas.painter else error(invalid, "draw the document once before erasing")
+    var brush = canvas.brush
+    brush.erase = true
+    brush.opacity = 1.0
+    brush.flow = 1.0
+    let before = try fill_selection(&painter, document, layer, brush, false)
+    try canvas.remember(layer, before, false)

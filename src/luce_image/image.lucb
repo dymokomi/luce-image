@@ -361,13 +361,19 @@ pub struct Image:
         # Managed Luce text is a byte view, not necessarily NUL-terminated.
         let destination = try strings.copy(path)
         defer strings.release(destination)
-        try self.load()
-        let extension = strings.find_last(path, ".")
         var selected = file_format
         if selected.length == 0:
-            let dot = extension else error(invalid, "output format is required without a filename extension")
+            let dot = strings.find_last(path, ".") else error(invalid, "output format is required without a filename extension")
             selected = (str)path.bytes[dot + 1..]
-        let lower = try strings.to_lower(selected)
+        let encoded = try self.encode(selected, compression, quality, tile, bigtiff)
+        defer free(encoded) in memory.heap
+        try files.write_atomic((c_api.str)destination, encoded)
+
+    ## The image encoded as `file_format` ("png", "jpg"/"jpeg", "tif"/"tiff" or
+    ## "exr"), with the options `save` takes: heap bytes the caller frees.
+    pub mutating func encode(file_format: str, compression: str = "zip", quality: i64 = 90, tile: usize = 0, bigtiff: bool = false) -> u8[]!:
+        try self.load()
+        let lower = try strings.to_lower(file_format)
         defer strings.release(lower)
         var encoded = Buffer(maximum = self.raster.max_bytes)
         defer encoded.close()
@@ -387,7 +393,21 @@ pub struct Image:
             try exr.encode(&self.raster, &encoded, compression, tile)
         else:
             error(unsupported, "unsupported output image format")
-        try files.write_atomic((c_api.str)destination, encoded.view())
+        let view = encoded.view()
+        let bytes = try alloc u8[view.length] in memory.heap
+        memory.copy(bytes, view, view.length)
+        return bytes
+
+    ## An "RGBA" image's pixels as 8-bit samples, top-down, four per pixel: heap
+    ## bytes the caller frees.
+    pub mutating func rgba8() -> u8[]!:
+        try self.load()
+        if (try self.mode()) != "RGBA":
+            error(invalid, "only an RGBA image has 8-bit RGBA samples")
+        let bytes = try alloc u8[self.raster.pixels.length] in memory.heap
+        for index in 0..<bytes.length:
+            bytes[index] = (u8)self.raster.pixels[index]
+        return bytes
 
     ## Every pixel as straight-alpha linear-light RGBA f32 samples, top-down,
     ## four per pixel: integer modes are taken as sRGB-encoded, float modes as

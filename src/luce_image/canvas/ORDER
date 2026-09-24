@@ -1,6 +1,7 @@
 module.lucb
 drawing.lucb
 files.lucb
+clipboard.lucb
 history.lucb
 support.lucb
 tests.lucb

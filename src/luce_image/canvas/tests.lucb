@@ -392,3 +392,33 @@ test "selected pixels move or copy with their selection, and edits keep inside i
     assert((try shown_at(&canvas, &target, 36, 36))[0] == 255 and (try shown_at(&canvas, &target, 12, 36))[0] == 0)
     try canvas.end_preview(false)
     assert((try shown_at(&canvas, &target, 12, 36))[0] == 255 and (try shown_at(&canvas, &target, 36, 36))[0] == 0)
+
+test "layer via copy holds the selected pixels, and via cut takes them":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(8, 8, 32, 16, 0)
+    try canvas.fill(layer, false)
+    # Only the left half of the red band is selected for the copy.
+    try canvas.select_rectangle(8, 8, 16, 16, 0)
+    let copy = try canvas.layer_via_copy(layer)
+    assert(canvas.layer_count() == 2 and (try canvas.layer_name(1)) == "Layer via Copy")
+    try canvas.set_layer(layer, false, 1.0)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 255 and (try shown_at(&canvas, &target, 30, 12))[0] == 0)
+    try canvas.set_layer(layer, true, 1.0)
+    try canvas.set_layer(copy, false, 1.0)
+    # Via cut: a new layer takes the selected half, which leaves the original.
+    let taken = try canvas.layer_via_copy(layer, cut = true)
+    try canvas.set_layer(taken, false, 1.0)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 0 and (try shown_at(&canvas, &target, 30, 12))[0] == 255)
+    try canvas.set_layer(taken, true, 1.0)
+    try canvas.set_layer(layer, false, 1.0)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 255 and (try shown_at(&canvas, &target, 30, 12))[0] == 0)

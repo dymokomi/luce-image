@@ -6,12 +6,21 @@
 
 ## `Canvas.save`: the flattened document as a picture, the format from `path`'s extension.
 func save_flattened(canvas: Canvas*, path: str) -> !:
+    let pixels = try flattened_pixels(canvas)
+    defer free(pixels) in memory.heap
+    let picture = try Image.from_linear_rgba((usize)canvas.extent_x, (usize)canvas.extent_y, pixels)
+    defer picture.release()
+    try picture.value().save(path)
+
+## The flattened document as straight-alpha linear RGBA f32 samples, top-down,
+## four per pixel: heap storage the caller frees.
+func flattened_pixels(canvas: Canvas*) -> f32[]!:
     try canvas.require_open()
-    let document = canvas.document else error(invalid, "draw the document once before saving")
-    let composer = canvas.composer else error(invalid, "draw the document once before saving")
+    let document = canvas.document else error(invalid, "draw the document once before reading it flattened")
+    let composer = canvas.composer else error(invalid, "draw the document once before reading it flattened")
     let count = (usize)canvas.extent_x * (usize)canvas.extent_y * 4
     let pixels = try alloc f32[count] in memory.heap
-    defer free(pixels) in memory.heap
+    errdefer free(pixels) in memory.heap
     let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
     defer free(bytes) in memory.heap
     for row in 0..<tile_columns(canvas.extent_y):
@@ -26,9 +35,7 @@ func save_flattened(canvas: Canvas*, path: str) -> !:
                     let destination = (((usize)row * (usize)tile_size + y) * (usize)canvas.extent_x + (usize)column * (usize)tile_size + x) * 4
                     for channel in 0..<(usize)4:
                         pixels[destination + channel] = from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8))
-    let picture = try Image.from_linear_rgba((usize)canvas.extent_x, (usize)canvas.extent_y, pixels)
-    defer picture.release()
-    try picture.value().save(path)
+    return pixels
 
 ## `Canvas.save_package`: an `.l2d` package, a directory of the manifest and each layer's pictures.
 func save_canvas_package(canvas: Canvas*, path: str) -> !:
@@ -100,11 +107,16 @@ func save_canvas_package(canvas: Canvas*, path: str) -> !:
 
 ## `Canvas.place_layer`: the picture at `path` on layer `id`, centred on a document point.
 func place_picture(canvas: Canvas*, id: i64, path: str, center_x: i64, center_y: i64) -> !:
+    let picture = try Image.open(path)
+    defer picture.release()
+    try place_image_at(canvas, id, picture, center_x, center_y)
+
+## `picture` becomes all of layer `id`'s pixels, centred on a document point;
+## what falls outside the document is cut off.
+func place_image_at(canvas: Canvas*, id: i64, picture: interop.Reference[Image], center_x: i64, center_y: i64) -> !:
     try canvas.require_open()
     let document = canvas.document else error(invalid, "draw the document once before placing a picture")
     discard(try canvas.index((u64)id))
-    let picture = try Image.open(path)
-    defer picture.release()
     let width = try picture.value().width()
     let height = try picture.value().height()
     let source = try alloc f32[width * height * 4] in memory.heap

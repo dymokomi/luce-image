@@ -13,6 +13,7 @@
 #       module.lucb    the Canvas and its per-layer Record
 #       drawing.lucb   drawing the document, a layer, a move and the selection onto a target
 #       files.lucb     opening and saving pictures, Photoshop files and .l2d packages
+#       clipboard.lucb copy, cut and paste, and layers via copy
 #       history.lucb   the undo and redo snapshots
 #       support.lucb   device binding, blend and style names, small checks
 #       tests.lucb     the canvas tests
@@ -25,6 +26,7 @@
 ## the device of the first target it is drawn on; until then layers and their
 ## pictures wait on the CPU, so a document can be built before it is shown.
 import c as c_api
+import clipboard
 import files
 import gpu
 import interop
@@ -1140,6 +1142,25 @@ pub struct Canvas:
         let document = self.document else trap("preview without a document")
         let transformer = self.transformer else trap("preview without a transformer")
         try transformer.apply(document, layer, scale_x, scale_y, angle * math.pi / 180.0, dx, dy)
+
+    # mark: Clipboard ============================================================================
+
+    ## Copy the selected pixels of layer `id` to the system clipboard as PNG,
+    ## cropped to the selection and faded by its coverage — or of the flattened
+    ## document when `merged` (Copy Merged). With `cut` they also leave the layer,
+    ## undoably; cutting takes a selection of one layer. Without a selection the
+    ## whole layer (or document) is copied.
+    pub mutating func copy_selection(id: i64, merged: bool = false, cut: bool = false) -> !:
+        try copy_to_clipboard(&self, id, merged, cut)
+
+    ## The clipboard's image on a new top layer, centred on a document point; its id.
+    pub mutating func paste(center_x: i64, center_y: i64) -> i64!:
+        return try paste_from_clipboard(&self, center_x, center_y)
+
+    ## Layer via Copy (via Cut with `cut`): a new layer above `id` holding its
+    ## selected pixels, or all of them without a selection; its id.
+    pub mutating func layer_via_copy(id: i64, cut: bool = false) -> i64!:
+        return try layer_from_selection(&self, id, cut)
 
     # mark: Canvas and image size =================================================================
 
