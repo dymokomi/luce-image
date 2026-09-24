@@ -513,6 +513,30 @@ pub struct Canvas:
         return blend_names[(usize)mode]
 
     ## Layers from the bottom up.
+    ## The stack index of the top-most visible layer with pixels at a document
+    ## point (alpha over 5%), or -1 there is none: what Photoshop's Move tool
+    ## picks with Auto-Select or a Cmd-click.
+    pub mutating func layer_at(x: i64, y: i64) -> i64!:
+        try self.require_open()
+        if x < 0 or y < 0 or x >= (i64)self.extent_x or y >= (i64)self.extent_y:
+            return -1
+        let document = self.document else return -1
+        let column = (u32)x // tile_size
+        let row = (u32)y // tile_size
+        var texel: u8[8]
+        var index = (i64)self.count - 1
+        while index >= 0:
+            let record = self.records[(usize)index]
+            if record.visible:
+                if let layer = document.find(record.id):
+                    if let tiles = layer.tiles():
+                        if let texture = tiles.texture(column, row):
+                            try texture.read(texel, gpu.Region((u32)x - column * tile_size, (u32)y - row * tile_size, 1, 1))
+                            if from_half((u16)texel[6] | ((u16)texel[7] << 8)) > 0.05:
+                                return index
+            index -= 1
+        return -1
+
     pub func layer_count() -> i64:
         return (i64)self.count
 
@@ -975,7 +999,8 @@ pub struct Canvas:
     pub static func text_height(size: f64) -> f64!:
         return try text_height(size)
 
-    ## Move a layer's pixels (or its mask while editing it) by whole pixels. Undoable.
+    ## Move a layer's pixels by whole pixels, its mask with them (linked, as in
+    ## Photoshop); while editing the mask, the mask alone. Undoable in one step.
     pub mutating func move_layer(id: i64, dx: i64, dy: i64) -> !:
         try self.require_open()
         try self.require_idle()
@@ -986,6 +1011,10 @@ pub struct Canvas:
         let on_mask = self.mask_editing and self.records[index].masked
         let before = try translate(document, (u64)id, dx, dy, on_mask)
         try self.remember((u64)id, before, on_mask)
+        # A mask is linked to its layer's pixels, as in Photoshop: it moves with them.
+        if self.records[index].masked and not on_mask:
+            let mask_before = try translate(document, (u64)id, dx, dy, true)
+            try self.remember((u64)id, mask_before, true, joined = true)
 
     # mark: Adjustments, filters and previews =====================================================
 
@@ -1206,10 +1235,14 @@ pub struct Canvas:
         if self.history_count == 0:
             error(invalid, "nothing to undo")
         let document = self.document else trap("history without a document")
-        let entry = self.history[self.history_count - 1]
-        self.history_count -= 1
-        let current = try (document.take_mask(entry.layer, entry.tiles) if entry.mask else document.take_tiles(entry.layer, entry.tiles))
-        try push(&self.future, &self.future_count, Snapshot(layer = entry.layer, tiles = current, mask = entry.mask))
+        # An edit may have remembered several snapshots; they go back together.
+        while self.history_count > 0:
+            let entry = self.history[self.history_count - 1]
+            self.history_count -= 1
+            let current = try (document.take_mask(entry.layer, entry.tiles) if entry.mask else document.take_tiles(entry.layer, entry.tiles))
+            try push(&self.future, &self.future_count, Snapshot(layer = entry.layer, tiles = current, mask = entry.mask, joined = entry.joined))
+            if not entry.joined:
+                break
 
     ## Redo the last undone edit.
     pub mutating func redo() -> !:
@@ -1218,14 +1251,17 @@ pub struct Canvas:
         if self.future_count == 0:
             error(invalid, "nothing to redo")
         let document = self.document else trap("history without a document")
-        let entry = self.future[self.future_count - 1]
-        self.future_count -= 1
-        let current = try (document.take_mask(entry.layer, entry.tiles) if entry.mask else document.take_tiles(entry.layer, entry.tiles))
-        try push(&self.history, &self.history_count, Snapshot(layer = entry.layer, tiles = current, mask = entry.mask))
+        var first = true
+        while self.future_count > 0 and (first or self.future[self.future_count - 1].joined):
+            first = false
+            let entry = self.future[self.future_count - 1]
+            self.future_count -= 1
+            let current = try (document.take_mask(entry.layer, entry.tiles) if entry.mask else document.take_tiles(entry.layer, entry.tiles))
+            try push(&self.history, &self.history_count, Snapshot(layer = entry.layer, tiles = current, mask = entry.mask, joined = entry.joined))
 
     ## Record a layer's pixels before a change, dropping the redo trail and the
     ## oldest entries past the limit.
-    mutating func remember(layer: u64, tiles: Tiles, mask: bool = false) -> !:
+    mutating func remember(layer: u64, tiles: Tiles, mask: bool = false, joined: bool = false) -> !:
         var owned = tiles
         errdefer owned.destroy()
         clear_snapshots(&self.future, &self.future_count)
@@ -1234,7 +1270,9 @@ pub struct Canvas:
             for index in 1..<self.history_count:
                 self.history[index - 1] = self.history[index]
             self.history_count -= 1
-        try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = tiles, mask = mask))
+            # What was joined to the dropped entry now starts the oldest edit kept.
+            self.history[0].joined = false
+        try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = tiles, mask = mask, joined = joined))
 
     # mark: Files and drawing =====================================================================
 

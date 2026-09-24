@@ -4,11 +4,14 @@
 #
 #==============================================================================================
 
-## A layer's pixels at one moment, shared with whatever else holds them.
+## A layer's pixels (or its mask's) at one moment, shared with whatever else
+## holds them. A joined snapshot belongs to the same edit as the one before it:
+## undo and redo take them together.
 struct Snapshot:
     var layer: u64
     var tiles: Tiles
     var mask: bool
+    var joined: bool = false
 
 ## Append `entry` to a snapshot list, growing it.
 func push(list: Snapshot[]*, count: usize*, entry: Snapshot) -> !:

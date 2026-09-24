@@ -422,3 +422,41 @@ test "layer via copy holds the selected pixels, and via cut takes them":
     try canvas.set_layer(taken, true, 1.0)
     try canvas.set_layer(layer, false, 1.0)
     assert((try shown_at(&canvas, &target, 12, 12))[0] == 255 and (try shown_at(&canvas, &target, 30, 12))[0] == 0)
+
+test "the top layer with pixels is found at a point, and a mask moves with its layer in one undo":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    let lower = try canvas.add_layer("Red")
+    let upper = try canvas.add_layer("Green")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(8, 8, 16, 16, 0)
+    try canvas.fill(lower, false)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, false)
+    try canvas.select_rectangle(40, 40, 16, 16, 0)
+    try canvas.fill(upper, false)
+    assert((try canvas.layer_at(12, 12)) == 0 and (try canvas.layer_at(44, 44)) == 1 and (try canvas.layer_at(30, 30)) == -1)
+    # A mask hiding the red square's left half.
+    try canvas.set_mask(lower, true)
+    canvas.edit_mask(true)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(8, 8, 8, 16, 0)
+    try canvas.fill(lower, false)
+    canvas.edit_mask(false)
+    try canvas.deselect()
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 0 and (try shown_at(&canvas, &target, 20, 12))[0] == 255)
+    # Moved right by 24, the mask goes with the pixels: the hidden half stays hidden.
+    try canvas.move_layer(lower, 24, 0)
+    assert((try shown_at(&canvas, &target, 36, 12))[0] == 0 and (try shown_at(&canvas, &target, 44, 12))[0] == 255)
+    # One undo takes back both.
+    try canvas.undo()
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 0 and (try shown_at(&canvas, &target, 20, 12))[0] == 255)
+    assert((try shown_at(&canvas, &target, 44, 12))[0] == 0)
+    try canvas.redo()
+    assert((try shown_at(&canvas, &target, 36, 12))[0] == 0 and (try shown_at(&canvas, &target, 44, 12))[0] == 255)
