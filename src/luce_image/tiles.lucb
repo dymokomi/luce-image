@@ -37,8 +37,26 @@ pub struct Bounds:
 pub func tile_columns(width: u32) -> u32:
     return (width + tile_size - 1) // tile_size
 
-## A layer's pixels: `columns` by `rows` cells, each a shared tile or `none`
-## for a fully transparent one. Copies do not alias; clone what you keep.
+## Cells by whole-cell position, signed: column 0 is the canvas's first;
+## `right` and `bottom` are just past.
+pub struct CellRange:
+    pub var left: i64
+    pub var top: i64
+    pub var right: i64
+    pub var bottom: i64
+
+## A layer's pixels: `columns` by `rows` cells over the canvas, each a shared
+## tile or `none` for a fully transparent one. Copies do not alias; clone what
+## you keep.
+##
+## Pixels moved past the canvas are kept, as Compositor keeps them, in the
+## `outside` grid: whole cells aligned with the canvas's, its first at cell
+## (`outside_column`, `outside_row`) (negative to the left and above). Only
+## what lies past the canvas counts there — a cell on the canvas's right or
+## bottom edge holds the canvas part in the canvas grid (its `region`) and the
+## rest in the outside grid, often as one shared tile. Everything that works
+## on the canvas grid alone (painting, filters, compositing) leaves the
+## outside grid be; clone, destroy and history carry it along.
 pub struct Tiles:
     var owner: gpu.Device
     var extent_x: u32
@@ -46,6 +64,9 @@ pub struct Tiles:
     var cell_columns: u32
     var cell_rows: u32
     var cells: Tile*?[]
+    var outside: Tiles*?
+    var outside_column: i64
+    var outside_row: i64
 
     ## Fully transparent pixels for a `width` by `height` layer.
     pub static func create(device: gpu.Device, width: u32, height: u32) -> Tiles!:
@@ -58,7 +79,7 @@ pub struct Tiles:
             cells[index] = none
         var owned = device
         discard(try owned.backend())
-        return Tiles(owner = device, extent_x = width, extent_y = height, cell_columns = columns, cell_rows = rows, cells = cells)
+        return Tiles(owner = device, extent_x = width, extent_y = height, cell_columns = columns, cell_rows = rows, cells = cells, outside = none, outside_column = 0, outside_row = 0)
 
     pub func width() -> u32:
         return self.extent_x
@@ -98,7 +119,14 @@ pub struct Tiles:
             cells[index] = none
             if let tile = self.cells[index]:
                 cells[index] = retain(tile)
-        return Tiles(owner = self.owner, extent_x = self.extent_x, extent_y = self.extent_y, cell_columns = self.cell_columns, cell_rows = self.cell_rows, cells = cells)
+        var copy = Tiles(owner = self.owner, extent_x = self.extent_x, extent_y = self.extent_y, cell_columns = self.cell_columns, cell_rows = self.cell_rows, cells = cells,
+                         outside = none, outside_column = 0, outside_row = 0)
+        if let outside = self.outside:
+            errdefer copy.destroy()
+            copy.outside = try box(try outside.clone())
+            copy.outside_column = self.outside_column
+            copy.outside_row = self.outside_row
+        return copy
 
     ## Put `texture` (a full 256 by 256 rgba16_float texture this takes over) at a
     ## cell, replacing what was there. Other holders keep the old tile.
@@ -242,12 +270,176 @@ pub struct Tiles:
                         if py + 1 > bounds.bottom: bounds.bottom = py + 1
         return bounds if found else none
 
+    # -- Past the canvas.
+
+    ## Whether any pixels lie past the canvas.
+    pub func has_outside() -> bool:
+        return self.outside != none
+
+    ## The cells holding any tile, on the canvas or past it; none when the
+    ## layer is empty.
+    pub func occupied() -> CellRange?:
+        var found = false
+        var range = CellRange(left = 0, top = 0, right = 0, bottom = 0)
+        for row in 0..<self.cell_rows:
+            for column in 0..<self.cell_columns:
+                if self.cells[(usize)row * (usize)self.cell_columns + (usize)column] != none:
+                    grow(&range, &found, (i64)column, (i64)row)
+        if let outside = self.outside:
+            for row in 0..<outside.cell_rows:
+                for column in 0..<outside.cell_columns:
+                    if outside.cells[(usize)row * (usize)outside.cell_columns + (usize)column] != none:
+                        grow(&range, &found, self.outside_column + (i64)column, self.outside_row + (i64)row)
+        return range if found else none
+
+    ## Whether signed cell (`column`, `row`) is one of the canvas grid's.
+    pub func on_canvas(column: i64, row: i64) -> bool:
+        return column >= 0 and row >= 0 and column < (i64)self.cell_columns and row < (i64)self.cell_rows
+
+    ## Whether cell (`column`, `row`) has pixels past the canvas: it is off
+    ## the canvas grid, or on its right or bottom edge where the canvas ends
+    ## inside the cell.
+    pub func reaches_past(column: i64, row: i64) -> bool:
+        if not self.on_canvas(column, row):
+            return true
+        let area = self.region((u32)column, (u32)row)
+        return area.width < tile_size or area.height < tile_size
+
+    ## The outside grid's cells, as signed cells on the canvas's grid.
+    pub func outside_range() -> CellRange?:
+        let outside = self.outside else return none
+        return CellRange(left = self.outside_column, top = self.outside_row, right = self.outside_column + (i64)outside.cell_columns,
+                         bottom = self.outside_row + (i64)outside.cell_rows)
+
+    ## The outside grid's texture at signed cell (`column`, `row`), borrowed:
+    ## only its part past the canvas counts.
+    pub func outside_texture(column: i64, row: i64) -> gpu.Texture?:
+        let outside = self.outside else return none
+        let x = column - self.outside_column
+        let y = row - self.outside_row
+        if x < 0 or y < 0:
+            return none
+        return outside.texture((u32)x, (u32)y)
+
+    ## Make the outside grid cover `range` as well as what it covers already,
+    ## its tiles kept.
+    pub mutating func cover(range: CellRange) -> !:
+        var wanted = range
+        if let outside = self.outside:
+            let right = self.outside_column + (i64)outside.cell_columns
+            let bottom = self.outside_row + (i64)outside.cell_rows
+            if range.left >= self.outside_column and range.top >= self.outside_row and range.right <= right and range.bottom <= bottom:
+                return
+            wanted.left = min_i64(wanted.left, self.outside_column)
+            wanted.top = min_i64(wanted.top, self.outside_row)
+            wanted.right = max_i64(wanted.right, right)
+            wanted.bottom = max_i64(wanted.bottom, bottom)
+        let columns = wanted.right - wanted.left
+        let rows = wanted.bottom - wanted.top
+        if columns * (i64)tile_size > 65536 or rows * (i64)tile_size > 65536:
+            error(limit, "a layer reaches at most 65536 pixels, on the canvas and past it")
+        var grown = try Tiles.create(self.owner, (u32)columns * tile_size, (u32)rows * tile_size)
+        errdefer grown.destroy()
+        if let outside = self.outside:
+            for row in 0..<outside.cell_rows:
+                for column in 0..<outside.cell_columns:
+                    let tile = outside.cells[(usize)row * (usize)outside.cell_columns + (usize)column] else continue
+                    let at = (usize)(self.outside_row + (i64)row - wanted.top) * (usize)columns + (usize)(self.outside_column + (i64)column - wanted.left)
+                    grown.cells[at] = retain(tile)
+            self.outside = none
+            unbox(outside)
+        self.outside = try box(grown)
+        self.outside_column = wanted.left
+        self.outside_row = wanted.top
+
+    ## Put `texture` (a fresh tile this takes over) at signed cell (`column`,
+    ## `row`): into the canvas grid when its canvas part holds anything
+    ## (`inside`), into the outside grid when its part past the canvas does
+    ## (`beyond`; `cover` it first) — one shared tile for both — and nowhere
+    ## when neither.
+    pub mutating func place(column: i64, row: i64, texture: gpu.Texture, inside: bool, beyond: bool) -> !:
+        let keep_inside = inside and self.on_canvas(column, row)
+        let keep_beyond = beyond and self.reaches_past(column, row)
+        if not keep_inside and not keep_beyond:
+            var dropped = texture
+            dropped.destroy()
+            return
+        let tile = try new Tile(texture = texture, references = 1) in memory.heap
+        defer release(tile)
+        if keep_inside:
+            let index = try self.index((u32)column, (u32)row)
+            if let previous = self.cells[index]:
+                release(previous)
+            self.cells[index] = retain(tile)
+        if keep_beyond:
+            let outside = self.outside else error(invalid, "cover the cell past the canvas before placing it")
+            let x = column - self.outside_column
+            let y = row - self.outside_row
+            if x < 0 or y < 0 or x >= (i64)outside.cell_columns or y >= (i64)outside.cell_rows:
+                error(invalid, "cover the cell past the canvas before placing it")
+            let index = (usize)y * (usize)outside.cell_columns + (usize)x
+            if let previous = outside.cells[index]:
+                release(previous)
+            outside.cells[index] = retain(tile)
+
+    ## Clear the outside cells with nothing past the canvas — nothing with
+    ## any alpha, or for a `mask` nothing but white — and drop the outside
+    ## grid if nothing is left. Rebuilding places whole pieces, so a cell can
+    ## hold only the transparent margin of one; this reads them back to know.
+    pub mutating func settle(mask: bool = false) -> !:
+        let outside = self.outside else return
+        let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+        defer free(bytes) in memory.heap
+        var kept = false
+        for row in 0..<outside.cell_rows:
+            for column in 0..<outside.cell_columns:
+                let index = (usize)row * (usize)outside.cell_columns + (usize)column
+                let tile = outside.cells[index] else continue
+                let x = self.outside_column + (i64)column
+                let y = self.outside_row + (i64)row
+                # The canvas part, which does not count here.
+                var inside_width: usize = 0
+                var inside_height: usize = 0
+                if self.on_canvas(x, y):
+                    let area = self.region((u32)x, (u32)y)
+                    inside_width = (usize)area.width
+                    inside_height = (usize)area.height
+                try tile.texture.read(bytes)
+                var found = false
+                for texel_y in 0..<(usize)tile_size:
+                    for texel_x in 0..<(usize)tile_size:
+                        if texel_x < inside_width and texel_y < inside_height:
+                            continue
+                        let at = (texel_y * (usize)tile_size + texel_x) * 8
+                        if mask:
+                            # Anything but white (half 1.0 is 0x3c00) hides something.
+                            for channel in 0..<(usize)4:
+                                if ((u16)bytes[at + channel * 2] | ((u16)bytes[at + channel * 2 + 1] << 8)) != 0x3c00:
+                                    found = true
+                        elif ((u16)bytes[at + 6] | ((u16)bytes[at + 7] << 8)) & 0x7fff != 0:
+                            found = true
+                        if found:
+                            break
+                    if found:
+                        break
+                if found:
+                    kept = true
+                else:
+                    release(tile)
+                    outside.cells[index] = none
+        if not kept:
+            self.outside = none
+            unbox(outside)
+
     func index(column: u32, row: u32) -> usize!:
         if column >= self.cell_columns or row >= self.cell_rows:
             error(invalid, "tile cell out of range")
         return (usize)row * (usize)self.cell_columns + (usize)column
 
     pub mutating func destroy():
+        if let outside = self.outside:
+            self.outside = none
+            unbox(outside)
         for index in 0..<self.cells.length:
             if let tile = self.cells[index]:
                 release(tile)
@@ -274,6 +466,22 @@ func try_index(tiles: const Tiles*, column: u32, row: u32) -> usize?:
     if column >= tiles.cell_columns or row >= tiles.cell_rows:
         return none
     return (usize)row * (usize)tiles.cell_columns + (usize)column
+
+func grow(range: CellRange*, found: bool*, column: i64, row: i64):
+    if not *found:
+        *range = CellRange(left = column, top = row, right = column + 1, bottom = row + 1)
+        *found = true
+        return
+    range.left = min_i64(range.left, column)
+    range.top = min_i64(range.top, row)
+    range.right = max_i64(range.right, column + 1)
+    range.bottom = max_i64(range.bottom, row + 1)
+
+pub func min_i64(a: i64, b: i64) -> i64:
+    return a if a < b else b
+
+pub func max_i64(a: i64, b: i64) -> i64:
+    return a if a > b else b
 
 ## The smaller of two unsigned sizes.
 pub func min_u32(a: u32, b: u32) -> u32:

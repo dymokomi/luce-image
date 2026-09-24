@@ -1,11 +1,13 @@
-## Destructive geometry: a layer's pixels moved by a whole number of pixels.
-## Each output tile is drawn from the up to four input tiles it overlaps;
-## pixels pushed off the document are lost, as in Photoshop.
+## Destructive geometry: a layer's pixels moved by whole pixels, or scaled,
+## turned and moved together (free transform). Pixels moved past the canvas
+## are kept past it (see `Tiles`) and come back when moved back, as in
+## Compositor.
 import gpu
 import interop
 import math
 import memory
-from luce_image.tiles import Tiles, tile_size, min_u32, max_u32, flatten
+from luce_image.tiles import Tiles, tile_size
+from luce_image.extent import relocate, flatten_all, landing_cells, canvas_part, reaches_past_part
 from luce_image.document import Document
 from luce_image.shaders import warp_frag_words, warp_frag_msl
 from raster_errors import invalid
@@ -16,48 +18,13 @@ pub func translate(document: Document*, layer: u64, dx: i64, dy: i64, on_mask: b
     let tiles = (target.mask_tiles() else error(invalid, "the layer has no mask")) if on_mask else (target.tiles() else error(invalid, "a group cannot be moved"))
     if dx < -65536 or dx > 65536 or dy < -65536 or dy > 65536:
         error(invalid, "moves are limited to 65536 pixels")
-    var before = try tiles.clone()
-    errdefer before.destroy()
-    for row in 0..<tiles.rows():
-        for column in 0..<tiles.columns():
-            let left = (i64)(column * tile_size) - dx
-            let top = (i64)(row * tile_size) - dy
-            # Source cells overlapping this cell's origin window.
-            var any = false
-            var fresh = gpu.Texture()
-            var opened = false
-            var frame_holder: interop.Reference[gpu.Frame]? = none
-            for sy in 0..<(i64)2:
-                for sx in 0..<(i64)2:
-                    let cell_x = floor_div(left, (i64)tile_size) + sx
-                    let cell_y = floor_div(top, (i64)tile_size) + sy
-                    if cell_x < 0 or cell_y < 0 or cell_x >= (i64)before.columns() or cell_y >= (i64)before.rows():
-                        continue
-                    let texture = before.texture((u32)cell_x, (u32)cell_y) else continue
-                    let area = before.region((u32)cell_x, (u32)cell_y)
-                    # Where this source tile lands within the output tile.
-                    let offset_x = (f64)(cell_x * (i64)tile_size - left)
-                    let offset_y = (f64)(cell_y * (i64)tile_size - top)
-                    if offset_x >= (f64)tile_size or offset_y >= (f64)tile_size or offset_x + (f64)area.width <= 0.0 or offset_y + (f64)area.height <= 0.0:
-                        continue
-                    if not opened:
-                        fresh = try tiles.blank()
-                        opened = true
-                    any = true
-                    let frame = frame_holder else try fresh.frame()
-                    frame_holder = frame
-                    let whole = try frame.value().target()
-                    defer whole.release()
-                    try gpu.copy_image(whole.value(), texture, gpu.Rect(offset_x, offset_y, (f64)area.width, (f64)area.height), area)
-            if let frame = frame_holder:
-                discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
-                frame.release()
-            if any:
-                try tiles.set(column, row, fresh)
-            else:
-                if opened:
-                    fresh.destroy()
-                try tiles.clear(column, row)
+    var moved = try Tiles.create(document.device(), tiles.width(), tiles.height())
+    errdefer moved.destroy()
+    let empty = 1.0 if on_mask else 0.0
+    try relocate(tiles, &moved, 1.0, 1.0, (f64)dx, (f64)dy, false, gpu.Color(empty, empty, empty, empty))
+    # In place, so pointers to the layer's tiles stay good.
+    let before = *tiles
+    *tiles = moved
     target.revision += 1
     return before
 
@@ -81,7 +48,7 @@ pub struct Transformer:
     ## Replace `layer`'s pixels (or, `on_mask`, its mask) with them scaled by
     ## (`scale_x`, `scale_y`) — negative flips — and rotated by `angle` radians
     ## about the document point (`pivot_x`, `pivot_y`), then moved by (`dx`,
-    ## `dy`). What leaves the document is lost; a mask reveals where it came
+    ## `dy`). What leaves the document is kept past it; a mask reveals where it came
     ## from nothing, as an unpainted mask does.
     pub func apply(document: Document*, layer: u64, scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64,
                    pivot_x: f64, pivot_y: f64, on_mask: bool = false) -> !:
@@ -92,35 +59,24 @@ pub struct Transformer:
             error(invalid, "transform scales are 0.001..1000")
         let target = document.find(layer) else error(invalid, "no such layer")
         let tiles = (target.mask_tiles() else error(invalid, "the layer has no mask")) if on_mask else (target.tiles() else error(invalid, "a group cannot be transformed"))
-        let width = tiles.width()
-        let height = tiles.height()
-        # The content's bounding box, at tile granularity, bounds where it can land.
-        var left = tiles.columns()
-        var top = tiles.rows()
-        var right: u32 = 0
-        var bottom: u32 = 0
-        for row in 0..<tiles.rows():
-            for column in 0..<tiles.columns():
-                if tiles.texture(column, row) != none:
-                    left = min_u32(left, column)
-                    top = min_u32(top, row)
-                    right = max_u32(right, column + 1)
-                    bottom = max_u32(bottom, row + 1)
         # Nothing painted: no pixels to move, or a mask revealing everything wherever it goes.
-        if right <= left or bottom <= top:
+        if tiles.occupied() == none:
             return
-        let box_left = (f64)(left * tile_size)
-        let box_top = (f64)(top * tile_size)
-        let box_right = math.min((f64)width, (f64)(right * tile_size))
-        let box_bottom = math.min((f64)height, (f64)(bottom * tile_size))
+        # The whole layer, past the canvas too, in one texture the shader can
+        # sample anywhere; a mask's unpainted cells are white.
+        let outside = 1.0 if on_mask else 0.0
+        var flat = try flatten_all(self.owner, tiles, gpu.Color(outside, outside, outside, outside))
+        defer flat.destroy()
+        let flat_width = (try flat.texture.width())
+        let flat_height = (try flat.texture.height())
+        let box_left = (f64)flat.left
+        let box_top = (f64)flat.top
+        let box_right = box_left + (f64)flat_width
+        let box_bottom = box_top + (f64)flat_height
         let cx = pivot_x
         let cy = pivot_y
-        # Flatten the layer into one texture the shader can sample anywhere; a
-        # mask's unpainted cells are white.
-        let outside = 1.0 if on_mask else 0.0
-        var flat = try flatten(self.owner, tiles, gpu.Color(outside, outside, outside, outside))
-        defer flat.destroy()
-        # Forward: p' = R S (p - c) + c + d. Inverse: p = S⁻¹ R⁻¹ (p' - c - d) + c.
+        # Forward: p' = R S (p - c) + c + d. Inverse: p = S⁻¹ R⁻¹ (p' - c - d) + c,
+        # then into the flat texture's texels.
         let cos = math.cos(angle)
         let sin = math.sin(angle)
         let a = cos / scale_x
@@ -129,13 +85,13 @@ pub struct Transformer:
         let e = cos / scale_y
         let ox = cx + dx
         let oy = cy + dy
-        let c = cx - a * ox - b * oy
-        let f = cy - d * ox - e * oy
-        # Where the content lands, to skip tiles it cannot reach.
-        var out_left = (f64)width
-        var out_top = (f64)height
-        var out_right = 0.0
-        var out_bottom = 0.0
+        let c = cx - a * ox - b * oy - box_left
+        let f = cy - d * ox - e * oy - box_top
+        # Where the content lands, and so which cells to build.
+        var out_left = 1.0e18
+        var out_top = 1.0e18
+        var out_right = -1.0e18
+        var out_bottom = -1.0e18
         for corner in 0..<(usize)4:
             let px = (box_left if corner % 2 == 0 else box_right) - cx
             let py = (box_top if corner < 2 else box_bottom) - cy
@@ -145,25 +101,38 @@ pub struct Transformer:
             out_right = math.max(out_right, qx)
             out_top = math.min(out_top, qy)
             out_bottom = math.max(out_bottom, qy)
-        var params: f32[11] = [(f32)a, (f32)b, (f32)c, (f32)d, (f32)e, (f32)f, 0.0, 0.0, (f32)width, (f32)height, (f32)outside]
-        for row in 0..<tiles.rows():
-            for column in 0..<tiles.columns():
-                let tile_left = (f64)(column * tile_size)
-                let tile_top = (f64)(row * tile_size)
-                if tile_left > out_right + 1.0 or tile_top > out_bottom + 1.0 or tile_left + (f64)tile_size < out_left - 1.0 or tile_top + (f64)tile_size < out_top - 1.0:
-                    try tiles.clear(column, row)
-                    continue
+        var fresh = try Tiles.create(self.owner, tiles.width(), tiles.height())
+        errdefer fresh.destroy()
+        let range = landing_cells(out_left - 1.0, out_top - 1.0, out_right + 1.0, out_bottom + 1.0)
+        if out_left < 1.0 or out_top < 1.0 or out_right + 1.0 > (f64)tiles.width() or out_bottom + 1.0 > (f64)tiles.height():
+            try fresh.cover(range)
+        var params: f32[11] = [(f32)a, (f32)b, (f32)c, (f32)d, (f32)e, (f32)f, 0.0, 0.0, (f32)flat_width, (f32)flat_height, (f32)outside]
+        for row in range.top..<range.bottom:
+            for column in range.left..<range.right:
+                let tile_left = (f64)(column * (i64)tile_size)
+                let tile_top = (f64)(row * (i64)tile_size)
                 params[6] = (f32)tile_left
                 params[7] = (f32)tile_top
-                var fresh = try tiles.blank()
-                errdefer fresh.destroy()
-                let frame = try fresh.frame()
+                var texture = try fresh.blank()
+                errdefer texture.destroy()
+                let frame = try texture.frame()
                 defer frame.release()
                 let area = try frame.value().target()
                 defer area.release()
-                try gpu.shade(area.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 44), [flat], gpu.Filter.nearest)
+                try gpu.shade(area.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 44), [flat.texture], gpu.Filter.nearest)
                 discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
-                try tiles.set(column, row, fresh)
+                # Which parts of the cell the landed box reaches.
+                let x = out_left - 1.0 - tile_left
+                let y = out_top - 1.0 - tile_top
+                let w = out_right - out_left + 2.0
+                let h = out_bottom - out_top + 2.0
+                let canvas = canvas_part(&fresh, column, row)
+                try fresh.place(column, row, texture, x < canvas.width and y < canvas.height, reaches_past_part(x, y, w, h, canvas))
+        try fresh.settle(on_mask)
+        # In place, so pointers to the layer's tiles stay good.
+        var before = *tiles
+        *tiles = fresh
+        before.destroy()
         target.revision += 1
 
     pub mutating func destroy():
@@ -235,7 +204,7 @@ test "a free transform scales, turns and flips a layer about a pivot, and a mask
         rejected = true
     assert(rejected)
 
-test "translating a layer moves its pixels across tiles and drops what leaves":
+test "translating a layer moves its pixels across tiles, and what leaves the canvas comes back":
     var device = gpu.Device.open() catch failure:
         assert(failure.code == gpu.unavailable)
         return
@@ -268,4 +237,23 @@ test "translating a layer moves its pixels across tiles and drops what leaves":
     var again = try translate(&document, layer, 100, 0)
     again.destroy()
     try current.read(pixels)
-    assert(pixels[(15 * 300 + 270) * 4 + 3] == 0.0)
+    assert(pixels[(15 * 300 + 270) * 4 + 3] == 0.0 and current.has_outside())
+    # Past the right edge (partly inside the edge cell) and past the top-left, then back.
+    var back = try translate(&document, layer, -100, 0)
+    back.destroy()
+    try current.read(pixels)
+    assert(pixels[(15 * 300 + 270) * 4 + 1] > 0.99 and not current.has_outside())
+    var away = try translate(&document, layer, -600, -300)
+    away.destroy()
+    try current.read(pixels)
+    assert(pixels[(15 * 300 + 270) * 4 + 3] == 0.0 and current.has_outside() and current.texture(0, 0) == none and current.texture(1, 0) == none)
+    var home = try translate(&document, layer, 600, 300)
+    home.destroy()
+    try current.read(pixels)
+    assert(pixels[(15 * 300 + 270) * 4 + 1] > 0.99 and pixels[soft + 3] > 0.49 and pixels[soft + 3] < 0.51 and not current.has_outside())
+    # The layer's clone carries what is past the canvas, for history.
+    var far = try translate(&document, layer, 0, 50)
+    var kept = try current.clone()
+    defer kept.destroy()
+    assert(kept.has_outside() and not far.has_outside())
+    far.destroy()

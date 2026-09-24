@@ -1,55 +1,25 @@
 ## Document-wide geometry, destructive: changing the canvas size (with the
 ## existing pixels anchored at an offset, so cropping is a canvas size with a
 ## negative offset) and resampling the whole image to a new size. Every raster
-## layer and mask is rebuilt tile by tile on the GPU.
+## layer and mask is rebuilt tile by tile on the GPU; pixels the new canvas
+## does not reach are kept past it, as Compositor keeps them.
 import gpu
 import interop
 import math
 import memory
 from luce_image.tiles import Tiles, tile_size, box, unbox
+from luce_image.extent import relocate
 from luce_image.document import Document, Layer
 from raster_errors import invalid
 
 ## `tiles` drawn into a `width` by `height` layer with its pixels scaled by
-## (`scale_x`, `scale_y`) and its origin at (`offset_x`, `offset_y`).
-func rebuilt(device: gpu.Device, tiles: Tiles*, width: u32, height: u32, scale_x: f64, scale_y: f64, offset_x: f64, offset_y: f64, smooth: bool) -> Tiles!:
+## (`scale_x`, `scale_y`) and its origin at (`offset_x`, `offset_y`); what
+## falls past the new canvas stays past it.
+func rebuilt(device: gpu.Device, tiles: Tiles*, width: u32, height: u32, scale_x: f64, scale_y: f64, offset_x: f64, offset_y: f64, smooth: bool,
+             empty: gpu.Color) -> Tiles!:
     var fresh = try Tiles.create(device, width, height)
     errdefer fresh.destroy()
-    for row in 0..<fresh.rows():
-        for column in 0..<fresh.columns():
-            let left = (f64)(column * tile_size)
-            let top = (f64)(row * tile_size)
-            var texture = gpu.Texture()
-            var opened = false
-            var drew = false
-            var holder: interop.Reference[gpu.Frame]? = none
-            for source_row in 0..<tiles.rows():
-                for source_column in 0..<tiles.columns():
-                    let area = tiles.region(source_column, source_row)
-                    # Where this source tile lands in the new layer, in new pixels.
-                    let x = offset_x + (f64)(source_column * tile_size) * scale_x - left
-                    let y = offset_y + (f64)(source_row * tile_size) * scale_y - top
-                    let w = (f64)area.width * scale_x
-                    let h = (f64)area.height * scale_y
-                    if x >= (f64)tile_size or y >= (f64)tile_size or x + w <= 0.0 or y + h <= 0.0:
-                        continue
-                    let source = tiles.texture(source_column, source_row) else continue
-                    if not opened:
-                        texture = try fresh.blank()
-                        opened = true
-                    let frame = holder else try texture.frame()
-                    holder = frame
-                    let target = try frame.value().target()
-                    defer target.release()
-                    try gpu.copy_image(target.value(), source, gpu.Rect(x, y, w, h), area, gpu.Filter.linear if smooth else gpu.Filter.nearest)
-                    drew = true
-            if let frame = holder:
-                discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
-                frame.release()
-            if drew:
-                try fresh.set(column, row, texture)
-            elif opened:
-                texture.destroy()
+    try relocate(tiles, &fresh, scale_x, scale_y, offset_x, offset_y, smooth, empty)
     return fresh
 
 func rebuild_layers(device: gpu.Device, layers: Layer*[], width: u32, height: u32, scale_x: f64, scale_y: f64, offset_x: f64, offset_y: f64, smooth: bool) -> !:
@@ -58,10 +28,10 @@ func rebuild_layers(device: gpu.Device, layers: Layer*[], width: u32, height: u3
             try rebuild_layers(device, layer.layers(), width, height, scale_x, scale_y, offset_x, offset_y, smooth)
             continue
         if let tiles = layer.tiles():
-            let replaced = try rebuilt(device, tiles, width, height, scale_x, scale_y, offset_x, offset_y, smooth)
+            let replaced = try rebuilt(device, tiles, width, height, scale_x, scale_y, offset_x, offset_y, smooth, gpu.Color(0.0, 0.0, 0.0, 0.0))
             try layer.replace_tiles(replaced)
         if let mask = layer.mask_tiles():
-            let replaced = try rebuilt(device, mask, width, height, scale_x, scale_y, offset_x, offset_y, smooth)
+            let replaced = try rebuilt(device, mask, width, height, scale_x, scale_y, offset_x, offset_y, smooth, gpu.Color(1.0, 1.0, 1.0, 1.0))
             try layer.replace_mask(replaced)
 
 ## Change the canvas to `width` by `height`, keeping the existing pixels with
@@ -81,7 +51,7 @@ pub func resize_image(document: Document*, width: u32, height: u32) -> !:
     try rebuild_layers(document.device(), document.layers(), width, height, scale_x, scale_y, 0.0, 0.0, true)
     try document.set_extent(width, height)
 
-test "canvas and image resizing keep pixels in place and scale them":
+test "canvas and image resizing keep pixels in place, scale them, and keep what the canvas no longer reaches":
     var device = gpu.Device.open() catch failure:
         assert(failure.code == gpu.unavailable)
         return
@@ -96,6 +66,9 @@ test "canvas and image resizing keep pixels in place and scale them":
         pixels[index] = 0.0
     pixels[(10 * 300 + 260) * 4 + 1] = 1.0
     pixels[(10 * 300 + 260) * 4 + 3] = 1.0
+    # A red dot the crop leaves past the canvas.
+    pixels[(10 * 300 + 20) * 4] = 1.0
+    pixels[(10 * 300 + 20) * 4 + 3] = 1.0
     var tiles = try Tiles.create(device, 300, 40)
     try tiles.write(pixels)
     try document.set_tiles(layer, tiles)
@@ -118,3 +91,11 @@ test "canvas and image resizing keep pixels in place and scale them":
     defer free(doubled) in memory.heap
     try ((document.find(layer) else trap("layer")).tiles() else trap("tiles")).read(doubled)
     assert(doubled[(60 * 200 + 60) * 4 + 3] > 0.2 and doubled[(30 * 200 + 30) * 4 + 3] == 0.0)
+    # The red dot went to (-230, 10), (-210, 30), then (-420, 60) scaled; a
+    # canvas grown 440 to the left shows it again at (20, 60).
+    assert(((document.find(layer) else trap("layer")).tiles() else trap("tiles")).has_outside())
+    try resize_canvas(&document, 700, 160, 440, 0)
+    let revealed = try alloc f32[(usize)700 * 160 * 4] in memory.heap
+    defer free(revealed) in memory.heap
+    try ((document.find(layer) else trap("layer")).tiles() else trap("tiles")).read(revealed)
+    assert(revealed[(60 * 700 + 20) * 4] > 0.2 and revealed[(60 * 700 + 20) * 4 + 3] > 0.2 and revealed[(60 * 700 + 500) * 4 + 3] > 0.2)

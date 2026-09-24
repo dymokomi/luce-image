@@ -1,0 +1,218 @@
+## Layers past the canvas: rebuilding a layer's pixels — moved, resampled,
+## onto a canvas of another size — from its canvas grid and what lies past
+## the canvas together, keeping whatever lands past the new canvas (see
+## `Tiles`). A layer is read as pieces that never overlap: each canvas cell's
+## region, and each outside cell's part past the canvas (the whole cell off
+## the grid; a right and a bottom strip on the canvas's edge).
+import gpu
+import interop
+import math
+import memory
+from luce_image.tiles import Tiles, CellRange, Bounds, tile_size, min_i64, max_i64
+from raster_errors import invalid
+
+## Texels `source` of `texture` (borrowed), their top-left at document pixel (`x`, `y`).
+pub struct Piece:
+    pub var texture: gpu.Texture
+    pub var source: gpu.Region
+    pub var x: i64
+    pub var y: i64
+
+## A layer's pieces; `destroy` frees the list, not the textures.
+pub struct Pieces:
+    var all: Piece[]
+    pub var count: usize
+
+    pub func at(index: usize) -> Piece:
+        return self.all[index]
+
+    mutating func add(texture: gpu.Texture, source: gpu.Region, x: i64, y: i64):
+        self.all[self.count] = Piece(texture = texture, source = source, x = x, y = y)
+        self.count += 1
+
+    pub mutating func destroy():
+        if self.all.length > 0:
+            free(self.all) in memory.heap
+        var empty: Piece[]
+        self.all = empty
+        self.count = 0
+
+## Every piece of `tiles`, on the canvas and past it.
+pub func pieces(tiles: const Tiles*) -> Pieces!:
+    let outside = tiles.outside_range()
+    var room = (usize)tiles.columns() * (usize)tiles.rows()
+    if let range = outside:
+        room += (usize)((range.right - range.left) * (range.bottom - range.top)) * 2
+    var list = Pieces(all = try alloc Piece[room + 1] in memory.heap, count = 0)
+    for row in 0..<tiles.rows():
+        for column in 0..<tiles.columns():
+            let texture = tiles.texture(column, row) else continue
+            list.add(texture, tiles.region(column, row), (i64)(column * tile_size), (i64)(row * tile_size))
+    let range = outside else return list
+    for row in range.top..<range.bottom:
+        for column in range.left..<range.right:
+            let texture = tiles.outside_texture(column, row) else continue
+            let x = column * (i64)tile_size
+            let y = row * (i64)tile_size
+            if not tiles.on_canvas(column, row):
+                list.add(texture, gpu.Region(0, 0, tile_size, tile_size), x, y)
+                continue
+            # On the canvas's edge: the strips the canvas does not reach.
+            let area = tiles.region((u32)column, (u32)row)
+            if area.width < tile_size:
+                list.add(texture, gpu.Region(area.width, 0, tile_size - area.width, tile_size), x + (i64)area.width, y)
+            if area.height < tile_size:
+                list.add(texture, gpu.Region(0, area.height, area.width, tile_size - area.height), x, y + (i64)area.height)
+    return list
+
+## `source`'s pixels drawn into `dest` (empty, of any canvas size), scaled by
+## (`scale_x`, `scale_y`) about the document's origin and then moved by
+## (`offset_x`, `offset_y`); what lands past `dest`'s canvas is kept past it.
+## Where nothing lands reads as `empty`: no pixels, or a mask's white.
+pub func relocate(source: const Tiles*, dest: Tiles*, scale_x: f64, scale_y: f64, offset_x: f64, offset_y: f64, smooth: bool,
+                  empty: gpu.Color = gpu.Color(0.0, 0.0, 0.0, 0.0)) -> !:
+    var parts = try pieces(source)
+    defer parts.destroy()
+    if parts.count == 0:
+        return
+    # Where the pieces land, and so which cells to build.
+    var left = 1.0e18
+    var top = 1.0e18
+    var right = -1.0e18
+    var bottom = -1.0e18
+    for index in 0..<parts.count:
+        let piece = parts.at(index)
+        let x = offset_x + (f64)piece.x * scale_x
+        let y = offset_y + (f64)piece.y * scale_y
+        left = math.min(left, x)
+        top = math.min(top, y)
+        right = math.max(right, x + (f64)piece.source.width * scale_x)
+        bottom = math.max(bottom, y + (f64)piece.source.height * scale_y)
+    let range = landing_cells(left, top, right, bottom)
+    if left < 0.0 or top < 0.0 or right > (f64)dest.width() or bottom > (f64)dest.height():
+        try dest.cover(range)
+    let filter = gpu.Filter.linear if smooth else gpu.Filter.nearest
+    for row in range.top..<range.bottom:
+        for column in range.left..<range.right:
+            let cell_x = (f64)(column * (i64)tile_size)
+            let cell_y = (f64)(row * (i64)tile_size)
+            let canvas = canvas_part(dest, column, row)
+            var texture = gpu.Texture()
+            var opened = false
+            var inside = false
+            var beyond = false
+            var holder: interop.Reference[gpu.Frame]? = none
+            for index in 0..<parts.count:
+                let piece = parts.at(index)
+                let x = offset_x + (f64)piece.x * scale_x - cell_x
+                let y = offset_y + (f64)piece.y * scale_y - cell_y
+                let w = (f64)piece.source.width * scale_x
+                let h = (f64)piece.source.height * scale_y
+                if x >= (f64)tile_size or y >= (f64)tile_size or x + w <= 0.0 or y + h <= 0.0:
+                    continue
+                if not opened:
+                    texture = try dest.blank()
+                    opened = true
+                let frame = holder else try texture.frame()
+                holder = frame
+                let target = try frame.value().target()
+                defer target.release()
+                try gpu.copy_image(target.value(), piece.texture, gpu.Rect(x, y, w, h), piece.source, filter)
+                inside = inside or (x < canvas.width and y < canvas.height)
+                beyond = beyond or reaches_past_part(x, y, w, h, canvas)
+            if let frame = holder:
+                discard(try frame.value().present(empty))
+                frame.release()
+            if opened:
+                try dest.place(column, row, texture, inside, beyond)
+    try dest.settle(empty.alpha > 0.5)
+
+## The cells a box of document pixels touches.
+pub func landing_cells(left: f64, top: f64, right: f64, bottom: f64) -> CellRange:
+    let size = (f64)tile_size
+    return CellRange(left = (i64)math.floor(left / size), top = (i64)math.floor(top / size),
+                     right = (i64)math.ceil(right / size), bottom = (i64)math.ceil(bottom / size))
+
+## Cell (`column`, `row`)'s canvas part, from its top-left: its region on the
+## canvas grid, nothing off it.
+pub func canvas_part(tiles: const Tiles*, column: i64, row: i64) -> Part:
+    if not tiles.on_canvas(column, row):
+        return Part(width = 0.0, height = 0.0)
+    let area = tiles.region((u32)column, (u32)row)
+    return Part(width = (f64)area.width, height = (f64)area.height)
+
+## The size of a cell's canvas part.
+pub struct Part:
+    pub var width: f64
+    pub var height: f64
+
+## Whether a box at (`x`, `y`) of `w` by `h` in a cell, which it overlaps,
+## reaches past the cell's `canvas` part.
+pub func reaches_past_part(x: f64, y: f64, w: f64, h: f64, canvas: Part) -> bool:
+    return math.min(x + w, (f64)tile_size) > canvas.width or math.min(y + h, (f64)tile_size) > canvas.height
+
+## A layer flattened whole, past the canvas too: `texture`'s texel (0, 0) is
+## document pixel (`left`, `top`).
+pub struct Flat:
+    pub var texture: gpu.Texture
+    pub var left: i64
+    pub var top: i64
+
+    pub mutating func destroy():
+        self.texture.destroy()
+
+## Every piece of `tiles` in one texture over the cells they occupy (the
+## canvas's first cell when there are none); the rest is `empty`.
+pub func flatten_all(device: gpu.Device, tiles: const Tiles*, empty: gpu.Color = gpu.Color(0.0, 0.0, 0.0, 0.0)) -> Flat!:
+    let range = tiles.occupied() else CellRange(left = 0, top = 0, right = 1, bottom = 1)
+    let left = range.left * (i64)tile_size
+    let top = range.top * (i64)tile_size
+    var flat = try gpu.Texture.create(device, (u32)(range.right - range.left) * tile_size, (u32)(range.bottom - range.top) * tile_size, gpu.Format.rgba16_float)
+    errdefer flat.destroy()
+    var parts = try pieces(tiles)
+    defer parts.destroy()
+    let frame = try flat.frame()
+    defer frame.release()
+    let whole = try frame.value().target()
+    defer whole.release()
+    for index in 0..<parts.count:
+        let piece = parts.at(index)
+        try gpu.copy_image(whole.value(), piece.texture, gpu.Rect((f64)(piece.x - left), (f64)(piece.y - top), (f64)piece.source.width, (f64)piece.source.height), piece.source)
+    discard(try frame.value().present(empty))
+    return Flat(texture = flat, left = left, top = top)
+
+## The smallest box of whole document pixels holding every pixel of `tiles`
+## with any alpha, past the canvas too; none when there is none. It reads the
+## painted tiles back from the GPU.
+pub func full_bounds(tiles: const Tiles*) -> Bounds?!:
+    var found = false
+    var bounds = Bounds(left = 0, top = 0, right = 0, bottom = 0)
+    if let inside = try tiles.content_bounds():
+        bounds = inside
+        found = true
+    let range = tiles.outside_range() else return bounds if found else none
+    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    defer free(bytes) in memory.heap
+    for row in range.top..<range.bottom:
+        for column in range.left..<range.right:
+            let texture = tiles.outside_texture(column, row) else continue
+            let canvas = canvas_part(tiles, column, row)
+            try texture.read(bytes)
+            for y in 0..<(usize)tile_size:
+                for x in 0..<(usize)tile_size:
+                    if (f64)x < canvas.width and (f64)y < canvas.height:
+                        continue
+                    let at = (y * (usize)tile_size + x) * 8
+                    if ((u16)bytes[at + 6] | ((u16)bytes[at + 7] << 8)) & 0x7fff == 0:
+                        continue
+                    let px = column * (i64)tile_size + (i64)x
+                    let py = row * (i64)tile_size + (i64)y
+                    if not found:
+                        bounds = Bounds(left = px, top = py, right = px + 1, bottom = py + 1)
+                        found = true
+                        continue
+                    bounds.left = min_i64(bounds.left, px)
+                    bounds.top = min_i64(bounds.top, py)
+                    bounds.right = max_i64(bounds.right, px + 1)
+                    bounds.bottom = max_i64(bounds.bottom, py + 1)
+    return bounds if found else none

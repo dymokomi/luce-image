@@ -82,17 +82,24 @@ func draw_canvas_moving(canvas: Canvas*, target: interop.View[gpu.RenderTarget],
     document.revision += 1
     if not shown or rectangle.width <= 0.0 or rectangle.height <= 0.0:
         return
+    # The moving layer shows on the canvas only, what it had past the canvas included.
+    let left = math.max(rectangle.x, rectangle.x + offset_x)
+    let top = math.max(rectangle.y, rectangle.y + offset_y)
+    let right = math.min(rectangle.x + rectangle.width, rectangle.x + offset_x + (f64)canvas.extent_x * zoom)
+    let bottom = math.min(rectangle.y + rectangle.height, rectangle.y + offset_y + (f64)canvas.extent_y * zoom)
+    if right <= left or bottom <= top:
+        return
     let checked = try target.get()
-    let clipped = try checked.clipped(rectangle)
+    let clipped = try checked.clipped(gpu.Rect(left, top, right - left, bottom - top))
     defer clipped.release()
     let tiles = layer.tiles() else return
-    for row in 0..<tiles.rows():
-        for column in 0..<tiles.columns():
-            let texture = tiles.texture(column, row) else continue
-            let area = tiles.region(column, row)
-            let destination = gpu.Rect(rectangle.x + offset_x + ((f64)(column * tile_size) + dx) * zoom, rectangle.y + offset_y + ((f64)(row * tile_size) + dy) * zoom,
-                                       (f64)area.width * zoom, (f64)area.height * zoom)
-            try gpu.draw_image(clipped.value(), texture, destination, area, canvas.records[index].opacity, gpu.Filter.nearest if zoom >= 1.0 else gpu.Filter.linear)
+    var parts = try pieces(tiles)
+    defer parts.destroy()
+    for at in 0..<parts.count:
+        let piece = parts.at(at)
+        let destination = gpu.Rect(rectangle.x + offset_x + ((f64)piece.x + dx) * zoom, rectangle.y + offset_y + ((f64)piece.y + dy) * zoom,
+                                   (f64)piece.source.width * zoom, (f64)piece.source.height * zoom)
+        try gpu.draw_image(clipped.value(), piece.texture, destination, piece.source, canvas.records[index].opacity, gpu.Filter.nearest if zoom >= 1.0 else gpu.Filter.linear)
 
 ## `Canvas.draw_selection`: marching ants along the selection's edge at screen resolution.
 func draw_canvas_selection(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, phase: f64) -> !:

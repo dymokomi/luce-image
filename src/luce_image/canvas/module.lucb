@@ -48,6 +48,7 @@ from luce_image.curves import Curves, lut_size
 from luce_image.filter import Filters
 import luce_image.filter as filtering
 from luce_image.transform import translate, Transformer
+from luce_image.extent import full_bounds, pieces, relocate
 from luce_image.selection_passes import SelectionPasses
 from luce_image.text import draw_text, measure_text, text_height
 import psd
@@ -75,9 +76,15 @@ struct Record:
     var masked: bool
     var clipped: bool
     var style: Style = Style()
-    ## A picture waiting to become tiles once a device is bound, and a mask likewise.
+    ## A picture waiting to become tiles once a device is bound, and a mask
+    ## likewise, each with the document pixel its top-left goes at (a picture
+    ## may reach past the canvas).
     var picture: interop.Reference[Image]?
     var mask_picture: interop.Reference[Image]?
+    var picture_x: i64 = 0
+    var picture_y: i64 = 0
+    var mask_x: i64 = 0
+    var mask_y: i64 = 0
 
 pub struct Canvas:
     var extent_x: u32
@@ -344,12 +351,12 @@ pub struct Canvas:
             if let picture = self.records[index].picture:
                 self.records[index].picture = none
                 defer picture.release()
-                let tiles = try self.tiles_of(picture)
+                let tiles = try self.tiles_of(picture, self.records[index].picture_x, self.records[index].picture_y)
                 try (self.document else trap("bound")).set_tiles(self.records[index].id, tiles)
             if let picture = self.records[index].mask_picture:
                 self.records[index].mask_picture = none
                 defer picture.release()
-                let tiles = try self.tiles_of(picture)
+                let tiles = try self.tiles_of(picture, self.records[index].mask_x, self.records[index].mask_y, true)
                 var old = try (self.document else trap("bound")).take_mask(self.records[index].id, tiles)
                 old.destroy()
 
@@ -551,28 +558,40 @@ pub struct Canvas:
     pub mutating func place_layer(id: i64, path: str, center_x: i64, center_y: i64) -> !:
         try place_picture(&self, id, path, center_x, center_y)
 
-    mutating func place(id: u64, picture: interop.Reference[Image]) -> !:
+    mutating func place(id: u64, picture: interop.Reference[Image], x: i64 = 0, y: i64 = 0) -> !:
         let index = try self.index(id)
         if let document = self.document:
-            try document.set_tiles(id, try self.tiles_of(picture))
+            try document.set_tiles(id, try self.tiles_of(picture, x, y))
             picture.release()
             return
         # Replace, then release: a release can run the cycle collector, which traces the records.
         let previous = self.records[index].picture
         self.records[index].picture = picture
+        self.records[index].picture_x = x
+        self.records[index].picture_y = y
         if let old = previous:
             old.release()
 
-    ## Tiles on the bound device holding `picture`'s pixels.
-    mutating func tiles_of(picture: interop.Reference[Image]) -> Tiles!:
+    ## Tiles on the bound device holding `picture`'s pixels with its top-left
+    ## at document pixel (`x`, `y`); what lies past the canvas is kept past it
+    ## (for a `mask`, white past it is left out, as unpainted).
+    mutating func tiles_of(picture: interop.Reference[Image], x: i64 = 0, y: i64 = 0, mask: bool = false) -> Tiles!:
         let device = self.device else error(invalid, "the document is not bound to a device")
-        let count = (usize)self.extent_x * (usize)self.extent_y * 4
-        let pixels = try alloc f32[count] in memory.heap
+        let width = try picture.value().width()
+        let height = try picture.value().height()
+        let pixels = try alloc f32[width * height * 4] in memory.heap
         defer free(pixels) in memory.heap
         try picture.value().linear_rgba(pixels)
+        var whole = try Tiles.create(device, (u32)width, (u32)height)
+        errdefer whole.destroy()
+        try whole.write(pixels)
+        if x == 0 and y == 0 and width == (usize)self.extent_x and height == (usize)self.extent_y:
+            return whole
+        defer whole.destroy()
         var tiles = try Tiles.create(device, self.extent_x, self.extent_y)
         errdefer tiles.destroy()
-        try tiles.write(pixels)
+        let empty = 1.0 if mask else 0.0
+        try relocate(&whole, &tiles, 1.0, 1.0, (f64)x, (f64)y, false, gpu.Color(empty, empty, empty, empty))
         return tiles
 
     pub mutating func remove_layer(id: i64) -> !:
@@ -1601,7 +1620,7 @@ pub struct Canvas:
     ## Free transform: scale a layer's pixels by (`scale_x`, `scale_y`) —
     ## negative flips — and turn them `angle` degrees about the document point
     ## (`pivot_x`, `pivot_y`), then move them by (`dx`, `dy`) pixels; what leaves
-    ## the document is lost. A linked mask goes with them (while editing the
+    ## the document is kept past it. A linked mask goes with them (while editing the
     ## mask, the mask alone). Undoable in one step.
     pub mutating func transform_layer(id: i64, scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64, pivot_x: f64, pivot_y: f64) -> !:
         try self.require_open()
@@ -1649,14 +1668,15 @@ pub struct Canvas:
             if self.records[index].masked:
                 try self.transform_one(self.records[index].id, scale_x, scale_y, 0.0, 0.0, 0.0, pivot_x, pivot_y, true, true)
 
-    ## Find layer `id`'s painted box, exactly, for `content_left` and the rest;
-    ## false when it has nothing painted. It reads the layer back from the GPU.
+    ## Find layer `id`'s painted box, exactly, for `content_left` and the rest
+    ## (past the canvas too); false when it has nothing painted. It reads the
+    ## layer back from the GPU.
     pub mutating func measure_content(id: i64) -> bool!:
         try self.require_open()
         let document = self.document else error(invalid, "draw the document once before measuring")
         let layer = document.find((u64)id) else error(invalid, "no such layer")
         let tiles = layer.tiles() else error(invalid, "a group has no pixels of its own")
-        if let found = try tiles.content_bounds():
+        if let found = try full_bounds(tiles):
             self.content = found
             return true
         self.content = Bounds(left = 0, top = 0, right = 0, bottom = 0)
@@ -1730,6 +1750,29 @@ pub struct Canvas:
         if not self.has_selection():
             error(invalid, "nothing is selected")
         try self.resize_canvas(self.selection_width(), self.selection_height(), -self.selection_left(), -self.selection_top())
+
+    ## Image › Reveal All: grow the canvas to hold every layer's pixels, those
+    ## moved past it included; false when nothing lies past it. Undoable.
+    pub mutating func reveal_all() -> bool!:
+        try self.require_open()
+        let document = self.document else error(invalid, "draw the document once before revealing")
+        var box = Bounds(left = 0, top = 0, right = (i64)self.extent_x, bottom = (i64)self.extent_y)
+        for index in 0..<self.count:
+            let layer = document.find(self.records[index].id) else continue
+            let tiles = layer.tiles() else continue
+            if not tiles.has_outside():
+                continue
+            let found = try full_bounds(tiles) else continue
+            box.left = math.imin(box.left, found.left)
+            box.top = math.imin(box.top, found.top)
+            box.right = math.imax(box.right, found.right)
+            box.bottom = math.imax(box.bottom, found.bottom)
+        if box.left == 0 and box.top == 0 and box.right == (i64)self.extent_x and box.bottom == (i64)self.extent_y:
+            return false
+        try self.begin_edit("Reveal All")
+        defer self.end_edit()
+        try self.resize_canvas(box.right - box.left, box.bottom - box.top, -box.left, -box.top)
+        return true
 
     ## Resample the whole image to a new size. Not undoable: the history is dropped.
     pub mutating func resize_image(width: i64, height: i64) -> !:
