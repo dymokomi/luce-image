@@ -52,6 +52,40 @@ func flattened_pixels(canvas: Canvas*) -> f32[]!:
                         pixels[destination + channel] = from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8))
     return pixels
 
+## `Canvas.measure_trim`: the box of the flattened picture unlike what
+## `based_on` names (0 transparent, 1 the top-left color, 2 the bottom-right),
+## into `canvas.content`.
+func measure_trim_bounds(canvas: Canvas*, based_on: i64) -> bool!:
+    if based_on < 0 or based_on > 2:
+        error(invalid, "trim is based on 0 transparency, 1 the top-left color or 2 the bottom-right color")
+    let pixels = try flattened_pixels(canvas)
+    defer free(pixels) in memory.heap
+    let width = (usize)canvas.extent_x
+    let height = (usize)canvas.extent_y
+    let corner = 0 if based_on == 1 else (width * height - 1)
+    var found = false
+    var bounds = Bounds(left = (i64)width, top = (i64)height, right = 0, bottom = 0)
+    for y in 0..<height:
+        for x in 0..<width:
+            let at = (y * width + x) * 4
+            var kept = false
+            if based_on == 0:
+                kept = pixels[at + 3] > 0.0
+            else:
+                # Unlike the corner by more than a step of 8-bit color.
+                for channel in 0..<(usize)4:
+                    if math.abs((f64)(pixels[at + channel] - pixels[corner * 4 + channel])) > 0.5 / 255.0:
+                        kept = true
+            if not kept:
+                continue
+            found = true
+            bounds.left = math.imin(bounds.left, (i64)x)
+            bounds.top = math.imin(bounds.top, (i64)y)
+            bounds.right = math.imax(bounds.right, (i64)x + 1)
+            bounds.bottom = math.imax(bounds.bottom, (i64)y + 1)
+    canvas.content = bounds if found else Bounds(left = 0, top = 0, right = 0, bottom = 0)
+    return found
+
 ## `Canvas.save_package`: an `.l2d` package, a directory of the manifest and each layer's pictures.
 func save_canvas_package(canvas: Canvas*, path: str) -> !:
     try canvas.require_open()

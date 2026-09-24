@@ -153,6 +153,8 @@ pub struct Canvas:
     ## The last step's serial handed out, and the step the document was saved at (0: none).
     var serial: u64
     var saved_version: u64
+    ## Whether the edit under way (`begin_edit`) recorded the whole document.
+    var edit_captured: bool
     ## The free transform under way, if any.
     var transform_session: TransformSession*?
     ## What `measure_histogram` counted: luminosity, red, green and blue, 256
@@ -219,6 +221,7 @@ pub struct Canvas:
         self.transform_session = none
         self.heal_opacity = 1.0
         self.edit_depth = 0
+        self.edit_captured = false
         self.preview_name = "Adjustment"
         self.serial = 0
         self.saved_version = 0
@@ -1724,6 +1727,27 @@ pub struct Canvas:
         self.content = Bounds(left = 0, top = 0, right = 0, bottom = 0)
         return false
 
+    ## Image › Trim: find the box of the flattened picture that is not
+    ## `based_on` — 0 transparent pixels, 1 the top-left pixel's color, 2 the
+    ## bottom-right's — for `content_left` and the rest; false when nothing
+    ## is left. It reads the picture back from the GPU.
+    pub mutating func measure_trim(based_on: i64) -> bool!:
+        return try measure_trim_bounds(&self, based_on)
+
+    ## The size of the image on the system clipboard, for a new canvas that
+    ## fits it; 0 by 0 when there is none.
+    pub static func clipboard_image_width() -> i64!:
+        let found = try clipboard.read_image() else return 0
+        var image = found
+        defer image.destroy()
+        return (i64)image.width
+
+    pub static func clipboard_image_height() -> i64!:
+        let found = try clipboard.read_image() else return 0
+        var image = found
+        defer image.destroy()
+        return (i64)image.height
+
     ## The box `measure_content` found, in document pixels.
     pub func content_left() -> i64:
         return self.content.left
@@ -1806,14 +1830,14 @@ pub struct Canvas:
         return true
 
     ## Resample the whole image to a new size. Not undoable: the history is dropped.
-    pub mutating func resize_image(width: i64, height: i64) -> !:
+    pub mutating func resize_image(width: i64, height: i64, smooth: bool = true) -> !:
         try self.require_open()
         try self.require_idle()
         try self.remember_state("Image Size")
         if width < 1 or height < 1 or width > 65536 or height > 65536:
             error(invalid, "image dimensions must be in 1..65536")
         let document = self.document else error(invalid, "draw the document once before resizing")
-        try resize_image(document, (u32)width, (u32)height)
+        try resize_image(document, (u32)width, (u32)height, smooth)
         try self.adopt_extent((u32)width, (u32)height)
 
     # mark: History ===============================================================================
@@ -1858,6 +1882,10 @@ pub struct Canvas:
     mutating func remember(layer: u64, tiles: Tiles, mask: bool = false, joined: bool = false, name: str = "Edit") -> !:
         var owned = tiles
         errdefer owned.destroy()
+        # Inside an edit that recorded the whole document, its step already holds these pixels.
+        if self.edit_depth > 0 and self.edit_captured:
+            owned.destroy()
+            return
         self.make_room()
         let join = joined or (self.joining and self.history_count > 0)
         self.joining = false
@@ -1926,7 +1954,9 @@ pub struct Canvas:
     pub mutating func begin_edit(name: str) -> !:
         try self.require_open()
         if self.edit_depth == 0:
+            let before = self.serial
             try self.remember_state(name)
+            self.edit_captured = self.serial != before
         self.edit_depth += 1
 
     pub mutating func end_edit():

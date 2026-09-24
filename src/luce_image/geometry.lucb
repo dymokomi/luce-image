@@ -42,13 +42,14 @@ pub func resize_canvas(document: Document*, width: u32, height: u32, offset_x: i
     try rebuild_layers(document.device(), document.layers(), width, height, 1.0, 1.0, (f64)offset_x, (f64)offset_y, false)
     try document.set_extent(width, height)
 
-## Resample the whole image to `width` by `height`.
-pub func resize_image(document: Document*, width: u32, height: u32) -> !:
+## Resample the whole image to `width` by `height`, smoothly (bilinear) or
+## to the nearest pixel.
+pub func resize_image(document: Document*, width: u32, height: u32, smooth: bool = true) -> !:
     if width == 0 or height == 0 or width > 65536 or height > 65536:
         error(invalid, "image dimensions must be in 1..65536")
     let scale_x = (f64)width / (f64)document.width()
     let scale_y = (f64)height / (f64)document.height()
-    try rebuild_layers(document.device(), document.layers(), width, height, scale_x, scale_y, 0.0, 0.0, true)
+    try rebuild_layers(document.device(), document.layers(), width, height, scale_x, scale_y, 0.0, 0.0, smooth)
     try document.set_extent(width, height)
 
 test "canvas and image resizing keep pixels in place, scale them, and keep what the canvas no longer reaches":

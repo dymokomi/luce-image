@@ -925,3 +925,30 @@ test "a transform session moves several layers live, distorts, floats a selectio
     assert(canvas.selected_at(9, 32) == 255 and canvas.selected_at(9, 12) == 0)
     try canvas.undo()
     assert((try shown_at(&canvas, &target, 9, 12))[0] == 255 and canvas.selected_at(9, 12) == 255)
+
+test "trim finds the picture's box by transparency or a corner's color":
+    var canvas = try Canvas(40, 30)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try canvas.select_rectangle(10, 5, 8, 6)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    assert((try canvas.measure_trim(0)) and canvas.content_left() == 10 and canvas.content_top() == 5 and canvas.content_width() == 8 and canvas.content_height() == 6)
+    # By the top-left color (transparent here) the same box; nothing when all is alike.
+    assert((try canvas.measure_trim(1)) and canvas.content_width() == 8)
+    try canvas.resize_canvas(canvas.content_width(), canvas.content_height(), -canvas.content_left(), -canvas.content_top())
+    assert(canvas.width() == 8 and not (try canvas.measure_trim(2)))
+    try canvas.resize_image(16, 12, false)
+    assert(canvas.width() == 16 and canvas.height() == 12)
+    # Pixels changed inside an edit are part of its one step.
+    try canvas.begin_edit("Size and Fill")
+    try canvas.resize_canvas(20, 12, 0, 0)
+    try canvas.fill(layer, true)
+    canvas.end_edit()
+    assert(canvas.undo_name() == "Size and Fill")
+    try canvas.undo()
+    assert(canvas.width() == 16 and canvas.undo_name() == "Image Size")
