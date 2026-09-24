@@ -25,7 +25,11 @@ struct Entry:
 ## A styled layer's rendered effects, kept while its pixels and style stand.
 struct Effects:
     var key: u64
+    ## Drawn under the layer's pixels; and, when the style changes the layer's
+    ## own colors, the layer as it then is, drawn instead of its pixels.
     var tiles: Tiles
+    var over: Tiles
+    var has_over: bool
     var used: u64
     var live: bool
 
@@ -84,7 +88,7 @@ pub struct Composer:
         errdefer mix.destroy()
         var effects: Effects[8]
         for index in 0..<effects_budget:
-            effects[index] = Effects(key = 0, tiles = Tiles(), used = 0, live = false)
+            effects[index] = Effects(key = 0, tiles = Tiles(), over = Tiles(), has_over = false, used = 0, live = false)
         return Composer(owner = device, entries = entries, count = 0, budget = budget, tick = 0, shader = shader, pipeline = pipeline, blank = blank, white = white, styler = styler,
                         adjuster = adjuster, mix_shader = mix_shader, mix = mix, effects = effects, renders = 0)
 
@@ -179,13 +183,18 @@ pub struct Composer:
             if let mask_tiles = layer.active_mask():
                 if let mask_texture = mask_tiles.texture(column, row):
                     mask = mask_texture
-            # The layer's effects go under it, with its opacity and mask, blended normally.
+            # The layer's effects go under it, with its opacity and mask, blended
+            # normally; those inside it (overlay, inner shadow, an inside stroke)
+            # come as the layer itself, recolored.
+            var texture = tiles.texture(column, row)
             if layer.style.any():
                 let effects = try self.effects_for(layer)
-                if let effect = effects.texture(column, row):
+                if let effect = effects.tiles.texture(column, row):
                     try self.pass(backdrop, owned, effect, mask, clip, area, effective, 0)
-            let texture = tiles.texture(column, row) else continue
-            try self.pass(backdrop, owned, texture, mask, clip, area, effective, layer.blend)
+                if effects.has_over:
+                    texture = effects.over.texture(column, row)
+            let drawn = texture else continue
+            try self.pass(backdrop, owned, drawn, mask, clip, area, effective, layer.blend)
 
     ## One layer (or effects) tile composited over the backdrop so far.
     mutating func pass(backdrop: gpu.Texture*, owned: bool*, texture: gpu.Texture, mask: gpu.Texture, clip: gpu.Texture, area: gpu.Region, opacity: f64, blend: u32) -> !:
@@ -222,7 +231,7 @@ pub struct Composer:
         *backdrop = fresh
 
     ## The effects tiles for a styled layer, rendered once per pixels-and-style state.
-    mutating func effects_for(layer: const Layer*) -> const Tiles*!:
+    mutating func effects_for(layer: const Layer*) -> const Effects*!:
         var key = fnv_start()
         key = fnv_mix(key, layer.id)
         key = fnv_mix(key, layer.revision)
@@ -230,7 +239,7 @@ pub struct Composer:
         for index in 0..<effects_budget:
             if self.effects[index].live and self.effects[index].key == key:
                 self.effects[index].used = self.tick
-                return &self.effects[index].tiles
+                return &self.effects[index]
         var rendered = try self.styler.render(layer)
         errdefer rendered.destroy()
         var slot: usize = 0
@@ -240,9 +249,9 @@ pub struct Composer:
             elif self.effects[index].live == self.effects[slot].live and self.effects[index].used < self.effects[slot].used:
                 slot = index
         if self.effects[slot].live:
-            self.effects[slot].tiles.destroy()
-        self.effects[slot] = Effects(key = key, tiles = rendered, used = self.tick, live = true)
-        return &self.effects[slot].tiles
+            drop_effects(&self.effects[slot])
+        self.effects[slot] = Effects(key = key, tiles = rendered.under, over = rendered.over, has_over = rendered.has_over, used = self.tick, live = true)
+        return &self.effects[slot]
 
     ## A coarser tile: the four tiles of the level below, each drawn at half size.
     mutating func halve(document: const Document*, column: u32, row: u32, level: u32) -> gpu.Texture!:
@@ -332,7 +341,7 @@ pub struct Composer:
         self.count = 0
         for index in 0..<effects_budget:
             if self.effects[index].live:
-                self.effects[index].tiles.destroy()
+                drop_effects(&self.effects[index])
                 self.effects[index].live = false
 
     pub mutating func destroy():
@@ -387,7 +396,8 @@ func hash_layers(seed: u64, layers: Layer*[], opacity: f64, first_column: u32, f
             for column in first_column..<min_u32(first_column + span, tiles.columns()):
                 if tiles.tile(column, row) != none:
                     touches = true
-        if not touches:
+        # A style's effects can reach cells the layer has no pixels in (a shadow, a glow).
+        if not touches and not layer.style.any():
             continue
         digest = fnv_mix(digest, layer.id)
         digest = fnv_mix(digest, layer.revision)
@@ -397,6 +407,12 @@ func hash_layers(seed: u64, layers: Layer*[], opacity: f64, first_column: u32, f
         if layer.style.any():
             digest = fnv_mix(digest, layer.style.digest())
     return digest
+
+func drop_effects(effects: Effects*):
+    effects.tiles.destroy()
+    if effects.has_over:
+        effects.over.destroy()
+    effects.has_over = false
 
 func drop_owned(texture: gpu.Texture*, owned: bool):
     if owned:

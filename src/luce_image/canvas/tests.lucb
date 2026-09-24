@@ -288,12 +288,14 @@ test "previews show edits on the original pixels and end kept or dropped":
     try canvas.undo()
     assert((try shown_centre(&canvas, &target, pixels)) == base)
     # A white glow lights the transparent surround of the dot; off again, it is dark.
-    try canvas.set_glow(layer, true, 6.0, 1.0, 1.0, 1.0, 1.0)
+    try canvas.set_style_value(layer, 14, 1.0)
+    try canvas.set_style_value(layer, 15, 6.0)
+    try canvas.set_style_value(layer, 19, 1.0)
     assert(try canvas.layer_styled(0))
     discard(try shown_centre(&canvas, &target, pixels))
     # The 40-pixel dot leaves only the corners bare; the glow reaches them.
     let lit = pixels[0]
-    try canvas.set_glow(layer, false, 6.0, 1.0, 1.0, 1.0, 1.0)
+    try canvas.set_style_value(layer, 14, 0.0)
     discard(try shown_centre(&canvas, &target, pixels))
     assert(lit > 20 and pixels[0] == 0 and not (try canvas.layer_styled(0)))
     # A previewed transform is shown, then cancelled back to the original.

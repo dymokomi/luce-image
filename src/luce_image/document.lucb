@@ -13,9 +13,13 @@ from raster_errors import invalid, limit
 
 pub let blend_mode_count: u32 = 26
 
-## A layer's styles, Photoshop's layer effects drawn under its pixels by the
-## compositor and kept with the layer; none is on by default. Colors are
-## linear light, 0..1; sizes and offsets in document pixels.
+## A layer's styles, Photoshop's layer effects, kept with the layer; none is
+## on by default. Drop shadow, outer glow and the stroke outside the edge are
+## drawn under the layer's pixels; color overlay, inner shadow and the stroke
+## inside the edge change the layer's own colors (its alpha kept), in
+## Photoshop's order: overlay, inner shadow, stroke on top. Colors are linear
+## light, 0..1; sizes and offsets in document pixels. Every setting is also a
+## numbered field (`field`, `set_field`, `style_field_names`).
 pub struct Style:
     pub var shadow: bool = false
     pub var shadow_dx: f64 = 4.0
@@ -37,20 +41,158 @@ pub struct Style:
     pub var glow_green: f64 = 1.0
     pub var glow_blue: f64 = 1.0
     pub var glow_opacity: f64 = 0.75
+    ## Where the stroke runs: 0 outside the edge, 1 centered on it, 2 inside.
+    pub var stroke_position: f64 = 0.0
+    pub var overlay: bool = false
+    pub var overlay_red: f64 = 1.0
+    pub var overlay_green: f64 = 0.0
+    pub var overlay_blue: f64 = 0.0
+    pub var overlay_opacity: f64 = 1.0
+    pub var inner: bool = false
+    pub var inner_dx: f64 = 4.0
+    pub var inner_dy: f64 = 4.0
+    pub var inner_blur: f64 = 5.0
+    pub var inner_red: f64 = 0.0
+    pub var inner_green: f64 = 0.0
+    pub var inner_blue: f64 = 0.0
+    pub var inner_opacity: f64 = 0.75
 
     ## Whether any effect is on.
     pub func any() -> bool:
-        return self.shadow or self.stroke or self.glow
+        return self.shadow or self.stroke or self.glow or self.overlay or self.inner
+
+    ## Whether an effect goes under the layer's pixels.
+    pub func under() -> bool:
+        return self.shadow or self.glow or (self.stroke and self.stroke_position < 1.5)
+
+    ## Whether an effect changes the layer's own colors.
+    pub func over() -> bool:
+        return self.overlay or self.inner or (self.stroke and self.stroke_position > 0.5)
 
     ## A digest of every setting, for caches.
     pub func digest() -> u64:
         var mixed = fnv_start()
-        for value in [self.shadow_dx, self.shadow_dy, self.shadow_blur, self.shadow_red, self.shadow_green, self.shadow_blue, self.shadow_opacity,
-                      self.stroke_size, self.stroke_red, self.stroke_green, self.stroke_blue, self.stroke_opacity,
-                      self.glow_size, self.glow_red, self.glow_green, self.glow_blue, self.glow_opacity]:
-            mixed = fnv_mix(mixed, value.bits())
-        let flags: u64 = (1 if self.shadow else 0) | (2 if self.stroke else 0) | (4 if self.glow else 0)
-        return fnv_mix(mixed, flags)
+        var index: i64 = 0
+        while index < style_field_count:
+            mixed = fnv_mix(mixed, (self.field(index) else 0.0).bits())
+            index += 1
+        return mixed
+
+    ## Setting `index` (see `style_field_names`) as a number; switches are 0 or 1.
+    pub func field(index: i64) -> f64?:
+        if index == 0: return 1.0 if self.shadow else 0.0
+        if index == 1: return self.shadow_dx
+        if index == 2: return self.shadow_dy
+        if index == 3: return self.shadow_blur
+        if index == 4: return self.shadow_red
+        if index == 5: return self.shadow_green
+        if index == 6: return self.shadow_blue
+        if index == 7: return self.shadow_opacity
+        if index == 8: return 1.0 if self.stroke else 0.0
+        if index == 9: return self.stroke_size
+        if index == 10: return self.stroke_red
+        if index == 11: return self.stroke_green
+        if index == 12: return self.stroke_blue
+        if index == 13: return self.stroke_opacity
+        if index == 14: return 1.0 if self.glow else 0.0
+        if index == 15: return self.glow_size
+        if index == 16: return self.glow_red
+        if index == 17: return self.glow_green
+        if index == 18: return self.glow_blue
+        if index == 19: return self.glow_opacity
+        if index == 20: return self.stroke_position
+        if index == 21: return 1.0 if self.overlay else 0.0
+        if index == 22: return self.overlay_red
+        if index == 23: return self.overlay_green
+        if index == 24: return self.overlay_blue
+        if index == 25: return self.overlay_opacity
+        if index == 26: return 1.0 if self.inner else 0.0
+        if index == 27: return self.inner_dx
+        if index == 28: return self.inner_dy
+        if index == 29: return self.inner_blur
+        if index == 30: return self.inner_red
+        if index == 31: return self.inner_green
+        if index == 32: return self.inner_blue
+        if index == 33: return self.inner_opacity
+        return none
+
+    ## Set setting `index` from a number, checked: switches take non-zero as
+    ## on, colors and opacities 0..1, sizes and blurs 0..250, offsets -1000..1000.
+    pub mutating func set_field(index: i64, value: f64) -> !:
+        if not math.is_finite(value):
+            error(invalid, "style settings must be finite")
+        let kind = field_kind(index)
+        if kind == 0:
+            error(invalid, "style fields are 0..33")
+        if kind == 2 and (value < 0.0 or value > 1.0):
+            error(invalid, "style colors and opacities are 0..1")
+        if kind == 3 and (value < 0.0 or value > 250.0):
+            error(invalid, "style sizes are 0..250 pixels")
+        if kind == 4 and (value < -1000.0 or value > 1000.0):
+            error(invalid, "style offsets are -1000..1000 pixels")
+        if kind == 5 and value != 0.0 and value != 1.0 and value != 2.0:
+            error(invalid, "a stroke runs outside (0), centered (1) or inside (2)")
+        let on = value != 0.0
+        if index == 0: self.shadow = on
+        elif index == 1: self.shadow_dx = value
+        elif index == 2: self.shadow_dy = value
+        elif index == 3: self.shadow_blur = value
+        elif index == 4: self.shadow_red = value
+        elif index == 5: self.shadow_green = value
+        elif index == 6: self.shadow_blue = value
+        elif index == 7: self.shadow_opacity = value
+        elif index == 8: self.stroke = on
+        elif index == 9: self.stroke_size = value
+        elif index == 10: self.stroke_red = value
+        elif index == 11: self.stroke_green = value
+        elif index == 12: self.stroke_blue = value
+        elif index == 13: self.stroke_opacity = value
+        elif index == 14: self.glow = on
+        elif index == 15: self.glow_size = value
+        elif index == 16: self.glow_red = value
+        elif index == 17: self.glow_green = value
+        elif index == 18: self.glow_blue = value
+        elif index == 19: self.glow_opacity = value
+        elif index == 20: self.stroke_position = value
+        elif index == 21: self.overlay = on
+        elif index == 22: self.overlay_red = value
+        elif index == 23: self.overlay_green = value
+        elif index == 24: self.overlay_blue = value
+        elif index == 25: self.overlay_opacity = value
+        elif index == 26: self.inner = on
+        elif index == 27: self.inner_dx = value
+        elif index == 28: self.inner_dy = value
+        elif index == 29: self.inner_blur = value
+        elif index == 30: self.inner_red = value
+        elif index == 31: self.inner_green = value
+        elif index == 32: self.inner_blue = value
+        else: self.inner_opacity = value
+
+## How many numbered style settings there are.
+pub let style_field_count: i64 = 34
+
+## The settings' names, in field order, as documents keep them.
+pub func style_field_names() -> str[34]:
+    return ["shadow", "shadow_dx", "shadow_dy", "shadow_blur", "shadow_red", "shadow_green", "shadow_blue", "shadow_opacity",
+            "stroke", "stroke_size", "stroke_red", "stroke_green", "stroke_blue", "stroke_opacity",
+            "glow", "glow_size", "glow_red", "glow_green", "glow_blue", "glow_opacity", "stroke_position",
+            "overlay", "overlay_red", "overlay_green", "overlay_blue", "overlay_opacity",
+            "inner", "inner_dx", "inner_dy", "inner_blur", "inner_red", "inner_green", "inner_blue", "inner_opacity"]
+
+## What a field holds: 1 a switch, 2 a color or opacity, 3 a size, 4 an
+## offset, 5 the stroke's position; 0 no such field.
+func field_kind(index: i64) -> i64:
+    if index == 0 or index == 8 or index == 14 or index == 21 or index == 26:
+        return 1
+    if index == 1 or index == 2 or index == 27 or index == 28:
+        return 4
+    if index == 3 or index == 9 or index == 15 or index == 29:
+        return 3
+    if index == 20:
+        return 5
+    if index > 0 and index < style_field_count:
+        return 2
+    return 0
 
 pub struct Layer:
     pub var id: u64

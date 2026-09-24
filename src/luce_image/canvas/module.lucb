@@ -40,7 +40,7 @@ from luce_image.image import Image, Pixel
 from luce_image.tiles import Tiles, Bounds, tile_size, tile_columns, min_u32, flatten
 from luce_image.heal import heal
 from luce_image.warp import WarpStroke, warp_smudge, warp_push
-from luce_image.document import Style, Document, Layer, box_document, unbox_document, blend_mode_count
+from luce_image.document import Style, Document, Layer, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
 from luce_image.composite import Composer, box_composer, unbox_composer
 from luce_image.brush import Brush, Painter, Stroke, begin_boxed, finish_boxed, fill_selection, fill_gradient
 from luce_image.adjust import Adjuster, adjustment_count, parameter_count, curves
@@ -874,63 +874,38 @@ pub struct Canvas:
             try document.set_clipped((u64)id, clipped)
         self.records[index].clipped = clipped
 
-    ## Layer styles, drawn under the layer by the compositor and kept with the
-    ## document. Colors are linear 0..1; sizes and offsets in pixels.
-    pub mutating func set_shadow(id: i64, on: bool, dx: f64, dy: f64, blur: f64, red: f64, green: f64, blue: f64, opacity: f64) -> !:
+    ## Set one of layer `id`'s style settings, by field (`style_value` lists
+    ## them); the compositor draws the effects and the document keeps them.
+    pub mutating func set_style_value(id: i64, field: i64, value: f64) -> !:
         var style = try self.style_of(id)
-        style.shadow = on
-        style.shadow_dx = dx
-        style.shadow_dy = dy
-        style.shadow_blur = blur
-        style.shadow_red = red
-        style.shadow_green = green
-        style.shadow_blue = blue
-        style.shadow_opacity = opacity
-        try self.set_style(id, style)
-
-    pub mutating func set_stroke(id: i64, on: bool, size: f64, red: f64, green: f64, blue: f64, opacity: f64) -> !:
-        var style = try self.style_of(id)
-        style.stroke = on
-        style.stroke_size = size
-        style.stroke_red = red
-        style.stroke_green = green
-        style.stroke_blue = blue
-        style.stroke_opacity = opacity
-        try self.set_style(id, style)
-
-    pub mutating func set_glow(id: i64, on: bool, size: f64, red: f64, green: f64, blue: f64, opacity: f64) -> !:
-        var style = try self.style_of(id)
-        style.glow = on
-        style.glow_size = size
-        style.glow_red = red
-        style.glow_green = green
-        style.glow_blue = blue
-        style.glow_opacity = opacity
+        try style.set_field(field, value)
         try self.set_style(id, style)
 
     ## Whether the layer at `index` has any style on.
     pub func layer_styled(index: i64) -> bool!:
         return (try self.record(index)).style.any()
 
-    ## One style setting of the layer at `index`, by field: 0 shadow on, 1 dx,
-    ## 2 dy, 3 blur, 4..6 color, 7 opacity; 8 stroke on, 9 size, 10..12
-    ## color, 13 opacity; 14 glow on, 15 size, 16..18 color, 19 opacity.
+    ## One style setting of the layer at `index`, by field: 0 drop shadow on,
+    ## 1 dx, 2 dy, 3 blur, 4..6 color, 7 opacity; 8 stroke on, 9 size, 10..12
+    ## color, 13 opacity; 14 outer glow on, 15 size, 16..18 color, 19 opacity;
+    ## 20 stroke position (0 outside, 1 centered, 2 inside); 21 color overlay
+    ## on, 22..24 color, 25 opacity; 26 inner shadow on, 27 dx, 28 dy, 29 blur,
+    ## 30..32 color, 33 opacity. Colors are linear 0..1; sizes in pixels.
     pub func style_value(index: i64, field: i64) -> f64!:
         let style = (try self.record(index)).style
-        return style_field(style, field) else error(invalid, "style fields are 0..19")
+        return style.field(field) else error(invalid, "style fields are 0..33")
+
+    ## How many style fields there are.
+    pub static func style_field_count() -> i64:
+        return style_field_count
 
     func style_of(id: i64) -> Style!:
         try self.require_open()
         let index = try self.index((u64)id)
         return self.records[index].style
 
+    ## Every field was checked as it was set (`Style.set_field`).
     mutating func set_style(id: i64, style: Style) -> !:
-        for value in [style.shadow_dx, style.shadow_dy, style.shadow_blur, style.shadow_opacity, style.stroke_size, style.stroke_opacity, style.glow_size, style.glow_opacity,
-                      style.shadow_red, style.shadow_green, style.shadow_blue, style.stroke_red, style.stroke_green, style.stroke_blue, style.glow_red, style.glow_green, style.glow_blue]:
-            if not math.is_finite(value):
-                error(invalid, "style settings must be finite")
-        if style.shadow_blur < 0.0 or style.shadow_blur > 250.0 or style.stroke_size < 0.0 or style.stroke_size > 250.0 or style.glow_size < 0.0 or style.glow_size > 250.0:
-            error(invalid, "style sizes are 0..250 pixels")
         let index = try self.index((u64)id)
         if let document = self.document:
             (document.find((u64)id) else error(invalid, "no such layer")).style = style
@@ -1250,7 +1225,7 @@ pub struct Canvas:
     ## Lay a linear gradient over layer `id` from one color at (`x0`, `y0`) to
     ## another at (`x1`, `y1`), straight alpha in linear light, inside the
     ## selection. Undoable.
-    pub mutating func fill_gradient(id: i64, x0: f64, y0: f64, x1: f64, y1: f64, r0: f64, g0: f64, b0: f64, a0: f64, r1: f64, g1: f64, b1: f64, a1: f64) -> !:
+    pub mutating func fill_gradient(id: i64, x0: f64, y0: f64, x1: f64, y1: f64, r0: f64, g0: f64, b0: f64, a0: f64, r1: f64, g1: f64, b1: f64, a1: f64, radial: bool = false) -> !:
         try self.require_open()
         try self.require_idle()
         let document = self.document else error(invalid, "draw the document once before filling")
@@ -1261,7 +1236,7 @@ pub struct Canvas:
         try gpu_check_color(to_color)
         if a0 < 0.0 or a0 > 1.0 or a1 < 0.0 or a1 > 1.0:
             error(invalid, "gradient alphas must be in 0..1")
-        var before = try fill_gradient(&painter, document, (u64)id, x0, y0, x1, y1, from_color, to_color)
+        var before = try fill_gradient(&painter, document, (u64)id, x0, y0, x1, y1, from_color, to_color, radial)
         errdefer before.destroy()
         try self.remember((u64)id, before)
 

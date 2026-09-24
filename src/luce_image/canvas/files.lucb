@@ -93,10 +93,11 @@ func save_canvas_package(canvas: Canvas*, path: str) -> !:
                 defer number.release()
                 try manifest.value().set(element, try format_file(key_buffer, "a", parameter, ""), number)
         if record.style.any():
-            for field in 0..<(i64)20:
-                let number = try prism.Value.number(style_field(record.style, field) else trap("style field"))
+            let names = style_field_names()
+            for field in 0..<style_field_count:
+                let number = try prism.Value.number(record.style.field(field) else trap("style field"))
                 defer number.release()
-                try manifest.value().set(element, style_names[(usize)field], number)
+                try manifest.value().set(element, names[(usize)field], number)
         let layer = document.find(record.id) else error(invalid, "a layer is missing")
         if record.group or record.adjustment >= 0:
             # No picture; an adjustment layer's mask still has one.
@@ -196,35 +197,6 @@ func ends_with(text: str, suffix: str) -> bool:
     if text.length < suffix.length:
         return false
     return (str)text.bytes[text.length - suffix.length..] == suffix
-
-## The `.l2d` names of the style fields, in `style_value` order.
-let style_names: str[20] = ["shadow", "shadow_dx", "shadow_dy", "shadow_blur", "shadow_red", "shadow_green", "shadow_blue", "shadow_opacity",
-                            "stroke", "stroke_size", "stroke_red", "stroke_green", "stroke_blue", "stroke_opacity",
-                            "glow", "glow_size", "glow_red", "glow_green", "glow_blue", "glow_opacity"]
-
-## Style field `field` (see `style_names`) of `style`, or none past the end.
-func style_field(style: Style, field: i64) -> f64?:
-    if field == 0: return 1.0 if style.shadow else 0.0
-    if field == 1: return style.shadow_dx
-    if field == 2: return style.shadow_dy
-    if field == 3: return style.shadow_blur
-    if field == 4: return style.shadow_red
-    if field == 5: return style.shadow_green
-    if field == 6: return style.shadow_blue
-    if field == 7: return style.shadow_opacity
-    if field == 8: return 1.0 if style.stroke else 0.0
-    if field == 9: return style.stroke_size
-    if field == 10: return style.stroke_red
-    if field == 11: return style.stroke_green
-    if field == 12: return style.stroke_blue
-    if field == 13: return style.stroke_opacity
-    if field == 14: return 1.0 if style.glow else 0.0
-    if field == 15: return style.glow_size
-    if field == 16: return style.glow_red
-    if field == 17: return style.glow_green
-    if field == 18: return style.glow_blue
-    if field == 19: return style.glow_opacity
-    return none
 
 ## Manifest helpers: an integer or number at `path`.`name`.
 func set_integer(doc: prism.Document*, path: str, name: str, value: i64) -> !:
@@ -344,12 +316,12 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
             discard(failure)
             recover -1.0
         if styled >= 0.0:
-            var values: f64[20]
-            for field in 0..<(usize)20:
-                values[field] = try get_number(doc, element, style_names[field])
-            try native.set_shadow(id, values[0] != 0.0, values[1], values[2], values[3], values[4], values[5], values[6], values[7])
-            try native.set_stroke(id, values[8] != 0.0, values[9], values[10], values[11], values[12], values[13])
-            try native.set_glow(id, values[14] != 0.0, values[15], values[16], values[17], values[18], values[19])
+            let names = style_field_names()
+            for field in 0..<style_field_count:
+                # A field a document does not have keeps its default.
+                let value = get_number(doc, element, names[(usize)field]) catch _:
+                    continue
+                try native.set_style_value(id, field, value)
         var file_buffer: u8[64]
         if not group and adjustment < 0:
             let picture = try Image.open(try paths.join(layers_dir, try format_file(file_buffer, "layer", index, ".png")))
