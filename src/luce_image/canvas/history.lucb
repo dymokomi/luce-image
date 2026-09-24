@@ -2,16 +2,45 @@
 #
 #   canvas/history - The undo and redo snapshots
 #
+#   DESCRIPTION:
+#       Two kinds of snapshot, one stack. A pixel snapshot holds one layer's pixels (or its
+#       mask's) from before an edit: strokes, fills, filters. A state snapshot holds the whole
+#       document from before a change to what it is made of: the layer tree (sharing tiles),
+#       the layers' records, the extent and the selection. Undo and redo swap a snapshot with
+#       the document, so neither copies anything. Every snapshot names its step.
+#
 #==============================================================================================
 
+## The document as a state snapshot keeps it: the tree, extent and selection,
+## and the layers' records beside them.
+struct DocumentState:
+    var tree: TreeState
+    var records: Record[]
+    var count: usize
+    var next_id: u64
+
 ## A layer's pixels (or its mask's) at one moment, shared with whatever else
-## holds them. A joined snapshot belongs to the same edit as the one before it:
-## undo and redo take them together.
+## holds them, or the whole document (`state`). A joined snapshot belongs to
+## the same edit as the one before it: undo and redo take them together.
+## `name` is the step's, as the Edit menu says it; `layer` also tells which
+## layer a state snapshot's change was on, so repeated changes to it coalesce.
 struct Snapshot:
     var layer: u64
     var tiles: Tiles
     var mask: bool
     var joined: bool = false
+    var state: DocumentState*? = none
+    var name: str = "Edit"
+
+## Free what a snapshot holds.
+func drop_snapshot(entry: Snapshot*):
+    if let state = entry.state:
+        state.tree.destroy()
+        release_records(state.records, state.count)
+        free(state) in memory.heap
+        entry.state = none
+    else:
+        entry.tiles.destroy()
 
 ## Append `entry` to a snapshot list, growing it.
 func push(list: Snapshot[]*, count: usize*, entry: Snapshot) -> !:
@@ -29,5 +58,27 @@ func push(list: Snapshot[]*, count: usize*, entry: Snapshot) -> !:
 ## Destroy every snapshot in a list and empty it.
 func clear_snapshots(list: Snapshot[]*, count: usize*):
     for index in 0..<*count:
-        (*list)[index].tiles.destroy()
+        drop_snapshot(&(*list)[index])
     *count = 0
+
+## A copy of the first `count` records, names and all, for a state snapshot
+## (pictures waiting to be bound are not kept: a bound document has none).
+func copy_records(records: const Record[], count: usize) -> Record[]!:
+    let copies = try alloc Record[count if count > 0 else 1] in memory.heap
+    for index in 0..<count:
+        var name: str = ""
+        with memory.heap:
+            name = strings.copy(records[index].name) catch failure:
+                release_records(copies, index)
+                error(failure.code, failure.message)
+        copies[index] = records[index]
+        copies[index].name = name
+        copies[index].picture = none
+        copies[index].mask_picture = none
+    return copies
+
+## Free a records copy and the first `count` names in it.
+func release_records(records: Record[], count: usize):
+    for index in 0..<count:
+        strings.release(records[index].name)
+    free(records) in memory.heap

@@ -40,7 +40,7 @@ from luce_image.image import Image, Pixel
 from luce_image.tiles import Tiles, Bounds, tile_size, tile_columns, min_u32, flatten
 from luce_image.heal import heal
 from luce_image.warp import WarpStroke, warp_smudge, warp_push
-from luce_image.document import Style, Document, Layer, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
+from luce_image.document import Style, Document, Layer, TreeState, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
 from luce_image.composite import Composer, box_composer, unbox_composer
 from luce_image.brush import Brush, Painter, Stroke, begin_boxed, finish_boxed, fill_selection, fill_gradient
 from luce_image.adjust import Adjuster, adjustment_count, parameter_count, curves
@@ -138,6 +138,10 @@ pub struct Canvas:
     var warp: WarpStroke*?
     var warped: u64
     var heal_opacity: f64
+    ## Inside `begin_edit`: changes record nothing more, the edit's first snapshot covers them.
+    var edit_depth: i64
+    ## What a kept preview is called in the history.
+    var preview_name: str
     ## What `measure_histogram` counted: luminosity, red, green and blue, 256
     ## bins each of the encoded values.
     var histogram_counts: u64[1024]
@@ -200,6 +204,8 @@ pub struct Canvas:
         self.warp = none
         self.warped = 0
         self.heal_opacity = 1.0
+        self.edit_depth = 0
+        self.preview_name = "Adjustment"
         var no_values: f64[23]
         self.adjustment = no_values
         var no_counts: u64[1024]
@@ -398,10 +404,12 @@ pub struct Canvas:
 
     ## Add a transparent layer on top; returns its id.
     pub mutating func add_layer(name: str) -> i64!:
+        try self.remember_state("New Layer")
         return try self.add_record(name, false, -1)
 
     ## Add an empty group on top; returns its id. Layers go in with `move_into`.
     pub mutating func add_group(name: str) -> i64!:
+        try self.remember_state("New Group")
         return try self.add_record(name, true, -1)
 
     ## Add an adjustment layer of `kind` on top, with the staged parameters
@@ -410,6 +418,7 @@ pub struct Canvas:
     ## clipped — the non-destructive twin of `adjust_layer`. Any kind but
     ## curves.
     pub mutating func add_adjustment_layer(name: str, kind: i64) -> i64!:
+        try self.remember_state("New Adjustment Layer")
         if kind < 0 or kind >= (i64)adjustment_count or kind == (i64)curves:
             error(invalid, "no such adjustment for a layer")
         return try self.add_record(name, false, kind)
@@ -417,6 +426,7 @@ pub struct Canvas:
     ## Give adjustment layer `id` the staged parameters: editing it, live.
     pub mutating func update_adjustment_layer(id: i64) -> !:
         try self.require_open()
+        try self.remember_state("Adjustment Layer", (u64)id)
         let index = try self.index((u64)id)
         let kind = self.records[index].adjustment
         if kind < 0:
@@ -473,6 +483,7 @@ pub struct Canvas:
     ## the records have it.
     pub mutating func move_into(id: i64, parent: i64, position: i64) -> !:
         try self.require_open()
+        try self.remember_state("Move Layer")
         let index = try self.index((u64)id)
         if parent != 0:
             let holder = try self.index((u64)parent)
@@ -548,6 +559,7 @@ pub struct Canvas:
 
     pub mutating func remove_layer(id: i64) -> !:
         try self.require_open()
+        try self.remember_state("Delete Layer")
         let index = try self.index((u64)id)
         if let document = self.document:
             try document.remove((u64)id)
@@ -575,6 +587,7 @@ pub struct Canvas:
     ## `blend_mode_name` lists them).
     pub mutating func set_layer(id: i64, visible: bool, opacity: f64, blend: i64 = 0) -> !:
         try self.require_open()
+        try self.remember_state("Layer Properties", (u64)id)
         if not math.is_finite(opacity) or opacity < 0.0 or opacity > 1.0:
             error(invalid, "opacity must be in 0..1")
         if blend < 0 or blend >= (i64)blend_mode_count:
@@ -592,6 +605,7 @@ pub struct Canvas:
     ## Move a layer one step up (1) or down (-1) in the stack.
     pub mutating func reorder_layer(id: i64, step: i64) -> !:
         try self.require_open()
+        try self.remember_state("Move Layer")
         let index = try self.index((u64)id)
         let target = (i64)index + step
         if target < 0 or target >= (i64)self.count:
@@ -609,6 +623,8 @@ pub struct Canvas:
     pub mutating func duplicate_layer(id: i64, name: str) -> i64!:
         try self.require_open()
         try self.require_idle()
+        try self.begin_edit("Duplicate Layer")
+        defer self.end_edit()
         let index = try self.index((u64)id)
         let created = try self.add_layer(name)
         let copy = try self.index((u64)created)
@@ -642,6 +658,7 @@ pub struct Canvas:
     pub mutating func merge_down(id: i64) -> !:
         try self.require_open()
         try self.require_idle()
+        try self.remember_state("Merge Down")
         let document = self.document else error(invalid, "draw the document once before merging")
         let composer = self.composer else error(invalid, "draw the document once before merging")
         let index = try self.index((u64)id)
@@ -657,12 +674,11 @@ pub struct Canvas:
             self.records[shift] = self.records[shift + 1]
         self.count -= 1
         try self.sync_records()
-        clear_snapshots(&self.history, &self.history_count)
-        clear_snapshots(&self.future, &self.future_count)
 
     ## Give layer `id` a new name.
     pub mutating func rename_layer(id: i64, name: str) -> !:
         try self.require_open()
+        try self.remember_state("Rename Layer")
         if name.length == 0 or name.length > 256:
             error(invalid, "a layer name is 1..256 bytes")
         let index = try self.index((u64)id)
@@ -732,8 +748,6 @@ pub struct Canvas:
         var replacement = try Selection.create(width, height)
         self.selection.destroy()
         self.selection = replacement
-        clear_snapshots(&self.history, &self.history_count)
-        clear_snapshots(&self.future, &self.future_count)
 
     func index(id: u64) -> usize!:
         for index in 0..<self.count:
@@ -754,6 +768,7 @@ pub struct Canvas:
     pub mutating func set_mask(id: i64, present: bool, fill: i64 = 0) -> !:
         try self.require_open()
         try self.require_idle()
+        try self.remember_state("Layer Mask")
         let index = try self.index((u64)id)
         if self.records[index].group:
             error(invalid, "a group cannot have a mask yet")
@@ -790,6 +805,7 @@ pub struct Canvas:
     ## Disable a layer's mask — kept, hiding nothing — or enable it again.
     pub mutating func enable_mask(id: i64, enabled: bool) -> !:
         try self.require_open()
+        try self.remember_state("Disable Mask")
         let index = try self.index((u64)id)
         if not self.records[index].masked:
             error(invalid, "the layer has no mask")
@@ -805,6 +821,7 @@ pub struct Canvas:
     ## intersect): Photoshop's Cmd-click on a thumbnail.
     pub mutating func select_from_layer(id: i64, mask: bool, mode: i64) -> !:
         try self.require_open()
+        try self.remember_state("Load Selection")
         let document = self.document else error(invalid, "draw the document once before selecting from a layer")
         let layer = document.find((u64)id) else error(invalid, "no such layer")
         let tiles = (layer.mask_tiles() else error(invalid, "the layer has no mask")) if mask else (layer.tiles() else error(invalid, "a group has no pixels to select"))
@@ -869,6 +886,7 @@ pub struct Canvas:
     ## Clip a layer to the nearest unclipped layer below it, or unclip it.
     pub mutating func set_clipped(id: i64, clipped: bool) -> !:
         try self.require_open()
+        try self.remember_state("Clipping Mask")
         let index = try self.index((u64)id)
         if let document = self.document:
             try document.set_clipped((u64)id, clipped)
@@ -877,6 +895,7 @@ pub struct Canvas:
     ## Set one of layer `id`'s style settings, by field (`style_value` lists
     ## them); the compositor draws the effects and the document keeps them.
     pub mutating func set_style_value(id: i64, field: i64, value: f64) -> !:
+        try self.remember_state("Layer Style", (u64)id)
         var style = try self.style_of(id)
         try style.set_field(field, value)
         try self.set_style(id, style)
@@ -920,11 +939,13 @@ pub struct Canvas:
     ## 1 add, 2 subtract, 3 intersect).
     pub mutating func select_rectangle(x: i64, y: i64, width: i64, height: i64, mode: i64 = 0) -> !:
         try self.require_open()
+        try self.remember_state("Select")
         self.live().rectangle(x, y, width, height, try selection_mode(mode))
 
     ## Select an ellipse inscribed in a rectangle, combined by `mode`.
     pub mutating func select_ellipse(x: i64, y: i64, width: i64, height: i64, mode: i64 = 0) -> !:
         try self.require_open()
+        try self.remember_state("Select")
         self.live().ellipse(x, y, width, height, try selection_mode(mode))
 
     ## The magic wand on layer `id`: select the pixels within `tolerance`
@@ -932,6 +953,7 @@ pub struct Canvas:
     ## reachable through such pixels when `contiguous`, combined by `mode`.
     pub mutating func select_wand(id: i64, x: i64, y: i64, tolerance: f64, contiguous: bool, mode: i64 = 0) -> !:
         try self.require_open()
+        try self.remember_state("Magic Wand")
         let document = self.document else error(invalid, "draw the document once before using the wand")
         let layer = document.find((u64)id) else error(invalid, "no such layer")
         let tiles = layer.tiles() else error(invalid, "a group has no pixels to sample")
@@ -964,6 +986,7 @@ pub struct Canvas:
     ## Select the polygon of the collected points, combined by `mode`, and forget them.
     pub mutating func select_polygon(mode: i64 = 0) -> !:
         try self.require_open()
+        try self.remember_state("Lasso")
         if self.polygon_count < 6:
             self.polygon_count = 0
             error(invalid, "a polygon needs at least three points")
@@ -972,19 +995,23 @@ pub struct Canvas:
 
     pub mutating func select_all() -> !:
         try self.require_open()
+        try self.remember_state("Select All")
         self.live().select_all()
 
     pub mutating func deselect() -> !:
         try self.require_open()
+        try self.remember_state("Deselect")
         self.live().clear()
 
     pub mutating func invert_selection() -> !:
         try self.require_open()
+        try self.remember_state("Inverse")
         self.live().invert()
 
     ## Grow (positive) or shrink (negative) the selection and feather its edge.
     pub mutating func adjust_selection(pixels: i64, feather: i64) -> !:
         try self.require_open()
+        try self.remember_state("Modify Selection")
         try self.live().adjust(pixels, feather)
 
     pub func has_selection() -> bool:
@@ -1026,6 +1053,7 @@ pub struct Canvas:
     ## Move the selection's outline by (`dx`, `dy`) pixels, leaving the pixels.
     pub mutating func move_selection(dx: i64, dy: i64) -> !:
         try self.require_open()
+        try self.remember_state("Move Selection", 1)
         try self.live().translate(dx, dy)
 
     ## Move the pixels the selection covers on layer `id` by (`dx`, `dy`), and
@@ -1039,7 +1067,7 @@ pub struct Canvas:
         let document = self.document else error(invalid, "draw the document once before moving pixels")
         let layer = document.find((u64)id) else error(invalid, "no such layer")
         let tiles = layer.tiles() else error(invalid, "a group has no pixels to move")
-        try self.remember((u64)id, try tiles.clone())
+        try self.remember((u64)id, try tiles.clone(), name = "Move")
         try self.lift_selected((u64)id, dx, dy, copy)
         try document.selection.translate(dx, dy)
 
@@ -1047,6 +1075,7 @@ pub struct Canvas:
     ## previewed, from its pixels when the preview began; `end_preview` keeps
     ## or drops the move, and `move_selection` then moves the outline to match.
     pub mutating func preview_move_selected(dx: i64, dy: i64, copy: bool) -> !:
+        self.preview_name = "Move"
         let layer = try self.restore_preview()
         try self.lift_selected(layer, dx, dy, copy)
 
@@ -1083,7 +1112,7 @@ pub struct Canvas:
         var brush = self.brush
         brush.erase = erase
         let before = try fill_selection(&painter, document, (u64)layer, brush, on_mask)
-        try self.remember((u64)layer, before, on_mask)
+        try self.remember((u64)layer, before, on_mask, name = "Fill")
 
     ## Set the brush every following stroke paints with: its size, edge, color
     ## and strength. The tip shape, dynamics and texture set separately stay.
@@ -1160,7 +1189,7 @@ pub struct Canvas:
         let on_mask = self.mask_editing and self.records[index].masked
         let stroke = try begin_boxed(&painter, document, (u64)layer, self.brush, x, y, on_mask, pressure)
         errdefer finish_boxed(stroke)
-        try self.remember((u64)layer, try stroke.original().clone(), on_mask)
+        try self.remember((u64)layer, try stroke.original().clone(), on_mask, name = "Eraser" if self.brush.erase else "Brush Stroke")
         self.stroke = stroke
 
     ## Continue the stroke to a document point.
@@ -1238,7 +1267,7 @@ pub struct Canvas:
             error(invalid, "gradient alphas must be in 0..1")
         var before = try fill_gradient(&painter, document, (u64)id, x0, y0, x1, y1, from_color, to_color, radial)
         errdefer before.destroy()
-        try self.remember((u64)id, before)
+        try self.remember((u64)id, before, name = "Gradient")
 
     ## The eyedropper: read the flattened document's color at a pixel into
     ## `picked_red` and friends (linear light, straight alpha).
@@ -1277,7 +1306,7 @@ pub struct Canvas:
         let tiles = layer.tiles() else error(invalid, "a group cannot take text")
         let color = gpu.Color(red, green, blue, 1.0)
         try gpu_check_color(color)
-        try self.remember((u64)id, try tiles.clone())
+        try self.remember((u64)id, try tiles.clone(), name = "Text")
         try draw_text(document, (u64)id, x, y, text, size, color)
 
     ## The width in pixels `text` takes at `size`.
@@ -1299,11 +1328,11 @@ pub struct Canvas:
         let index = try self.index((u64)id)
         let on_mask = self.mask_editing and self.records[index].masked
         let before = try translate(document, (u64)id, dx, dy, on_mask)
-        try self.remember((u64)id, before, on_mask)
+        try self.remember((u64)id, before, on_mask, name = "Move")
         # A mask is linked to its layer's pixels, as in Photoshop: it moves with them.
         if self.records[index].masked and not on_mask:
             let mask_before = try translate(document, (u64)id, dx, dy, true)
-            try self.remember((u64)id, mask_before, true, joined = true)
+            try self.remember((u64)id, mask_before, true, joined = true, name = "Move")
 
     # mark: Adjustments, filters and previews =====================================================
 
@@ -1335,7 +1364,7 @@ pub struct Canvas:
         let layer = document.find((u64)id) else error(invalid, "no such layer")
         let tiles = layer.tiles() else error(invalid, "a group cannot be adjusted")
         let table = try self.curve_table((u32)kind)
-        try self.remember((u64)id, try tiles.clone())
+        try self.remember((u64)id, try tiles.clone(), name = adjustment_name(kind))
         try adjuster.apply(document, (u64)id, (u32)kind, self.adjustment[..<parameter_count], table)
         try self.restrict_to_selection((u64)id, &self.history[self.history_count - 1].tiles)
 
@@ -1403,6 +1432,7 @@ pub struct Canvas:
 
     ## Show adjustment `kind` (as `adjust_layer`) applied to the layer as it was when the preview began.
     pub mutating func preview_adjust(kind: i64) -> !:
+        self.preview_name = adjustment_name(kind)
         if kind < 0 or kind >= (i64)adjustment_count:
             error(invalid, "no such adjustment")
         let table = try self.curve_table((u32)kind)
@@ -1414,6 +1444,7 @@ pub struct Canvas:
 
     ## Show a Gaussian blur of `radius` applied to the layer as it was when the preview began.
     pub mutating func preview_blur(radius: f64) -> !:
+        self.preview_name = "Gaussian Blur"
         let layer = try self.restore_preview()
         let document = self.document else trap("preview without a document")
         let filters = self.filters else trap("preview without filters")
@@ -1428,7 +1459,7 @@ pub struct Canvas:
         self.preview = none
         let document = self.document else trap("preview without a document")
         if keep:
-            try self.remember(preview.layer, preview.tiles)
+            try self.remember(preview.layer, preview.tiles, name = self.preview_name)
         else:
             var shown = try document.take_tiles(preview.layer, preview.tiles)
             shown.destroy()
@@ -1451,12 +1482,13 @@ pub struct Canvas:
         let document = self.document else error(invalid, "draw the document once before filtering")
         let layer = document.find((u64)id) else error(invalid, "no such layer")
         let tiles = layer.tiles() else error(invalid, "a group cannot be filtered")
-        try self.remember((u64)id, try tiles.clone())
+        try self.remember((u64)id, try tiles.clone(), name = "Add Noise")
         try filtering.add_noise(document, (u64)id, amount, monochrome, (u64)seed)
         try self.restrict_to_selection((u64)id, &self.history[self.history_count - 1].tiles)
 
     ## Show the noise `add_noise` would make on the layer as it was when the preview began.
     pub mutating func preview_noise(amount: f64, monochrome: bool, seed: i64) -> !:
+        self.preview_name = "Add Noise"
         let layer = try self.restore_preview()
         let document = self.document else trap("preview without a document")
         try filtering.add_noise(document, layer, amount, monochrome, (u64)seed)
@@ -1544,7 +1576,7 @@ pub struct Canvas:
         let filters = self.filters else error(invalid, "draw the document once before filtering")
         let layer = document.find((u64)id) else error(invalid, "no such layer")
         let tiles = layer.tiles() else error(invalid, "a group cannot be filtered")
-        try self.remember((u64)id, try tiles.clone())
+        try self.remember((u64)id, try tiles.clone(), name = "Gaussian Blur")
         try filters.gaussian_blur(document, (u64)id, radius)
         try self.restrict_to_selection((u64)id, &self.history[self.history_count - 1].tiles)
 
@@ -1564,6 +1596,7 @@ pub struct Canvas:
 
     ## Show a free transform (as `transform_layer`) of the previewed layer's original pixels.
     pub mutating func preview_transform(scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64, pivot_x: f64, pivot_y: f64) -> !:
+        self.preview_name = "Free Transform"
         let layer = try self.restore_preview()
         let document = self.document else trap("preview without a document")
         let transformer = self.transformer else trap("preview without a transformer")
@@ -1632,7 +1665,7 @@ pub struct Canvas:
         let transformer = self.transformer else error(invalid, "draw the document once before transforming")
         let layer = document.find(id) else error(invalid, "no such layer")
         let tiles = (layer.mask_tiles() else error(invalid, "the layer has no mask")) if on_mask else (layer.tiles() else error(invalid, "a group cannot be transformed"))
-        try self.remember(id, try tiles.clone(), on_mask, joined = joined)
+        try self.remember(id, try tiles.clone(), on_mask, joined = joined, name = "Transform")
         try transformer.apply(document, id, scale_x, scale_y, angle * math.pi / 180.0, dx, dy, pivot_x, pivot_y, on_mask = on_mask)
 
     # mark: Clipboard ============================================================================
@@ -1647,11 +1680,15 @@ pub struct Canvas:
 
     ## The clipboard's image on a new top layer, centred on a document point; its id.
     pub mutating func paste(center_x: i64, center_y: i64) -> i64!:
+        try self.begin_edit("Paste")
+        defer self.end_edit()
         return try paste_from_clipboard(&self, center_x, center_y)
 
     ## Layer via Copy (via Cut with `cut`): a new layer above `id` holding its
     ## selected pixels, or all of them without a selection; its id.
     pub mutating func layer_via_copy(id: i64, cut: bool = false) -> i64!:
+        try self.begin_edit("Layer via Copy")
+        defer self.end_edit()
         return try layer_from_selection(&self, id, cut)
 
     # mark: Canvas and image size =================================================================
@@ -1661,6 +1698,7 @@ pub struct Canvas:
     pub mutating func resize_canvas(width: i64, height: i64, offset_x: i64, offset_y: i64) -> !:
         try self.require_open()
         try self.require_idle()
+        try self.remember_state("Canvas Size")
         if width < 1 or height < 1 or width > 65536 or height > 65536:
             error(invalid, "canvas dimensions must be in 1..65536")
         let document = self.document else error(invalid, "draw the document once before resizing")
@@ -1669,6 +1707,8 @@ pub struct Canvas:
 
     ## Crop the canvas to the selection's bounding box.
     pub mutating func crop() -> !:
+        try self.begin_edit("Crop")
+        defer self.end_edit()
         if not self.has_selection():
             error(invalid, "nothing is selected")
         try self.resize_canvas(self.selection_width(), self.selection_height(), -self.selection_left(), -self.selection_top())
@@ -1677,6 +1717,7 @@ pub struct Canvas:
     pub mutating func resize_image(width: i64, height: i64) -> !:
         try self.require_open()
         try self.require_idle()
+        try self.remember_state("Image Size")
         if width < 1 or height < 1 or width > 65536 or height > 65536:
             error(invalid, "image dimensions must be in 1..65536")
         let document = self.document else error(invalid, "draw the document once before resizing")
@@ -1702,8 +1743,7 @@ pub struct Canvas:
         while self.history_count > 0:
             let entry = self.history[self.history_count - 1]
             self.history_count -= 1
-            let current = try (document.take_mask(entry.layer, entry.tiles) if entry.mask else document.take_tiles(entry.layer, entry.tiles))
-            try push(&self.future, &self.future_count, Snapshot(layer = entry.layer, tiles = current, mask = entry.mask, joined = entry.joined))
+            try push(&self.future, &self.future_count, try self.swap_in(document, entry))
             if not entry.joined:
                 break
 
@@ -1719,25 +1759,91 @@ pub struct Canvas:
             first = false
             let entry = self.future[self.future_count - 1]
             self.future_count -= 1
-            let current = try (document.take_mask(entry.layer, entry.tiles) if entry.mask else document.take_tiles(entry.layer, entry.tiles))
-            try push(&self.history, &self.history_count, Snapshot(layer = entry.layer, tiles = current, mask = entry.mask, joined = entry.joined))
+            try push(&self.history, &self.history_count, try self.swap_in(document, entry))
 
-    ## Record a layer's pixels before a change, dropping the redo trail and the
-    ## oldest entries past the limit.
-    mutating func remember(layer: u64, tiles: Tiles, mask: bool = false, joined: bool = false) -> !:
+    ## Record a layer's pixels before a change, as step `name`, dropping the
+    ## redo trail and the oldest entries past the limit.
+    mutating func remember(layer: u64, tiles: Tiles, mask: bool = false, joined: bool = false, name: str = "Edit") -> !:
         var owned = tiles
         errdefer owned.destroy()
+        self.make_room()
+        let join = joined or (self.joining and self.history_count > 0)
+        self.joining = false
+        try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = tiles, mask = mask, joined = join, name = name))
+
+    ## Record the whole document before a change to what it is made of, as
+    ## step `name`. The same change to the same layer again (`layer` non-zero)
+    ## right after is one step with it — an opacity slider dragged — and
+    ## inside `begin_edit` nothing more is recorded. Nothing is kept before the
+    ## document is drawn once.
+    mutating func remember_state(name: str, layer: u64 = 0) -> !:
+        let document = self.document else return
+        if self.edit_depth > 0 and self.history_count > 0:
+            return
+        if self.edit_depth == 0 and layer != 0 and self.future_count == 0 and self.history_count > 0:
+            let top = self.history[self.history_count - 1]
+            if top.state != none and top.layer == layer and top.name == name:
+                return
+        var tree = try document.capture()
+        errdefer tree.destroy()
+        let records = try copy_records(self.records, self.count)
+        errdefer release_records(records, self.count)
+        let state = try new DocumentState(tree = tree, records = records, count = self.count, next_id = self.next_id) in memory.heap
+        errdefer free(state) in memory.heap
+        self.make_room()
+        let join = self.joining and self.history_count > 0
+        self.joining = false
+        try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = Tiles(), mask = false, joined = join, state = state, name = name))
+
+    ## Drop the redo trail and, at the limit, the oldest step.
+    mutating func make_room():
         clear_snapshots(&self.future, &self.future_count)
         if self.history_count == 64:
-            self.history[0].tiles.destroy()
+            drop_snapshot(&self.history[0])
             for index in 1..<self.history_count:
                 self.history[index - 1] = self.history[index]
             self.history_count -= 1
             # What was joined to the dropped entry now starts the oldest edit kept.
             self.history[0].joined = false
-        let join = joined or (self.joining and self.history_count > 0)
-        self.joining = false
-        try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = tiles, mask = mask, joined = join))
+
+    ## Put `entry`'s pixels or document in place, returning a snapshot of what
+    ## was there, for the other stack.
+    mutating func swap_in(document: Document*, entry: Snapshot) -> Snapshot!:
+        if let state = entry.state:
+            document.exchange(&state.tree)
+            let records = self.records
+            self.records = state.records
+            state.records = records
+            let count = self.count
+            self.count = state.count
+            state.count = count
+            let next_id = self.next_id
+            self.next_id = state.next_id
+            state.next_id = next_id
+            self.extent_x = document.width()
+            self.extent_y = document.height()
+            return entry
+        let current = try (document.take_mask(entry.layer, entry.tiles) if entry.mask else document.take_tiles(entry.layer, entry.tiles))
+        return Snapshot(layer = entry.layer, tiles = current, mask = entry.mask, joined = entry.joined, name = entry.name)
+
+    ## Make everything until `end_edit` one step named `name`: a layer grouped
+    ## with others, a picture placed.
+    pub mutating func begin_edit(name: str) -> !:
+        try self.require_open()
+        if self.edit_depth == 0:
+            try self.remember_state(name)
+        self.edit_depth += 1
+
+    pub mutating func end_edit():
+        if self.edit_depth > 0:
+            self.edit_depth -= 1
+
+    ## The step Undo would take back, or "" when there is none; `redo_name` likewise.
+    pub func undo_name() -> str:
+        return self.history[self.history_count - 1].name if self.history_count > 0 else ""
+
+    pub func redo_name() -> str:
+        return self.future[self.future_count - 1].name if self.future_count > 0 else ""
 
     # mark: Files and drawing =====================================================================
 

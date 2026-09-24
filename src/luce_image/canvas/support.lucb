@@ -90,3 +90,9 @@ func srgb_encode(linear: f64) -> f64:
 ## The 256-bin histogram bin an encoded value 0..1 falls in.
 func bin_of(encoded: f64) -> usize:
     return (usize)math.clamp(math.floor(encoded * 255.0 + 0.5), 0.0, 255.0)
+
+## An adjustment's name for the history, by kind.
+func adjustment_name(kind: i64) -> str:
+    let names: str[12] = ["Brightness/Contrast", "Hue/Saturation", "Invert", "Levels", "Desaturate", "Threshold", "Posterize", "Curves",
+                          "Exposure", "Black & White", "Color Balance", "Gradient Map"]
+    return names[(usize)kind] if kind >= 0 and kind < 12 else "Adjustment"

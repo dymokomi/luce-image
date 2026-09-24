@@ -35,7 +35,7 @@ func begin_retouch(canvas: Canvas*, id: u64, x: f64, y: f64, pressure: f64) -> !
         errdefer warp.destroy()
         let boxed = try new WarpStroke in memory.heap
         *boxed = warp
-        try canvas.remember(id, try tiles.clone())
+        try canvas.remember(id, try tiles.clone(), name = "Smudge" if kind == retouch_smudge else "Liquify")
         canvas.warp = boxed
         canvas.warped = id
         return
@@ -61,7 +61,7 @@ func begin_retouch(canvas: Canvas*, id: u64, x: f64, y: f64, pressure: f64) -> !
         brush.opacity = 0.45
     let stroke = try begin_boxed(&painter, document, id, brush, x, y, false, pressure)
     errdefer finish_boxed(stroke)
-    try canvas.remember(id, try stroke.original().clone())
+    try canvas.remember(id, try stroke.original().clone(), name = retouch_name(kind))
     if let given = effect:
         try stroke.use_effect(&painter, document, given, 1.0, brush.opacity)
     canvas.stroke = stroke
@@ -195,3 +195,11 @@ func blurred_copy(canvas: Canvas*, id: u64, sigma: f64) -> Tiles!:
     let copy = try blurred.clone()
     try document.set_tiles(id, kept)
     return copy
+
+## A retouching stroke's name for the history.
+func retouch_name(kind: i64) -> str:
+    if kind == retouch_clone:
+        return "Clone Stamp"
+    if kind == retouch_heal:
+        return "Spot Healing"
+    return "Blur Tool"

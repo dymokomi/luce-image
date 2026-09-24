@@ -37,6 +37,13 @@ pub struct Selection:
             coverage[index] = 0
         return Selection(extent_x = width, extent_y = height, coverage = coverage, tiles = none, owner = none, uploaded = false, empty = true)
 
+    ## A copy of the coverage (its GPU tiles are made again when wanted).
+    pub func copy() -> Selection!:
+        let coverage = try alloc u8[self.coverage.length] in memory.heap
+        memory.copy(coverage, self.coverage, self.coverage.length)
+        return Selection(extent_x = self.extent_x, extent_y = self.extent_y, coverage = coverage, tiles = none, owner = none, uploaded = false,
+                         empty = self.empty, left = self.left, top = self.top, right = self.right, bottom = self.bottom)
+
     pub func is_empty() -> bool:
         return self.empty
 

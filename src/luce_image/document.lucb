@@ -268,6 +268,48 @@ func layer_destroy(layer: Layer*):
     strings.release(layer.name)
     free(layer) in memory.heap
 
+## The layer tree, extent and selection at one moment, for undo: a copy of
+## the tree sharing its tiles, so taking one costs little.
+pub struct TreeState:
+    var root: Layer*
+    var next_id: u64
+    var extent_x: u32
+    var extent_y: u32
+    var selection: Selection
+
+    pub mutating func destroy():
+        layer_destroy(self.root)
+        self.selection.destroy()
+
+## A copy of `layer` and all it holds, sharing their tiles.
+func clone_layer(layer: const Layer*) -> Layer*!:
+    var copied: str = ""
+    with memory.heap:
+        copied = try strings.copy(layer.name)
+    errdefer strings.release(copied)
+    var pixels: Tiles*? = none
+    if let tiles = layer.pixels:
+        pixels = try box(try tiles.clone())
+    errdefer release_tiles(&pixels)
+    let copy = try new Layer(id = layer.id, name = copied, group = layer.group, pixels = pixels, revision = layer.revision) in memory.heap
+    errdefer layer_destroy(copy)
+    copy.visible = layer.visible
+    copy.opacity = layer.opacity
+    copy.blend = layer.blend
+    copy.clipped = layer.clipped
+    copy.style = layer.style
+    copy.mask_enabled = layer.mask_enabled
+    copy.adjustment = layer.adjustment
+    copy.adjustment_values = layer.adjustment_values
+    if let mask = layer.mask:
+        copy.mask = try box(try mask.clone())
+    if layer.child_count > 0:
+        copy.children = try alloc Layer*[layer.child_count] in memory.heap
+        for index in 0..<layer.child_count:
+            copy.children[index] = try clone_layer(layer.children[index])
+            copy.child_count += 1
+    return copy
+
 pub struct Document:
     var owner: gpu.Device
     var extent_x: u32
@@ -513,6 +555,32 @@ pub struct Document:
         return taken
 
     ## Adopt new extents after every layer has been rebuilt for them.
+    ## The tree, extent and selection as they are, for undo.
+    pub func capture() -> TreeState!:
+        let root = try clone_layer(self.root)
+        errdefer layer_destroy(root)
+        return TreeState(root = root, next_id = self.next_id, extent_x = self.extent_x, extent_y = self.extent_y, selection = try self.selection.copy())
+
+    ## Take `state` as the document and leave what was in its place: undo and
+    ## redo swap, never copy.
+    pub mutating func exchange(state: TreeState*):
+        let root = self.root
+        self.root = state.root
+        state.root = root
+        let next_id = self.next_id
+        self.next_id = state.next_id
+        state.next_id = next_id
+        let width = self.extent_x
+        self.extent_x = state.extent_x
+        state.extent_x = width
+        let height = self.extent_y
+        self.extent_y = state.extent_y
+        state.extent_y = height
+        let selection = self.selection
+        self.selection = state.selection
+        state.selection = selection
+        self.revision += 1
+
     pub mutating func set_extent(width: u32, height: u32) -> !:
         self.extent_x = width
         self.extent_y = height

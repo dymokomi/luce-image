@@ -99,4 +99,4 @@ func erase_selected(canvas: Canvas*, layer: u64) -> !:
     brush.opacity = 1.0
     brush.flow = 1.0
     let before = try fill_selection(&painter, document, layer, brush, false)
-    try canvas.remember(layer, before, false)
+    try canvas.remember(layer, before, false, name = "Cut")
