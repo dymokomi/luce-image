@@ -47,7 +47,8 @@ from luce_image.adjust import Adjuster, adjustment_count, parameter_count, curve
 from luce_image.curves import Curves, lut_size
 from luce_image.filter import Filters
 import luce_image.filter as filtering
-from luce_image.transform import translate, Transformer
+from luce_image.transform import translate, Transformer, Landed, sampling_nearest, sampling_smooth, sampling_high
+from luce_image.projective import Warp, affine_warp, quad_warp
 from luce_image.extent import full_bounds, pieces, relocate
 from luce_image.selection_passes import SelectionPasses
 from luce_image.text import draw_text, measure_text, text_height
@@ -152,6 +153,8 @@ pub struct Canvas:
     ## The last step's serial handed out, and the step the document was saved at (0: none).
     var serial: u64
     var saved_version: u64
+    ## The free transform under way, if any.
+    var transform_session: TransformSession*?
     ## What `measure_histogram` counted: luminosity, red, green and blue, 256
     ## bins each of the encoded values.
     var histogram_counts: u64[1024]
@@ -213,6 +216,7 @@ pub struct Canvas:
         self.clone_all = false
         self.warp = none
         self.warped = 0
+        self.transform_session = none
         self.heal_opacity = 1.0
         self.edit_depth = 0
         self.preview_name = "Adjustment"
@@ -272,6 +276,8 @@ pub struct Canvas:
     func require_idle() -> !:
         if self.stroke != none:
             error(invalid, "finish the stroke first")
+        if self.transform_session != none:
+            error(invalid, "finish the transform first")
         if self.preview != none:
             error(invalid, "finish the preview first")
 
@@ -368,6 +374,9 @@ pub struct Canvas:
         if self.closed:
             return
         self.closed = true
+        if let session = self.transform_session:
+            self.transform_session = none
+            drop_session(session)
         if let stroke = self.stroke:
             self.stroke = none
             finish_boxed(stroke)
@@ -1617,27 +1626,58 @@ pub struct Canvas:
         try filters.gaussian_blur(document, (u64)id, radius)
         try self.restrict_to_selection((u64)id, &self.history[self.history_count - 1].tiles)
 
-    ## Free transform: scale a layer's pixels by (`scale_x`, `scale_y`) —
-    ## negative flips — and turn them `angle` degrees about the document point
-    ## (`pivot_x`, `pivot_y`), then move them by (`dx`, `dy`) pixels; what leaves
-    ## the document is kept past it. A linked mask goes with them (while editing the
-    ## mask, the mask alone). Undoable in one step.
-    pub mutating func transform_layer(id: i64, scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64, pivot_x: f64, pivot_y: f64) -> !:
-        try self.require_open()
-        try self.require_idle()
-        let index = try self.index((u64)id)
-        let on_mask = self.mask_editing and self.records[index].masked
-        try self.transform_one((u64)id, scale_x, scale_y, angle, dx, dy, pivot_x, pivot_y, on_mask, false)
-        if self.records[index].masked and not on_mask:
-            try self.transform_one((u64)id, scale_x, scale_y, angle, dx, dy, pivot_x, pivot_y, true, true)
+    # mark: Transforms ============================================================================
 
-    ## Show a free transform (as `transform_layer`) of the previewed layer's original pixels.
+    ## Begin a free transform of layer `id` and its linked mask (while editing
+    ## a mask, the mask alone); `add_to_transform` brings more layers. With a
+    ## selection the selected pixels float instead. Shown live by
+    ## `preview_transform` or `preview_distort`, kept or dropped by `end_transform`.
+    pub mutating func begin_transform(id: i64) -> !:
+        try begin_transform_session(&self, (u64)id, true)
+
+    pub mutating func add_to_transform(id: i64) -> !:
+        let session = self.transform_session else error(invalid, "no transform is in progress")
+        let document = self.document else trap("transform without a document")
+        try add_to_session(&self, document, session, (u64)id)
+
+    pub func transforming() -> bool:
+        return self.transform_session != none
+
+    ## Whether the transform under way moves floating selected pixels.
+    pub func transform_floats() -> bool:
+        let session = self.transform_session else return false
+        return session.floating
+
+    ## Show the transform's layers scaled by (`scale_x`, `scale_y`) — negative
+    ## flips — and turned `angle` degrees about (`pivot_x`, `pivot_y`), then
+    ## moved by (`dx`, `dy`).
     pub mutating func preview_transform(scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64, pivot_x: f64, pivot_y: f64) -> !:
-        self.preview_name = "Free Transform"
-        let layer = try self.restore_preview()
-        let document = self.document else trap("preview without a document")
-        let transformer = self.transformer else trap("preview without a transformer")
-        try transformer.apply(document, layer, scale_x, scale_y, angle * math.pi / 180.0, dx, dy, pivot_x, pivot_y)
+        try show_session(&self, try affine_warp(scale_x, scale_y, angle * math.pi / 180.0, dx, dy, pivot_x, pivot_y), "Free Transform")
+
+    ## Show the transform's layers distorted: the box at (`left`, `top`),
+    ## `width` by `height`, with its corners (top-left, top-right,
+    ## bottom-right, bottom-left) taken to the points given, in perspective.
+    pub mutating func preview_distort(left: f64, top: f64, width: f64, height: f64, x0: f64, y0: f64, x1: f64, y1: f64,
+                                      x2: f64, y2: f64, x3: f64, y3: f64) -> !:
+        let corners: f64[8] = [x0, y0, x1, y1, x2, y2, x3, y3]
+        let box = Landed(left = left, top = top, right = left + width, bottom = top + height)
+        try show_session(&self, try quad_warp(left, top, width, height, corners[..<8]), "Distort", box)
+
+    ## How the transform resamples from now on: 0 nearest, 1 smooth
+    ## (bilinear), 2 high quality (bicubic). `preview_*` again to show it.
+    pub mutating func set_transform_sampling(sampling: i64) -> !:
+        let session = self.transform_session else error(invalid, "no transform is in progress")
+        if sampling < sampling_nearest or sampling > sampling_high:
+            error(invalid, "sampling is 0 nearest, 1 smooth or 2 high quality")
+        session.sampling = sampling
+
+    ## Keep what the transform shows as one undo step, or put it all back.
+    pub mutating func end_transform(keep: bool) -> !:
+        try end_session(&self, keep)
+
+    ## Free transform (as `preview_transform`) of layer `id` at once, one undo step.
+    pub mutating func transform_layer(id: i64, scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64, pivot_x: f64, pivot_y: f64) -> !:
+        try transform_now(&self, (u64)id, try affine_warp(scale_x, scale_y, angle * math.pi / 180.0, dx, dy, pivot_x, pivot_y), "Free Transform", true)
 
     ## Mirror a layer's pixels (and linked mask) left to right, or top to
     ## bottom, about the middle of what it has painted. Undoable.
@@ -1646,27 +1686,29 @@ pub struct Canvas:
             return
         let pivot_x = (f64)(self.content.left + self.content.right) * 0.5
         let pivot_y = (f64)(self.content.top + self.content.bottom) * 0.5
-        try self.transform_layer(id, -1.0 if horizontal else 1.0, 1.0 if horizontal else -1.0, 0.0, 0.0, 0.0, pivot_x, pivot_y)
+        let warp = try affine_warp(-1.0 if horizontal else 1.0, 1.0 if horizontal else -1.0, 0.0, 0.0, 0.0, pivot_x, pivot_y)
+        try transform_now(&self, (u64)id, warp, "Flip Horizontal" if horizontal else "Flip Vertical", false)
 
     ## Mirror the whole image — every layer and mask — about the canvas's
     ## middle. Undoable in one step.
     pub mutating func flip_canvas(horizontal: bool) -> !:
-        try self.require_open()
-        try self.require_idle()
-        let scale_x = -1.0 if horizontal else 1.0
-        let scale_y = 1.0 if horizontal else -1.0
-        let pivot_x = (f64)self.extent_x * 0.5
-        let pivot_y = (f64)self.extent_y * 0.5
-        var joined = false
+        let document = self.document else error(invalid, "draw the document once before flipping")
+        let warp = try affine_warp(-1.0 if horizontal else 1.0, 1.0 if horizontal else -1.0, 0.0, 0.0, 0.0, (f64)self.extent_x * 0.5, (f64)self.extent_y * 0.5)
+        var begun = false
         for index in 0..<self.count:
-            let document = self.document else error(invalid, "draw the document once before flipping")
             let layer = document.find(self.records[index].id) else continue
             if layer.tiles() == none:
                 continue
-            try self.transform_one(self.records[index].id, scale_x, scale_y, 0.0, 0.0, 0.0, pivot_x, pivot_y, false, joined)
-            joined = true
-            if self.records[index].masked:
-                try self.transform_one(self.records[index].id, scale_x, scale_y, 0.0, 0.0, 0.0, pivot_x, pivot_y, true, true)
+            if begun:
+                try self.add_to_transform((i64)self.records[index].id)
+            else:
+                try begin_transform_session(&self, self.records[index].id, false)
+                begun = true
+        let session = self.transform_session else return
+        session.warp = warp
+        session.shown = true
+        session.name = "Flip Canvas"
+        try end_session(&self, true)
 
     ## Find layer `id`'s painted box, exactly, for `content_left` and the rest
     ## (past the canvas too); false when it has nothing painted. It reads the
@@ -1694,17 +1736,6 @@ pub struct Canvas:
 
     pub func content_height() -> i64:
         return self.content.bottom - self.content.top
-
-    ## Transform a layer's pixels or mask, remembering them first (`joined` to
-    ## the step before).
-    mutating func transform_one(id: u64, scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64, pivot_x: f64, pivot_y: f64,
-                                on_mask: bool, joined: bool) -> !:
-        let document = self.document else error(invalid, "draw the document once before transforming")
-        let transformer = self.transformer else error(invalid, "draw the document once before transforming")
-        let layer = document.find(id) else error(invalid, "no such layer")
-        let tiles = (layer.mask_tiles() else error(invalid, "the layer has no mask")) if on_mask else (layer.tiles() else error(invalid, "a group cannot be transformed"))
-        try self.remember(id, try tiles.clone(), on_mask, joined = joined, name = "Transform")
-        try transformer.apply(document, id, scale_x, scale_y, angle * math.pi / 180.0, dx, dy, pivot_x, pivot_y, on_mask = on_mask)
 
     # mark: Clipboard ============================================================================
 

@@ -6,6 +6,7 @@ import gpu
 import math
 import memory
 from luce_image.tiles import Tiles, tile_size, box, unbox
+from luce_image.projective import Warp
 from raster_errors import invalid
 
 ## How a new shape combines with the selection so far.
@@ -91,6 +92,40 @@ pub struct Selection:
         free(self.coverage) in memory.heap
         self.coverage = moved
         self.finish()
+
+    ## Take the selection through `warp` (a backwards map, as free transform
+    ## and distort use), bilinear; what leaves the document is dropped.
+    pub mutating func warp(warp: Warp) -> !:
+        if self.empty:
+            return
+        let width = (i64)self.extent_x
+        let height = (i64)self.extent_y
+        let moved = try alloc u8[self.coverage.length] in memory.heap
+        for row in 0..<height:
+            for column in 0..<width:
+                var x = 0.0
+                var y = 0.0
+                var value = 0.0
+                if warp.map((f64)column + 0.5, (f64)row + 0.5, &x, &y):
+                    let sx = x - 0.5
+                    let sy = y - 0.5
+                    let x0 = (i64)math.floor(sx)
+                    let y0 = (i64)math.floor(sy)
+                    let fx = sx - (f64)x0
+                    let fy = sy - (f64)y0
+                    let top = (f64)self.sample(x0, y0) * (1.0 - fx) + (f64)self.sample(x0 + 1, y0) * fx
+                    let bottom = (f64)self.sample(x0, y0 + 1) * (1.0 - fx) + (f64)self.sample(x0 + 1, y0 + 1) * fx
+                    value = top * (1.0 - fy) + bottom * fy
+                moved[(usize)(row * width + column)] = (u8)math.clamp(math.round(value), 0.0, 255.0)
+        free(self.coverage) in memory.heap
+        self.coverage = moved
+        self.finish()
+
+    ## Coverage at a pixel, nothing past the document.
+    func sample(x: i64, y: i64) -> u8:
+        if x < 0 or y < 0 or x >= (i64)self.extent_x or y >= (i64)self.extent_y:
+            return 0
+        return self.coverage[(usize)y * (usize)self.extent_x + (usize)x]
 
     ## A rectangle, combined by `mode`.
     pub mutating func rectangle(x: i64, y: i64, width: i64, height: i64, mode: Mode):

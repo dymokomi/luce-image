@@ -304,10 +304,10 @@ test "previews show edits on the original pixels and end kept or dropped":
     discard(try shown_centre(&canvas, &target, pixels))
     assert(lit > 20 and pixels[0] == 0 and not (try canvas.layer_styled(0)))
     # A previewed transform is shown, then cancelled back to the original.
-    try canvas.begin_preview(layer)
+    try canvas.begin_transform(layer)
     try canvas.preview_transform(0.25, 0.25, 45.0, 0.0, 0.0, 16.0, 16.0)
     assert((try shown_centre(&canvas, &target, pixels)) == base)
-    try canvas.end_preview(false)
+    try canvas.end_transform(false)
     assert((try shown_centre(&canvas, &target, pixels)) == base)
     # The wand on the painted dot selects it and nothing of the transparent surround.
     try canvas.select_wand(layer, 16, 16, 32.0, true, 0)
@@ -875,3 +875,53 @@ test "dragging a layer shows what it had past the canvas coming back":
     var pixel: u8[4]
     try target.read(pixel, gpu.Region(45, 10, 1, 1))
     assert(pixel[0] == 255 and pixel[1] == 0)
+
+test "a transform session moves several layers live, distorts, floats a selection, and undoes in one step":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    let bottom = try canvas.add_layer("Bottom")
+    let top = try canvas.add_layer("Top")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(8, 8, 8, 8, 0)
+    try canvas.fill(bottom, false)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, false)
+    try canvas.select_rectangle(8, 40, 8, 8, 0)
+    try canvas.fill(top, false)
+    try canvas.deselect()
+    # Both layers moved 30 right, live, then kept as one step.
+    try canvas.begin_transform(bottom)
+    try canvas.add_to_transform(top)
+    assert(canvas.transforming() and not canvas.transform_floats())
+    # High quality sampling on a whole-pixel move leaves the squares crisp.
+    try canvas.set_transform_sampling(2)
+    try canvas.preview_transform(1.0, 1.0, 0.0, 30.0, 0.0, 12.0, 28.0)
+    assert((try shown_at(&canvas, &target, 42, 12))[0] == 255 and (try shown_at(&canvas, &target, 42, 44))[2] == 255)
+    try canvas.end_transform(true)
+    assert(not canvas.transforming() and (try shown_at(&canvas, &target, 12, 12))[0] == 0)
+    assert(canvas.undo_name() == "Free Transform")
+    try canvas.undo()
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 255 and (try shown_at(&canvas, &target, 12, 44))[2] == 255)
+    # A distortion taking the red square's box to a wider trapezoid.
+    try canvas.begin_transform(bottom)
+    try canvas.preview_distort(8.0, 8.0, 8.0, 8.0, 4.0, 8.0, 20.0, 8.0, 30.0, 16.0, -6.0, 16.0)
+    try canvas.end_transform(true)
+    assert(canvas.undo_name() == "Distort" and (try shown_at(&canvas, &target, 24, 14))[0] == 255 and (try shown_at(&canvas, &target, 24, 9))[0] == 0)
+    try canvas.undo()
+    # A floating selection: the left half of the red square moves down, the rest stays.
+    try canvas.select_rectangle(8, 8, 4, 8, 0)
+    try canvas.begin_transform(bottom)
+    assert(canvas.transform_floats())
+    try canvas.preview_transform(1.0, 1.0, 0.0, 0.0, 20.0, 10.0, 12.0)
+    try canvas.end_transform(true)
+    assert((try shown_at(&canvas, &target, 9, 12))[0] == 0 and (try shown_at(&canvas, &target, 9, 32))[0] == 255 and (try shown_at(&canvas, &target, 14, 12))[0] == 255)
+    # The outline went with the pixels.
+    assert(canvas.selected_at(9, 32) == 255 and canvas.selected_at(9, 12) == 0)
+    try canvas.undo()
+    assert((try shown_at(&canvas, &target, 9, 12))[0] == 255 and canvas.selected_at(9, 12) == 255)

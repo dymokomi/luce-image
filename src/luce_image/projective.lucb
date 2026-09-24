@@ -1,0 +1,147 @@
+## The maps free transform and distort resample through: 3×3 projective
+## matrices on document pixels, row-major, mapping (x, y) to
+## ((m0 x + m1 y + m2) / w, (m3 x + m4 y + m5) / w) with w = m6 x + m7 y + m8.
+## A `Warp` runs backwards — from where a pixel lands to where it comes from —
+## which is what resampling needs; `forward` turns it round.
+import math
+from raster_errors import invalid
+
+pub struct Warp:
+    pub var m: f64[9]
+
+    ## Where document point (`x`, `y`) maps to: false when it lies on or
+    ## behind the map's horizon.
+    pub func map(x: f64, y: f64, out_x: f64*, out_y: f64*) -> bool:
+        let w = self.m[6] * x + self.m[7] * y + self.m[8]
+        if w <= 1e-9:
+            return false
+        *out_x = (self.m[0] * x + self.m[1] * y + self.m[2]) / w
+        *out_y = (self.m[3] * x + self.m[4] * y + self.m[5]) / w
+        return true
+
+    ## The map the other way round, defined at document point (`x`, `y`).
+    pub func forward(x: f64, y: f64) -> Warp!:
+        return try invert(self, x, y)
+
+    ## The same map written with `w` positive at document point (`x`, `y`),
+    ## which lies where the map is defined.
+    func normalized(x: f64, y: f64) -> Warp:
+        var result = self
+        if result.m[6] * x + result.m[7] * y + result.m[8] < 0.0:
+            for index in 0..<(usize)9:
+                result.m[index] = -result.m[index]
+        return result
+
+## Free transform: pixels scaled by (`scale_x`, `scale_y`) — negative flips —
+## and turned `angle` radians about (`pivot_x`, `pivot_y`), then moved by
+## (`dx`, `dy`). Forward p' = R S (p - c) + c + d, so backwards
+## p = S⁻¹ R⁻¹ (p' - c - d) + c.
+pub func affine_warp(scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64, pivot_x: f64, pivot_y: f64) -> Warp!:
+    for value in [scale_x, scale_y, angle, dx, dy, pivot_x, pivot_y]:
+        if not math.is_finite(value):
+            error(invalid, "transform parameters must be finite")
+    if math.abs(scale_x) < 0.001 or math.abs(scale_y) < 0.001 or math.abs(scale_x) > 1000.0 or math.abs(scale_y) > 1000.0:
+        error(invalid, "transform scales are 0.001..1000")
+    let cos = math.cos(angle)
+    let sin = math.sin(angle)
+    let a = cos / scale_x
+    let b = sin / scale_x
+    let d = -sin / scale_y
+    let e = cos / scale_y
+    let ox = pivot_x + dx
+    let oy = pivot_y + dy
+    return Warp(m = [a, b, pivot_x - a * ox - b * oy, d, e, pivot_y - d * ox - e * oy, 0.0, 0.0, 1.0])
+
+## Distort: the box at (`left`, `top`), `width` by `height`, its corners
+## taken to `corners` (x, y pairs: top-left, top-right, bottom-right,
+## bottom-left) in perspective. The corners must make a convex shape.
+pub func quad_warp(left: f64, top: f64, width: f64, height: f64, corners: const f64[]) -> Warp!:
+    if corners.length != 8 or not (width > 0.0) or not (height > 0.0):
+        error(invalid, "a distortion takes a box with area and four corners")
+    for value in corners:
+        if not math.is_finite(value) or math.abs(value) > 1000000.0:
+            error(invalid, "distortion corners must be finite")
+    if not convex(corners):
+        error(invalid, "the corners must make a convex shape")
+    # The unit square onto the corners (Heckbert's square-to-quad).
+    let sx = corners[0] - corners[2] + corners[4] - corners[6]
+    let sy = corners[1] - corners[3] + corners[5] - corners[7]
+    var g = 0.0
+    var h = 0.0
+    if math.abs(sx) > 1e-9 or math.abs(sy) > 1e-9:
+        let dx1 = corners[2] - corners[4]
+        let dx2 = corners[6] - corners[4]
+        let dy1 = corners[3] - corners[5]
+        let dy2 = corners[7] - corners[5]
+        let den = dx1 * dy2 - dx2 * dy1
+        if math.abs(den) > 1e-12:
+            g = (sx * dy2 - dx2 * sy) / den
+            h = (dx1 * sy - sx * dy1) / den
+    let square = Warp(m = [corners[2] - corners[0] + g * corners[2], corners[6] - corners[0] + h * corners[6], corners[0],
+                           corners[3] - corners[1] + g * corners[3], corners[7] - corners[1] + h * corners[7], corners[1], g, h, 1.0])
+    # Backwards: from the shape to the unit square, then out to the box;
+    # defined over the shape, whose middle is inside it as it is convex.
+    let middle_x = (corners[0] + corners[2] + corners[4] + corners[6]) * 0.25
+    let middle_y = (corners[1] + corners[3] + corners[5] + corners[7]) * 0.25
+    let back = try invert(square, middle_x, middle_y)
+    let box = Warp(m = [width, 0.0, left, 0.0, height, top, 0.0, 0.0, 1.0])
+    return multiply(box, back).normalized(middle_x, middle_y)
+
+## Whether four corners (x, y pairs) wind one way round with area at each turn.
+pub func convex(corners: const f64[]) -> bool:
+    var sign = 0.0
+    for index in 0..<(usize)4:
+        let a = index * 2
+        let b = ((index + 1) % 4) * 2
+        let c = ((index + 2) % 4) * 2
+        let cross = (corners[b] - corners[a]) * (corners[c + 1] - corners[b + 1]) - (corners[b + 1] - corners[a + 1]) * (corners[c] - corners[b])
+        if math.abs(cross) <= 0.01:
+            return false
+        if sign == 0.0:
+            sign = -1.0 if cross < 0.0 else 1.0
+        elif (cross < 0.0) != (sign < 0.0):
+            return false
+    return true
+
+## `first` after `second`: p ↦ first(second(p)).
+pub func multiply(first: Warp, second: Warp) -> Warp:
+    var result = Warp(m = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    for row in 0..<(usize)3:
+        for column in 0..<(usize)3:
+            var sum = 0.0
+            for k in 0..<(usize)3:
+                sum += first.m[row * 3 + k] * second.m[k * 3 + column]
+            result.m[row * 3 + column] = sum
+    return result
+
+## The inverse map, written to be defined at document point (`x`, `y`); an
+## error for one that flattens the plane.
+pub func invert(warp: Warp, x: f64, y: f64) -> Warp!:
+    let m = warp.m
+    let c0 = m[4] * m[8] - m[5] * m[7]
+    let c1 = m[5] * m[6] - m[3] * m[8]
+    let c2 = m[3] * m[7] - m[4] * m[6]
+    let det = m[0] * c0 + m[1] * c1 + m[2] * c2
+    if math.abs(det) < 1e-15:
+        error(invalid, "the map flattens the picture")
+    let r = 1.0 / det
+    let inverse = Warp(m = [c0 * r, (m[2] * m[7] - m[1] * m[8]) * r, (m[1] * m[5] - m[2] * m[4]) * r,
+                            c1 * r, (m[0] * m[8] - m[2] * m[6]) * r, (m[2] * m[3] - m[0] * m[5]) * r,
+                            c2 * r, (m[1] * m[6] - m[0] * m[7]) * r, (m[0] * m[4] - m[1] * m[3]) * r])
+    return inverse.normalized(x, y)
+
+test "free transforms and distortions map points both ways":
+    let turn = try affine_warp(2.0, 2.0, 0.0, 10.0, 0.0, 50.0, 50.0)
+    var x = 0.0
+    var y = 0.0
+    # (60, 50) is where the pivot lands, so it comes from the pivot (50, 50).
+    assert(turn.map(60.0, 50.0, &x, &y) and math.abs(x - 50.0) < 1e-9 and math.abs(y - 50.0) < 1e-9)
+    let ahead = try turn.forward(50.0, 50.0)
+    assert(ahead.map(40.0, 50.0, &x, &y) and math.abs(x - 40.0) < 1e-9)
+    # A box taken to a trapezoid: each corner comes from the box's corner.
+    let corners: f64[8] = [10.0, 0.0, 90.0, 0.0, 120.0, 100.0, -20.0, 100.0]
+    let distort = try quad_warp(0.0, 0.0, 100.0, 50.0, corners[..<8])
+    assert(distort.map(90.0, 0.0, &x, &y) and math.abs(x - 100.0) < 1e-6 and math.abs(y) < 1e-6)
+    assert(distort.map(-20.0, 100.0, &x, &y) and math.abs(x) < 1e-6 and math.abs(y - 50.0) < 1e-6)
+    let folded: f64[8] = [0.0, 0.0, 100.0, 0.0, 0.0, 100.0, 100.0, 100.0]
+    assert(not convex(folded[..<8]))

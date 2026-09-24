@@ -1,0 +1,149 @@
+#==============================================================================================
+#
+#   canvas/transforming - Free transform and distort, live
+#
+#   DESCRIPTION:
+#       A transform session, as Photoshop's Free Transform: one or more layers (each with
+#       its linked mask) shown through the box as it is dragged, then kept as one undo
+#       step or dropped. With a selection the selected pixels of one layer float instead:
+#       they move over what the selection leaves behind, and the selection's outline
+#       follows them when kept. The map is a free transform (scale, turn, move about a
+#       pivot) or a distortion (the box's corners moved freely, in perspective).
+#
+#==============================================================================================
+
+## One layer in the session: its pixels and mask as the session began.
+struct Transformed:
+    var id: u64
+    var pixels: Tiles
+    var mask: Tiles
+    var masked: bool
+
+struct TransformSession:
+    var entries: Transformed[]
+    var count: usize
+    ## Only the selected pixels move, on the one layer.
+    var floating: bool
+    ## The map shown now, and whether one is shown at all.
+    var warp: Warp
+    var shown: bool
+    var name: str
+    ## A distortion's box, which bounds where its pixels come from.
+    var box: Landed?
+    ## Nearest, smooth or high quality (transform.lucb's `sampling_*`).
+    var sampling: i64
+
+## The most layers one transform takes.
+let transform_limit: usize = 64
+
+## `Canvas.begin_transform`: a session on layer `id`; with `float_selection`
+## and a selection (not while editing a mask), only its selected pixels move.
+func begin_transform_session(canvas: Canvas*, id: u64, float_selection: bool) -> !:
+    try canvas.require_open()
+    try canvas.require_idle()
+    let document = canvas.document else error(invalid, "draw the document once before transforming")
+    let floating = float_selection and canvas.has_selection() and not canvas.mask_editing
+    let entries = try alloc Transformed[transform_limit] in memory.heap
+    errdefer free(entries) in memory.heap
+    let session = try new TransformSession(entries = entries, count = 0, floating = floating,
+                                           warp = Warp(m = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]), shown = false, name = "Free Transform", box = none,
+                                           sampling = sampling_smooth) in memory.heap
+    canvas.transform_session = session
+    add_to_session(canvas, document, session, id) catch failure:
+        canvas.transform_session = none
+        drop_session(session)
+        error(failure.code, failure.message)
+
+## `Canvas.add_to_transform`: another layer, when nothing floats.
+func add_to_session(canvas: Canvas*, document: Document*, session: TransformSession*, id: u64) -> !:
+    let index = try canvas.index(id)
+    for at in 0..<session.count:
+        if session.entries[at].id == id:
+            return
+    if session.floating and session.count > 0:
+        error(invalid, "a floating selection moves the pixels of one layer")
+    if session.count == transform_limit:
+        error(limit, "a transform takes at most 64 layers")
+    let layer = document.find(id) else error(invalid, "no such layer")
+    let tiles = layer.tiles() else error(invalid, "a group has no pixels to transform")
+    var entry = Transformed(id = id, pixels = try tiles.clone(), mask = Tiles(), masked = false)
+    errdefer entry.pixels.destroy()
+    # A linked mask goes with the pixels; while editing a mask, the mask alone moves.
+    if canvas.records[index].masked and not session.floating:
+        if let mask = layer.mask_tiles():
+            entry.mask = try mask.clone()
+            entry.masked = true
+    session.entries[session.count] = entry
+    session.count += 1
+
+## Show the session's layers through `warp`, from their pixels as it began.
+func show_session(canvas: Canvas*, warp: Warp, name: str, box: Landed? = none) -> !:
+    let session = canvas.transform_session else error(invalid, "no transform is in progress")
+    let document = canvas.document else trap("transform without a document")
+    let transformer = canvas.transformer else trap("transform without a transformer")
+    try restore_session(document, session)
+    session.warp = warp
+    session.shown = true
+    session.name = name
+    session.box = box
+    try warp_session(canvas, document, transformer, session)
+
+## Every layer of the session (and its mask) through its warp; the floating
+## pixels over what the selection leaves.
+func warp_session(canvas: Canvas*, document: Document*, transformer: Transformer, session: TransformSession*) -> !:
+    for at in 0..<session.count:
+        let entry = session.entries[at]
+        if session.floating:
+            let selection = try document.selection_tiles() else error(invalid, "the selection is gone")
+            let outline = document.selection
+            try transformer.apply_selected(document, entry.id, session.warp, selection, outline.left, outline.top, outline.right, outline.bottom, session.sampling)
+            continue
+        let on_mask = canvas.mask_editing and entry.masked
+        if not on_mask:
+            try transformer.apply(document, entry.id, session.warp, source = session.box, sampling = session.sampling)
+        if entry.masked:
+            try transformer.apply(document, entry.id, session.warp, on_mask = true, source = session.box, sampling = session.sampling)
+
+## Put every layer of the session back as it began.
+func restore_session(document: Document*, session: TransformSession*) -> !:
+    for at in 0..<session.count:
+        let entry = session.entries[at]
+        try document.set_tiles(entry.id, try entry.pixels.clone())
+        if entry.masked:
+            var shown = try document.take_mask(entry.id, try entry.mask.clone())
+            shown.destroy()
+
+## `Canvas.end_transform`: keep what is shown as one undo step (the outline
+## following floating pixels), or put everything back.
+func end_session(canvas: Canvas*, keep: bool) -> !:
+    let session = canvas.transform_session else error(invalid, "no transform is in progress")
+    canvas.transform_session = none
+    defer drop_session(session)
+    let document = canvas.document else trap("transform without a document")
+    let transformer = canvas.transformer else trap("transform without a transformer")
+    try restore_session(document, session)
+    if not keep or not session.shown:
+        return
+    # From the pixels as they began, so the step undoes to them.
+    try canvas.begin_edit(session.name)
+    defer canvas.end_edit()
+    try warp_session(canvas, document, transformer, session)
+    if session.floating:
+        try canvas.live().warp(session.warp)
+
+func drop_session(session: TransformSession*):
+    for at in 0..<session.count:
+        session.entries[at].pixels.destroy()
+        if session.entries[at].masked:
+            session.entries[at].mask.destroy()
+    free(session.entries) in memory.heap
+    free(session) in memory.heap
+
+## `Canvas.transform_layer`: layer `id` through `warp` at once, one undo step.
+func transform_now(canvas: Canvas*, id: u64, warp: Warp, name: str, float_selection: bool) -> !:
+    try begin_transform_session(canvas, id, float_selection)
+    let session = canvas.transform_session else trap("begun")
+    session.warp = warp
+    session.shown = true
+    session.name = name
+    try end_session(canvas, true)

@@ -1,13 +1,14 @@
 ## Destructive geometry: a layer's pixels moved by whole pixels, or scaled,
-## turned and moved together (free transform). Pixels moved past the canvas
+## turned and moved together (free transform), or distorted in perspective. Pixels moved past the canvas
 ## are kept past it (see `Tiles`) and come back when moved back, as in
 ## Compositor.
 import gpu
 import interop
 import math
 import memory
-from luce_image.tiles import Tiles, tile_size
+from luce_image.tiles import Tiles, tile_size, flatten
 from luce_image.extent import relocate, flatten_all, landing_cells, canvas_part, reaches_past_part
+from luce_image.projective import Warp, affine_warp, multiply
 from luce_image.document import Document
 from luce_image.shaders import warp_frag_words, warp_frag_msl
 from raster_errors import invalid
@@ -31,8 +32,14 @@ pub func translate(document: Document*, layer: u64, dx: i64, dy: i64, on_mask: b
 func floor_div(a: i64, b: i64) -> i64:
     return (a - math.mod_floor(a, b)) // b
 
-## Free transform: a layer's pixels scaled, rotated and moved together, resampled
-## on the GPU through `warp.frag`. Built once per device.
+## How a transform resamples: Compositor's Nearest, Smooth and High quality.
+pub let sampling_nearest: i64 = 0
+pub let sampling_smooth: i64 = 1
+pub let sampling_high: i64 = 2
+
+## Free transform and distort: a layer's pixels resampled through a `Warp`
+## on the GPU with `warp.frag` — the whole layer, past the canvas too, or only
+## the selected pixels (a floating selection). Built once per device.
 pub struct Transformer:
     var owner: gpu.Device
     var shader: gpu.Shader
@@ -45,18 +52,12 @@ pub struct Transformer:
         errdefer pipeline.destroy()
         return Transformer(owner = device, shader = shader, pipeline = pipeline)
 
-    ## Replace `layer`'s pixels (or, `on_mask`, its mask) with them scaled by
-    ## (`scale_x`, `scale_y`) — negative flips — and rotated by `angle` radians
-    ## about the document point (`pivot_x`, `pivot_y`), then moved by (`dx`,
-    ## `dy`). What leaves the document is kept past it; a mask reveals where it came
-    ## from nothing, as an unpainted mask does.
-    pub func apply(document: Document*, layer: u64, scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64,
-                   pivot_x: f64, pivot_y: f64, on_mask: bool = false) -> !:
-        for value in [scale_x, scale_y, angle, dx, dy, pivot_x, pivot_y]:
-            if not math.is_finite(value):
-                error(invalid, "transform parameters must be finite")
-        if math.abs(scale_x) < 0.001 or math.abs(scale_y) < 0.001 or math.abs(scale_x) > 1000.0 or math.abs(scale_y) > 1000.0:
-            error(invalid, "transform scales are 0.001..1000")
+    ## Replace `layer`'s pixels (or, `on_mask`, its mask) with them taken
+    ## through `warp`. What leaves the document is kept past it; a mask
+    ## reveals where it came from nothing, as an unpainted mask does. A
+    ## distortion names the `source` box its pixels lie in, so the map is not
+    ## followed past its horizon.
+    pub func apply(document: Document*, layer: u64, warp: Warp, on_mask: bool = false, source: Landed? = none, sampling: i64 = sampling_smooth) -> !:
         let target = document.find(layer) else error(invalid, "no such layer")
         let tiles = (target.mask_tiles() else error(invalid, "the layer has no mask")) if on_mask else (target.tiles() else error(invalid, "a group cannot be transformed"))
         # Nothing painted: no pixels to move, or a mask revealing everything wherever it goes.
@@ -67,67 +68,27 @@ pub struct Transformer:
         let outside = 1.0 if on_mask else 0.0
         var flat = try flatten_all(self.owner, tiles, gpu.Color(outside, outside, outside, outside))
         defer flat.destroy()
-        let flat_width = (try flat.texture.width())
-        let flat_height = (try flat.texture.height())
-        let box_left = (f64)flat.left
-        let box_top = (f64)flat.top
-        let box_right = box_left + (f64)flat_width
-        let box_bottom = box_top + (f64)flat_height
-        let cx = pivot_x
-        let cy = pivot_y
-        # Forward: p' = R S (p - c) + c + d. Inverse: p = S⁻¹ R⁻¹ (p' - c - d) + c,
-        # then into the flat texture's texels.
-        let cos = math.cos(angle)
-        let sin = math.sin(angle)
-        let a = cos / scale_x
-        let b = sin / scale_x
-        let d = -sin / scale_y
-        let e = cos / scale_y
-        let ox = cx + dx
-        let oy = cy + dy
-        let c = cx - a * ox - b * oy - box_left
-        let f = cy - d * ox - e * oy - box_top
-        # Where the content lands, and so which cells to build.
-        var out_left = 1.0e18
-        var out_top = 1.0e18
-        var out_right = -1.0e18
-        var out_bottom = -1.0e18
-        for corner in 0..<(usize)4:
-            let px = (box_left if corner % 2 == 0 else box_right) - cx
-            let py = (box_top if corner < 2 else box_bottom) - cy
-            let qx = (cos * px * scale_x - sin * py * scale_y) + ox
-            let qy = (sin * px * scale_x + cos * py * scale_y) + oy
-            out_left = math.min(out_left, qx)
-            out_right = math.max(out_right, qx)
-            out_top = math.min(out_top, qy)
-            out_bottom = math.max(out_bottom, qy)
+        let width = (f64)(try flat.texture.width())
+        let height = (f64)(try flat.texture.height())
+        let box = source else Landed(left = (f64)flat.left, top = (f64)flat.top, right = (f64)flat.left + width, bottom = (f64)flat.top + height)
+        let landed = try landing(warp, box.left, box.top, box.right, box.bottom)
         var fresh = try Tiles.create(self.owner, tiles.width(), tiles.height())
         errdefer fresh.destroy()
-        let range = landing_cells(out_left - 1.0, out_top - 1.0, out_right + 1.0, out_bottom + 1.0)
-        if out_left < 1.0 or out_top < 1.0 or out_right + 1.0 > (f64)tiles.width() or out_bottom + 1.0 > (f64)tiles.height():
+        let range = landing_cells(landed.left, landed.top, landed.right, landed.bottom)
+        if landed.left < 0.0 or landed.top < 0.0 or landed.right > (f64)tiles.width() or landed.bottom > (f64)tiles.height():
             try fresh.cover(range)
-        var params: f32[11] = [(f32)a, (f32)b, (f32)c, (f32)d, (f32)e, (f32)f, 0.0, 0.0, (f32)flat_width, (f32)flat_height, (f32)outside]
+        # Into the flat texture's texels.
+        let shift = Warp(m = [1.0, 0.0, (f64)-flat.left, 0.0, 1.0, (f64)-flat.top, 0.0, 0.0, 1.0])
+        var params = shader_params(multiply(shift, warp), width, height, outside, false, sampling)
         for row in range.top..<range.bottom:
             for column in range.left..<range.right:
-                let tile_left = (f64)(column * (i64)tile_size)
-                let tile_top = (f64)(row * (i64)tile_size)
-                params[6] = (f32)tile_left
-                params[7] = (f32)tile_top
-                var texture = try fresh.blank()
-                errdefer texture.destroy()
-                let frame = try texture.frame()
-                defer frame.release()
-                let area = try frame.value().target()
-                defer area.release()
-                try gpu.shade(area.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 44), [flat.texture], gpu.Filter.nearest)
-                discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+                let texture = try self.shade_cell(&fresh, &params, column, row, flat.texture, flat.texture)
                 # Which parts of the cell the landed box reaches.
-                let x = out_left - 1.0 - tile_left
-                let y = out_top - 1.0 - tile_top
-                let w = out_right - out_left + 2.0
-                let h = out_bottom - out_top + 2.0
+                let x = landed.left - (f64)(column * (i64)tile_size)
+                let y = landed.top - (f64)(row * (i64)tile_size)
                 let canvas = canvas_part(&fresh, column, row)
-                try fresh.place(column, row, texture, x < canvas.width and y < canvas.height, reaches_past_part(x, y, w, h, canvas))
+                try fresh.place(column, row, texture, x < canvas.width and y < canvas.height,
+                                reaches_past_part(x, y, landed.right - landed.left, landed.bottom - landed.top, canvas))
         try fresh.settle(on_mask)
         # In place, so pointers to the layer's tiles stay good.
         var before = *tiles
@@ -135,11 +96,84 @@ pub struct Transformer:
         before.destroy()
         target.revision += 1
 
+    ## Take only the pixels `selection` covers (coverage in red; its painted
+    ## box `left`..`right`, `top`..`bottom`) through `warp`, over what the
+    ## selection leaves behind: a floating selection, set down on the canvas.
+    pub func apply_selected(document: Document*, layer: u64, warp: Warp, selection: const Tiles*, left: i64, top: i64, right: i64, bottom: i64,
+                            sampling: i64 = sampling_smooth) -> !:
+        let target = document.find(layer) else error(invalid, "no such layer")
+        let tiles = target.tiles() else error(invalid, "a group cannot be transformed")
+        if right <= left or bottom <= top:
+            return
+        var flat = try flatten(self.owner, tiles)
+        defer flat.destroy()
+        var mask = try flatten(self.owner, selection)
+        defer mask.destroy()
+        let landed = try landing(warp, (f64)left, (f64)top, (f64)right, (f64)bottom)
+        var params = shader_params(warp, (f64)tiles.width(), (f64)tiles.height(), 0.0, true, sampling)
+        for row in 0..<tiles.rows():
+            for column in 0..<tiles.columns():
+                let x0 = (f64)(column * tile_size)
+                let y0 = (f64)(row * tile_size)
+                let x1 = x0 + (f64)tile_size
+                let y1 = y0 + (f64)tile_size
+                # Only cells the selection leaves or the pixels land on change.
+                let under = x0 < (f64)right and x1 > (f64)left and y0 < (f64)bottom and y1 > (f64)top
+                let landing_here = x0 < landed.right and x1 > landed.left and y0 < landed.bottom and y1 > landed.top
+                if not under and not landing_here:
+                    continue
+                let texture = try self.shade_cell(tiles, &params, (i64)column, (i64)row, flat, mask)
+                try tiles.set(column, row, texture)
+        target.revision += 1
+
+    ## One output cell of `tiles` shaded with `params`, as a fresh tile texture.
+    func shade_cell(tiles: const Tiles*, params: f32[16]*, column: i64, row: i64, source: gpu.Texture, selection: gpu.Texture) -> gpu.Texture!:
+        (*params)[6] = (f32)(column * (i64)tile_size)
+        (*params)[7] = (f32)(row * (i64)tile_size)
+        var texture = try tiles.blank()
+        errdefer texture.destroy()
+        let frame = try texture.frame()
+        defer frame.release()
+        let area = try frame.value().target()
+        defer area.release()
+        try gpu.shade(area.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&(*params)[0], 64), [source, selection], gpu.Filter.nearest)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        return texture
+
     pub mutating func destroy():
         self.pipeline.destroy()
         self.shader.destroy()
 
+## A box of document pixels, fractional.
+pub struct Landed:
+    pub var left: f64
+    pub var top: f64
+    pub var right: f64
+    pub var bottom: f64
 
+## Where the box `left`..`right`, `top`..`bottom` lands through `warp` (a
+## backwards map), a pixel's margin around it for the resampling.
+pub func landing(warp: Warp, left: f64, top: f64, right: f64, bottom: f64) -> Landed!:
+    let ahead = try warp.forward((left + right) * 0.5, (top + bottom) * 0.5)
+    var landed = Landed(left = 1.0e18, top = 1.0e18, right = -1.0e18, bottom = -1.0e18)
+    for corner in 0..<(usize)4:
+        var x = 0.0
+        var y = 0.0
+        if not ahead.map(left if corner % 2 == 0 else right, top if corner < 2 else bottom, &x, &y):
+            error(invalid, "the distortion pulls the picture past its horizon")
+        landed.left = math.min(landed.left, x - 1.0)
+        landed.top = math.min(landed.top, y - 1.0)
+        landed.right = math.max(landed.right, x + 1.0)
+        landed.bottom = math.max(landed.bottom, y + 1.0)
+    return landed
+
+## `warp.frag`'s push constants: the map, the tile origin (set per cell), the
+## source's size, the outside value, whether it lifts a selection, and the
+## sampling.
+func shader_params(warp: Warp, width: f64, height: f64, outside: f64, lifting: bool, sampling: i64) -> f32[16]:
+    let m = warp.m
+    return [(f32)m[0], (f32)m[1], (f32)m[2], (f32)m[3], (f32)m[4], (f32)m[5], 0.0, 0.0, (f32)width, (f32)height, (f32)outside,
+            (f32)m[6], (f32)m[7], (f32)m[8], 1.0 if lifting else 0.0, (f32)sampling]
 
 test "a free transform scales, turns and flips a layer about a pivot, and a mask with white around it":
     var device = gpu.Device.open() catch failure:
@@ -168,19 +202,19 @@ test "a free transform scales, turns and flips a layer about a pivot, and a mask
     let found = try current.content_bounds() else trap("the square has bounds")
     assert(found.left == 48 and found.top == 48 and found.right == 80 and found.bottom == 80)
     # Doubling about the square's centre (64, 64) makes it 64×64: (32..96).
-    try transformer.apply(&document, layer, 2.0, 2.0, 0.0, 0.0, 0.0, 64.0, 64.0)
+    try transformer.apply(&document, layer, try affine_warp(2.0, 2.0, 0.0, 0.0, 0.0, 64.0, 64.0))
     try current.read(pixels)
     assert(pixels[(40 * 128 + 40) * 4 + 3] > 0.99 and pixels[(40 * 128 + 40) * 4 + 1] > 0.99)
     assert(pixels[(20 * 128 + 64) * 4 + 3] < 0.01 and pixels[(64 * 128 + 100) * 4 + 3] < 0.01)
     # A quarter turn keeps a centred square where it is; moving it by 40 shifts it.
-    try transformer.apply(&document, layer, 1.0, 1.0, math.pi * 0.5, 40.0, 0.0, 64.0, 64.0)
+    try transformer.apply(&document, layer, try affine_warp(1.0, 1.0, math.pi * 0.5, 40.0, 0.0, 64.0, 64.0))
     try current.read(pixels)
     assert(pixels[(64 * 128 + 110) * 4 + 3] > 0.99 and pixels[(64 * 128 + 40) * 4 + 3] < 0.01)
     let moved = try current.content_bounds() else trap("the square has bounds")
     # Doubled bilinearly, its edges went soft a pixel further out: 31..97, then 71.. after the move.
     assert(moved.left == 71 and moved.right == 128 and moved.top == 31 and moved.bottom == 97)
     # A flip about the document's middle mirrors it exactly: 71..128 lands on 0..57.
-    try transformer.apply(&document, layer, -1.0, 1.0, 0.0, 0.0, 0.0, 64.0, 64.0)
+    try transformer.apply(&document, layer, try affine_warp(-1.0, 1.0, 0.0, 0.0, 0.0, 64.0, 64.0))
     let flipped = try current.content_bounds() else trap("the square has bounds")
     assert(flipped.left == 0 and flipped.right == 57 and flipped.top == 31 and flipped.bottom == 97)
     # A mask painted black in the middle, moved right by 32: black follows, and
@@ -194,15 +228,16 @@ test "a free transform scales, turns and flips a layer about a pivot, and a mask
             for channel in 0..<(usize)3:
                 pixels[(y * 128 + x) * 4 + channel] = 0.0
     try mask_tiles.write(pixels)
-    try transformer.apply(&document, layer, 1.0, 1.0, 0.0, 32.0, 0.0, 64.0, 64.0, on_mask = true)
+    try transformer.apply(&document, layer, try affine_warp(1.0, 1.0, 0.0, 32.0, 0.0, 64.0, 64.0), on_mask = true)
     let moved_mask = (document.find(layer) else trap("layer")).mask_tiles() else trap("mask")
     try moved_mask.read(pixels)
     assert(pixels[(64 * 128 + 90) * 4] < 0.01 and pixels[(64 * 128 + 60) * 4] > 0.99 and pixels[(64 * 128 + 10) * 4] > 0.99)
     var rejected = false
-    transformer.apply(&document, layer, 0.0, 1.0, 0.0, 0.0, 0.0, 64.0, 64.0) catch failure:
+    let flat_warp = affine_warp(0.0, 1.0, 0.0, 0.0, 0.0, 64.0, 64.0) catch failure:
         assert(failure.code == invalid)
         rejected = true
-    assert(rejected)
+        recover Warp(m = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+    assert(rejected and flat_warp.m[0] == 1.0)
 
 test "translating a layer moves its pixels across tiles, and what leaves the canvas comes back":
     var device = gpu.Device.open() catch failure:
