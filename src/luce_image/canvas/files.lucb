@@ -77,11 +77,20 @@ func save_canvas_package(canvas: Canvas*, path: str) -> !:
         try set_integer(manifest.value(), element, "blend", record.blend)
         try set_integer(manifest.value(), element, "clipped", 1 if record.clipped else 0)
         try set_integer(manifest.value(), element, "mask", 1 if record.masked else 0)
+        try set_integer(manifest.value(), element, "mask_enabled", 1 if record.mask_enabled else 0)
+        # A group holds no pixels; its layers name it by its place in the file, from 1.
+        try set_integer(manifest.value(), element, "group", 1 if record.group else 0)
+        var parent: i64 = 0
+        if record.parent != 0:
+            parent = (i64)(try canvas.index(record.parent)) + 1
+        try set_integer(manifest.value(), element, "parent", parent)
         if record.style.any():
             for field in 0..<(i64)20:
                 let number = try prism.Value.number(style_field(record.style, field) else trap("style field"))
                 defer number.release()
                 try manifest.value().set(element, style_names[(usize)field], number)
+        if record.group:
+            continue
         let layer = document.find(record.id) else error(invalid, "a layer is missing")
         var file_buffer: u8[64]
         let tiles = layer.tiles() else error(invalid, "a layer has no pixels")
@@ -285,11 +294,18 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
     defer profile_value.release()
     native.set_profile(try profile_value.value().text_at())
     let layers_dir = try paths.join(path, "layers")
-    for index in 0..<doc.child_count("/layers"):
+    let total = doc.child_count("/layers")
+    # The ids the file's layers get, for groups named by their place in it.
+    let ids = try alloc i64[total if total > 0 else 1] in memory.heap
+    defer free(ids) in memory.heap
+    for index in 0..<total:
         let element = doc.child_at("/layers", index) else error(invalid, "a layer element is missing")
         let name_value = try doc.get(element, "name")
         defer name_value.release()
-        let id = try native.add_layer(try name_value.value().text_at())
+        let group = (get_integer(doc, element, "group") catch _:
+            recover 0) != 0
+        let id = try native.add_group(try name_value.value().text_at()) if group else try native.add_layer(try name_value.value().text_at())
+        ids[index] = id
         let visible = (try get_integer(doc, element, "visible")) != 0
         let opacity = try get_number(doc, element, "opacity")
         let blend = try get_integer(doc, element, "blend")
@@ -306,6 +322,8 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
             try native.set_shadow(id, values[0] != 0.0, values[1], values[2], values[3], values[4], values[5], values[6], values[7])
             try native.set_stroke(id, values[8] != 0.0, values[9], values[10], values[11], values[12], values[13])
             try native.set_glow(id, values[14] != 0.0, values[15], values[16], values[17], values[18], values[19])
+        if group:
+            continue
         var file_buffer: u8[64]
         let picture = try Image.open(try paths.join(layers_dir, try format_file(file_buffer, "layer", index, ".png")))
         try native.place((u64)id, picture)
@@ -314,6 +332,16 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
             let mask = try Image.open(try paths.join(layers_dir, try format_file(file_buffer, "layer", index, ".mask.png")))
             let slot = try native.index((u64)id)
             native.records[slot].mask_picture = mask
+            let enabled = get_integer(doc, element, "mask_enabled") catch _:
+                recover 1
+            native.records[slot].mask_enabled = enabled != 0
+    # Groups come after their layers in the file, so layers go into them once all are read.
+    for index in 0..<total:
+        let element = doc.child_at("/layers", index) else error(invalid, "a layer element is missing")
+        let parent = get_integer(doc, element, "parent") catch _:
+            recover 0
+        if parent > 0 and parent <= (i64)total:
+            try native.move_into(ids[index], ids[(usize)parent - 1], -1)
     return reservation.publish(native, memory.heap)
 
 ## A Photoshop document: its raster layers, bottom-most first, with their

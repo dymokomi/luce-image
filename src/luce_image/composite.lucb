@@ -152,7 +152,7 @@ pub struct Composer:
             if not layer.clipped:
                 clip = self.white
             var mask = self.white
-            if let mask_tiles = layer.mask_tiles():
+            if let mask_tiles = layer.active_mask():
                 if let mask_texture = mask_tiles.texture(column, row):
                     mask = mask_texture
             # The layer's effects go under it, with its opacity and mask, blended normally.
@@ -253,7 +253,7 @@ pub struct Composer:
                 let area = tiles.region(column, row)
                 let backdrop = tiles.texture(column, row) else self.blank
                 var mask = self.white
-                if let mask_tiles = top.mask_tiles():
+                if let mask_tiles = top.active_mask():
                     if let mask_texture = mask_tiles.texture(column, row):
                         mask = mask_texture
                 let clip = (tiles.texture(column, row) else self.blank) if top.clipped else self.white

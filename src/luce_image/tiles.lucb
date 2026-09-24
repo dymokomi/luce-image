@@ -27,6 +27,13 @@ func release(tile: Tile*):
         tile.texture.destroy()
         free(tile) in memory.heap
 
+## A box of whole pixels: `left` and `top` inside, `right` and `bottom` just past.
+pub struct Bounds:
+    pub var left: i64
+    pub var top: i64
+    pub var right: i64
+    pub var bottom: i64
+
 pub func tile_columns(width: u32) -> u32:
     return (width + tile_size - 1) // tile_size
 
@@ -174,6 +181,33 @@ pub struct Tiles:
                                 value = from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8))
                             pixels[destination + channel] = value
 
+    ## The smallest box of whole pixels holding every pixel with any alpha; none
+    ## when there is none. It reads each painted tile back from the GPU.
+    pub func content_bounds() -> Bounds?!:
+        let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+        defer free(bytes) in memory.heap
+        var found = false
+        var bounds = Bounds(left = (i64)self.extent_x, top = (i64)self.extent_y, right = 0, bottom = 0)
+        for row in 0..<self.cell_rows:
+            for column in 0..<self.cell_columns:
+                let texture = self.texture(column, row) else continue
+                let area = self.region(column, row)
+                try texture.read(bytes[..<((usize)area.height * (usize)tile_size * 8)], gpu.Region(0, 0, tile_size, area.height))
+                for y in 0..<(usize)area.height:
+                    for x in 0..<(usize)area.width:
+                        let source = (y * (usize)tile_size + x) * 8
+                        # Any alpha at all: the half's bits but the sign.
+                        if ((u16)bytes[source + 6] | ((u16)bytes[source + 7] << 8)) & 0x7fff == 0:
+                            continue
+                        let px = (i64)(column * tile_size) + (i64)x
+                        let py = (i64)(row * tile_size) + (i64)y
+                        found = true
+                        if px < bounds.left: bounds.left = px
+                        if py < bounds.top: bounds.top = py
+                        if px + 1 > bounds.right: bounds.right = px + 1
+                        if py + 1 > bounds.bottom: bounds.bottom = py + 1
+        return bounds if found else none
+
     func index(column: u32, row: u32) -> usize!:
         if column >= self.cell_columns or row >= self.cell_rows:
             error(invalid, "tile cell out of range")
@@ -213,8 +247,9 @@ pub func min_u32(a: u32, b: u32) -> u32:
 pub func max_u32(a: u32, b: u32) -> u32:
     return a if a > b else b
 
-## Every tile of `tiles` drawn into one texture of the whole extent, as stored.
-pub func flatten(device: gpu.Device, tiles: const Tiles*) -> gpu.Texture!:
+## Every tile of `tiles` drawn into one texture of the whole extent, as stored;
+## empty cells come out as `empty` (a mask's are white: they reveal).
+pub func flatten(device: gpu.Device, tiles: const Tiles*, empty: gpu.Color = gpu.Color(0.0, 0.0, 0.0, 0.0)) -> gpu.Texture!:
     var flat = try gpu.Texture.create(device, tiles.width(), tiles.height(), gpu.Format.rgba16_float)
     errdefer flat.destroy()
     let frame = try flat.frame()
@@ -226,7 +261,7 @@ pub func flatten(device: gpu.Device, tiles: const Tiles*) -> gpu.Texture!:
             let texture = tiles.texture(column, row) else continue
             let area = tiles.region(column, row)
             try gpu.copy_image(whole.value(), texture, gpu.Rect((f64)(column * tile_size), (f64)(row * tile_size), (f64)area.width, (f64)area.height), area)
-    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+    discard(try frame.value().present(empty))
     return flat
 
 test "tiles share, replace, write and read on a device":

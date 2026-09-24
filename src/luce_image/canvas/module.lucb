@@ -37,8 +37,8 @@ import paths
 import prism
 import strings
 from luce_image.image import Image, Pixel
-from luce_image.tiles import Tiles, tile_size, tile_columns, min_u32
-from luce_image.document import Style, Document, box_document, unbox_document, blend_mode_count
+from luce_image.tiles import Tiles, Bounds, tile_size, tile_columns, min_u32
+from luce_image.document import Style, Document, Layer, box_document, unbox_document, blend_mode_count
 from luce_image.composite import Composer, box_composer, unbox_composer
 from luce_image.brush import Brush, Painter, Stroke, begin_boxed, finish_boxed, fill_selection, fill_gradient
 from luce_image.adjust import Adjuster, adjustment_count, curves
@@ -57,6 +57,12 @@ from raster_errors import invalid, limit
 struct Record:
     var id: u64
     var name: str
+    ## A group holds layers and has no pixels; `parent` is the group holding
+    ## this one, 0 at the top level.
+    var group: bool = false
+    var parent: u64 = 0
+    ## A disabled mask is kept but hides nothing.
+    var mask_enabled: bool = true
     var visible: bool
     var opacity: f64
     var blend: i64
@@ -105,6 +111,10 @@ pub struct Canvas:
     ## The color profile the pixels are in, by luce-color's space name.
     var profile_name: u8[64]
     var profile_length: usize
+    ## What `measure_content` found last: a layer's painted box.
+    var content: Bounds
+    ## The next edit joins the one before it in the history (`join_next_edit`).
+    var joining: bool
 
     # mark: Lifecycle and document settings =======================================================
 
@@ -150,6 +160,8 @@ pub struct Canvas:
         var no_name: u8[64]
         self.profile_name = no_name
         self.profile_length = 0
+        self.content = Bounds(left = 0, top = 0, right = 0, bottom = 0)
+        self.joining = false
         self.set_profile("sRGB")
 
     ## Pixels per inch: how big the document prints, and what a ruler in
@@ -215,16 +227,27 @@ pub struct Canvas:
         let device = binding.device else trap("bound")
         var document = try Document.create(device, self.extent_x, self.extent_y)
         errdefer document.destroy()
+        # Everything at the top level first, so the ids come out as the records'...
         for index in 0..<self.count:
             let record = self.records[index]
-            discard(try document.add_layer(record.name))
+            if record.group:
+                discard(try document.add_group(record.name))
+            else:
+                discard(try document.add_layer(record.name))
             try document.set_appearance(record.id, record.visible, record.opacity, (u32)record.blend)
             if record.masked:
                 try document.set_mask(record.id, true)
+                if not record.mask_enabled:
+                    try document.enable_mask(record.id, false)
             if record.style.any():
                 (document.find(record.id) else trap("bound layer")).style = record.style
             if record.clipped:
                 try document.set_clipped(record.id, true)
+        # ...then into their groups, bottom to top, each on top of those before it.
+        for index in 0..<self.count:
+            let record = self.records[index]
+            if record.parent != 0:
+                try document.move_to(record.id, record.parent, (usize)self.count)
         binding.document = try box_document(document)
         var composer = try Composer.create(device)
         errdefer composer.destroy()
@@ -352,6 +375,59 @@ pub struct Canvas:
         self.next_id += 1
         return (i64)id
 
+    ## Add an empty group on top; returns its id. Layers go in with `move_into`.
+    pub mutating func add_group(name: str) -> i64!:
+        let id = try self.add_layer(name)
+        let index = try self.index((u64)id)
+        self.records[index].group = true
+        if let document = self.document:
+            # The record's layer becomes a group in the tree, keeping its id.
+            try document.remove((u64)id)
+            let created = try document.add_group(name)
+            assert(created == (u64)id + 1)
+            self.records[index].id = created
+            self.next_id = created + 1
+            return (i64)created
+        return id
+
+    ## Move a layer — a group with everything in it — into group `parent` (0
+    ## the top level) at `position` among its layers, 0 the bottom, or on top
+    ## when past it. Unbound (a document being loaded), the order is kept as
+    ## the records have it.
+    pub mutating func move_into(id: i64, parent: i64, position: i64) -> !:
+        try self.require_open()
+        let index = try self.index((u64)id)
+        if parent != 0:
+            let holder = try self.index((u64)parent)
+            if not self.records[holder].group:
+                error(invalid, "only a group can hold layers")
+        if let document = self.document:
+            try document.move_to((u64)id, none if parent == 0 else (u64)parent, (usize)position if position >= 0 else (usize)self.count)
+            try self.sync_records()
+            return
+        self.records[index].parent = (u64)parent
+
+    ## Put the records in the tree's order — each group's layers bottom to top,
+    ## then the group, as the Layers panel lists them upside down — with their
+    ## groups.
+    mutating func sync_records() -> !:
+        let document = self.document else return
+        let ids = try alloc u64[self.count] in memory.heap
+        defer free(ids) in memory.heap
+        let parents = try alloc u64[self.count] in memory.heap
+        defer free(parents) in memory.heap
+        var order = Order(ids = ids, parents = parents, count = 0)
+        post_order(document.layers(), 0, &order)
+        if order.count != self.count:
+            error(invalid, "the layer records and the document disagree")
+        let sorted = try alloc Record[self.records.length] in memory.heap
+        for at in 0..<order.count:
+            let index = try self.index(ids[at])
+            sorted[at] = self.records[index]
+            sorted[at].parent = parents[at]
+        free(self.records) in memory.heap
+        self.records = sorted
+
     ## Replace a layer's pixels with the picture at `path`, which must be the
     ## document's size.
     pub mutating func load_layer(id: i64, path: str) -> !:
@@ -375,9 +451,11 @@ pub struct Canvas:
             try document.set_tiles(id, try self.tiles_of(picture))
             picture.release()
             return
-        if let previous = self.records[index].picture:
-            previous.release()
+        # Replace, then release: a release can run the cycle collector, which traces the records.
+        let previous = self.records[index].picture
         self.records[index].picture = picture
+        if let old = previous:
+            old.release()
 
     ## Tiles on the bound device holding `picture`'s pixels.
     mutating func tiles_of(picture: interop.Reference[Image]) -> Tiles!:
@@ -396,6 +474,17 @@ pub struct Canvas:
         let index = try self.index((u64)id)
         if let document = self.document:
             try document.remove((u64)id)
+            # A group goes with everything in it: drop every record the tree lost.
+            var at: usize = 0
+            while at < self.count:
+                if document.find(self.records[at].id) == none:
+                    self.drop_record(at)
+                else:
+                    at += 1
+            return
+        self.drop_record(index)
+
+    mutating func drop_record(index: usize):
         strings.release(self.records[index].name)
         if let picture = self.records[index].picture:
             picture.release()
@@ -431,7 +520,10 @@ pub struct Canvas:
         if target < 0 or target >= (i64)self.count:
             return
         if let document = self.document:
+            # Among its own group's layers: a group moves with all it holds.
             try document.reorder((u64)id, step)
+            try self.sync_records()
+            return
         let moved = self.records[index]
         self.records[index] = self.records[(usize)target]
         self.records[(usize)target] = moved
@@ -455,6 +547,8 @@ pub struct Canvas:
             let actual = try document.duplicate((u64)id, name)
             self.records[copy].id = actual
             self.next_id = actual + 1
+            try self.sync_records()
+            return (i64)actual
         elif let picture = self.records[index].picture:
             self.records[copy].picture = picture.clone()
         # Place the copy right above the source.
@@ -483,6 +577,7 @@ pub struct Canvas:
         for shift in index..<(self.count - 1):
             self.records[shift] = self.records[shift + 1]
         self.count -= 1
+        try self.sync_records()
         clear_snapshots(&self.history, &self.history_count)
         clear_snapshots(&self.future, &self.future_count)
 
@@ -574,19 +669,115 @@ pub struct Canvas:
 
     # mark: Masks, clipping and styles ============================================================
 
-    ## Give a layer a mask that reveals everything, or remove its mask.
-    pub mutating func set_mask(id: i64, present: bool) -> !:
+    ## Give a layer a mask, or remove its mask. `fill` is what the new mask
+    ## holds: 0 reveals everything, 1 hides everything (Photoshop's Alt-click),
+    ## 2 reveals the selection.
+    pub mutating func set_mask(id: i64, present: bool, fill: i64 = 0) -> !:
         try self.require_open()
         try self.require_idle()
         let index = try self.index((u64)id)
+        if self.records[index].group:
+            error(invalid, "a group cannot have a mask yet")
+        if fill < 0 or fill > 2:
+            error(invalid, "a mask is filled 0 white, 1 black or 2 from the selection")
         if let document = self.document:
             try document.set_mask((u64)id, present)
+            if present and fill != 0:
+                let mask = (document.find((u64)id) else trap("masked layer")).mask_tiles() else trap("just masked")
+                let count = (usize)self.extent_x * (usize)self.extent_y
+                let pixels = try alloc f32[count * 4] in memory.heap
+                defer free(pixels) in memory.heap
+                let selection = self.current()
+                for at in 0..<count:
+                    var value: f32 = 0.0
+                    if fill == 2:
+                        value = (f32)selection.at((i64)(at % (usize)self.extent_x), (i64)(at // (usize)self.extent_x)) / 255.0
+                    pixels[at * 4] = value
+                    pixels[at * 4 + 1] = value
+                    pixels[at * 4 + 2] = value
+                    # Opaque everywhere, so every cell is kept, black ones too.
+                    pixels[at * 4 + 3] = 1.0
+                try mask.write(pixels)
+        elif present and fill != 0:
+            error(invalid, "draw the document once before filling a mask")
         self.records[index].masked = present
+        self.records[index].mask_enabled = true
         if not present and self.mask_editing:
             self.mask_editing = false
 
     pub func layer_masked(index: i64) -> bool!:
         return (try self.record(index)).masked
+
+    ## Disable a layer's mask — kept, hiding nothing — or enable it again.
+    pub mutating func enable_mask(id: i64, enabled: bool) -> !:
+        try self.require_open()
+        let index = try self.index((u64)id)
+        if not self.records[index].masked:
+            error(invalid, "the layer has no mask")
+        if let document = self.document:
+            try document.enable_mask((u64)id, enabled)
+        self.records[index].mask_enabled = enabled
+
+    pub func layer_mask_enabled(index: i64) -> bool!:
+        return (try self.record(index)).mask_enabled
+
+    ## Load a layer's transparency — or with `mask` its mask — as the
+    ## selection, combined by `mode` (0 replace, 1 add, 2 subtract, 3
+    ## intersect): Photoshop's Cmd-click on a thumbnail.
+    pub mutating func select_from_layer(id: i64, mask: bool, mode: i64) -> !:
+        try self.require_open()
+        let document = self.document else error(invalid, "draw the document once before selecting from a layer")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = (layer.mask_tiles() else error(invalid, "the layer has no mask")) if mask else (layer.tiles() else error(invalid, "a group has no pixels to select"))
+        let count = (usize)self.extent_x * (usize)self.extent_y * 4
+        let pixels = try alloc f32[count] in memory.heap
+        defer free(pixels) in memory.heap
+        try tiles.read(pixels)
+        if mask:
+            # A mask cell never painted reveals everything.
+            for row in 0..<tiles.rows():
+                for column in 0..<tiles.columns():
+                    if tiles.texture(column, row) != none:
+                        continue
+                    let area = tiles.region(column, row)
+                    for y in 0..<(usize)area.height:
+                        for x in 0..<(usize)area.width:
+                            pixels[(((usize)row * (usize)tile_size + y) * (usize)self.extent_x + (usize)column * (usize)tile_size + x) * 4] = 1.0
+        try self.live().from_samples(pixels, 0 if mask else 3, try selection_mode(mode))
+
+    ## Whether the layer at `index` is a group.
+    pub func layer_is_group(index: i64) -> bool!:
+        return (try self.record(index)).group
+
+    ## The id of the group holding the layer at `index`, 0 at the top level.
+    pub func layer_parent(index: i64) -> i64!:
+        return (i64)(try self.record(index)).parent
+
+    ## Where the layer at `index` sits among its group's layers (or the top
+    ## level's), 0 the bottom.
+    pub func layer_position(index: i64) -> i64!:
+        let record = try self.record(index)
+        if let document = self.document:
+            return (i64)(try document.position(record.id))
+        var position: i64 = 0
+        for at in 0..<(usize)index:
+            if self.records[at].parent == record.parent:
+                position += 1
+        return position
+
+    ## How many groups hold the layer at `index`: 0 at the top level.
+    pub func layer_depth(index: i64) -> i64!:
+        var depth: i64 = 0
+        var parent = (try self.record(index)).parent
+        while parent != 0:
+            depth += 1
+            parent = self.records[try self.index(parent)].parent
+        return depth
+
+    ## Make the next edit undo and redo together with the one before it, as
+    ## one step: several layers moved at once.
+    pub mutating func join_next_edit():
+        self.joining = true
 
     ## Route strokes to the selected layer's mask instead of its pixels: white
     ## reveals, black hides.
@@ -1152,25 +1343,92 @@ pub struct Canvas:
         try filters.gaussian_blur(document, (u64)id, radius)
         try self.restrict_to_selection((u64)id, &self.history[self.history_count - 1].tiles)
 
-    ## Free transform: scale a layer's pixels by (`scale_x`, `scale_y`) and turn
-    ## them `angle` degrees about the centre of what the layer has, then move
-    ## them by (`dx`, `dy`) pixels; what leaves the document is lost. Undoable.
-    pub mutating func transform_layer(id: i64, scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64) -> !:
+    ## Free transform: scale a layer's pixels by (`scale_x`, `scale_y`) —
+    ## negative flips — and turn them `angle` degrees about the document point
+    ## (`pivot_x`, `pivot_y`), then move them by (`dx`, `dy`) pixels; what leaves
+    ## the document is lost. A linked mask goes with them (while editing the
+    ## mask, the mask alone). Undoable in one step.
+    pub mutating func transform_layer(id: i64, scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64, pivot_x: f64, pivot_y: f64) -> !:
         try self.require_open()
         try self.require_idle()
-        let document = self.document else error(invalid, "draw the document once before transforming")
-        let transformer = self.transformer else error(invalid, "draw the document once before transforming")
-        let layer = document.find((u64)id) else error(invalid, "no such layer")
-        let tiles = layer.tiles() else error(invalid, "a group cannot be transformed")
-        try self.remember((u64)id, try tiles.clone())
-        try transformer.apply(document, (u64)id, scale_x, scale_y, angle * math.pi / 180.0, dx, dy)
+        let index = try self.index((u64)id)
+        let on_mask = self.mask_editing and self.records[index].masked
+        try self.transform_one((u64)id, scale_x, scale_y, angle, dx, dy, pivot_x, pivot_y, on_mask, false)
+        if self.records[index].masked and not on_mask:
+            try self.transform_one((u64)id, scale_x, scale_y, angle, dx, dy, pivot_x, pivot_y, true, true)
 
     ## Show a free transform (as `transform_layer`) of the previewed layer's original pixels.
-    pub mutating func preview_transform(scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64) -> !:
+    pub mutating func preview_transform(scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64, pivot_x: f64, pivot_y: f64) -> !:
         let layer = try self.restore_preview()
         let document = self.document else trap("preview without a document")
         let transformer = self.transformer else trap("preview without a transformer")
-        try transformer.apply(document, layer, scale_x, scale_y, angle * math.pi / 180.0, dx, dy)
+        try transformer.apply(document, layer, scale_x, scale_y, angle * math.pi / 180.0, dx, dy, pivot_x, pivot_y)
+
+    ## Mirror a layer's pixels (and linked mask) left to right, or top to
+    ## bottom, about the middle of what it has painted. Undoable.
+    pub mutating func flip_layer(id: i64, horizontal: bool) -> !:
+        if not try self.measure_content(id):
+            return
+        let pivot_x = (f64)(self.content.left + self.content.right) * 0.5
+        let pivot_y = (f64)(self.content.top + self.content.bottom) * 0.5
+        try self.transform_layer(id, -1.0 if horizontal else 1.0, 1.0 if horizontal else -1.0, 0.0, 0.0, 0.0, pivot_x, pivot_y)
+
+    ## Mirror the whole image — every layer and mask — about the canvas's
+    ## middle. Undoable in one step.
+    pub mutating func flip_canvas(horizontal: bool) -> !:
+        try self.require_open()
+        try self.require_idle()
+        let scale_x = -1.0 if horizontal else 1.0
+        let scale_y = 1.0 if horizontal else -1.0
+        let pivot_x = (f64)self.extent_x * 0.5
+        let pivot_y = (f64)self.extent_y * 0.5
+        var joined = false
+        for index in 0..<self.count:
+            let document = self.document else error(invalid, "draw the document once before flipping")
+            let layer = document.find(self.records[index].id) else continue
+            if layer.tiles() == none:
+                continue
+            try self.transform_one(self.records[index].id, scale_x, scale_y, 0.0, 0.0, 0.0, pivot_x, pivot_y, false, joined)
+            joined = true
+            if self.records[index].masked:
+                try self.transform_one(self.records[index].id, scale_x, scale_y, 0.0, 0.0, 0.0, pivot_x, pivot_y, true, true)
+
+    ## Find layer `id`'s painted box, exactly, for `content_left` and the rest;
+    ## false when it has nothing painted. It reads the layer back from the GPU.
+    pub mutating func measure_content(id: i64) -> bool!:
+        try self.require_open()
+        let document = self.document else error(invalid, "draw the document once before measuring")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = layer.tiles() else error(invalid, "a group has no pixels of its own")
+        if let found = try tiles.content_bounds():
+            self.content = found
+            return true
+        self.content = Bounds(left = 0, top = 0, right = 0, bottom = 0)
+        return false
+
+    ## The box `measure_content` found, in document pixels.
+    pub func content_left() -> i64:
+        return self.content.left
+
+    pub func content_top() -> i64:
+        return self.content.top
+
+    pub func content_width() -> i64:
+        return self.content.right - self.content.left
+
+    pub func content_height() -> i64:
+        return self.content.bottom - self.content.top
+
+    ## Transform a layer's pixels or mask, remembering them first (`joined` to
+    ## the step before).
+    mutating func transform_one(id: u64, scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64, pivot_x: f64, pivot_y: f64,
+                                on_mask: bool, joined: bool) -> !:
+        let document = self.document else error(invalid, "draw the document once before transforming")
+        let transformer = self.transformer else error(invalid, "draw the document once before transforming")
+        let layer = document.find(id) else error(invalid, "no such layer")
+        let tiles = (layer.mask_tiles() else error(invalid, "the layer has no mask")) if on_mask else (layer.tiles() else error(invalid, "a group cannot be transformed"))
+        try self.remember(id, try tiles.clone(), on_mask, joined = joined)
+        try transformer.apply(document, id, scale_x, scale_y, angle * math.pi / 180.0, dx, dy, pivot_x, pivot_y, on_mask = on_mask)
 
     # mark: Clipboard ============================================================================
 
@@ -1272,7 +1530,9 @@ pub struct Canvas:
             self.history_count -= 1
             # What was joined to the dropped entry now starts the oldest edit kept.
             self.history[0].joined = false
-        try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = tiles, mask = mask, joined = joined))
+        let join = joined or (self.joining and self.history_count > 0)
+        self.joining = false
+        try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = tiles, mask = mask, joined = join))
 
     # mark: Files and drawing =====================================================================
 

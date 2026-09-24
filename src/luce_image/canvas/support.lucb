@@ -65,3 +65,19 @@ func curve_channel(channel: i64) -> usize!:
         error(invalid, "curve channels are 0 (RGB), 1 (red), 2 (green) and 3 (blue)")
     return (usize)channel
 
+
+## The layer tree read out for the records: ids and their groups, in order.
+struct Order:
+    var ids: u64[]
+    var parents: u64[]
+    var count: usize
+
+## Each group's layers bottom to top, then the group itself.
+func post_order(layers: Layer*[], parent: u64, order: Order*):
+    for layer in layers:
+        if layer.group:
+            post_order(layer.layers(), layer.id, order)
+        if order.count < order.ids.length:
+            order.ids[order.count] = layer.id
+            order.parents[order.count] = parent
+        order.count += 1

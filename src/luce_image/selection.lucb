@@ -122,6 +122,20 @@ pub struct Selection:
             self.outside(left, top, right, bottom)
         self.finish()
 
+    ## Coverage from channel `channel` (0 red .. 3 alpha) of straight RGBA
+    ## samples covering the document, 0..1, combined by `mode`: a layer's
+    ## transparency, or its mask, loaded as a selection.
+    pub mutating func from_samples(samples: const f32[], channel: usize, mode: Mode) -> !:
+        if samples.length != self.coverage.length * 4 or channel > 3:
+            error(invalid, "samples must be RGBA for every document pixel")
+        if mode == Mode.replace:
+            for index in 0..<self.coverage.length:
+                self.coverage[index] = 0
+        for index in 0..<self.coverage.length:
+            let value = (u8)(math.clamp((f64)samples[index * 4 + channel], 0.0, 1.0) * 255.0 + 0.5)
+            self.combine(index, value, mode)
+        self.finish()
+
     ## A polygon from `points` (x, y pairs in document pixels), even-odd filled,
     ## combined by `mode`.
     pub mutating func polygon(points: const f64[], mode: Mode) -> !:

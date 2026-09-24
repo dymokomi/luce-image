@@ -72,6 +72,8 @@ pub struct Layer:
     var pixels: Tiles*?
     ## The layer mask: red reveals, a missing tile reveals fully.
     var mask: Tiles*?
+    ## A disabled mask is kept but hides nothing, as Photoshop's Shift-click.
+    pub var mask_enabled: bool = true
     var children: Layer*[]
     var child_count: usize
     ## Bumps whenever the pixels are replaced.
@@ -84,6 +86,10 @@ pub struct Layer:
     ## The layer's mask tiles, borrowed; `none` without a mask.
     pub func mask_tiles() -> Tiles*?:
         return self.mask
+
+    ## The mask as it hides pixels: `none` without one or while it is disabled.
+    pub func active_mask() -> Tiles*?:
+        return self.mask if self.mask_enabled else none
 
     ## The children of a group, bottom to top.
     pub func layers() -> Layer*[]:
@@ -184,14 +190,7 @@ pub struct Document:
             target = self.find(id) else error(invalid, "no such parent layer")
             if not target.group:
                 error(invalid, "only a group can hold layers")
-        if target.child_count == target.children.length:
-            let capacity = 8 if target.children.length == 0 else target.children.length * 2
-            let grown = try alloc Layer*[capacity] in memory.heap
-            if target.child_count > 0:
-                memory.copy(grown, target.children, target.child_count)
-            if target.children.length > 0:
-                free(target.children) in memory.heap
-            target.children = grown
+        try make_room(target)
         var copied: str = ""
         with memory.heap:
             copied = try strings.copy(name)
@@ -204,6 +203,56 @@ pub struct Document:
         self.next_id += 1
         self.revision += 1
         return id
+
+    ## Move a layer — a group with everything in it — into group `parent` (the
+    ## top level when none) at `position` among its layers, 0 the bottom; past
+    ## the top it goes on top. A group cannot go inside itself.
+    pub mutating func move_to(id: u64, parent: u64?, position: usize) -> !:
+        let moving = self.find(id) else error(invalid, "no such layer")
+        var target = self.root
+        if let parent_id = parent:
+            target = self.find(parent_id) else error(invalid, "no such parent layer")
+            if not target.group:
+                error(invalid, "only a group can hold layers")
+            if parent_id == id or find_in(moving, parent_id) != none:
+                error(invalid, "a group cannot go inside itself")
+        # Room first, so a failed allocation leaves the tree as it was.
+        try make_room(target)
+        let source = parent_of(self.root, id) else error(invalid, "no such layer")
+        var index: usize = 0
+        while source.children[index].id != id:
+            index += 1
+        for shift in index..<(source.child_count - 1):
+            source.children[shift] = source.children[shift + 1]
+        source.child_count -= 1
+        let at = position if position < target.child_count else target.child_count
+        var shift = target.child_count
+        while shift > at:
+            target.children[shift] = target.children[shift - 1]
+            shift -= 1
+        target.children[at] = moving
+        target.child_count += 1
+        self.revision += 1
+
+    ## The group holding `id`, or none at the top level.
+    pub func parent_id(id: u64) -> u64?:
+        let parent = parent_of(self.root, id) else return none
+        return none if parent == self.root else parent.id
+
+    ## Where `id` sits among its parent's layers, 0 the bottom.
+    pub func position(id: u64) -> usize!:
+        let parent = parent_of(self.root, id) else error(invalid, "no such layer")
+        var index: usize = 0
+        while parent.children[index].id != id:
+            index += 1
+        return index
+
+    ## Keep a layer's mask but stop it hiding anything, or bring it back.
+    pub mutating func enable_mask(id: u64, enabled: bool) -> !:
+        let layer = self.find(id) else error(invalid, "no such layer")
+        layer.mask_enabled = enabled
+        layer.revision += 1
+        self.revision += 1
 
     ## Move a layer one step up (`step` 1) or down (-1) among its siblings.
     pub mutating func reorder(id: u64, step: i64) -> !:
@@ -375,6 +424,18 @@ pub func box_document(document: Document) -> Document*!:
 pub func unbox_document(document: Document*):
     document.destroy()
     free(document) in memory.heap
+
+## Grow a group's children so one more fits.
+func make_room(layer: Layer*) -> !:
+    if layer.child_count < layer.children.length:
+        return
+    let capacity = 8 if layer.children.length == 0 else layer.children.length * 2
+    let grown = try alloc Layer*[capacity] in memory.heap
+    if layer.child_count > 0:
+        memory.copy(grown, layer.children, layer.child_count)
+    if layer.children.length > 0:
+        free(layer.children) in memory.heap
+    layer.children = grown
 
 func parent_of(layer: Layer*, id: u64) -> Layer*?:
     for child in layer.children[..<layer.child_count]:
