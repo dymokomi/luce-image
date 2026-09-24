@@ -952,3 +952,41 @@ test "trim finds the picture's box by transparency or a corner's color":
     assert(canvas.undo_name() == "Size and Fill")
     try canvas.undo()
     assert(canvas.width() == 16 and canvas.undo_name() == "Image Size")
+
+test "selection shapes feather or harden alone, and the wand samples a square or every layer":
+    var canvas = try Canvas(64, 48)
+    defer canvas.close()
+    let bottom = try canvas.add_layer("Bottom")
+    let top = try canvas.add_layer("Top")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    # An anti-aliased ellipse has soft edge pixels; hard-edged it has none.
+    try canvas.select_ellipse(4, 4, 21, 21)
+    var soft = false
+    for x in 0..<(i64)30:
+        let value = canvas.selected_at(x, 7)
+        soft = soft or (value > 0 and value < 255)
+    assert(soft)
+    try canvas.set_selection_shape(0, false)
+    try canvas.select_ellipse(4, 4, 21, 21)
+    for x in 0..<(i64)30:
+        let value = canvas.selected_at(x, 7)
+        assert(value == 0 or value == 255)
+    # Feathered, a rectangle added to the ellipse fades out; the ellipse stays hard.
+    try canvas.set_selection_shape(4, true)
+    try canvas.select_rectangle(40, 10, 16, 16, 1)
+    assert(canvas.selected_at(48, 18) > 200 and canvas.selected_at(40, 18) > 0 and canvas.selected_at(40, 18) < 255 and canvas.selected_at(14, 14) == 255)
+    try canvas.set_selection_shape(0, true)
+    # The wand on all layers sees the top layer's red over the bottom's blue.
+    try canvas.deselect()
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, false)
+    try canvas.fill(bottom, false)
+    try canvas.select_rectangle(0, 0, 32, 48)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.fill(top, false)
+    try canvas.deselect()
+    try canvas.select_wand(bottom, 50, 20, 10.0, true, 0, 3, true)
+    assert(canvas.selected_at(50, 20) == 255 and canvas.selected_at(10, 20) == 0)
+    try canvas.select_wand(bottom, 10, 20, 10.0, true, 0, 5, false)
+    assert(canvas.selected_at(10, 20) == 255 and canvas.selected_at(50, 20) == 255)

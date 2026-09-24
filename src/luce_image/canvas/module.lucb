@@ -155,6 +155,10 @@ pub struct Canvas:
     var saved_version: u64
     ## Whether the edit under way (`begin_edit`) recorded the whole document.
     var edit_captured: bool
+    ## How the next marquee, lasso or wand shape is made: feathered by this
+    ## many pixels, and with hard edges when not anti-aliased.
+    var shape_feather: i64
+    var shape_hard: bool
     ## The free transform under way, if any.
     var transform_session: TransformSession*?
     ## What `measure_histogram` counted: luminosity, red, green and blue, 256
@@ -222,6 +226,8 @@ pub struct Canvas:
         self.heal_opacity = 1.0
         self.edit_depth = 0
         self.edit_captured = false
+        self.shape_feather = 0
+        self.shape_hard = false
         self.preview_name = "Adjustment"
         self.serial = 0
         self.saved_version = 0
@@ -989,28 +995,77 @@ pub struct Canvas:
     pub mutating func select_rectangle(x: i64, y: i64, width: i64, height: i64, mode: i64 = 0) -> !:
         try self.require_open()
         try self.remember_state("Select")
-        self.live().rectangle(x, y, width, height, try selection_mode(mode))
+        if not self.shaping():
+            self.live().rectangle(x, y, width, height, try selection_mode(mode))
+            return
+        var shape = try Selection.create(self.extent_x, self.extent_y)
+        defer shape.destroy()
+        shape.rectangle(x, y, width, height, Mode.replace)
+        try self.merge_shape(&shape, mode)
 
     ## Select an ellipse inscribed in a rectangle, combined by `mode`.
     pub mutating func select_ellipse(x: i64, y: i64, width: i64, height: i64, mode: i64 = 0) -> !:
         try self.require_open()
         try self.remember_state("Select")
-        self.live().ellipse(x, y, width, height, try selection_mode(mode))
+        if not self.shaping():
+            self.live().ellipse(x, y, width, height, try selection_mode(mode))
+            return
+        var shape = try Selection.create(self.extent_x, self.extent_y)
+        defer shape.destroy()
+        shape.ellipse(x, y, width, height, Mode.replace)
+        try self.merge_shape(&shape, mode)
 
-    ## The magic wand on layer `id`: select the pixels within `tolerance`
-    ## (0..255, sRGB, alpha included) of the color at (`x`, `y`), only those
-    ## reachable through such pixels when `contiguous`, combined by `mode`.
-    pub mutating func select_wand(id: i64, x: i64, y: i64, tolerance: f64, contiguous: bool, mode: i64 = 0) -> !:
+    ## The next marquee, lasso and wand shapes: feathered by `feather`
+    ## pixels (0..250) and anti-aliased or hard-edged, as the tool options say.
+    pub mutating func set_selection_shape(feather: i64, antialias: bool) -> !:
+        if feather < 0 or feather > 250:
+            error(invalid, "feather is 0..250 pixels")
+        self.shape_feather = feather
+        self.shape_hard = not antialias
+
+    ## Whether shapes are made alone first, to be feathered or hardened.
+    func shaping() -> bool:
+        return self.shape_feather > 0 or self.shape_hard
+
+    ## A shape made alone, hardened and feathered as set, then combined in by `mode`.
+    mutating func merge_shape(shape: Selection*, mode: i64) -> !:
+        if self.shape_hard:
+            shape.harden()
+        if self.shape_feather > 0:
+            try shape.adjust(0, self.shape_feather)
+        try self.live().merge(shape, try selection_mode(mode))
+
+    ## The magic wand on layer `id` (or, `all_layers`, the flattened picture):
+    ## select the pixels within `tolerance` (0..255, sRGB, alpha included) of
+    ## the color at (`x`, `y`) — averaged over a `sample` by `sample` square
+    ## (1, 3 or 5) — only those reachable through such pixels when
+    ## `contiguous`, combined by `mode`.
+    pub mutating func select_wand(id: i64, x: i64, y: i64, tolerance: f64, contiguous: bool, mode: i64 = 0, sample: i64 = 1, all_layers: bool = false) -> !:
         try self.require_open()
         try self.remember_state("Magic Wand")
-        let document = self.document else error(invalid, "draw the document once before using the wand")
-        let layer = document.find((u64)id) else error(invalid, "no such layer")
-        let tiles = layer.tiles() else error(invalid, "a group has no pixels to sample")
-        let count = (usize)self.extent_x * (usize)self.extent_y * 4
-        let pixels = try alloc f32[count] in memory.heap
+        if sample != 1 and sample != 3 and sample != 5:
+            error(invalid, "the wand samples 1, 3 or 5 pixels square")
+        var pixels: f32[]
+        if all_layers:
+            pixels = try flattened_pixels(&self)
+        else:
+            let document = self.document else error(invalid, "draw the document once before using the wand")
+            let layer = document.find((u64)id) else error(invalid, "no such layer")
+            let tiles = layer.tiles() else error(invalid, "a group has no pixels to sample")
+            pixels = try alloc f32[(usize)self.extent_x * (usize)self.extent_y * 4] in memory.heap
+            tiles.read(pixels) catch failure:
+                free(pixels) in memory.heap
+                error(failure.code, failure.message)
         defer free(pixels) in memory.heap
-        try tiles.read(pixels)
-        try self.live().wand(pixels, x, y, tolerance, contiguous, try selection_mode(mode))
+        if sample > 1 and x >= 0 and y >= 0 and x < (i64)self.extent_x and y < (i64)self.extent_y:
+            average_around(pixels, (usize)self.extent_x, (usize)self.extent_y, x, y, sample // 2)
+        if not self.shaping():
+            try self.live().wand(pixels, x, y, tolerance, contiguous, try selection_mode(mode))
+            return
+        var shape = try Selection.create(self.extent_x, self.extent_y)
+        defer shape.destroy()
+        try shape.wand(pixels, x, y, tolerance, contiguous, Mode.replace)
+        try self.merge_shape(&shape, mode)
 
     ## Collect a polygon point for `select_polygon`.
     pub mutating func add_point(x: f64, y: f64) -> !:
@@ -1039,8 +1094,16 @@ pub struct Canvas:
         if self.polygon_count < 6:
             self.polygon_count = 0
             error(invalid, "a polygon needs at least three points")
-        try self.live().polygon(self.polygon[..<self.polygon_count], try selection_mode(mode))
+        # The points are used once: the buffer stays, the count starts again.
+        let points = self.polygon[..<self.polygon_count]
         self.polygon_count = 0
+        if not self.shaping():
+            try self.live().polygon(points, try selection_mode(mode))
+            return
+        var shape = try Selection.create(self.extent_x, self.extent_y)
+        defer shape.destroy()
+        try shape.polygon(points, Mode.replace)
+        try self.merge_shape(&shape, mode)
 
     pub mutating func select_all() -> !:
         try self.require_open()

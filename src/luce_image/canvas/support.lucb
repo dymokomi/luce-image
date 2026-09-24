@@ -28,6 +28,26 @@ struct Binding:
     var transformer: Transformer? = none
     var passes: SelectionPasses? = none
 
+## The wand's seed at (`x`, `y`) of straight-alpha `pixels` set to the mean
+## of the square `reach` pixels round it (clipped to the picture), so the wand
+## compares against a sample rather than one pixel.
+func average_around(pixels: f32[], width: usize, height: usize, x: i64, y: i64, reach: i64):
+    var sum: f64[4] = [0.0, 0.0, 0.0, 0.0]
+    var count = 0.0
+    for dy in -reach..<(reach + 1):
+        for dx in -reach..<(reach + 1):
+            let px = x + dx
+            let py = y + dy
+            if px < 0 or py < 0 or px >= (i64)width or py >= (i64)height:
+                continue
+            let at = ((usize)py * width + (usize)px) * 4
+            for channel in 0..<(usize)4:
+                sum[channel] += (f64)pixels[at + channel]
+            count += 1.0
+    let seed = ((usize)y * width + (usize)x) * 4
+    for channel in 0..<(usize)4:
+        pixels[seed + channel] = (f32)(sum[channel] / count)
+
 ## A color the brush, a fill, a gradient or text paints in: components in 0..1.
 func gpu_check_color(color: gpu.Color) -> !:
     if not (color.red >= 0.0 and color.red <= 1.0 and color.green >= 0.0 and color.green <= 1.0 and color.blue >= 0.0 and color.blue <= 1.0):

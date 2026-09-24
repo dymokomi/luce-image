@@ -391,6 +391,24 @@ pub struct Selection:
         else:
             self.coverage[index] = value if value < current else current
 
+    ## Every pixel of `other` (a shape made alone) combined in by `mode`, as
+    ## a shape drawn here would be.
+    pub mutating func merge(other: const Selection*, mode: Mode) -> !:
+        if other.coverage.length != self.coverage.length:
+            error(invalid, "selections must be the same size to merge")
+        if mode == Mode.replace:
+            for index in 0..<self.coverage.length:
+                self.coverage[index] = 0
+        for index in 0..<self.coverage.length:
+            self.combine(index, other.coverage[index], mode)
+        self.finish()
+
+    ## Hard edges: each pixel wholly in or out, at half coverage (anti-alias off).
+    pub mutating func harden():
+        for index in 0..<self.coverage.length:
+            self.coverage[index] = 255 if self.coverage[index] >= 128 else 0
+        self.finish()
+
     ## Intersecting clears everything outside the shape's rectangle.
     mutating func outside(left: i64, top: i64, right: i64, bottom: i64):
         for row in 0..<(i64)self.extent_y:
