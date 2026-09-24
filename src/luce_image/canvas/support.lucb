@@ -26,6 +26,7 @@ struct Binding:
     var adjuster: Adjuster? = none
     var filters: Filters? = none
     var transformer: Transformer? = none
+    var passes: SelectionPasses? = none
 
 ## A color the brush, a fill, a gradient or text paints in: components in 0..1.
 func gpu_check_color(color: gpu.Color) -> !:
@@ -34,6 +35,9 @@ func gpu_check_color(color: gpu.Color) -> !:
 
 ## Destroy what `binding` holds, in reverse order of creation, and empty it.
 func unwind(binding: Binding*):
+    if let passes = binding.passes:
+        var owned = passes
+        owned.destroy()
     if let transformer = binding.transformer:
         var owned = transformer
         owned.destroy()

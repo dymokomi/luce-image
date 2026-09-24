@@ -333,3 +333,62 @@ test "a document keeps its resolution and color profile":
         assert(failure.code == invalid)
         rejected = true
     assert(rejected and canvas.resolution() == 300.0)
+
+## The color at one pixel of the canvas drawn at 1:1 over black.
+func shown_at(canvas: Canvas*, target: gpu.Texture*, x: u32, y: u32) -> u8[4]!:
+    let frame = try target.frame()
+    defer frame.release()
+    let root = try frame.value().target()
+    defer root.release()
+    try canvas.draw(root, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
+    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    var pixel: u8[4]
+    try target.read(pixel, gpu.Region(x, y, 1, 1))
+    return pixel
+
+test "selected pixels move or copy with their selection, and edits keep inside it":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    # A red square at 8..24.
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(8, 8, 16, 16, 0)
+    try canvas.fill(layer, false)
+    # Moved right by 24: it leaves its place, lands at 32..48, and the outline follows.
+    try canvas.move_selected_pixels(layer, 24, 0, false)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 0)
+    assert((try shown_at(&canvas, &target, 36, 12))[0] == 255)
+    assert(canvas.selection_left() == 32 and canvas.selection_top() == 8)
+    try canvas.undo()
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 255 and (try shown_at(&canvas, &target, 36, 12))[0] == 0)
+    # Copied down by 24 (Alt): both places are red.
+    try canvas.select_rectangle(8, 8, 16, 16, 0)
+    try canvas.move_selected_pixels(layer, 0, 24, true)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 255 and (try shown_at(&canvas, &target, 12, 36))[0] == 255)
+    # An inversion with the top band selected changes only the top square.
+    try canvas.select_rectangle(0, 0, 64, 20, 0)
+    try canvas.adjust_layer(layer, 2, 0.0, 0.0, 0.0, 0.0, 0.0)
+    let top = try shown_at(&canvas, &target, 12, 12)
+    let below = try shown_at(&canvas, &target, 12, 36)
+    assert(top[0] == 0 and top[1] == 255 and top[2] == 255)
+    assert(below[0] == 255 and below[1] == 0)
+    # A previewed inversion is kept inside the selection too, then dropped.
+    try canvas.begin_preview(layer)
+    try canvas.preview_adjust(2, 0.0, 0.0, 0.0, 0.0, 0.0)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 255 and (try shown_at(&canvas, &target, 12, 36))[0] == 255)
+    try canvas.end_preview(false)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 0)
+    # A preview of the move shows it; dropped, nothing moved.
+    try canvas.select_rectangle(8, 32, 16, 16, 0)
+    try canvas.begin_preview(layer)
+    try canvas.preview_move_selected(24, 0, false)
+    assert((try shown_at(&canvas, &target, 36, 36))[0] == 255 and (try shown_at(&canvas, &target, 12, 36))[0] == 0)
+    try canvas.end_preview(false)
+    assert((try shown_at(&canvas, &target, 12, 36))[0] == 255 and (try shown_at(&canvas, &target, 36, 36))[0] == 0)

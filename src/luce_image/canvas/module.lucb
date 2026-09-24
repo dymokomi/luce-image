@@ -43,6 +43,7 @@ from luce_image.adjust import Adjuster, adjustment_count, curves
 from luce_image.curves import Curves, lut_size
 from luce_image.filter import Filters
 from luce_image.transform import translate, Transformer
+from luce_image.selection_passes import SelectionPasses
 from luce_image.text import draw_text, measure_text, text_height
 import psd
 from luce_image.geometry import resize_canvas, resize_image
@@ -77,6 +78,7 @@ pub struct Canvas:
     var adjuster: Adjuster?
     var filters: Filters?
     var transformer: Transformer?
+    var passes: SelectionPasses?
     var brush: Brush
     var stroke: Stroke*?
     var preview: Snapshot?
@@ -121,6 +123,7 @@ pub struct Canvas:
         self.adjuster = none
         self.filters = none
         self.transformer = none
+        self.passes = none
         self.brush = Brush()
         self.stroke = none
         self.preview = none
@@ -228,11 +231,13 @@ pub struct Canvas:
         binding.adjuster = try Adjuster.create(device)
         binding.filters = try Filters.create(device)
         binding.transformer = try Transformer.create(device)
+        binding.passes = try SelectionPasses.create(device)
         self.device = binding.device
         self.painter = binding.painter
         self.adjuster = binding.adjuster
         self.filters = binding.filters
         self.transformer = binding.transformer
+        self.passes = binding.passes
         # The cold selection moves into the boxed document; a fresh empty one takes its place here.
         let bound = binding.document else trap("boxed")
         bound.selection.destroy()
@@ -290,7 +295,7 @@ pub struct Canvas:
             free(self.history) in memory.heap
         if self.future.length > 0:
             free(self.future) in memory.heap
-        var binding = Binding(device = self.device, document = self.document, composer = self.composer, painter = self.painter, adjuster = self.adjuster, filters = self.filters, transformer = self.transformer)
+        var binding = Binding(device = self.device, document = self.document, composer = self.composer, painter = self.painter, adjuster = self.adjuster, filters = self.filters, transformer = self.transformer, passes = self.passes)
         self.device = none
         self.document = none
         self.composer = none
@@ -298,6 +303,7 @@ pub struct Canvas:
         self.adjuster = none
         self.filters = none
         self.transformer = none
+        self.passes = none
         unwind(&binding)
         for index in 0..<self.count:
             strings.release(self.records[index].name)
@@ -746,6 +752,52 @@ pub struct Canvas:
         self.ants = pipeline
         return pipeline
 
+    ## Move the selection's outline by (`dx`, `dy`) pixels, leaving the pixels.
+    pub mutating func move_selection(dx: i64, dy: i64) -> !:
+        try self.require_open()
+        try self.live().translate(dx, dy)
+
+    ## Move the pixels the selection covers on layer `id` by (`dx`, `dy`), and
+    ## the selection with them, as Photoshop's Move tool does with a selection;
+    ## with `copy` (Alt) the pixels also stay where they were. Undoable.
+    pub mutating func move_selected_pixels(id: i64, dx: i64, dy: i64, copy: bool) -> !:
+        try self.require_open()
+        try self.require_idle()
+        if dx == 0 and dy == 0:
+            return
+        let document = self.document else error(invalid, "draw the document once before moving pixels")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = layer.tiles() else error(invalid, "a group has no pixels to move")
+        try self.remember((u64)id, try tiles.clone())
+        try self.lift_selected((u64)id, dx, dy, copy)
+        try document.selection.translate(dx, dy)
+
+    ## Show the selected pixels moved by (`dx`, `dy`) on the layer being
+    ## previewed, from its pixels when the preview began; `end_preview` keeps
+    ## or drops the move, and `move_selection` then moves the outline to match.
+    pub mutating func preview_move_selected(dx: i64, dy: i64, copy: bool) -> !:
+        let layer = try self.restore_preview()
+        try self.lift_selected(layer, dx, dy, copy)
+
+    mutating func lift_selected(layer: u64, dx: i64, dy: i64, copy: bool) -> !:
+        let document = self.document else error(invalid, "draw the document once before moving pixels")
+        let passes = self.passes else trap("bound without selection passes")
+        let selection = document.selection
+        let mask = try document.selection_tiles() else error(invalid, "nothing is selected")
+        try passes.move_selected(document, layer, mask, dx, dy, copy, selection.left, selection.top, selection.right, selection.bottom)
+
+    ## Keep the edit just made to `layer` only inside the selection, when there is one.
+    mutating func restrict_to_selection(layer: u64, before: const Tiles*) -> !:
+        let document = self.document else return
+        let passes = self.passes else return
+        let mask = try document.selection_tiles() else return
+        try passes.restrict(document, layer, before, mask)
+
+    ## As `restrict_to_selection`, against the pixels the preview began from.
+    mutating func restrict_preview(layer: u64) -> !:
+        let preview = self.preview else return
+        try self.restrict_to_selection(layer, &preview.tiles)
+
     # mark: Painting ==============================================================================
 
     ## Fill the selection (or the whole layer) on `layer` with the brush color
@@ -953,6 +1005,7 @@ pub struct Canvas:
         let table = try self.curve_table((u32)kind)
         try self.remember((u64)id, try tiles.clone())
         try adjuster.apply(document, (u64)id, (u32)kind, a, b, c, d, e, table)
+        try self.restrict_to_selection((u64)id, &self.history[self.history_count - 1].tiles)
 
     pub static func adjustment_count() -> i64:
         return (i64)adjustment_count
@@ -1025,6 +1078,7 @@ pub struct Canvas:
         let document = self.document else trap("preview without a document")
         let adjuster = self.adjuster else trap("preview without an adjuster")
         try adjuster.apply(document, layer, (u32)kind, a, b, c, d, e, table)
+        try self.restrict_preview(layer)
 
     ## Show a Gaussian blur of `radius` applied to the layer as it was when the preview began.
     pub mutating func preview_blur(radius: f64) -> !:
@@ -1032,6 +1086,7 @@ pub struct Canvas:
         let document = self.document else trap("preview without a document")
         let filters = self.filters else trap("preview without filters")
         try filters.gaussian_blur(document, layer, radius)
+        try self.restrict_preview(layer)
 
     ## Finish the preview: keep what it shows as one undoable edit, or put the
     ## layer's pixels back as they were.
@@ -1064,6 +1119,7 @@ pub struct Canvas:
         let tiles = layer.tiles() else error(invalid, "a group cannot be filtered")
         try self.remember((u64)id, try tiles.clone())
         try filters.gaussian_blur(document, (u64)id, radius)
+        try self.restrict_to_selection((u64)id, &self.history[self.history_count - 1].tiles)
 
     ## Free transform: scale a layer's pixels by (`scale_x`, `scale_y`) and turn
     ## them `angle` degrees about the centre of what the layer has, then move

@@ -69,6 +69,22 @@ pub struct Selection:
             self.coverage[index] = 255 - self.coverage[index]
         self.finish()
 
+    ## Move the selection by (`dx`, `dy`) pixels; what leaves the document is dropped.
+    pub mutating func translate(dx: i64, dy: i64) -> !:
+        if (dx == 0 and dy == 0) or self.empty:
+            return
+        let width = (i64)self.extent_x
+        let height = (i64)self.extent_y
+        let moved = try alloc u8[self.coverage.length] in memory.heap
+        for index in 0..<moved.length:
+            moved[index] = 0
+        for row in math.imax(0, dy)..<math.imin(height, height + dy):
+            for column in math.imax(0, dx)..<math.imin(width, width + dx):
+                moved[(usize)(row * width + column)] = self.coverage[(usize)((row - dy) * width + column - dx)]
+        free(self.coverage) in memory.heap
+        self.coverage = moved
+        self.finish()
+
     ## A rectangle, combined by `mode`.
     pub mutating func rectangle(x: i64, y: i64, width: i64, height: i64, mode: Mode):
         self.shape(x, y, width, height, mode, false)
