@@ -602,6 +602,9 @@ test "adjustment layers change what is below them live, leave the pixels alone, 
     assert((try shown_at(&canvas, &target, 12, 12))[0] > 250)
     try canvas.set_mask(turn, false)
     try canvas.set_layer(turn, true, 1.0)
+    # What shows below the adjustment layer: the red square, before it is adjusted.
+    try canvas.measure_histogram_below(turn)
+    assert((try canvas.histogram(1, 255)) == 256 and (try canvas.histogram(3, 255)) == 0)
     # It has no pixels to paint on or merge.
     var refused = false
     canvas.merge_down(turn) catch failure:

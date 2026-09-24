@@ -1425,9 +1425,55 @@ pub struct Canvas:
         let pixels = try alloc f32[count * 4] in memory.heap
         defer free(pixels) in memory.heap
         try tiles.read(pixels)
+        self.count_histogram(pixels)
+
+    ## Count what shows below layer `id` — the whole picture with it and the
+    ## layers over it hidden — for `histogram`: what an adjustment layer's
+    ## Levels takes in.
+    pub mutating func measure_histogram_below(id: i64) -> !:
+        try self.require_open()
+        let document = self.document else error(invalid, "draw the document once before measuring")
+        let index = try self.index((u64)id)
+        let hidden = try alloc bool[self.count] in memory.heap
+        defer free(hidden) in memory.heap
+        for at in 0..<self.count:
+            let record = self.records[at]
+            # The groups holding it stay: hiding them would hide what is below it inside them.
+            hidden[at] = at >= index and record.visible and not self.holds(record.id, (u64)id)
+            if hidden[at]:
+                try document.set_appearance(record.id, false, record.opacity, (u32)record.blend)
+        let flattened = flattened_pixels(&self) catch failure:
+            self.show_again(hidden)
+            error(failure.code, failure.message)
+        defer free(flattened) in memory.heap
+        self.show_again(hidden)
+        self.count_histogram(flattened)
+
+    ## Whether group `group` holds layer `id`, however deep.
+    func holds(group: u64, id: u64) -> bool:
+        var parent = id
+        while parent != 0:
+            let at = self.index(parent) catch _:
+                return false
+            parent = self.records[at].parent
+            if parent == group:
+                return true
+        return false
+
+    ## Put back the visibility `measure_histogram_below` took away.
+    mutating func show_again(hidden: const bool[]):
+        let document = self.document else return
+        for at in 0..<self.count:
+            if hidden[at]:
+                let record = self.records[at]
+                document.set_appearance(record.id, true, record.opacity, (u32)record.blend) catch _:
+                    recover ()
+
+    ## Count straight linear RGBA `pixels` by their encoded values; transparency is left out.
+    mutating func count_histogram(pixels: const f32[]):
         for slot in 0..<(usize)1024:
             self.histogram_counts[slot] = 0
-        for at in 0..<count:
+        for at in 0..<pixels.length // 4:
             if pixels[at * 4 + 3] <= 0.0:
                 continue
             var encoded: f64[3]
