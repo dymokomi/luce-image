@@ -2,7 +2,10 @@
 // with the stroke's paint (image 2, premultiplied: dabs' color and coverage)
 // applied as paint or as erasure, the coverage capped by the stroke opacity
 // and, for a textured brush, modulated by a procedural pattern in document
-// space, as Photoshop textures a whole stroke rather than each dab.
+// space, as Photoshop textures a whole stroke rather than each dab. A
+// retouching stroke paints an effect image (image 4, straight alpha) instead
+// of a color: laid over the original through the coverage (clone stamp, blur
+// tool), or mixed with it (healing).
 // Drawn with `replace`, so what is emitted is stored as is: straight alpha.
 #version 450
 layout(location = 0) in vec4 vertex_color;
@@ -17,7 +20,7 @@ layout(push_constant) uniform Params {
     float texture_kind;   // 0 none, 1 grain, 2 canvas weave, 3 dots
     float texture_scale;
     float texture_depth;  // 0..1: how much the pattern shows
-    float unused0;
+    float effect;         // 0 the color, 1 the effect image over, 2 the effect image mixed
     float unused1;
     float unused2;
 } params;
@@ -50,6 +53,7 @@ float textured(vec2 document) {
 layout(set = 0, binding = 1) uniform sampler2D original;
 layout(set = 0, binding = 2) uniform sampler2D coverage;
 layout(set = 0, binding = 3) uniform sampler2D selection;
+layout(set = 0, binding = 4) uniform sampler2D effect;
 void main() {
     vec2 uv = gl_FragCoord.xy / 256.0;
     vec4 o = texture(original, uv);
@@ -57,6 +61,20 @@ void main() {
     float s = (params.fill > 0.5 ? 1.0 : min(paint.a, 1.0)) * params.opacity;
     if (params.fill < 0.5) s *= mix(1.0, textured(gl_FragCoord.xy + params.tile), params.texture_depth);
     if (params.selected > 0.5) s *= texture(selection, uv).r;
+    if (params.effect > 0.5) {
+        vec4 e = texture(effect, uv);
+        if (params.effect < 1.5) {
+            // Over: a transparent source leaves the original, as a stamp does.
+            float ea = e.a * s;
+            float a = ea + o.a * (1.0 - ea);
+            fragment_color = vec4(a > 0.0 ? (e.rgb * ea + o.rgb * o.a * (1.0 - ea)) / a : o.rgb, a);
+        } else {
+            // Mixed, premultiplied: the healed pixels replace the original by coverage.
+            vec4 m = mix(vec4(o.rgb * o.a, o.a), vec4(e.rgb * e.a, e.a), s);
+            fragment_color = m.a > 0.0 ? vec4(m.rgb / m.a, m.a) : vec4(0.0);
+        }
+        return;
+    }
     if (params.erase > 0.5) {
         fragment_color = vec4(o.rgb, o.a * (1.0 - s));
         return;

@@ -80,9 +80,11 @@ pub struct Painter:
     var paint: gpu.Pipeline
     var gradient_shader: gpu.Shader
     var gradient: gpu.Pipeline
-    ## One white and one black texel: "everything selected" and "nothing selected".
+    ## One white and one black texel: "everything selected" and "nothing
+    ## selected"; one clear texel: no effect image where a retouch has none.
     pub var white: gpu.Texture
     pub var black: gpu.Texture
+    pub var clear: gpu.Texture
 
     pub static func create(device: gpu.Device) -> Painter!:
         var dab_shader = try gpu.Shader.create(device, dab_frag_words, dab_frag_msl)
@@ -103,9 +105,14 @@ pub struct Painter:
         var black = try gpu.Texture.create(device, 1, 1, gpu.Format.rgba8_linear)
         errdefer black.destroy()
         try black.upload([(u8)0, (u8)0, (u8)0, (u8)255])
-        return Painter(owner = device, dab_shader = dab_shader, paint_shader = paint_shader, dab = dab, paint = paint, white = white, black = black, gradient_shader = gradient_shader, gradient = gradient)
+        var clear = try gpu.Texture.create(device, 1, 1, gpu.Format.rgba8_linear)
+        errdefer clear.destroy()
+        try clear.upload([(u8)0, (u8)0, (u8)0, (u8)0])
+        return Painter(owner = device, dab_shader = dab_shader, paint_shader = paint_shader, dab = dab, paint = paint, white = white, black = black, clear = clear,
+                       gradient_shader = gradient_shader, gradient = gradient)
 
     pub mutating func destroy():
+        self.clear.destroy()
         self.black.destroy()
         self.white.destroy()
         self.paint.destroy()
@@ -170,6 +177,10 @@ pub struct Stroke:
     ## The dabs of the segment being stamped, `dab_limit` slots on the heap.
     var dabs: Dab[]
     var dab_count: usize = 0
+    ## A retouching stroke's effect image, document-aligned (owned), and how it
+    ## goes on: 1 over the original, 2 mixed with it; 0 paints the color.
+    var effect: Tiles? = none
+    var effect_mode: f64 = 0.0
 
     ## Begin at a point on `layer`'s pixels, or on its mask, painting the first
     ## dab there. A mask's missing cells count as white (revealing).
@@ -366,7 +377,10 @@ pub struct Stroke:
         var params: f32[16] = [(f32)self.brush.color.red, (f32)self.brush.color.green, (f32)self.brush.color.blue, 1.0,
                                (f32)self.brush.opacity, 1.0 if self.brush.erase else 0.0, 0.0, 0.0,
                                (f32)(entry.column * tile_size), (f32)(entry.row * tile_size), (f32)self.brush.texture, (f32)self.brush.texture_scale,
-                               (f32)self.brush.texture_depth, 0.0, 0.0, 0.0]
+                               (f32)self.brush.texture_depth, (f32)self.effect_mode, 0.0, 0.0]
+        var effect_tile = painter.clear
+        if let effect = self.effect:
+            effect_tile = effect.texture(entry.column, entry.row) else painter.clear
         var clip = painter.white
         if let selected = self.selection:
             params[7] = 1.0
@@ -376,7 +390,7 @@ pub struct Stroke:
         let target = try frame.value().target()
         defer target.release()
         let original = self.before.texture(entry.column, entry.row) else try self.blank_tile(tiles)
-        try gpu.shade(target.value(), painter.paint, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 64), [original, entry.coverage, clip], gpu.Filter.nearest)
+        try gpu.shade(target.value(), painter.paint, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 64), [original, entry.coverage, clip, effect_tile], gpu.Filter.nearest)
         discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         try tiles.set(entry.column, entry.row, fresh)
 
@@ -431,7 +445,35 @@ pub struct Stroke:
             free(self.dabs) in memory.heap
         var no_dabs: Dab[]
         self.dabs = no_dabs
+        if let effect = self.effect:
+            var owned = effect
+            owned.destroy()
+            self.effect = none
         self.before.destroy()
+
+    ## Paint `effect` (document-aligned tiles, taken) instead of the color: 1
+    ## over the original through the coverage, 2 mixed with it. Every tile
+    ## reached so far is rebuilt at once, at `opacity`.
+    pub mutating func use_effect(painter: Painter*, document: Document*, effect: Tiles, mode: f64, opacity: f64) -> !:
+        if let previous = self.effect:
+            var owned = previous
+            owned.destroy()
+        self.effect = effect
+        self.effect_mode = mode
+        self.brush.opacity = opacity
+        let target = document.find(self.layer) else error(invalid, "the painted layer is gone")
+        let tiles = target.tiles() else error(invalid, "the painted layer has no pixels")
+        for index in 0..<self.count:
+            try self.rebuild(painter, tiles, index)
+        target.revision += 1
+
+    ## The coverage laid on the cell at `column`, `row` so far (premultiplied
+    ## paint; its alpha is the coverage), or none where the stroke has not been.
+    pub func coverage_at(column: u32, row: u32) -> gpu.Texture?:
+        for index in 0..<self.count:
+            if self.touched[index].column == column and self.touched[index].row == row:
+                return self.touched[index].coverage
+        return none
 
 ## `color` shifted by `hue` degrees and by `saturation` and `brightness`
 ## fractions (each -1..1), through HSV over the linear components.

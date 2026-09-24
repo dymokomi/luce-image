@@ -37,7 +37,9 @@ import paths
 import prism
 import strings
 from luce_image.image import Image, Pixel
-from luce_image.tiles import Tiles, Bounds, tile_size, tile_columns, min_u32
+from luce_image.tiles import Tiles, Bounds, tile_size, tile_columns, min_u32, flatten
+from luce_image.heal import heal
+from luce_image.warp import WarpStroke, warp_smudge, warp_push
 from luce_image.document import Style, Document, Layer, box_document, unbox_document, blend_mode_count
 from luce_image.composite import Composer, box_composer, unbox_composer
 from luce_image.brush import Brush, Painter, Stroke, begin_boxed, finish_boxed, fill_selection, fill_gradient
@@ -121,6 +123,21 @@ pub struct Canvas:
     var joining: bool
     ## The parameters the next adjustment takes (`set_adjustment`).
     var adjustment: f64[23]
+    ## The retouching tool strokes use (`set_retouch`), the clone stamp's
+    ## source and offset (whole pixels) and options, a smudge or push under
+    ## way and its layer, and a spot healing stroke's opacity.
+    var retouch: i64
+    var clone_x: f64
+    var clone_y: f64
+    var clone_set: bool
+    var clone_offset_x: i64
+    var clone_offset_y: i64
+    var clone_offset_set: bool
+    var clone_aligned: bool
+    var clone_all: bool
+    var warp: WarpStroke*?
+    var warped: u64
+    var heal_opacity: f64
     ## What `measure_histogram` counted: luminosity, red, green and blue, 256
     ## bins each of the encoded values.
     var histogram_counts: u64[1024]
@@ -171,6 +188,18 @@ pub struct Canvas:
         self.profile_length = 0
         self.content = Bounds(left = 0, top = 0, right = 0, bottom = 0)
         self.joining = false
+        self.retouch = 0
+        self.clone_x = 0.0
+        self.clone_y = 0.0
+        self.clone_set = false
+        self.clone_offset_x = 0
+        self.clone_offset_y = 0
+        self.clone_offset_set = false
+        self.clone_aligned = true
+        self.clone_all = false
+        self.warp = none
+        self.warped = 0
+        self.heal_opacity = 1.0
         var no_values: f64[23]
         self.adjustment = no_values
         var no_counts: u64[1024]
@@ -1143,10 +1172,13 @@ pub struct Canvas:
     ## the stroke go on the history.
     pub mutating func begin_stroke(layer: i64, x: f64, y: f64, pressure: f64 = 1.0) -> !:
         try self.require_open()
-        if self.stroke != none:
+        if self.stroke != none or self.warp != none:
             error(invalid, "a stroke is already in progress")
         if self.preview != none:
             error(invalid, "finish the preview first")
+        if self.retouch != retouch_paint:
+            try begin_retouch(&self, (u64)layer, x, y, pressure)
+            return
         let document = self.document else error(invalid, "draw the document once before painting")
         var painter = self.painter else error(invalid, "draw the document once before painting")
         let index = try self.index((u64)layer)
@@ -1159,6 +1191,9 @@ pub struct Canvas:
     ## Continue the stroke to a document point.
     pub mutating func extend_stroke(x: f64, y: f64, pressure: f64 = 1.0) -> !:
         try self.require_open()
+        if let warp = self.warp:
+            try extend_warp(&self, warp, x, y)
+            return
         let stroke = self.stroke else error(invalid, "no stroke is in progress")
         let document = self.document else trap("stroke without a document")
         var painter = self.painter else trap("stroke without a painter")
@@ -1167,12 +1202,50 @@ pub struct Canvas:
     ## End the stroke, keeping what it painted.
     pub mutating func end_stroke() -> !:
         try self.require_open()
+        if let warp = self.warp:
+            try finish_warp(&self, warp)
+            return
         let stroke = self.stroke else error(invalid, "no stroke is in progress")
         self.stroke = none
-        finish_boxed(stroke)
+        defer finish_boxed(stroke)
+        if self.retouch == retouch_heal:
+            try finish_heal(&self, stroke)
 
     pub func painting() -> bool:
-        return self.stroke != none
+        return self.stroke != none or self.warp != none
+
+    # mark: Retouching ============================================================================
+
+    ## The tool strokes use: 0 paint (the brush), 1 clone stamp, 2 spot
+    ## healing, 3 blur, 4 smudge, 5 push (Liquify's forward warp). Retouching
+    ## takes the brush's diameter, hardness and opacity (strength).
+    pub mutating func set_retouch(kind: i64) -> !:
+        if kind < retouch_paint or kind > retouch_push:
+            error(invalid, "retouching tools are 0 paint, 1 clone, 2 heal, 3 blur, 4 smudge, 5 push")
+        self.retouch = kind
+
+    ## Where the clone stamp copies from (Alt-click): a new source starts a new alignment.
+    pub mutating func set_clone_source(x: f64, y: f64):
+        self.clone_x = x
+        self.clone_y = y
+        self.clone_set = true
+        self.clone_offset_set = false
+
+    ## Aligned: every stroke keeps the first one's offset; otherwise each
+    ## starts at the source again. `all_layers` samples everything shown.
+    pub mutating func set_clone_options(aligned: bool, all_layers: bool):
+        self.clone_aligned = aligned
+        self.clone_all = all_layers
+
+    pub func has_clone_source() -> bool:
+        return self.clone_set
+
+    ## Where a clone stroke through (`x`, `y`) takes its pixels from, for the source crosshair.
+    pub func clone_sample_x(x: f64) -> f64:
+        return x + (f64)self.clone_offset_x if self.clone_aligned and self.clone_offset_set else self.clone_x
+
+    pub func clone_sample_y(y: f64) -> f64:
+        return y + (f64)self.clone_offset_y if self.clone_aligned and self.clone_offset_set else self.clone_y
 
     ## Lay a linear gradient over layer `id` from one color at (`x0`, `y0`) to
     ## another at (`x1`, `y1`), straight alpha in linear light, inside the

@@ -2,6 +2,7 @@ module.lucb
 drawing.lucb
 files.lucb
 clipboard.lucb
+retouch.lucb
 history.lucb
 support.lucb
 tests.lucb

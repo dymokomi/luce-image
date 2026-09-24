@@ -620,3 +620,77 @@ test "adjustment layers change what is below them live, leave the pixels alone, 
     discard(try shown_at(copy, &target, 0, 0))
     shown = try shown_at(copy, &target, 12, 12)
     assert(shown[2] > 250 and shown[0] < 5)
+
+test "retouching: clone stamp copies from its source, blur softens, healing fills a spot, smudge and push move paint":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(8, 8, 16, 16, 0)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    # Clone: the red at (16, 16) stamped at (44, 44); one undo takes it back.
+    try canvas.set_retouch(1)
+    var refused = false
+    canvas.begin_stroke(layer, 44.0, 44.0) catch failure:
+        assert(failure.code == invalid)
+        refused = true
+    assert(refused)
+    canvas.set_clone_source(16.0, 16.0)
+    # A blue brush: red where it stamps can only have come from the source.
+    try canvas.set_brush(8.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, false)
+    try canvas.begin_stroke(layer, 44.0, 44.0)
+    try canvas.end_stroke()
+    let stamped = try shown_at(&canvas, &target, 44, 44)
+    assert(stamped[0] > 250 and stamped[2] < 5 and canvas.clone_sample_x(50.0) == 22.0)
+    try canvas.undo()
+    assert((try shown_at(&canvas, &target, 44, 44))[0] == 0)
+    # Blur along the square's right edge softens it outward.
+    try canvas.set_retouch(3)
+    try canvas.set_brush(40.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.begin_stroke(layer, 24.0, 12.0)
+    try canvas.extend_stroke(24.0, 20.0)
+    try canvas.end_stroke()
+    let soft = (try shown_at(&canvas, &target, 26, 16))[0]
+    assert(soft > 10 and soft < 250)
+    try canvas.undo()
+    # Smudge from inside the square outward drags red along.
+    try canvas.set_retouch(4)
+    try canvas.set_brush(8.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.begin_stroke(layer, 16.0, 16.0)
+    try canvas.extend_stroke(34.0, 16.0)
+    try canvas.end_stroke()
+    assert((try shown_at(&canvas, &target, 30, 16))[0] > 60)
+    try canvas.undo()
+    assert((try shown_at(&canvas, &target, 30, 16))[0] == 0)
+    # Push from the square's edge moves its red right.
+    try canvas.set_retouch(5)
+    try canvas.set_brush(12.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.begin_stroke(layer, 22.0, 16.0)
+    try canvas.extend_stroke(30.0, 16.0)
+    try canvas.end_stroke()
+    assert((try shown_at(&canvas, &target, 26, 16))[0] > 60)
+    try canvas.undo()
+    # Healing: an even gray with a black dot; brushed over, the dot is gray again.
+    try canvas.set_retouch(0)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.5, 0.5, 0.5, false)
+    try canvas.select_all()
+    try canvas.fill(layer, false)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(40, 40, 4, 4, 0)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    assert((try shown_at(&canvas, &target, 41, 41))[0] < 5)
+    try canvas.set_retouch(2)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, false)
+    try canvas.begin_stroke(layer, 42.0, 42.0)
+    try canvas.end_stroke()
+    let healed = (try shown_at(&canvas, &target, 41, 41))[0]
+    assert(healed > 120 and healed < 135)

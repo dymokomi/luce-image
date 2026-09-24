@@ -159,6 +159,40 @@ pub struct Tiles:
                 try texture.upload(bytes[..<((usize)area.height * (usize)tile_size * 8)], gpu.Region(0, 0, tile_size, area.height))
                 try self.set(column, row, texture)
 
+    ## Upload one cell from `pixels`, premultiplied RGBA f32 for the whole
+    ## extent (a warp stroke's working copy), as straight alpha; a cell with
+    ## nothing left in it is cleared.
+    pub mutating func write_cell_premultiplied(column: u32, row: u32, pixels: const f32[]) -> !:
+        if pixels.length != (usize)self.extent_x * (usize)self.extent_y * 4:
+            error(invalid, "pixel data must hold width * height RGBA samples")
+        let area = self.region(column, row)
+        let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+        defer free(bytes) in memory.heap
+        for index in 0..<bytes.length:
+            bytes[index] = 0
+        var opaque = false
+        for y in 0..<(usize)area.height:
+            for x in 0..<(usize)area.width:
+                let source = (((usize)row * (usize)tile_size + y) * (usize)self.extent_x + (usize)column * (usize)tile_size + x) * 4
+                let destination = (y * (usize)tile_size + x) * 8
+                let alpha = pixels[source + 3]
+                if alpha > 0.0:
+                    opaque = true
+                for channel in 0..<(usize)4:
+                    var value = pixels[source + channel]
+                    if channel < 3:
+                        value = value / alpha if alpha > 0.0 else 0.0
+                    let half = to_half(value)
+                    bytes[destination + channel * 2] = (u8)(half & 0xff)
+                    bytes[destination + channel * 2 + 1] = (u8)(half >> 8)
+        if not opaque:
+            try self.clear(column, row)
+            return
+        var texture = try self.blank()
+        errdefer texture.destroy()
+        try texture.upload(bytes[..<((usize)area.height * (usize)tile_size * 8)], gpu.Region(0, 0, tile_size, area.height))
+        try self.set(column, row, texture)
+
     ## Read every pixel back as straight-alpha RGBA f32 samples, top-down.
     pub func read(pixels: f32[]) -> !:
         if pixels.length != (usize)self.extent_x * (usize)self.extent_y * 4:

@@ -1,0 +1,197 @@
+#==============================================================================================
+#
+#   canvas/retouch - Clone stamp, spot healing, the blur tool, smudge and push
+#
+#   DESCRIPTION:
+#       The retouching tools, as Compositor's. Clone stamp, the blur tool and spot healing
+#       are brush strokes painting an effect image through their coverage instead of a
+#       color: the picture shifted by the clone offset, a blurred copy, the healed spot
+#       (worked out when the stroke ends; a dark wash marks it meanwhile). Smudge and push
+#       (Liquify) work on the CPU dab by dab (warp.lucb). Each stroke is one undo step.
+#
+#==============================================================================================
+
+## The retouching tools `Canvas.set_retouch` picks for strokes: 0 is plain paint.
+let retouch_paint: i64 = 0
+let retouch_clone: i64 = 1
+let retouch_heal: i64 = 2
+let retouch_blur: i64 = 3
+let retouch_smudge: i64 = 4
+let retouch_push: i64 = 5
+
+## `Canvas.begin_stroke` with a retouching tool: the stroke for it, begun at
+## (`x`, `y`) on layer `id`, with its original remembered for undo.
+func begin_retouch(canvas: Canvas*, id: u64, x: f64, y: f64, pressure: f64) -> !:
+    let document = canvas.document else error(invalid, "draw the document once before retouching")
+    var painter = canvas.painter else error(invalid, "draw the document once before retouching")
+    let index = try canvas.index(id)
+    if canvas.mask_editing and canvas.records[index].masked:
+        error(invalid, "retouching works on a layer's pixels, not its mask")
+    let layer = document.find(id) else error(invalid, "no such layer")
+    let tiles = layer.tiles() else error(invalid, "this layer has no pixels to retouch")
+    let kind = canvas.retouch
+    if kind == retouch_smudge or kind == retouch_push:
+        var warp = try WarpStroke.begin(tiles, warp_smudge if kind == retouch_smudge else warp_push, x, y, canvas.brush.diameter, canvas.brush.hardness, canvas.brush.opacity)
+        errdefer warp.destroy()
+        let boxed = try new WarpStroke in memory.heap
+        *boxed = warp
+        try canvas.remember(id, try tiles.clone())
+        canvas.warp = boxed
+        canvas.warped = id
+        return
+    var brush = canvas.brush
+    brush.erase = false
+    var effect: Tiles? = none
+    if kind == retouch_clone:
+        if not canvas.clone_set:
+            error(invalid, "Alt-click where the Clone Stamp copies from first")
+        if not canvas.clone_aligned or not canvas.clone_offset_set:
+            canvas.clone_offset_x = (i64)math.round(canvas.clone_x - x)
+            canvas.clone_offset_y = (i64)math.round(canvas.clone_y - y)
+            canvas.clone_offset_set = true
+        var flat = try sample_texture(canvas, id, canvas.clone_all)
+        defer flat.destroy()
+        effect = try shifted_tiles(canvas, flat, canvas.clone_offset_x, canvas.clone_offset_y)
+    elif kind == retouch_blur:
+        effect = try blurred_copy(canvas, id, math.clamp(brush.diameter / 10.0, 1.5, 30.0))
+    elif kind == retouch_heal:
+        # While painting, a dark wash marks the spot; healing replaces it at the end.
+        canvas.heal_opacity = brush.opacity
+        brush.color = gpu.Color(0.12, 0.12, 0.12, 1.0)
+        brush.opacity = 0.45
+    let stroke = try begin_boxed(&painter, document, id, brush, x, y, false, pressure)
+    errdefer finish_boxed(stroke)
+    try canvas.remember(id, try stroke.original().clone())
+    if let given = effect:
+        try stroke.use_effect(&painter, document, given, 1.0, brush.opacity)
+    canvas.stroke = stroke
+
+## Continue a smudge or push to (`x`, `y`), showing it at once.
+func extend_warp(canvas: Canvas*, warp: WarpStroke*, x: f64, y: f64) -> !:
+    let document = canvas.document else trap("stroke without a document")
+    let layer = document.find(canvas.warped) else error(invalid, "the retouched layer is gone")
+    let tiles = layer.tiles() else error(invalid, "the retouched layer has no pixels")
+    try warp.extend(x, y)
+    try warp.flush(tiles)
+    layer.revision += 1
+
+## End a smudge or push: it stays where the selection allows.
+func finish_warp(canvas: Canvas*, warp: WarpStroke*) -> !:
+    warp.destroy()
+    free(warp) in memory.heap
+    canvas.warp = none
+    try canvas.restrict_to_selection(canvas.warped, &canvas.history[canvas.history_count - 1].tiles)
+
+## End a spot healing stroke: the painted spot (the stroke's coverage) filled
+## from the picture beside it, mixed in by the coverage at the tool's opacity.
+func finish_heal(canvas: Canvas*, stroke: Stroke*) -> !:
+    let document = canvas.document else trap("stroke without a document")
+    var painter = canvas.painter else trap("stroke without a painter")
+    let original = stroke.original()
+    let width = (usize)canvas.extent_x
+    let height = (usize)canvas.extent_y
+    let pixels = try alloc f32[width * height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    try original.read(pixels)
+    for at in 0..<width * height:
+        for channel in 0..<(usize)3:
+            pixels[at * 4 + channel] *= pixels[at * 4 + 3]
+    # The spot: where the stroke laid any coverage.
+    let painted = try alloc u8[width * height] in memory.heap
+    defer free(painted) in memory.heap
+    for index in 0..<painted.length:
+        painted[index] = 0
+    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    defer free(bytes) in memory.heap
+    for row in 0..<original.rows():
+        for column in 0..<original.columns():
+            let coverage = stroke.coverage_at(column, row) else continue
+            let area = original.region(column, row)
+            try coverage.read(bytes[..<((usize)area.height * (usize)tile_size * 8)], gpu.Region(0, 0, tile_size, area.height))
+            for y in 0..<(usize)area.height:
+                for x in 0..<(usize)area.width:
+                    let half = (u16)bytes[(y * (usize)tile_size + x) * 8 + 6] | ((u16)bytes[(y * (usize)tile_size + x) * 8 + 7] << 8)
+                    if from_half(half) > 0.01:
+                        painted[((usize)row * (usize)tile_size + y) * width + (usize)column * (usize)tile_size + x] = 1
+    if not (try heal(pixels, width, height, painted)):
+        return
+    # Back to straight alpha for the effect tiles.
+    for at in 0..<width * height:
+        let alpha = pixels[at * 4 + 3]
+        for channel in 0..<(usize)3:
+            pixels[at * 4 + channel] = pixels[at * 4 + channel] / alpha if alpha > 0.0 else 0.0
+    let device = canvas.device else trap("stroke without a device")
+    var healed = try Tiles.create(device, canvas.extent_x, canvas.extent_y)
+    errdefer healed.destroy()
+    try healed.write(pixels)
+    try stroke.use_effect(&painter, document, healed, 2.0, canvas.heal_opacity)
+
+## What a clone stamp samples, as one texture: layer `id`'s pixels, or every
+## visible layer composited.
+func sample_texture(canvas: Canvas*, id: u64, all: bool) -> gpu.Texture!:
+    let document = canvas.document else trap("sampling without a document")
+    let device = canvas.device else trap("sampling without a device")
+    if not all:
+        let layer = document.find(id) else error(invalid, "no such layer")
+        let tiles = layer.tiles() else error(invalid, "this layer has no pixels")
+        return try flatten(device, tiles)
+    let composer = canvas.composer else trap("sampling without a compositor")
+    var flat = try gpu.Texture.create(device, canvas.extent_x, canvas.extent_y, gpu.Format.rgba16_float)
+    errdefer flat.destroy()
+    let frame = try flat.frame()
+    defer frame.release()
+    let whole = try frame.value().target()
+    defer whole.release()
+    for row in 0..<tile_columns(canvas.extent_y):
+        for column in 0..<tile_columns(canvas.extent_x):
+            let texture = try composer.tile(document, column, row, 0)
+            let width = min_u32(tile_size, canvas.extent_x - column * tile_size)
+            let height = min_u32(tile_size, canvas.extent_y - row * tile_size)
+            try gpu.copy_image(whole.value(), texture, gpu.Rect((f64)(column * tile_size), (f64)(row * tile_size), (f64)width, (f64)height), gpu.Region(0, 0, width, height))
+    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+    return flat
+
+## `flat` moved by the clone offset: each cell holds the picture at its own
+## place plus (`dx`, `dy`); past the picture, nothing.
+func shifted_tiles(canvas: Canvas*, flat: gpu.Texture, dx: i64, dy: i64) -> Tiles!:
+    let device = canvas.device else trap("shifting without a device")
+    var tiles = try Tiles.create(device, canvas.extent_x, canvas.extent_y)
+    errdefer tiles.destroy()
+    let extent_x = (i64)canvas.extent_x
+    let extent_y = (i64)canvas.extent_y
+    for row in 0..<tiles.rows():
+        for column in 0..<tiles.columns():
+            let cell_x = (i64)(column * tile_size)
+            let cell_y = (i64)(row * tile_size)
+            # The source window, clipped to the picture, and where it lands in the cell.
+            let x0 = math.imax(0, cell_x + dx)
+            let y0 = math.imax(0, cell_y + dy)
+            let x1 = math.imin(extent_x, cell_x + dx + (i64)tile_size)
+            let y1 = math.imin(extent_y, cell_y + dy + (i64)tile_size)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            var cell = try tiles.blank()
+            errdefer cell.destroy()
+            let frame = try cell.frame()
+            defer frame.release()
+            let target = try frame.value().target()
+            defer target.release()
+            try gpu.copy_image(target.value(), flat, gpu.Rect((f64)(x0 - dx - cell_x), (f64)(y0 - dy - cell_y), (f64)(x1 - x0), (f64)(y1 - y0)),
+                               gpu.Region((u32)x0, (u32)y0, (u32)(x1 - x0), (u32)(y1 - y0)))
+            discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+            try tiles.set(column, row, cell)
+    return tiles
+
+## Layer `id`'s pixels blurred by a Gaussian of `sigma`, as tiles of their
+## own; the layer itself is left as it was.
+func blurred_copy(canvas: Canvas*, id: u64, sigma: f64) -> Tiles!:
+    let document = canvas.document else trap("blurring without a document")
+    let filters = canvas.filters else trap("blurring without filters")
+    let layer = document.find(id) else error(invalid, "no such layer")
+    let tiles = layer.tiles() else error(invalid, "this layer has no pixels")
+    let kept = try tiles.clone()
+    try filters.gaussian_blur(document, id, sigma)
+    let blurred = (document.find(id) else trap("blurred layer")).tiles() else trap("blurred tiles")
+    let copy = try blurred.clone()
+    try document.set_tiles(id, kept)
+    return copy

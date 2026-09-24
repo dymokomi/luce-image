@@ -1,0 +1,241 @@
+## Smudge and Liquify's push, as Compositor's (Document/SmudgeLiquify.swift):
+## both work dab by dab on a premultiplied working copy of the layer on the
+## CPU, and the tiles a dab reaches are uploaded as the stroke goes, so the
+## canvas shows it live. The tip falls off as a smoothstep from the hardness
+## to the rim.
+## - Smudge picks up the pixels under the first dab and carries them: each
+##   dab lays them down by the tip, and keeps `strength` of what it carried
+##   (1 carries forever, less picks up more of what it passes).
+## - Push moves the pixels under the tip along the stroke by `strength` of
+##   each step, sampled back from behind the brush (bilinear).
+import math
+import memory
+from luce_image.tiles import Tiles, tile_size
+from raster_errors import invalid
+
+pub let warp_smudge: i64 = 0
+pub let warp_push: i64 = 1
+
+pub struct WarpStroke:
+    var width: usize
+    var height: usize
+    ## The layer as the stroke has it, premultiplied RGBA f32.
+    var pixels: f32[]
+    var mode: i64
+    var radius: f64
+    var hardness: f64
+    var strength: f64
+    ## Smudge's carried square, (2r+1)² RGBA; push's scratch copy of a dab's area.
+    var carried: f32[]
+    var scratch: f32[]
+    var last_x: f64
+    var last_y: f64
+    var debt: f64
+    ## The cells changed since the last upload.
+    var dirty_left: i64
+    var dirty_top: i64
+    var dirty_right: i64
+    var dirty_bottom: i64
+
+    ## Begin on `tiles` (straight alpha) at (`x`, `y`): `diameter`, `hardness`
+    ## (at most 0.98) and `strength` (0.01..1).
+    pub static func begin(tiles: const Tiles*, mode: i64, x: f64, y: f64, diameter: f64, hardness: f64, strength: f64) -> WarpStroke!:
+        if mode != warp_smudge and mode != warp_push:
+            error(invalid, "a warp stroke smudges or pushes")
+        if not math.is_finite(x) or not math.is_finite(y) or not (diameter >= 1.0 and diameter <= 5000.0):
+            error(invalid, "a warp stroke needs a finite point and a diameter of 1..5000")
+        let width = (usize)tiles.width()
+        let height = (usize)tiles.height()
+        let pixels = try alloc f32[width * height * 4] in memory.heap
+        errdefer free(pixels) in memory.heap
+        try tiles.read(pixels)
+        for at in 0..<width * height:
+            let alpha = pixels[at * 4 + 3]
+            for channel in 0..<(usize)3:
+                pixels[at * 4 + channel] *= alpha
+        let radius = math.max(1.0, diameter * 0.5)
+        let side = (usize)(math.ceil(radius) * 2.0 + 1.0)
+        let carried = try alloc f32[side * side * 4] in memory.heap
+        errdefer free(carried) in memory.heap
+        var no_scratch: f32[]
+        var stroke = WarpStroke(width = width, height = height, pixels = pixels, mode = mode, radius = radius,
+                                hardness = math.clamp(hardness, 0.0, 0.98), strength = math.clamp(strength, 0.01, 1.0),
+                                carried = carried, scratch = no_scratch, last_x = x, last_y = y, debt = 0.0,
+                                dirty_left = 1, dirty_top = 1, dirty_right = 0, dirty_bottom = 0)
+        if mode == warp_smudge:
+            stroke.pick_up(x, y)
+        return stroke
+
+    ## Continue to (`x`, `y`), a dab every spacing along the way.
+    pub mutating func extend(x: f64, y: f64) -> !:
+        if not math.is_finite(x) or not math.is_finite(y):
+            error(invalid, "stroke coordinates must be finite")
+        let dx = x - self.last_x
+        let dy = y - self.last_y
+        let length = math.sqrt(dx * dx + dy * dy)
+        let step = math.max(1.0, self.radius * 2.0 * (0.08 if self.mode == warp_smudge else 0.025))
+        var along = step - self.debt
+        var from_x = self.last_x
+        var from_y = self.last_y
+        while along <= length:
+            let t = along / length
+            let to_x = self.last_x + dx * t
+            let to_y = self.last_y + dy * t
+            if self.mode == warp_smudge:
+                self.smudge(to_x, to_y)
+            else:
+                try self.push(from_x, from_y, to_x, to_y)
+            from_x = to_x
+            from_y = to_y
+            along += step
+        self.debt = length - (along - step)
+        self.last_x = x
+        self.last_y = y
+
+    ## Upload the cells changed since the last upload into `tiles`.
+    pub mutating func flush(tiles: Tiles*) -> !:
+        if self.dirty_right < self.dirty_left:
+            return
+        var row = self.dirty_top
+        while row <= self.dirty_bottom:
+            var column = self.dirty_left
+            while column <= self.dirty_right:
+                try tiles.write_cell_premultiplied((u32)column, (u32)row, self.pixels)
+                column += 1
+            row += 1
+        self.dirty_left = 1
+        self.dirty_right = 0
+
+    pub mutating func destroy():
+        free(self.pixels) in memory.heap
+        free(self.carried) in memory.heap
+        if self.scratch.length > 0:
+            free(self.scratch) in memory.heap
+
+    # -- The dabs.
+
+    ## How much of a dab reaches `distance` from its middle: whole within the
+    ## hardness, a smoothstep down to nothing at the rim.
+    func weight(distance: f64) -> f64:
+        let u = distance / self.radius
+        if u >= 1.0:
+            return 0.0
+        if u <= self.hardness:
+            return 1.0
+        let t = (1.0 - u) / (1.0 - self.hardness)
+        return t * t * (3.0 - 2.0 * t)
+
+    ## Smudge: the square under the first dab, carried.
+    mutating func pick_up(x: f64, y: f64):
+        let reach = (i64)math.ceil(self.radius)
+        let side = reach * 2 + 1
+        let cx = (i64)math.round(x)
+        let cy = (i64)math.round(y)
+        for j in 0..<side:
+            for i in 0..<side:
+                let at = ((usize)j * (usize)side + (usize)i) * 4
+                for channel in 0..<(usize)4:
+                    self.carried[at + channel] = self.pixel(cx - reach + i, cy - reach + j, channel)
+
+    mutating func smudge(x: f64, y: f64):
+        let reach = (i64)math.ceil(self.radius)
+        let side = reach * 2 + 1
+        let cx = (i64)math.round(x)
+        let cy = (i64)math.round(y)
+        for j in 0..<side:
+            for i in 0..<side:
+                let px = cx - reach + i
+                let py = cy - reach + j
+                if px < 0 or py < 0 or px >= (i64)self.width or py >= (i64)self.height:
+                    continue
+                let w = self.weight(math.hypot((f64)(i - reach), (f64)(j - reach)))
+                let k = ((usize)j * (usize)side + (usize)i) * 4
+                let at = ((usize)py * self.width + (usize)px) * 4
+                for channel in 0..<(usize)4:
+                    let under = (f64)self.pixels[at + channel]
+                    let carried = (f64)self.carried[k + channel]
+                    let painted = under + (carried - under) * w
+                    self.pixels[at + channel] = (f32)painted
+                    self.carried[k + channel] = (f32)(painted + (carried - painted) * self.strength)
+        self.touch(cx - reach, cy - reach, cx + reach, cy + reach)
+
+    ## Push: each pixel under the tip takes what was behind it along the
+    ## step, by the tip's weight there.
+    mutating func push(from_x: f64, from_y: f64, to_x: f64, to_y: f64) -> !:
+        let move_x = (to_x - from_x) * self.strength
+        let move_y = (to_y - from_y) * self.strength
+        let reach = (i64)math.ceil(self.radius)
+        let margin = reach + (i64)math.ceil(math.abs(move_x) + math.abs(move_y)) + 2
+        let cx = (i64)math.round(to_x)
+        let cy = (i64)math.round(to_y)
+        # The area as it was before this dab, so the dab reads nothing it wrote.
+        let left = cx - margin
+        let top = cy - margin
+        let side = (usize)(margin * 2 + 1)
+        if self.scratch.length < side * side * 4:
+            if self.scratch.length > 0:
+                free(self.scratch) in memory.heap
+            self.scratch = try alloc f32[side * side * 4] in memory.heap
+        for j in 0..<side:
+            for i in 0..<side:
+                for channel in 0..<(usize)4:
+                    self.scratch[(j * side + i) * 4 + channel] = self.pixel(left + (i64)i, top + (i64)j, channel)
+        for j in -reach..<(reach + 1):
+            for i in -reach..<(reach + 1):
+                let px = cx + i
+                let py = cy + j
+                if px < 0 or py < 0 or px >= (i64)self.width or py >= (i64)self.height:
+                    continue
+                let w = self.weight(math.hypot((f64)px - to_x, (f64)py - to_y))
+                if w <= 0.0:
+                    continue
+                let sx = (f64)(px - left) - move_x * w
+                let sy = (f64)(py - top) - move_y * w
+                let at = ((usize)py * self.width + (usize)px) * 4
+                for channel in 0..<(usize)4:
+                    self.pixels[at + channel] = (f32)bilinear(self.scratch, side, sx, sy, channel)
+        self.touch(cx - reach, cy - reach, cx + reach, cy + reach)
+
+    ## A sample of the working copy; transparent past its edges.
+    func pixel(x: i64, y: i64, channel: usize) -> f32:
+        if x < 0 or y < 0 or x >= (i64)self.width or y >= (i64)self.height:
+            return 0.0
+        return self.pixels[((usize)y * self.width + (usize)x) * 4 + channel]
+
+    ## Mark the cells a dab over document pixels `left`..`right`, `top`..`bottom` reached.
+    mutating func touch(left: i64, top: i64, right: i64, bottom: i64):
+        let columns = ((i64)self.width + (i64)tile_size - 1) // (i64)tile_size
+        let rows = ((i64)self.height + (i64)tile_size - 1) // (i64)tile_size
+        let first_column = math.imax(0, left // (i64)tile_size)
+        let first_row = math.imax(0, top // (i64)tile_size)
+        let last_column = math.imin(columns - 1, right // (i64)tile_size)
+        let last_row = math.imin(rows - 1, bottom // (i64)tile_size)
+        if last_column < first_column or last_row < first_row:
+            return
+        if self.dirty_right < self.dirty_left:
+            self.dirty_left = first_column
+            self.dirty_top = first_row
+            self.dirty_right = last_column
+            self.dirty_bottom = last_row
+            return
+        self.dirty_left = math.imin(self.dirty_left, first_column)
+        self.dirty_top = math.imin(self.dirty_top, first_row)
+        self.dirty_right = math.imax(self.dirty_right, last_column)
+        self.dirty_bottom = math.imax(self.dirty_bottom, last_row)
+
+## A bilinear sample of a `side`-wide square of RGBA samples; transparent past it.
+func bilinear(samples: const f32[], side: usize, x: f64, y: f64, channel: usize) -> f64:
+    let x0 = math.floor(x)
+    let y0 = math.floor(y)
+    let fx = x - x0
+    let fy = y - y0
+    let a = texel(samples, side, (i64)x0, (i64)y0, channel)
+    let b = texel(samples, side, (i64)x0 + 1, (i64)y0, channel)
+    let c = texel(samples, side, (i64)x0, (i64)y0 + 1, channel)
+    let d = texel(samples, side, (i64)x0 + 1, (i64)y0 + 1, channel)
+    return (a + (b - a) * fx) + ((c + (d - c) * fx) - (a + (b - a) * fx)) * fy
+
+func texel(samples: const f32[], side: usize, x: i64, y: i64, channel: usize) -> f64:
+    if x < 0 or y < 0 or x >= (i64)side or y >= (i64)side:
+        return 0.0
+    return (f64)samples[((usize)y * side + (usize)x) * 4 + channel]
