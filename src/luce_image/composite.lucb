@@ -6,6 +6,9 @@
 ## to one layer invalidates only the tiles it touches, and a change to a top
 ## layer's opacity never re-renders what lies below it in another tile. There is
 ## one way to produce pixels; export asks for level-0 tiles like the screen.
+## A Blur adjustment layer is the one thing that reaches past its cell: it
+## flattens what is below it in the eight cells around too, and while a
+## document has one every key covers those neighbours.
 import gpu
 import memory
 from luce_image.tiles import Tiles, Tile, tile_size, min_u32
@@ -14,7 +17,8 @@ from luce_image.style import Styler
 from raster_errors import invalid, limit
 from luce_image.half import from_half
 from luce_image.shaders import composite_frag_words, composite_frag_msl, adjust_mix_frag_words, adjust_mix_frag_msl
-from luce_image.adjust import Adjuster, Place, curves
+from luce_image.adjust import Adjuster, Place, curves, blur
+from luce_image.filter import Filters
 from luce_image.curves import lut_size
 
 struct Entry:
@@ -69,6 +73,12 @@ pub struct Composer:
     ## The document being drawn's size, for adjustments that depend on where a pixel is.
     var extent_x: u32
     var extent_y: u32
+    ## Blur layers: the document being drawn, the Gaussian, and the layer a
+    ## flatten stops before (0: none) and whether it has.
+    var drawing: const Document*?
+    var filters: Filters
+    var stop_at: u64
+    var stopped: bool
 
     ## A compositor keeping at most `budget` rendered tiles (1 MiB each).
     pub static func create(device: gpu.Device, budget: usize = 512) -> Composer!:
@@ -97,6 +107,8 @@ pub struct Composer:
         errdefer styler.destroy()
         var adjuster = try Adjuster.create(device)
         errdefer adjuster.destroy()
+        var filters = try Filters.create(device)
+        errdefer filters.destroy()
         var mix_shader = try gpu.Shader.create(device, adjust_mix_frag_words, adjust_mix_frag_msl)
         errdefer mix_shader.destroy()
         var mix = try gpu.Pipeline.create(device, mix_shader, gpu.Blend.replace, gpu.Format.rgba16_float)
@@ -108,7 +120,8 @@ pub struct Composer:
         for index in 0..<curve_table_budget:
             tables[index] = CurveTable(key = 0, texture = gpu.Texture(), live = false)
         return Composer(owner = device, entries = entries, count = 0, budget = budget, tick = 0, shader = shader, pipeline = pipeline, blank = blank, white = white, styler = styler,
-                        adjuster = adjuster, mix_shader = mix_shader, mix = mix, effects = effects, curve_tables = tables, next_curve_table = 0, renders = 0, extent_x = 0, extent_y = 0)
+                        adjuster = adjuster, mix_shader = mix_shader, mix = mix, effects = effects, curve_tables = tables, next_curve_table = 0, renders = 0, extent_x = 0, extent_y = 0,
+                        drawing = none, filters = filters, stop_at = 0, stopped = false)
 
     ## The flattened tile at `column`, `row` of pyramid `level`, borrowed until
     ## the next call. Straight-alpha rgba16_float, transparent where nothing is.
@@ -121,13 +134,20 @@ pub struct Composer:
         self.tick += 1
         self.extent_x = document.width()
         self.extent_y = document.height()
+        self.drawing = document
         var digest = fnv_start()
         digest = fnv_mix(digest, (u64)level)
         digest = fnv_mix(digest, (u64)column)
         digest = fnv_mix(digest, (u64)row)
         digest = fnv_mix(digest, (u64)document.width())
         digest = fnv_mix(digest, (u64)document.height())
-        digest = hash_layers(digest, document.layers(), 1.0, column * span, row * span, span)
+        if has_blur(document.layers()):
+            # What is below a blur in the cells around shows through it.
+            let first_column = column * span - 1 if column > 0 else 0
+            let first_row = row * span - 1 if row > 0 else 0
+            digest = hash_layers(digest, document.layers(), 1.0, first_column, first_row, span + 2)
+        else:
+            digest = hash_layers(digest, document.layers(), 1.0, column * span, row * span, span)
         if let found = self.lookup(digest):
             return found
         var texture = gpu.Texture()
@@ -171,6 +191,11 @@ pub struct Composer:
         var base: gpu.Texture? = none
         var base_missing = false
         for layer in layers:
+            if self.stopped:
+                return
+            if layer.id == self.stop_at:
+                self.stopped = true
+                return
             if not layer.visible or layer.opacity == 0.0:
                 continue
             let effective = opacity * layer.opacity
@@ -226,6 +251,13 @@ pub struct Composer:
         var inside_owned = false
         defer drop_owned(&inside, inside_owned)
         try self.flatten_layers(group.layers(), 1.0, column, row, &inside, &inside_owned)
+        if self.stopped:
+            # Stopped inside: what the group holds so far is the backdrop there.
+            drop_owned(backdrop, *owned)
+            *backdrop = inside
+            *owned = inside_owned
+            inside_owned = false
+            return
         if not inside_owned:
             return
         let mask = mask_tiles.texture(column, row) else self.white
@@ -247,13 +279,18 @@ pub struct Composer:
         *backdrop = fresh
         *owned = true
 
-    ## An adjustment layer applied to the backdrop so far; nothing below, nothing to adjust.
+    ## An adjustment layer applied to the backdrop so far; nothing below,
+    ## nothing to adjust — but a blur, whose neighbours may bleed in.
     mutating func adjust(backdrop: gpu.Texture*, owned: bool*, layer: const Layer*, mask: gpu.Texture, clip: gpu.Texture, opacity: f64, column: u32, row: u32) -> !:
-        if not *owned:
+        if not *owned and layer.adjustment != (i64)blur:
             return
-        let table = try self.curve_table_for(layer)
-        let place = Place(x = column * tile_size, y = row * tile_size, width = self.extent_x, height = self.extent_y)
-        var adjusted = try self.adjuster.adjusted(*backdrop, (u32)layer.adjustment, layer.adjustment_values[..<23], table, place)
+        var adjusted = gpu.Texture()
+        if layer.adjustment == (i64)blur:
+            adjusted = try self.blurred(*backdrop, layer, column, row)
+        else:
+            let table = try self.curve_table_for(layer)
+            let place = Place(x = column * tile_size, y = row * tile_size, width = self.extent_x, height = self.extent_y)
+            adjusted = try self.adjuster.adjusted(*backdrop, (u32)layer.adjustment, layer.adjustment_values[..<23], table, place)
         defer adjusted.destroy()
         var params: f32[1] = [(f32)opacity]
         var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
@@ -264,8 +301,65 @@ pub struct Composer:
         defer target.release()
         try gpu.shade(target.value(), self.mix, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 4), [*backdrop, adjusted, mask, clip], gpu.Filter.nearest)
         discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
-        backdrop.destroy()
+        drop_owned(backdrop, *owned)
         *backdrop = fresh
+        *owned = true
+
+    ## What is below Blur layer `layer` at the cell, `middle`, blurred with
+    ## what is below it in the cells around (flattened up to it), as a fresh
+    ## texture.
+    mutating func blurred(middle: gpu.Texture, layer: const Layer*, column: u32, row: u32) -> gpu.Texture!:
+        let document = self.drawing else error(invalid, "a blur layer is drawn within a document")
+        var block = try Tiles.create(self.owner, tile_size * 3, tile_size * 3)
+        defer block.destroy()
+        var dy: i64 = -1
+        while dy <= 1:
+            var dx: i64 = -1
+            while dx <= 1:
+                let x = (i64)column + dx
+                let y = (i64)row + dy
+                if x >= 0 and y >= 0 and x * (i64)tile_size < (i64)self.extent_x and y * (i64)tile_size < (i64)self.extent_y:
+                    var texture = gpu.Texture()
+                    if dx == 0 and dy == 0:
+                        texture = try block.blank()
+                        errdefer texture.destroy()
+                        try copy_tile(&texture, middle)
+                    else:
+                        texture = try self.flatten_until(document, (u32)x, (u32)y, layer.id)
+                    try block.set((u32)(dx + 1), (u32)(dy + 1), texture)
+                dx += 1
+            dy += 1
+        try self.filters.blur_tiles(&block, clamp_radius(layer.adjustment_values[0]))
+        var result = try block.blank()
+        errdefer result.destroy()
+        if let blurred = block.texture(1, 1):
+            try copy_tile(&result, blurred)
+        return result
+
+    ## The level-0 cell as flattened up to layer `stop` (not including it), a
+    ## fresh texture; transparent when nothing is below it there.
+    mutating func flatten_until(document: const Document*, column: u32, row: u32, stop: u64) -> gpu.Texture!:
+        let outer_stop = self.stop_at
+        let outer_stopped = self.stopped
+        self.stop_at = stop
+        self.stopped = false
+        var backdrop = self.blank
+        var owned = false
+        self.flatten_layers(document.layers(), 1.0, column, row, &backdrop, &owned) catch failure:
+            drop_owned(&backdrop, owned)
+            self.stop_at = outer_stop
+            self.stopped = outer_stopped
+            error(failure.code, failure.message)
+        self.stop_at = outer_stop
+        self.stopped = outer_stopped
+        if owned:
+            return backdrop
+        var clear = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        errdefer clear.destroy()
+        let frame = try clear.frame()
+        defer frame.release()
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        return clear
 
     ## A Curves layer's lookup table, made once per state of its curves; none
     ## for any other kind.
@@ -421,6 +515,7 @@ pub struct Composer:
         self.mix.destroy()
         self.mix_shader.destroy()
         self.adjuster.destroy()
+        self.filters.destroy()
         self.blank.destroy()
         self.white.destroy()
         self.pipeline.destroy()
@@ -437,6 +532,28 @@ pub func box_composer(composer: Composer) -> Composer*!:
 pub func unbox_composer(composer: Composer*):
     composer.destroy()
     free(composer) in memory.heap
+
+## Whether any visible layer among `layers` (or in their groups) is a Blur layer.
+func has_blur(layers: Layer*[]) -> bool:
+    for layer in layers:
+        if not layer.visible:
+            continue
+        if layer.adjustment == (i64)blur or (layer.group and has_blur(layer.layers())):
+            return true
+    return false
+
+## A Blur layer's radius as the Gaussian takes it.
+func clamp_radius(radius: f64) -> f64:
+    return radius if radius >= 0.5 and radius <= 250.0 else (0.5 if not (radius > 0.5) else 250.0)
+
+## Every texel of `source` into `target`, both whole tiles.
+func copy_tile(target: gpu.Texture*, source: gpu.Texture) -> !:
+    let frame = try target.frame()
+    defer frame.release()
+    let whole = try frame.value().target()
+    defer whole.release()
+    try gpu.copy_image(whole.value(), source, gpu.Rect(0.0, 0.0, (f64)tile_size, (f64)tile_size), gpu.Region(0, 0, tile_size, tile_size))
+    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
 
 ## Fold every layer that contributes to the cells in range into `digest`.
 func hash_layers(seed: u64, layers: Layer*[], opacity: f64, first_column: u32, first_row: u32, span: u32) -> u64:
@@ -642,3 +759,46 @@ test "a styled layer's glow is composited under it":
     # The half at byte 6..7 is alpha; a glow beside the square makes it nonzero.
     assert(bytes[(32 * 256 + 20) * 8 + 7] != 0)
     assert(composer.renders == 2)
+
+test "a blur layer softens what is below it across cell edges, and the cache follows its neighbours":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var document = try Document.create(device, 512, 64)
+    defer document.destroy()
+    let layer = try document.add_layer("Bar")
+    let count = (usize)512 * 64 * 4
+    let pixels = try alloc f32[count] in memory.heap
+    defer free(pixels) in memory.heap
+    for index in 0..<count:
+        pixels[index] = 0.0
+    # Opaque white on the left cell up to its edge.
+    for y in 0..<(usize)64:
+        for x in 0..<(usize)256:
+            for channel in 0..<(usize)4:
+                pixels[(y * 512 + x) * 4 + channel] = 1.0
+    var tiles = try Tiles.create(device, 512, 64)
+    try tiles.write(pixels)
+    try document.set_tiles(layer, tiles)
+    let values: f64[1] = [6.0]
+    discard(try document.add_adjustment("Blur", (i64)blur, values))
+    var composer = try Composer.create(device)
+    defer composer.destroy()
+    let right = try composer.tile(&document, 1, 0, 0)
+    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    defer free(bytes) in memory.heap
+    try right.read(bytes)
+    # Just right of the edge the white bleeds in (alpha half in f16 bytes 6..7).
+    let at = ((usize)32 * (usize)tile_size + 2) * 8
+    let alpha = from_half((u16)bytes[at + 6] | ((u16)bytes[at + 7] << 8))
+    assert(alpha > 0.1 and alpha < 0.6)
+    # Painting the left cell changes the right cell's key.
+    let before = composer.renders
+    for y in 0..<(usize)64:
+        for x in 0..<(usize)256:
+            pixels[(y * 512 + x) * 4 + 3] = 0.0
+    let current = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
+    try current.write(pixels)
+    discard(try composer.tile(&document, 1, 0, 0))
+    assert(composer.renders == before + 1)
