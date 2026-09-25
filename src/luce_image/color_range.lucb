@@ -1,0 +1,130 @@
+## Select › Color Range, as Photoshop's: pixels selected by how near their
+## color is to sampled colors (within Fuzziness, measured as ΔE in CIELAB), or
+## by a fixed range: one of the six hues, or the highlights, midtones or
+## shadows. Subtracted samples take their neighbourhood back out. Coverage
+## fades with the distance, so the edge of a range is soft, as Photoshop's.
+import math
+import color
+import space
+import lab
+import hsl
+import transfer
+from raster_errors import invalid
+
+pub let range_sampled: i64 = 0
+## 1 reds, 2 yellows, 3 greens, 4 cyans, 5 blues, 6 magentas.
+pub let range_reds: i64 = 1
+pub let range_highlights: i64 = 7
+pub let range_midtones: i64 = 8
+pub let range_shadows: i64 = 9
+
+## A sampled color, in CIELAB; subtracted ones are taken back out.
+pub struct RangeSample:
+    pub var l: f64
+    pub var a: f64
+    pub var b: f64
+    pub var subtract: bool
+
+## A linear-light color as a sample.
+pub func range_sample(red: f64, green: f64, blue: f64, subtract: bool) -> RangeSample:
+    let value = lab_of(red, green, blue)
+    return RangeSample(l = value.l, a = value.a, b = value.b, subtract = subtract)
+
+## Coverage 0..255 for every pixel of `pixels` (straight RGBA, linear light):
+## how far each is in `range` — by `samples` within `fuzziness` (0..200 ΔE)
+## for the sampled range — turned around by `invert`. Transparent pixels are
+## never selected.
+pub func range_coverage(pixels: const f32[], samples: const RangeSample[], range: i64, fuzziness: f64, invert: bool, coverage: u8[]) -> !:
+    if pixels.length != coverage.length * 4:
+        error(invalid, "color range needs RGBA pixels and a coverage byte each")
+    if range < range_sampled or range > range_shadows:
+        error(invalid, "a color range is 0 sampled, 1..6 a hue, 7 highlights, 8 midtones or 9 shadows")
+    if not math.is_finite(fuzziness) or fuzziness < 0.0 or fuzziness > 200.0:
+        error(invalid, "fuzziness is 0..200")
+    for index in 0..<coverage.length:
+        let red = math.max(0.0, (f64)pixels[index * 4])
+        let green = math.max(0.0, (f64)pixels[index * 4 + 1])
+        let blue = math.max(0.0, (f64)pixels[index * 4 + 2])
+        var value = 0.0
+        if range == range_sampled:
+            value = sampled(red, green, blue, samples, fuzziness)
+        elif range < range_highlights:
+            value = hue_weight(red, green, blue, range)
+        else:
+            value = tone_weight(red, green, blue, range)
+        if invert:
+            value = 1.0 - value
+        value *= math.clamp((f64)pixels[index * 4 + 3], 0.0, 1.0)
+        coverage[index] = (u8)(math.clamp(value, 0.0, 1.0) * 255.0 + 0.5)
+
+## Nearest to an added sample, less nearest to a subtracted one.
+func sampled(red: f64, green: f64, blue: f64, samples: const RangeSample[], fuzziness: f64) -> f64:
+    if samples.length == 0:
+        return 0.0
+    let here = lab_of(red, green, blue)
+    var keep = 0.0
+    var away = 0.0
+    for sample in samples:
+        let near = falloff(lab.delta_e76(here, lab.Lab(l = sample.l, a = sample.a, b = sample.b)), fuzziness)
+        if sample.subtract:
+            away = math.max(away, near)
+        else:
+            keep = math.max(keep, near)
+    return keep * (1.0 - away)
+
+## Whole within a quarter of the fuzziness, fading to nothing at it; with no
+## fuzziness only the color itself.
+func falloff(distance: f64, fuzziness: f64) -> f64:
+    if fuzziness <= 0.0:
+        return 1.0 if distance < 0.5 else 0.0
+    return math.clamp((fuzziness - distance) / (fuzziness * 0.75), 0.0, 1.0)
+
+## One of the six hues: whole within 15° of it, gone past 45°, and only as
+## much as the color is saturated — greys are no hue's.
+func hue_weight(red: f64, green: f64, blue: f64, range: i64) -> f64:
+    let shade = hsl.to_hsv(encoded(red, green, blue))
+    let centre = (f64)(range - range_reds) * 60.0
+    var apart = math.abs(shade.h - centre)
+    if apart > 180.0:
+        apart = 360.0 - apart
+    return math.clamp((45.0 - apart) / 30.0, 0.0, 1.0) * math.clamp(shade.s * 2.5, 0.0, 1.0)
+
+## Highlights, midtones or shadows by the encoded luma, with soft shoulders.
+func tone_weight(red: f64, green: f64, blue: f64, range: i64) -> f64:
+    let shade = encoded(red, green, blue)
+    let luma = 0.2126 * shade.red + 0.7152 * shade.green + 0.0722 * shade.blue
+    if range == range_highlights:
+        return math.clamp((luma - 0.55) / 0.25, 0.0, 1.0)
+    if range == range_shadows:
+        return math.clamp((0.45 - luma) / 0.25, 0.0, 1.0)
+    return math.clamp((0.35 - math.abs(luma - 0.5)) / 0.2, 0.0, 1.0)
+
+func encoded(red: f64, green: f64, blue: f64) -> color.Color:
+    return color.Color(transfer.srgb_encode(math.min(1.0, red)), transfer.srgb_encode(math.min(1.0, green)), transfer.srgb_encode(math.min(1.0, blue)))
+
+func lab_of(red: f64, green: f64, blue: f64) -> lab.Lab:
+    return space.to_lab(color.Color(red, green, blue), space.linear_srgb)
+
+test "a sampled color is selected whole, a far one not, a subtracted one taken back":
+    let pixels: f32[12] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.95, 0.01, 0.01, 1.0]
+    var coverage: u8[3]
+    let red: RangeSample[1] = [range_sample(1.0, 0.0, 0.0, false)]
+    try range_coverage(pixels, red, range_sampled, 40.0, false, coverage)
+    assert(coverage[0] == 255 and coverage[1] == 0 and coverage[2] > 128)
+    let taken: RangeSample[2] = [range_sample(1.0, 0.0, 0.0, false), range_sample(0.95, 0.01, 0.01, true)]
+    try range_coverage(pixels, taken, range_sampled, 40.0, false, coverage)
+    assert(coverage[2] == 0 and coverage[1] == 0)
+    try range_coverage(pixels, red, range_sampled, 40.0, true, coverage)
+    assert(coverage[0] == 0 and coverage[1] == 255)
+
+test "hue and tone ranges: blues, greys in none, shadows and highlights":
+    let pixels: f32[16] = [0.0, 0.0, 1.0, 1.0, 0.2, 0.2, 0.2, 1.0, 0.002, 0.002, 0.002, 1.0, 1.0, 1.0, 1.0, 0.0]
+    var coverage: u8[4]
+    var nothing: RangeSample[]
+    try range_coverage(pixels, nothing, 5, 40.0, false, coverage)
+    assert(coverage[0] == 255 and coverage[1] == 0 and coverage[2] == 0)
+    try range_coverage(pixels, nothing, range_shadows, 40.0, false, coverage)
+    assert(coverage[2] == 255 and coverage[0] > 0)
+    try range_coverage(pixels, nothing, range_highlights, 40.0, false, coverage)
+    # White but transparent: not selected.
+    assert(coverage[3] == 0 and coverage[2] == 0)

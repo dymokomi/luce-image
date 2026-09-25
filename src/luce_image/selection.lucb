@@ -179,7 +179,7 @@ pub struct Selection:
         self.finish()
 
     ## Coverage bytes, one for every document pixel, combined by `mode`: a
-    ## subject found (subject.lucb).
+    ## color range (color_range.lucb).
     pub mutating func from_coverage(values: const u8[], mode: Mode) -> !:
         if values.length != self.coverage.length:
             error(invalid, "coverage must have a byte for every document pixel")

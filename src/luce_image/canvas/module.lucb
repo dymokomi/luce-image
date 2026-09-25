@@ -40,7 +40,7 @@ import svg
 from luce_image.image import Image, Pixel
 from luce_image.tiles import Tiles, Bounds, tile_size, tile_columns, min_u32, flatten
 from luce_image.heal import heal
-from luce_image.subject import find_subject
+from luce_image.color_range import RangeSample, range_sample, range_coverage
 from luce_image.warp import WarpStroke, warp_smudge, warp_push
 from luce_image.document import Style, Document, Layer, TreeState, release_snapshot, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
 from luce_image.composite import Composer, box_composer, unbox_composer
@@ -126,6 +126,9 @@ pub struct Canvas:
     var selection: Selection
     var polygon: f64[]
     var polygon_count: usize
+    ## Color Range's sampled colors (`add_range_sample`).
+    var range_samples: RangeSample[32]
+    var range_count: usize
     var ants_shader: gpu.Shader?
     var ants: gpu.Pipeline?
     var history: Snapshot[]
@@ -222,6 +225,9 @@ pub struct Canvas:
         var no_points: f64[]
         self.polygon = no_points
         self.polygon_count = 0
+        var no_samples: RangeSample[32]
+        self.range_samples = no_samples
+        self.range_count = 0
         self.ants_shader = none
         self.ants = none
         var no_history: Snapshot[]
@@ -1197,17 +1203,31 @@ pub struct Canvas:
         try shape.wand(pixels, x, y, tolerance, contiguous, Mode.replace)
         try self.merge_shape(&shape, mode)
 
-    ## Select Subject (a box of no size) or Object Selection (the box
-    ## `left`, `top`, `width`, `height`): the subject of layer `id` — or of the
-    ## whole picture with `all_layers` — found by color, combined by `mode`.
-    pub mutating func select_subject(id: i64, left: i64, top: i64, width: i64, height: i64, mode: i64 = 0, all_layers: bool = false) -> !:
+    ## Forget Color Range's sampled colors.
+    pub mutating func clear_range_samples():
+        self.range_count = 0
+
+    ## A color (linear light) for Color Range to select, or, `subtract`, to take back out.
+    pub mutating func add_range_sample(red: f64, green: f64, blue: f64, subtract: bool) -> !:
+        if not math.is_finite(red) or not math.is_finite(green) or not math.is_finite(blue):
+            error(invalid, "range samples must be finite")
+        if self.range_count >= self.range_samples.length:
+            error(limit, "Color Range keeps at most 32 samples")
+        self.range_samples[self.range_count] = range_sample(red, green, blue, subtract)
+        self.range_count += 1
+
+    ## Select › Color Range: the pixels of layer `id` — or of the whole picture
+    ## with `all_layers` — in `range` (0 the sampled colors within `fuzziness`,
+    ## 1..6 reds to magentas, 7 highlights, 8 midtones, 9 shadows), turned
+    ## around by `invert`, combined by `mode`.
+    pub mutating func select_color_range(id: i64, range: i64, fuzziness: f64, invert: bool, mode: i64 = 0, all_layers: bool = true) -> !:
         try self.require_open()
-        try self.remember_state("Select Subject" if width <= 0 else "Object Selection")
+        try self.remember_state("Color Range")
         var pixels: f32[]
         if all_layers:
             pixels = try flattened_pixels(&self)
         else:
-            let document = self.document else error(invalid, "draw the document once before selecting a subject")
+            let document = self.document else error(invalid, "draw the document once before selecting a color range")
             let layer = document.find((u64)id) else error(invalid, "no such layer")
             let tiles = layer.tiles() else error(invalid, "a group has no pixels to look at")
             pixels = try alloc f32[(usize)self.extent_x * (usize)self.extent_y * 4] in memory.heap
@@ -1217,8 +1237,7 @@ pub struct Canvas:
         defer free(pixels) in memory.heap
         let found = try alloc u8[(usize)self.extent_x * (usize)self.extent_y] in memory.heap
         defer free(found) in memory.heap
-        if not (try find_subject(pixels, (usize)self.extent_x, (usize)self.extent_y, left, top, width, height, found)):
-            error(invalid, "no subject stands out there")
+        try range_coverage(pixels, self.range_samples[..<self.range_count], range, fuzziness, invert, found)
         if not self.shaping():
             try self.live().from_coverage(found, try selection_mode(mode))
             return
