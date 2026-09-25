@@ -1,62 +1,48 @@
-## Content-Aware Fill, after Photoshop's: the hole filled with texture from
-## the rest of the picture so that every patch of the result looks like some
-## patch outside it — Wexler, Shechtman and Irani's completion over Barnes et
-## al.'s PatchMatch. Coarse to fine: at the smallest scale the hole starts as
-## the tone flowing in from its edge; at each scale nearest-neighbour fields
-## (each hole-touching patch's best match outside) are improved by propagation
-## and random search, and every hole pixel becomes the average of what the
-## matches covering it say; the fields go up a scale to start the next. On the
-## CPU, once per fill.
+## Content-Aware Fill, after Photoshop's: the hole filled with texture taken
+## from around it, patch by patch, as Criminisi, Pérez and Toyama's
+## exemplar-based inpainting does. The hole is filled from its edge inward;
+## the next patch filled is the one on the edge that is most known and sits
+## on the strongest structure, so lines run on into the hole before flat
+## areas close over them. Each patch is matched on its known pixels only — no
+## guess of the hole takes part — against patches wholly outside the hole,
+## searched among those its filled neighbours came from (texture stays
+## coherent), random ones, and the best's surroundings; the best is copied in
+## as it is. On the CPU, once per fill.
 import math
 import memory
 from raster_errors import invalid, limit
 
 ## Patches are (2 × radius + 1) pixels square.
-let radius: i64 = 3
+let radius: i64 = 4
 ## Past this many pixels in the work box the fill refuses.
 let work_limit: usize = 6000000
+## Random candidates tried for each patch.
+let random_tries: usize = 160
 
-## One scale: premultiplied RGBA pixels, which are unknown (the hole), and
-## which pixels may centre a source patch (it and all its patch known).
-struct Level:
+## The work box: premultiplied pixels matched on the square roots of light
+## (near what the eye sees, so dark texture is told apart as well as bright),
+## what is still unknown, how sure each pixel is, where filled pixels came
+## from, and which pixels may centre a source patch.
+struct Work:
     var width: i64
     var height: i64
     var pixels: f32[]
     var unknown: u8[]
+    var confidence: f32[]
+    var came_x: i32[]
+    var came_y: i32[]
     var source: u8[]
-    ## Every source centre, for random picks.
     var sources: i32[]
     var source_count: usize
 
     mutating func destroy():
         free(self.pixels) in memory.heap
         free(self.unknown) in memory.heap
+        free(self.confidence) in memory.heap
+        free(self.came_x) in memory.heap
+        free(self.came_y) in memory.heap
         free(self.source) in memory.heap
         free(self.sources) in memory.heap
-
-## The scales, finest first.
-struct Pyramid:
-    var levels: Level[8]
-    var count: usize
-
-    mutating func destroy():
-        for index in 0..<self.count:
-            self.levels[index].destroy()
-        self.count = 0
-
-## The nearest-neighbour field of one scale: each pixel's matching source
-## centre, and the distance, for pixels whose patch touches the hole.
-struct Field:
-    var match_x: i32[]
-    var match_y: i32[]
-    var cost: f32[]
-    var target: u8[]
-
-    mutating func destroy():
-        free(self.match_x) in memory.heap
-        free(self.match_y) in memory.heap
-        free(self.cost) in memory.heap
-        free(self.target) in memory.heap
 
 ## Fill `pixels` (premultiplied RGBA, 4 samples a pixel, `width` × `height`)
 ## where `hole` is non-zero, in place, from the rest; the same `seed` makes
@@ -78,101 +64,82 @@ pub func content_fill(pixels: f32[], width: usize, height: usize, hole: const u8
     if right == 0:
         return false
     # The work box: the hole and as much again around it, where the texture to use most likely is.
-    let margin = math.max(64.0, (f64)math.max((f64)(right - left), (f64)(bottom - top)))
+    let margin = math.max(48.0, (f64)math.max((f64)(right - left), (f64)(bottom - top)))
     let box_left = (usize)math.max(0.0, (f64)left - margin)
     let box_top = (usize)math.max(0.0, (f64)top - margin)
     let box_right = (usize)math.min((f64)width, (f64)right + margin)
     let box_bottom = (usize)math.min((f64)height, (f64)bottom + margin)
-    let box_width = box_right - box_left
-    let box_height = box_bottom - box_top
-    if box_width * box_height > work_limit:
+    if (box_right - box_left) * (box_bottom - box_top) > work_limit:
         error(limit, "the area to fill is too large; select less")
-    var finest = try level_of(pixels, width, box_left, box_top, box_width, box_height, hole)
-    if finest.source_count == 0:
-        finest.destroy()
+    var work = try work_of(pixels, width, box_left, box_top, box_right - box_left, box_bottom - box_top, hole)
+    defer work.destroy()
+    if work.source_count == 0:
         return false
-    var pyramid = Pyramid(count = 1)
-    pyramid.levels[0] = finest
-    defer pyramid.destroy()
-    # Down while the hole is wider than a few patches and there are sources left.
-    while pyramid.count < 8 and hole_span(&pyramid.levels[pyramid.count - 1]) > radius * 6 and pyramid.levels[pyramid.count - 1].width > 32 and pyramid.levels[pyramid.count - 1].height > 32:
-        var coarser = try halved(&pyramid.levels[pyramid.count - 1])
-        if coarser.source_count < 16:
-            coarser.destroy()
-            break
-        pyramid.levels[pyramid.count] = coarser
-        pyramid.count += 1
-    let count = pyramid.count
     var random = seed | 1
-    diffuse(&pyramid.levels[count - 1])
-    var field = try field_of(&pyramid.levels[count - 1])
-    defer field.destroy()
-    randomize(&field, &pyramid.levels[count - 1], &random)
-    var at = count
-    while at > 0:
-        at -= 1
-        let scale = &pyramid.levels[at]
-        if at < count - 1:
-            var finer = try field_of(scale)
-            upsample(&finer, &field, scale, &pyramid.levels[at + 1], &random)
-            field.destroy()
-            field = finer
-            vote(scale, &field)
-        # Fewer rounds at the fine scales, where each costs most.
-        let rounds = 3 if at == 0 else 5
-        for round in 0..<rounds:
-            improve(&field, scale, &random, round % 2 == 1)
-            vote(scale, &field)
-    # The finest scale's hole back into the picture.
-    let scale = &pyramid.levels[0]
-    for y in 0..<scale.height:
-        for x in 0..<scale.width:
-            let spot = y * scale.width + x
-            if scale.unknown[(usize)spot] == 0:
+    while true:
+        let spot = next_patch(&work) else break
+        let x = spot % work.width
+        let y = spot // work.width
+        let chosen = best_source(&work, x, y, &random)
+        copy_patch(&work, x, y, chosen % work.width, chosen // work.width)
+    # The filled box back into the picture.
+    for y in 0..<work.height:
+        for x in 0..<work.width:
+            let index = (usize)(y * work.width + x)
+            let global = ((usize)y + box_top) * width + (usize)x + box_left
+            if hole[global] == 0:
                 continue
-            let global = ((y + (i64)box_top) * (i64)width + x + (i64)box_left) * 4
             for channel in 0..<(usize)4:
-                pixels[(usize)global + channel] = scale.pixels[(usize)spot * 4 + channel]
+                let value = work.pixels[index * 4 + channel]
+                pixels[global * 4 + channel] = value * value
     return true
 
-## The work box of the picture as a scale.
-func level_of(pixels: const f32[], width: usize, left: usize, top: usize, box_width: usize, box_height: usize, hole: const u8[]) -> Level!:
+## The work box of the picture.
+func work_of(pixels: const f32[], width: usize, left: usize, top: usize, box_width: usize, box_height: usize, hole: const u8[]) -> Work!:
     let count = box_width * box_height
     let copied = try alloc f32[count * 4] in memory.heap
     errdefer free(copied) in memory.heap
     let unknown = try alloc u8[count] in memory.heap
     errdefer free(unknown) in memory.heap
+    let confidence = try alloc f32[count] in memory.heap
+    errdefer free(confidence) in memory.heap
+    let came_x = try alloc i32[count] in memory.heap
+    errdefer free(came_x) in memory.heap
+    let came_y = try alloc i32[count] in memory.heap
+    errdefer free(came_y) in memory.heap
     for y in 0..<box_height:
         for x in 0..<box_width:
             let origin = (top + y) * width + left + x
-            unknown[y * box_width + x] = 1 if hole[origin] != 0 else 0
+            let index = y * box_width + x
+            let missing = hole[origin] != 0
+            unknown[index] = 1 if missing else 0
+            confidence[index] = 0.0 if missing else 1.0
+            came_x[index] = -1
+            came_y[index] = -1
             for channel in 0..<(usize)4:
-                copied[(y * box_width + x) * 4 + channel] = 0.0 if hole[origin] != 0 else pixels[origin * 4 + channel]
-    return try with_sources(copied, unknown, (i64)box_width, (i64)box_height)
-
-## A scale's source map and list, from its pixels and unknowns (which it takes).
-func with_sources(pixels: f32[], unknown: u8[], width: i64, height: i64) -> Level!:
-    let count = (usize)(width * height)
+                copied[index * 4 + channel] = 0.0 if missing else (f32)math.sqrt(math.max(0.0, (f64)pixels[origin * 4 + channel]))
+    let w = (i64)box_width
+    let h = (i64)box_height
     let source = try alloc u8[count] in memory.heap
     errdefer free(source) in memory.heap
     var found: usize = 0
-    for y in 0..<height:
-        for x in 0..<width:
-            source[(usize)(y * width + x)] = 0
-            if x < radius or y < radius or x >= width - radius or y >= height - radius:
+    for y in 0..<h:
+        for x in 0..<w:
+            source[(usize)(y * w + x)] = 0
+            if x < radius or y < radius or x >= w - radius or y >= h - radius:
                 continue
             var clear = true
             var dy = -radius
             while dy <= radius and clear:
                 var dx = -radius
                 while dx <= radius:
-                    if unknown[(usize)((y + dy) * width + x + dx)] != 0:
+                    if unknown[(usize)((y + dy) * w + x + dx)] != 0:
                         clear = false
                         break
                     dx += 1
                 dy += 1
             if clear:
-                source[(usize)(y * width + x)] = 1
+                source[(usize)(y * w + x)] = 1
                 found += 1
     let sources = try alloc i32[found if found > 0 else 1] in memory.heap
     var at: usize = 0
@@ -180,241 +147,161 @@ func with_sources(pixels: f32[], unknown: u8[], width: i64, height: i64) -> Leve
         if source[index] != 0:
             sources[at] = (i32)index
             at += 1
-    return Level(width = width, height = height, pixels = pixels, unknown = unknown, source = source, sources = sources, source_count = found)
+    return Work(width = w, height = h, pixels = copied, unknown = unknown, confidence = confidence, came_x = came_x, came_y = came_y,
+                source = source, sources = sources, source_count = found)
 
-## Half the size: known pixels average their known children; a pixel is
-## unknown when any child is.
-func halved(finer: const Level*) -> Level!:
-    let width = (finer.width + 1) // 2
-    let height = (finer.height + 1) // 2
-    let count = (usize)(width * height)
-    let pixels = try alloc f32[count * 4] in memory.heap
-    errdefer free(pixels) in memory.heap
-    let unknown = try alloc u8[count] in memory.heap
-    errdefer free(unknown) in memory.heap
-    for y in 0..<height:
-        for x in 0..<width:
-            var sum: f32[4] = [0.0, 0.0, 0.0, 0.0]
-            var known = 0
-            var missing = false
-            for sy in 0..<(i64)2:
-                for sx in 0..<(i64)2:
-                    let fx = x * 2 + sx
-                    let fy = y * 2 + sy
-                    if fx >= finer.width or fy >= finer.height:
-                        continue
-                    let index = (usize)(fy * finer.width + fx)
-                    if finer.unknown[index] != 0:
-                        missing = true
-                        continue
-                    for channel in 0..<(usize)4:
-                        sum[channel] += finer.pixels[index * 4 + channel]
-                    known += 1
-            let index = (usize)(y * width + x)
-            unknown[index] = 1 if missing else 0
-            for channel in 0..<(usize)4:
-                pixels[index * 4 + channel] = sum[channel] / (f32)known if known > 0 and not missing else 0.0
-    return try with_sources(pixels, unknown, width, height)
-
-## How wide the hole's box is, the larger side.
-func hole_span(scale: const Level*) -> i64:
-    var left = scale.width
-    var top = scale.height
-    var right: i64 = -1
-    var bottom: i64 = -1
-    for y in 0..<scale.height:
-        for x in 0..<scale.width:
-            if scale.unknown[(usize)(y * scale.width + x)] != 0:
-                left = x if x < left else left
-                top = y if y < top else top
-                right = x if x > right else right
-                bottom = y if y > bottom else bottom
-    return 0 if right < 0 else (right - left + 1 if right - left > bottom - top else bottom - top + 1)
-
-## The hole filled with the tone flowing in from its edge, ring by ring.
-func diffuse(scale: Level*):
-    let count = (usize)(scale.width * scale.height)
-    let filled = try alloc u8[count] in memory.heap catch _:
-        return
-    defer free(filled) in memory.heap
-    for index in 0..<count:
-        filled[index] = 1 if scale.unknown[index] == 0 else 0
-    var changed = true
-    while changed:
-        changed = false
-        for y in 0..<scale.height:
-            for x in 0..<scale.width:
-                let index = (usize)(y * scale.width + x)
-                if filled[index] != 0:
-                    continue
-                var sum: f32[4] = [0.0, 0.0, 0.0, 0.0]
-                var known = 0
-                for dy in -1..<(i64)2:
-                    for dx in -1..<(i64)2:
-                        let nx = x + dx
-                        let ny = y + dy
-                        if nx < 0 or ny < 0 or nx >= scale.width or ny >= scale.height:
-                            continue
-                        let neighbour = (usize)(ny * scale.width + nx)
-                        if filled[neighbour] != 1:
-                            continue
-                        for channel in 0..<(usize)4:
-                            sum[channel] += scale.pixels[neighbour * 4 + channel]
-                        known += 1
-                if known > 0:
-                    for channel in 0..<(usize)4:
-                        scale.pixels[index * 4 + channel] = sum[channel] / (f32)known
-                    # Filled this ring: counted as known from the next ring on.
-                    filled[index] = 2
-                    changed = true
-        for index in 0..<count:
-            if filled[index] == 2:
-                filled[index] = 1
-
-## An empty field for `scale`: its targets are the pixels whose patch touches the hole.
-func field_of(scale: const Level*) -> Field!:
-    let count = (usize)(scale.width * scale.height)
-    let match_x = try alloc i32[count] in memory.heap
-    errdefer free(match_x) in memory.heap
-    let match_y = try alloc i32[count] in memory.heap
-    errdefer free(match_y) in memory.heap
-    let cost = try alloc f32[count] in memory.heap
-    errdefer free(cost) in memory.heap
-    let target = try alloc u8[count] in memory.heap
-    for index in 0..<count:
-        target[index] = 0
-        match_x[index] = 0
-        match_y[index] = 0
-        cost[index] = 1.0e30
-    for y in 0..<scale.height:
-        for x in 0..<scale.width:
-            if scale.unknown[(usize)(y * scale.width + x)] == 0:
+## The edge pixel to fill around next, as an index: the highest priority —
+## how much of its patch is known, times how strong the structure beside it
+## is — or none when the hole is filled.
+func next_patch(work: const Work*) -> i64?:
+    var best = -1.0
+    var chosen: i64? = none
+    for y in 0..<work.height:
+        for x in 0..<work.width:
+            let index = y * work.width + x
+            if work.unknown[(usize)index] == 0 or not on_edge(work, x, y):
                 continue
-            for dy in -radius..<radius + 1:
-                for dx in -radius..<radius + 1:
-                    let tx = x + dx
-                    let ty = y + dy
-                    if tx >= 0 and ty >= 0 and tx < scale.width and ty < scale.height:
-                        target[(usize)(ty * scale.width + tx)] = 1
-    return Field(match_x = match_x, match_y = match_y, cost = cost, target = target)
+            let priority = patch_confidence(work, x, y) * (0.05 + structure(work, x, y))
+            if priority > best:
+                best = priority
+                chosen = index
+    return chosen
 
-## Every target matched to a random source.
-func randomize(field: Field*, scale: const Level*, random: u64*):
-    for index in 0..<field.target.length:
-        if field.target[index] == 0:
-            continue
-        let pick = (usize)scale.sources[(usize)(next(random) % (u64)scale.source_count)]
-        field.match_x[index] = (i32)((i64)pick % scale.width)
-        field.match_y[index] = (i32)((i64)pick // scale.width)
-        field.cost[index] = (f32)distance(scale, (i64)index % scale.width, (i64)index // scale.width, (i64)field.match_x[index], (i64)field.match_y[index], 1.0e30)
+## Whether unknown pixel (`x`, `y`) touches a known one.
+func on_edge(work: const Work*, x: i64, y: i64) -> bool:
+    return known_at(work, x + 1, y) or known_at(work, x - 1, y) or known_at(work, x, y + 1) or known_at(work, x, y - 1)
 
-## The coarser field doubled onto `scale`, each target's match its coarse
-## pixel's, shifted by where it lies in that pixel; random where that is no source.
-func upsample(field: Field*, coarse: const Field*, scale: const Level*, coarser: const Level*, random: u64*):
-    for y in 0..<scale.height:
-        for x in 0..<scale.width:
-            let index = (usize)(y * scale.width + x)
-            if field.target[index] == 0:
-                continue
-            let cx = math.min((f64)(x // 2), (f64)(coarser.width - 1))
-            let cy = math.min((f64)(y // 2), (f64)(coarser.height - 1))
-            let origin = (usize)((i64)cy * coarser.width + (i64)cx)
-            var sx = (i64)coarse.match_x[origin] * 2 + x % 2
-            var sy = (i64)coarse.match_y[origin] * 2 + y % 2
-            if coarse.target[origin] == 0 or sx >= scale.width or sy >= scale.height or scale.source[(usize)(sy * scale.width + sx)] == 0:
-                let pick = (i64)scale.sources[(usize)(next(random) % (u64)scale.source_count)]
-                sx = pick % scale.width
-                sy = pick // scale.width
-            field.match_x[index] = (i32)sx
-            field.match_y[index] = (i32)sy
-            field.cost[index] = (f32)distance(scale, x, y, sx, sy, 1.0e30)
+func known_at(work: const Work*, x: i64, y: i64) -> bool:
+    return x >= 0 and y >= 0 and x < work.width and y < work.height and work.unknown[(usize)(y * work.width + x)] == 0
 
-## One PatchMatch sweep: each target tries its neighbours' matches shifted
-## (propagation), then random sources ever nearer its own (search).
-func improve(field: Field*, scale: const Level*, random: u64*, backwards: bool):
-    let step: i64 = -1 if backwards else 1
-    var y = scale.height - 1 if backwards else 0
-    while y >= 0 and y < scale.height:
-        var x = scale.width - 1 if backwards else 0
-        while x >= 0 and x < scale.width:
-            let index = (usize)(y * scale.width + x)
-            if field.target[index] != 0:
-                # From the neighbour already swept, horizontally and vertically.
-                try_neighbour(field, scale, x, y, x - step, y)
-                try_neighbour(field, scale, x, y, x, y - step)
-                var reach = (f64)math.max((f64)scale.width, (f64)scale.height)
-                while reach >= 1.0:
-                    let sx = (i64)field.match_x[index] + (i64)(((f64)(next(random) % 2001) / 1000.0 - 1.0) * reach)
-                    let sy = (i64)field.match_y[index] + (i64)(((f64)(next(random) % 2001) / 1000.0 - 1.0) * reach)
-                    consider(field, scale, x, y, sx, sy)
-                    reach *= 0.5
-            x += step
-        y += step
-
-## Target (`x`, `y`) tries the match of its neighbour (`nx`, `ny`) shifted by where it lies.
-func try_neighbour(field: Field*, scale: const Level*, x: i64, y: i64, nx: i64, ny: i64):
-    if nx < 0 or ny < 0 or nx >= scale.width or ny >= scale.height:
-        return
-    let neighbour = (usize)(ny * scale.width + nx)
-    if field.target[neighbour] == 0:
-        return
-    consider(field, scale, x, y, (i64)field.match_x[neighbour] + x - nx, (i64)field.match_y[neighbour] + y - ny)
-
-## Keep source (`sx`, `sy`) for target (`x`, `y`) when it is a source and matches better.
-func consider(field: Field*, scale: const Level*, x: i64, y: i64, sx: i64, sy: i64):
-    if sx < 0 or sy < 0 or sx >= scale.width or sy >= scale.height or scale.source[(usize)(sy * scale.width + sx)] == 0:
-        return
-    let index = (usize)(y * scale.width + x)
-    let cost = distance(scale, x, y, sx, sy, (f64)field.cost[index])
-    if cost < (f64)field.cost[index]:
-        field.cost[index] = (f32)cost
-        field.match_x[index] = (i32)sx
-        field.match_y[index] = (i32)sy
-
-## The squared difference between the patches at target (`x`, `y`) and source
-## (`sx`, `sy`), given up past `bound`; the target's patch is clamped to the scale.
-func distance(scale: const Level*, x: i64, y: i64, sx: i64, sy: i64, bound: f64) -> f64:
+## The mean confidence over the patch at (`x`, `y`).
+func patch_confidence(work: const Work*, x: i64, y: i64) -> f64:
     var total = 0.0
+    var count = 0.0
     for dy in -radius..<radius + 1:
-        let ty = math.clamp((f64)(y + dy), 0.0, (f64)(scale.height - 1))
         for dx in -radius..<radius + 1:
-            let tx = math.clamp((f64)(x + dx), 0.0, (f64)(scale.width - 1))
-            let target = (usize)((i64)ty * scale.width + (i64)tx) * 4
-            let source = (usize)((sy + dy) * scale.width + sx + dx) * 4
-            for channel in 0..<(usize)4:
-                let difference = (f64)(scale.pixels[target + channel] - scale.pixels[source + channel])
-                total += difference * difference
-        if total > bound:
-            return total
-    return total
+            let px = x + dx
+            let py = y + dy
+            if px >= 0 and py >= 0 and px < work.width and py < work.height:
+                total += (f64)work.confidence[(usize)(py * work.width + px)]
+                count += 1.0
+    return total / count
 
-## Every hole pixel the average of what the matches of the patches over it say it is.
-func vote(scale: Level*, field: const Field*):
-    for y in 0..<scale.height:
-        for x in 0..<scale.width:
-            let index = (usize)(y * scale.width + x)
-            if scale.unknown[index] == 0:
+## How strong the edges among the known pixels next to (`x`, `y`) are: the
+## largest difference between known neighbours, so lines are carried in first.
+func structure(work: const Work*, x: i64, y: i64) -> f64:
+    var strongest = 0.0
+    for dy in -2..<(i64)3:
+        for dx in -2..<(i64)3:
+            let ax = x + dx
+            let ay = y + dy
+            if not known_at(work, ax, ay):
                 continue
-            var sum: f64[4] = [0.0, 0.0, 0.0, 0.0]
-            var votes = 0.0
-            for dy in -radius..<radius + 1:
-                for dx in -radius..<radius + 1:
-                    let tx = x + dx
-                    let ty = y + dy
-                    if tx < 0 or ty < 0 or tx >= scale.width or ty >= scale.height:
-                        continue
-                    let target = (usize)(ty * scale.width + tx)
-                    if field.target[target] == 0:
-                        continue
-                    let sx = (i64)field.match_x[target] - dx
-                    let sy = (i64)field.match_y[target] - dy
-                    let source = (usize)(sy * scale.width + sx) * 4
-                    for channel in 0..<(usize)4:
-                        sum[channel] += (f64)scale.pixels[source + channel]
-                    votes += 1.0
-            if votes > 0.0:
-                for channel in 0..<(usize)4:
-                    scale.pixels[index * 4 + channel] = (f32)(sum[channel] / votes)
+            let a = (usize)(ay * work.width + ax)
+            if known_at(work, ax + 1, ay):
+                strongest = math.max(strongest, luma_gap(work, a, a + 1))
+            if known_at(work, ax, ay + 1):
+                strongest = math.max(strongest, luma_gap(work, a, (usize)((ay + 1) * work.width + ax)))
+    return strongest
+
+func luma_gap(work: const Work*, a: usize, b: usize) -> f64:
+    var gap = 0.0
+    for channel in 0..<(usize)3:
+        gap += math.abs((f64)(work.pixels[a * 4 + channel] - work.pixels[b * 4 + channel]))
+    return gap
+
+## The best source patch centre, as an index, for the known pixels of the
+## patch at (`x`, `y`): among where its filled neighbours' pixels came from
+## (shifted), random sources, and around the best so far.
+func best_source(work: const Work*, x: i64, y: i64, random: u64*) -> i64:
+    var search = Search(best = -1, cost = 1.0e30)
+    # Coherence: what neighbours already filled were copied from, shifted to here.
+    for dy in -radius..<radius + 1:
+        for dx in -radius..<radius + 1:
+            let px = x + dx
+            let py = y + dy
+            if px < 0 or py < 0 or px >= work.width or py >= work.height:
+                continue
+            let index = (usize)(py * work.width + px)
+            if work.came_x[index] < 0:
+                continue
+            try_source(work, x, y, (i64)work.came_x[index] - dx, (i64)work.came_y[index] - dy, &search)
+    for attempt in 0..<random_tries:
+        let pick = (i64)work.sources[(usize)(next(random) % (u64)work.source_count)]
+        try_source(work, x, y, pick % work.width, pick // work.width, &search)
+    # Refine around the best: ever nearer steps.
+    var reach: i64 = 16
+    while reach >= 1:
+        let cx = search.best % work.width
+        let cy = search.best // work.width
+        for dy in -1..<(i64)2:
+            for dx in -1..<(i64)2:
+                try_source(work, x, y, cx + dx * reach, cy + dy * reach, &search)
+        reach = reach // 2
+    return search.best
+
+## The best source centre so far, as an index, and its cost.
+struct Search:
+    var best: i64
+    var cost: f64
+
+## Keep source (`sx`, `sy`) when it is a source and matches better.
+func try_source(work: const Work*, x: i64, y: i64, sx: i64, sy: i64, search: Search*):
+    if sx < 0 or sy < 0 or sx >= work.width or sy >= work.height or work.source[(usize)(sy * work.width + sx)] == 0:
+        return
+    let cost = distance(work, x, y, sx, sy, search.cost)
+    if cost < search.cost:
+        search.cost = cost
+        search.best = sy * work.width + sx
+
+## The mean squared difference over the known pixels of the patch at (`x`,
+## `y`) against the patch at (`sx`, `sy`); given up once past `bound`.
+func distance(work: const Work*, x: i64, y: i64, sx: i64, sy: i64, bound: f64) -> f64:
+    let most = bound * (f64)((2 * radius + 1) * (2 * radius + 1))
+    var total = 0.0
+    var known = 0.0
+    for dy in -radius..<radius + 1:
+        let ty = y + dy
+        if ty < 0 or ty >= work.height:
+            continue
+        for dx in -radius..<radius + 1:
+            let tx = x + dx
+            if tx < 0 or tx >= work.width:
+                continue
+            let spot = (usize)(ty * work.width + tx)
+            if work.unknown[spot] != 0:
+                continue
+            let source = (usize)((sy + dy) * work.width + sx + dx) * 4
+            for channel in 0..<(usize)4:
+                let difference = (f64)(work.pixels[spot * 4 + channel] - work.pixels[source + channel])
+                total += difference * difference
+            known += 1.0
+        if total > most:
+            return 1.0e30
+    return total / known if known > 0.0 else 1.0e30
+
+## The unknown pixels of the patch at (`x`, `y`) copied from the patch at
+## (`sx`, `sy`), now known with the patch's confidence.
+func copy_patch(work: Work*, x: i64, y: i64, sx: i64, sy: i64):
+    let sure = (f32)patch_confidence(work, x, y)
+    for dy in -radius..<radius + 1:
+        for dx in -radius..<radius + 1:
+            let tx = x + dx
+            let ty = y + dy
+            if tx < 0 or ty < 0 or tx >= work.width or ty >= work.height:
+                continue
+            let spot = (usize)(ty * work.width + tx)
+            if work.unknown[spot] == 0:
+                continue
+            let taken_x = sx + dx
+            let taken_y = sy + dy
+            let taken = (usize)(taken_y * work.width + taken_x)
+            for channel in 0..<(usize)4:
+                work.pixels[spot * 4 + channel] = work.pixels[taken * 4 + channel]
+            work.unknown[spot] = 0
+            work.confidence[spot] = sure
+            work.came_x[spot] = (i32)taken_x
+            work.came_y[spot] = (i32)taken_y
 
 ## xorshift64*.
 func next(state: u64*) -> u64:

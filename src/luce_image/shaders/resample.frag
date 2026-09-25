@@ -3,8 +3,9 @@
 // places other than its own pixels. `place` is the tile's first pixel and the
 // layer's size.
 //   0 motion blur: p0 angle in radians, p1 distance in pixels: evenly spaced
-//     taps along the line through each pixel, averaged by coverage; past the
-//     edges the edge pixels repeat, as Photoshop's
+//     taps along the line through each pixel, averaged by coverage; taps past
+//     the canvas are left out rather than repeating its edge, which would
+//     streak it
 //   1 lens correction: p0 distortion (positive straightens barrel, negative
 //     pincushion), p1 red-cyan and p2 blue-yellow fringe (-1..1, a percent of
 //     the radius each); what falls past the frame is transparent
@@ -35,11 +36,16 @@ void main() {
     if (kind == 0) {
         vec2 direction = vec2(cos(params.p[0]), -sin(params.p[0]));
         int count = int(clamp(params.p[1], 1.0, 96.0));
+        float inside = 0.0;
         for (int i = 0; i < count; i++) {
             float t = (float(i) + 0.5) / float(count) - 0.5;
-            sum += tap(at + direction * t * params.p[1]);
+            vec2 point = at + direction * t * params.p[1];
+            if (all(greaterThanEqual(point, vec2(0.0))) && all(lessThanEqual(point, params.place.zw))) {
+                sum += tap(point);
+                inside += 1.0;
+            }
         }
-        sum /= float(count);
+        sum /= max(inside, 1.0);
     } else {
         vec2 centre = params.place.zw * 0.5;
         float reach = length(centre);

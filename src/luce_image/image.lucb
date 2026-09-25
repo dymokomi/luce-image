@@ -11,6 +11,7 @@ import jpeg
 import tiff
 import exr
 import luce_image.parallel as parallel
+from luce_image.svg_import import is_svg, render_svg
 from binary import Buffer
 from raster_errors import invalid, unsupported
 
@@ -81,6 +82,11 @@ pub struct Image:
         try check_path(path)
         if threads < 1 or threads > 64:
             error(invalid, "thread count must be in 1-64")
+        if is_svg(path):
+            # Drawn rather than decoded: vector artwork at a size fit to edit.
+            let rendered = try render_svg(path, max_bytes, max_pixels)
+            defer free(rendered.pixels) in memory.heap
+            return try Image.from_linear_rgba(rendered.width, rendered.height, rendered.pixels)
         var raster = model.Raster(max_bytes = max_bytes, max_pixels = max_pixels, frame = frame)
         errdefer raster.close()
         with memory.heap:

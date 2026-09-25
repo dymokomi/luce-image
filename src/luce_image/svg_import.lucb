@@ -1,0 +1,65 @@
+## SVG pictures opened like any other: parsed and flattened by luce-svg, then
+## drawn in color at the drawing's own size — scaled up until its longer
+## side is at least 1024 pixels, as a small icon would otherwise open as a
+## speck — in linear light with straight alpha, `currentColor` black.
+import files
+import math
+import memory
+import c as c_api
+import strings
+import svg
+from raster_errors import invalid
+
+## The rasterised drawing: its size and its pixels (straight RGBA, linear
+## light, 4 floats a pixel, allocated in the heap; free them there).
+pub struct Rendered:
+    pub var width: usize
+    pub var height: usize
+    pub var pixels: f32[]
+
+## Whether `path` names an SVG file.
+pub func is_svg(path: str) -> bool:
+    if path.length < 4:
+        return false
+    let tail = (str)path.bytes[path.length - 4..]
+    return tail == ".svg" or tail == ".SVG"
+
+## The SVG at `path` drawn as pixels, refusing more than `max_pixels`.
+pub func render_svg(path: str, max_bytes: usize, max_pixels: usize) -> Rendered!:
+    var owned_path: str = ""
+    var bytes: u8[]
+    with memory.heap:
+        owned_path = try strings.copy(path)
+    defer strings.release(owned_path)
+    with memory.heap:
+        bytes = try files.read_limit((c_api.str)owned_path, max_bytes)
+    defer free(bytes) in memory.heap
+    let drawing = try svg.parse((str)bytes)
+    defer drawing.release()
+    let view_width = drawing.value().view_width()
+    let view_height = drawing.value().view_height()
+    if not (view_width > 0.0) or not (view_height > 0.0):
+        error(invalid, "the SVG has no size")
+    let scale = math.max(1.0, 1024.0 / math.max(view_width, view_height))
+    let width = (usize)math.ceil(view_width * scale)
+    let height = (usize)math.ceil(view_height * scale)
+    if width * height > max_pixels or width > 65536 or height > 65536:
+        error(invalid, "the SVG is too large to draw")
+    let pixels = try alloc f32[width * height * 4] in memory.heap
+    errdefer free(pixels) in memory.heap
+    for index in 0..<pixels.length:
+        pixels[index] = 0.0
+    try svg.rasterize_rgba(drawing.value(), (u32)width, (u32)height, pixels, svg.Color(r = 0.0, g = 0.0, b = 0.0))
+    return Rendered(width = width, height = height, pixels = pixels)
+
+test "an SVG opens drawn in color, a small one scaled up":
+    let path = "/tmp/luce-image-svg-test.svg"
+    try files.write_text(path, "<svg viewBox=\"0 0 32 16\"><rect width=\"16\" height=\"16\" fill=\"#ff0000\"/><circle cx=\"24\" cy=\"8\" r=\"8\" fill=\"blue\"/></svg>")
+    let rendered = try render_svg(path, 1048576, 16777216)
+    defer free(rendered.pixels) in memory.heap
+    assert(rendered.width == 1024 and rendered.height == 512)
+    let red = (100 * 1024 + 100) * 4
+    assert(rendered.pixels[red] > 0.99 and rendered.pixels[red + 2] < 0.01 and rendered.pixels[red + 3] > 0.99)
+    let blue = (256 * 1024 + 768) * 4
+    assert(rendered.pixels[blue + 2] > 0.99 and rendered.pixels[blue] < 0.01)
+    assert(is_svg("a.svg") and not is_svg("a.png"))
