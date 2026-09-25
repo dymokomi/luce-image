@@ -4,11 +4,14 @@
 ## shadows. Subtracted samples take their neighbourhood back out. Coverage
 ## fades with the distance, so the edge of a range is soft, as Photoshop's.
 import math
+import memory
 import color
 import space
 import lab
 import hsl
 import transfer
+import thread
+import os
 from raster_errors import invalid
 
 pub let range_sampled: i64 = 0
@@ -46,7 +49,51 @@ pub func range_coverage(pixels: const f32[], samples: const RangeSample[], range
     if let known = labs:
         if known.length != coverage.length * 3:
             error(invalid, "color range needs three Lab values a pixel")
-    for index in 0..<coverage.length:
+    # Spread over the processors in bands; each pixel is its own.
+    var job = RangeJob(pixels = pixels, samples = samples, range = range, fuzziness = fuzziness, invert = invert, coverage = coverage, labs = labs, first = 0, last = coverage.length)
+    let workers = math.imin(16, math.imax(1, (i64)os.cpus())) if coverage.length >= 262144 else 1
+    if workers <= 1:
+        cover_band(&job)
+        return
+    var bands: RangeJob[16]
+    var handles: thread.Handle[16]
+    var started: usize = 0
+    let per = (coverage.length + (usize)workers - 1) // (usize)workers
+    for band in 0..<(usize)workers:
+        bands[band] = job
+        bands[band].first = band * per
+        bands[band].last = coverage.length if band * per + per > coverage.length else band * per + per
+    for band in 1..<(usize)workers:
+        handles[started] = thread.spawn(cover_entry, (void*)&bands[band], name = "color-range") catch failure:
+            # Fewer threads: this one does the rest.
+            for other in band..<(usize)workers:
+                cover_band(&bands[other])
+            break
+        started += 1
+    cover_band(&bands[0])
+    for index in 0..<started:
+        try handles[index].join()
+
+## One band of `range_coverage`'s pixels.
+struct RangeJob:
+    var pixels: const f32[]
+    var samples: const RangeSample[]
+    var range: i64
+    var fuzziness: f64
+    var invert: bool
+    var coverage: u8[]
+    var labs: const f32[]?
+    var first: usize
+    var last: usize
+
+func cover_entry(context: void*?):
+    cover_band((RangeJob*)(context else return))
+
+func cover_band(job: RangeJob*):
+    let pixels = job.pixels
+    let coverage = job.coverage
+    let range = job.range
+    for index in job.first..<job.last:
         let alpha = math.clamp((f64)pixels[index * 4 + 3], 0.0, 1.0)
         if alpha <= 0.0:
             coverage[index] = 0
@@ -57,16 +104,16 @@ pub func range_coverage(pixels: const f32[], samples: const RangeSample[], range
         var value = 0.0
         if range == range_sampled:
             var here = lab.Lab(l = 0.0, a = 0.0, b = 0.0)
-            if let known = labs:
+            if let known = job.labs:
                 here = lab.Lab(l = (f64)known[index * 3], a = (f64)known[index * 3 + 1], b = (f64)known[index * 3 + 2])
             else:
                 here = lab_of(red, green, blue)
-            value = sampled(here, samples, fuzziness)
+            value = sampled(here, job.samples, job.fuzziness)
         elif range < range_highlights:
             value = hue_weight(red, green, blue, range)
         else:
             value = tone_weight(red, green, blue, range)
-        if invert:
+        if job.invert:
             value = 1.0 - value
         coverage[index] = (u8)(math.clamp(value * alpha, 0.0, 1.0) * 255.0 + 0.5)
 
@@ -150,3 +197,20 @@ test "hue and tone ranges: blues, greys in none, shadows and highlights":
     try range_coverage(pixels, nothing, range_highlights, 40.0, false, coverage)
     # White but transparent: not selected.
     assert(coverage[3] == 0 and coverage[2] == 0)
+
+test "a large picture is worked out in bands on every processor, the same as one pixel at a time":
+    let count: usize = 600 * 500
+    let pixels = try alloc f32[count * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    for index in 0..<count:
+        let red = index % 3 == 0
+        pixels[index * 4] = 1.0 if red else 0.0
+        pixels[index * 4 + 1] = 0.0
+        pixels[index * 4 + 2] = 0.0 if red else 1.0
+        pixels[index * 4 + 3] = 1.0
+    let coverage = try alloc u8[count] in memory.heap
+    defer free(coverage) in memory.heap
+    let red: RangeSample[1] = [range_sample(1.0, 0.0, 0.0, false)]
+    try range_coverage(pixels, red, range_sampled, 40.0, false, coverage)
+    for index in 0..<count:
+        assert(coverage[index] == (255 if index % 3 == 0 else 0))
