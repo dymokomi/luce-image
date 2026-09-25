@@ -343,7 +343,7 @@ func open_canvas(path: str) -> interop.Reference[Canvas]!:
         let folder = (str)path.bytes[..<(path.length - manifest.length - 1)]
         if ends_with(folder, ".l2d"):
             return try open_package(folder)
-    if ends_with(path, ".psd") or ends_with(path, ".PSD"):
+    if ends_with(path, ".psd") or ends_with(path, ".PSD") or ends_with(path, ".psb") or ends_with(path, ".PSB"):
         return try open_psd(path)
     let picture = try Image.open(path)
     errdefer picture.release()
@@ -526,31 +526,77 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
             try native.move_into(ids[index], ids[(usize)parent - 1], -1)
     return reservation.publish(native, memory.heap)
 
-## A Photoshop document: its raster layers, bottom-most first, with their
-## names, visibility, opacity, blend mode and clipping; group markers are
-## passed over so their layers arrive flat.
+## A Photoshop document (PSD or PSB): its layers bottom-most first, with
+## their names, visibility, opacity, blend mode, clipping and masks, in their
+## groups; a merged-only document as its one composite layer.
 func open_psd(path: str) -> interop.Reference[Canvas]!:
     var name: str = ""
     with memory.heap:
         name = try strings.copy(path)
     defer strings.release(name)
+    # files.read allocates from the current allocator; it is freed there.
     let data = try files.read((c_api.str)name)
-    defer free(data) in memory.heap
+    defer free(data)
     var parsed = try psd.parse(data)
     defer parsed.close()
     var reservation = try interop.Reservation[Canvas](canvas_type)
     errdefer reservation.cancel()
     let native = try new Canvas((i64)parsed.width, (i64)parsed.height) in memory.heap
     errdefer native.close()
-    for index in 0..<parsed.count:
-        let layer = &parsed.layers[index]
-        if layer.pixels.length == 0:
+    # Which group holds each record: walking down from the top, a group's own
+    # record opens it and the divider below its layers closes it.
+    let parents = try alloc i64[parsed.count if parsed.count > 0 else 1] in memory.heap
+    defer free(parents) in memory.heap
+    let open_groups = try alloc i64[parsed.count if parsed.count > 0 else 1] in memory.heap
+    defer free(open_groups) in memory.heap
+    var depth: usize = 0
+    var index = parsed.count
+    while index > 0:
+        index -= 1
+        let kind = parsed.layers[index].kind
+        parents[index] = -1
+        if depth > 0:
+            parents[index] = open_groups[depth - 1]
+        if kind == psd.group_start:
+            open_groups[depth] = (i64)index
+            depth += 1
+        elif kind == psd.group_end and depth > 0:
+            depth -= 1
+    # Every record becomes a layer or a group, bottom first; then each goes into its group.
+    let ids = try alloc i64[parsed.count if parsed.count > 0 else 1] in memory.heap
+    defer free(ids) in memory.heap
+    # One mask's gray pixels at a time, as RGBA for a picture.
+    let gray = try alloc u8[(usize)parsed.width * (usize)parsed.height * 4] in memory.heap
+    defer free(gray) in memory.heap
+    for at in 0..<parsed.count:
+        let layer = &parsed.layers[at]
+        ids[at] = 0
+        let named = (str)layer.name if layer.name.length > 0 else ("Group" if layer.kind == psd.group_start else "Layer")
+        if layer.kind == psd.group_end:
             continue
-        let picture = try Image.from_rgba8((usize)parsed.width, (usize)parsed.height, layer.pixels)
-        let id = try native.add_layer((str)layer.name if layer.name.length > 0 else "Layer")
-        try native.set_layer(id, layer.visible, layer.opacity, (i64)layer.blend)
-        try native.set_clipped(id, layer.clipped)
-        try native.place((u64)id, picture)
+        if layer.kind == psd.group_start:
+            ids[at] = try native.add_group(named)
+        else:
+            if layer.pixels.length == 0:
+                continue
+            ids[at] = try native.add_layer(named)
+            try native.place((u64)ids[at], try Image.from_rgba8((usize)parsed.width, (usize)parsed.height, layer.pixels))
+            try native.set_clipped(ids[at], layer.clipped)
+        try native.set_layer(ids[at], layer.visible, layer.opacity, (i64)layer.blend)
+        if layer.mask.length > 0:
+            try native.set_mask(ids[at], true)
+            for pixel in 0..<layer.mask.length:
+                gray[pixel * 4] = layer.mask[pixel]
+                gray[pixel * 4 + 1] = layer.mask[pixel]
+                gray[pixel * 4 + 2] = layer.mask[pixel]
+                gray[pixel * 4 + 3] = 255
+            let slot = try native.index((u64)ids[at])
+            native.records[slot].mask_picture = try Image.from_rgba8((usize)parsed.width, (usize)parsed.height, gray)
+            native.records[slot].mask_enabled = layer.mask_enabled
+    for at in 0..<parsed.count:
+        let parent = parents[at]
+        if ids[at] != 0 and parent >= 0 and ids[(usize)parent] != 0:
+            try native.move_into(ids[at], ids[(usize)parent], -1)
     if native.count == 0:
         discard(try native.add_layer("Background"))
     return reservation.publish(native, memory.heap)
