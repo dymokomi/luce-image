@@ -159,6 +159,8 @@ pub struct Canvas:
     var clone_offset_set: bool
     var clone_aligned: bool
     var clone_all: bool
+    ## The last Clone Stamp preview's bytes (`clone_preview`), kept for reuse.
+    var preview_bytes: u8[]
     var warp: WarpStroke*?
     var warped: u64
     var heal_opacity: f64
@@ -241,6 +243,8 @@ pub struct Canvas:
         self.clone_offset_set = false
         self.clone_aligned = true
         self.clone_all = false
+        var no_bytes: u8[]
+        self.preview_bytes = no_bytes
         self.warp = none
         self.warped = 0
         self.transform_session = none
@@ -477,6 +481,10 @@ pub struct Canvas:
             self.families = none
             names.close()
             free(names) in memory.heap
+        if self.preview_bytes.length > 0:
+            free(self.preview_bytes) in memory.heap
+            var no_bytes: u8[]
+            self.preview_bytes = no_bytes
         if self.records.length > 0:
             free(self.records) in memory.heap
         var empty: Record[]
@@ -1516,6 +1524,13 @@ pub struct Canvas:
 
     pub func has_clone_source() -> bool:
         return self.clone_set
+
+    ## What a Clone Stamp stroke on layer `id` at (`x`, `y`) would lay down:
+    ## the source under a brush `diameter` pixels wide, cut to its circle, as
+    ## RGBA8 (sRGB, straight alpha), a square the diameter rounded up — for
+    ## the preview inside the brush.
+    pub mutating func clone_preview(id: i64, x: f64, y: f64, diameter: f64) -> const u8[]!:
+        return try clone_preview_pixels(&self, (u64)id, x, y, diameter)
 
     ## Where a clone stroke through (`x`, `y`) takes its pixels from, for the source crosshair.
     pub func clone_sample_x(x: f64) -> f64:

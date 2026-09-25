@@ -205,3 +205,73 @@ func retouch_name(kind: i64) -> str:
     if kind == retouch_heal:
         return "Spot Healing"
     return "Blur Tool"
+
+## `Canvas.clone_preview`: what a Clone Stamp stroke at (`x`, `y`) would lay
+## down, as the source under a brush `diameter` pixels wide — the layer's own
+## pixels, or with All Layers the picture — cut to the brush's circle, as
+## RGBA8 (sRGB, straight alpha), `side` × `side` with `side` the diameter
+## rounded up. Only the cells under it are read back.
+func clone_preview_pixels(canvas: Canvas*, id: u64, x: f64, y: f64, diameter: f64) -> const u8[]!:
+    let document = canvas.document else error(invalid, "draw the document once before previewing a clone")
+    let side = (usize)math.max(1.0, math.min(1024.0, math.ceil(diameter)))
+    if canvas.preview_bytes.length != side * side * 4:
+        if canvas.preview_bytes.length > 0:
+            free(canvas.preview_bytes) in memory.heap
+        canvas.preview_bytes = try alloc u8[side * side * 4] in memory.heap
+    let out = canvas.preview_bytes
+    for index in 0..<out.length:
+        out[index] = 0
+    let left = (i64)math.floor(canvas.clone_sample_x(x) - (f64)side * 0.5)
+    let top = (i64)math.floor(canvas.clone_sample_y(y) - (f64)side * 0.5)
+    let layer = document.find(id) else error(invalid, "no such layer")
+    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    defer free(bytes) in memory.heap
+    let first_column = math.max(0.0, math.floor((f64)left / (f64)tile_size))
+    let first_row = math.max(0.0, math.floor((f64)top / (f64)tile_size))
+    let columns = (i64)tile_columns(canvas.extent_x)
+    let rows = (i64)tile_columns(canvas.extent_y)
+    var row = (i64)first_row
+    while row < rows and row * (i64)tile_size < top + (i64)side:
+        var column = (i64)first_column
+        while column < columns and column * (i64)tile_size < left + (i64)side:
+            var texture: gpu.Texture? = none
+            if canvas.clone_all:
+                let composer = canvas.composer else error(invalid, "draw the document once before previewing a clone")
+                texture = try composer.tile(document, (u32)column, (u32)row, 0)
+            elif let tiles = layer.tiles():
+                texture = tiles.texture((u32)column, (u32)row)
+            if let cell = texture:
+                try cell.read(bytes)
+                copy_cell(out, side, bytes, column * (i64)tile_size - left, row * (i64)tile_size - top)
+            column += 1
+        row += 1
+    # The brush's circle: nothing past it.
+    let radius = (f64)side * 0.5
+    for py in 0..<side:
+        for px in 0..<side:
+            let dx = (f64)px + 0.5 - radius
+            let dy = (f64)py + 0.5 - radius
+            if dx * dx + dy * dy > radius * radius:
+                out[(py * side + px) * 4 + 3] = 0
+    return out
+
+## A cell's half-float texels into the preview at (`at_x`, `at_y`), as sRGB bytes.
+func copy_cell(out: u8[], side: usize, bytes: const u8[], at_x: i64, at_y: i64):
+    for ty in 0..<(i64)tile_size:
+        let py = at_y + ty
+        if py < 0 or py >= (i64)side:
+            continue
+        for tx in 0..<(i64)tile_size:
+            let px = at_x + tx
+            if px < 0 or px >= (i64)side:
+                continue
+            let source = (usize)(ty * (i64)tile_size + tx) * 8
+            let target = (usize)(py * (i64)side + px) * 4
+            for channel in 0..<(usize)4:
+                let value = (f64)from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8))
+                let shown = value if channel == 3 else srgb_of(value)
+                out[target + channel] = (u8)math.round(math.clamp(shown, 0.0, 1.0) * 255.0)
+
+func srgb_of(linear: f64) -> f64:
+    let v = math.clamp(linear, 0.0, 1.0)
+    return v * 12.92 if v <= 0.0031308 else 1.055 * math.pow(v, 1.0 / 2.4) - 0.055

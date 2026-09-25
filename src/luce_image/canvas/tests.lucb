@@ -1460,3 +1460,22 @@ test "shape layers stay shapes: drawn, moved, scaled crisp, saved, and pixels on
     assert(not (try canvas.layer_shaped(0)))
     try canvas.undo()
     assert(try canvas.layer_shaped(0))
+
+test "the clone preview shows the source under the brush, cut to a circle":
+    var canvas = try Canvas(96, 64)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    # Red on the left half, the source there; the brush over the empty right.
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(0, 0, 48, 64, 0)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    canvas.set_clone_source(20.0, 32.0)
+    let preview = try canvas.clone_preview(layer, 70.0, 32.0, 21.0)
+    assert(preview.length == 21 * 21 * 4)
+    # The middle is the red source; a corner is outside the circle.
+    let middle = (10 * 21 + 10) * 4
+    assert(preview[middle] == 255 and preview[middle + 1] == 0 and preview[middle + 3] == 255 and preview[3] == 0)
