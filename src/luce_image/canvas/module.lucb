@@ -39,7 +39,6 @@ import strings
 from luce_image.image import Image, Pixel
 from luce_image.tiles import Tiles, Bounds, tile_size, tile_columns, min_u32, flatten
 from luce_image.heal import heal
-from luce_image.content_fill import content_fill
 from luce_image.subject import find_subject
 from luce_image.warp import WarpStroke, warp_smudge, warp_push
 from luce_image.document import Style, Document, Layer, TreeState, release_snapshot, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
@@ -159,9 +158,6 @@ pub struct Canvas:
     var warp: WarpStroke*?
     var warped: u64
     var heal_opacity: f64
-    ## Spot healing fills from a patch beside the spot (Proximity Match), or
-    ## with texture from all around it (Content-Aware).
-    var heal_content_aware: bool
     ## Inside `begin_edit`: changes record nothing more, the edit's first snapshot covers them.
     var edit_depth: i64
     ## What a kept preview is called in the history.
@@ -245,7 +241,6 @@ pub struct Canvas:
         self.warped = 0
         self.transform_session = none
         self.heal_opacity = 1.0
-        self.heal_content_aware = false
         self.edit_depth = 0
         self.edit_captured = false
         self.shape_feather = 0
@@ -2002,27 +1997,6 @@ pub struct Canvas:
         else:
             try light_filters.tonal_contrast(&filters, document, layer, a, b, mask)
         try self.restrict_preview(layer)
-
-    ## Edit › Content-Aware Fill: the selection on layer `id` filled with
-    ## texture from the rest of the layer, faded in by the selection's
-    ## coverage, as one step. `seed` picks among equally good fills.
-    pub mutating func content_aware_fill(id: i64, seed: i64 = 1) -> !:
-        try self.require_open()
-        try self.require_idle()
-        if self.current().is_empty():
-            error(invalid, "select what to fill first")
-        try self.begin_preview(id, false)
-        self.preview_name = "Content-Aware Fill"
-        fill_from_around(&self, (u64)id, (u64)seed) catch failure:
-            discard(self.end_preview(false) catch: recover ())
-            error(failure.code, failure.message)
-        try self.restrict_preview((u64)id)
-        try self.end_preview(true)
-
-    ## Spot Healing's mode: Content-Aware (texture from all around the spot,
-    ## as Content-Aware Fill) or Proximity Match (a patch from beside it).
-    pub mutating func set_heal_mode(content_aware: bool):
-        self.heal_content_aware = content_aware
 
     # mark: Transforms ============================================================================
 

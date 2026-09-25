@@ -701,14 +701,6 @@ test "retouching: clone stamp copies from its source, blur softens, healing fill
     try canvas.end_stroke()
     let healed = (try shown_at(&canvas, &target, 41, 41))[0]
     assert(healed > 120 and healed < 135)
-    # Content-Aware heals the same spot from texture all around it.
-    try canvas.undo()
-    assert((try shown_at(&canvas, &target, 41, 41))[0] < 5)
-    canvas.set_heal_mode(true)
-    try canvas.begin_stroke(layer, 42.0, 42.0)
-    try canvas.end_stroke()
-    let filled = (try shown_at(&canvas, &target, 41, 41))[0]
-    assert(filled > 120 and filled < 135)
 
 test "everything undoes: layers, properties, styles, masks, selections and the canvas size, each a named step":
     var device = gpu.Device.open() catch failure:
@@ -1378,35 +1370,6 @@ test "filters preview and keep as one step: motion blur, lens correction, bloom,
         kind += 1
     var rejected = false
     canvas.filter_layer(layer, 9, 0.0, 0.0, 0.0) catch failure:
-        assert(failure.code == invalid)
-        rejected = true
-    assert(rejected)
-
-test "content-aware fill replaces a selected blot with what is around it, as one step":
-    var canvas = try Canvas(96, 64)
-    defer canvas.close()
-    let layer = try canvas.add_layer("Wall")
-    canvas.bind_headless() catch failure:
-        assert(failure.code == gpu.unavailable)
-        return
-    # An even green wall with a red blot.
-    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, false)
-    try canvas.fill(layer, false)
-    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
-    try canvas.select_rectangle(40, 24, 12, 12, 0)
-    try canvas.fill(layer, false)
-    try canvas.select_rectangle(38, 22, 16, 16, 0)
-    try canvas.content_aware_fill(layer)
-    assert(canvas.undo_name() == "Content-Aware Fill")
-    let document = canvas.document else trap("bound")
-    let pixels = try alloc f32[96 * 64 * 4] in memory.heap
-    defer free(pixels) in memory.heap
-    try ((document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")).read(pixels)
-    let middle = (30 * 96 + 46) * 4
-    assert(pixels[middle] < 0.05 and pixels[middle + 1] > 0.95 and pixels[middle + 3] > 0.99)
-    var rejected = false
-    try canvas.deselect()
-    canvas.content_aware_fill(layer) catch failure:
         assert(failure.code == invalid)
         rejected = true
     assert(rejected)
