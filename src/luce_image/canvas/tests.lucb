@@ -1033,6 +1033,14 @@ test "text layers stay text: set, typed into, moved, saved and rasterised by pai
     try canvas.set_type(layer, "Hi!", "Helvetica", "Bold", 30.0, 1.0, 0.0, 0.0, 10.0, 10.0)
     try canvas.set_type(layer, "Hi!!", "Helvetica", "Bold", 30.0, 1.0, 0.0, 0.0, 10.0, 10.0)
     assert(canvas.undo_name() == "Type")
+    # A separate session of typing is its own step, taken back to its start.
+    let before = canvas.step_serial()
+    canvas.separate_next_step()
+    try canvas.set_type(layer, "Hello", "Helvetica", "Regular", 30.0, 1.0, 0.0, 0.0, 10.0, 10.0)
+    try canvas.set_type(layer, "Hello.", "Helvetica", "Regular", 30.0, 1.0, 0.0, 0.0, 10.0, 10.0)
+    assert(canvas.step_serial() == before + 1)
+    try canvas.undo()
+    assert(canvas.step_serial() == before and (try canvas.layer_text(0)) == "Hi!!" and (try canvas.layer_font_style(0)) == "Bold")
     # Moved, it stays text and its place follows.
     try canvas.move_layer(layer, 20, 5)
     assert((try canvas.layer_typed(0)) and (try canvas.layer_type_value(0, 4)) == 30.0 and (try canvas.layer_type_value(0, 5)) == 15.0)

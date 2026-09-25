@@ -132,6 +132,9 @@ pub struct Canvas:
     var content: Bounds
     ## The next edit joins the one before it in the history (`join_next_edit`).
     var joining: bool
+    ## The next typing step starts afresh rather than continuing the last one
+    ## (`separate_next_step`).
+    var separating: bool
     ## The parameters the next adjustment takes (`set_adjustment`).
     var adjustment: f64[23]
     ## The retouching tool strokes use (`set_retouch`), the clone stamp's
@@ -218,6 +221,7 @@ pub struct Canvas:
         self.profile_length = 0
         self.content = Bounds(left = 0, top = 0, right = 0, bottom = 0)
         self.joining = false
+        self.separating = false
         self.retouch = 0
         self.clone_x = 0.0
         self.clone_y = 0.0
@@ -952,6 +956,17 @@ pub struct Canvas:
     ## one step: several layers moved at once.
     pub mutating func join_next_edit():
         self.joining = true
+
+    ## Make the next step its own even where it would continue the last (typing
+    ## into the same text layer again): an edit session can then be taken back
+    ## on its own with `undo` down to `step_serial`.
+    pub mutating func separate_next_step():
+        self.separating = true
+
+    ## The serial of the step Undo would take back (0: none): unchanged
+    ## while nothing new is remembered.
+    pub func step_serial() -> i64:
+        return (i64)self.history[self.history_count - 1].serial if self.history_count > 0 else 0
 
     ## Route strokes to the selected layer's mask instead of its pixels: white
     ## reveals, black hides.
@@ -2117,7 +2132,7 @@ pub struct Canvas:
         if self.edit_depth == 0 and layer != 0 and self.future_count == 0 and self.history_count > 0:
             let top = self.history[self.history_count - 1]
             # Not into the step the document was saved at: the change after saving is its own.
-            if top.state != none and top.layer == layer and top.name == name and top.serial != self.saved_version:
+            if top.state != none and top.layer == layer and top.name == name and top.serial != self.saved_version and not self.separating:
                 return
         var tree = try document.capture()
         errdefer tree.destroy()
@@ -2128,6 +2143,7 @@ pub struct Canvas:
         self.make_room()
         let join = self.joining and self.history_count > 0
         self.joining = false
+        self.separating = false
         self.serial += 1
         try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = Tiles(), mask = false, joined = join, state = state, name = name, serial = self.serial))
 
