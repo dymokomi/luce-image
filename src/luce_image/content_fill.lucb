@@ -13,7 +13,7 @@ import memory
 from raster_errors import invalid, limit
 
 ## Patches are (2 × radius + 1) pixels square.
-let radius: i64 = 4
+let radius: i64 = 6
 ## Past this many pixels in the work box the fill refuses.
 let work_limit: usize = 6000000
 ## Random candidates tried for each patch.
@@ -316,8 +316,11 @@ struct Search:
     var cost: f64
 
 ## How much a source's distance counts against it: texture from nearby is
-## likelier the same stuff (sky beside sky, not the city below it).
+## likelier the same stuff. Height counts eight times as much as breadth:
+## the same height is sky beside sky and sea beside sea, where a photo's
+## horizon runs across.
 let nearness: f64 = 0.0000002
+let height_weight: f64 = 8.0
 
 ## Keep source (`sx`, `sy`) when it is a source and matches better, nearer
 ## sources winning ties.
@@ -326,7 +329,7 @@ func try_source(work: const Work*, x: i64, y: i64, sx: i64, sy: i64, search: Sea
         return
     let dx = (f64)(sx - x)
     let dy = (f64)(sy - y)
-    let far = (dx * dx + dy * dy) * nearness
+    let far = (dx * dx + dy * dy * height_weight) * nearness
     if far >= search.cost:
         return
     let cost = distance(work, x, y, sx, sy, search.cost - far) + far
