@@ -7,6 +7,7 @@
 ## `Canvas.draw`: the flattened document's tiles at the pyramid level for `zoom`.
 func draw_canvas(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64) -> !:
     try canvas.require_open()
+    try canvas.settle_stroke()
     if not math.is_finite(zoom) or zoom <= 0.0 or zoom > 256.0 or not math.is_finite(offset_x) or not math.is_finite(offset_y):
         error(invalid, "zoom must be in 0..256 and offsets finite")
     let checked = try target.get()
@@ -48,6 +49,7 @@ func draw_canvas(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectan
 ## `Canvas.draw_layer`: one layer's own pixels, or its mask, scaled into `rectangle`.
 func draw_one_layer(canvas: Canvas*, target: interop.View[gpu.RenderTarget], index: i64, rectangle: gpu.Rect, mask: bool) -> !:
     try canvas.require_open()
+    try canvas.settle_stroke()
     let record = try canvas.record(index)
     if rectangle.width <= 0.0 or rectangle.height <= 0.0:
         return
@@ -68,6 +70,7 @@ func draw_one_layer(canvas: Canvas*, target: interop.View[gpu.RenderTarget], ind
 ## `Canvas.draw_moving`: the document with layer `id` shown moved by (`dx`, `dy`).
 func draw_canvas_moving(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, id: i64, dx: f64, dy: f64) -> !:
     try canvas.require_open()
+    try canvas.settle_stroke()
     let index = try canvas.index((u64)id)
     if canvas.document == none:
         try canvas.draw(target, rectangle, zoom, offset_x, offset_y)

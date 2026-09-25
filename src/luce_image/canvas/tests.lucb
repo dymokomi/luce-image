@@ -1082,3 +1082,38 @@ test "after an undo, a cancelled transform shows the pixels as they are, not a c
     try canvas.begin_transform(layer)
     try canvas.end_transform(false)
     assert((try shown_at(&canvas, &target, 12, 12))[0] == 255 and (try shown_at(&canvas, &target, 44, 12))[0] == 0)
+
+test "painting one cell leaves every other cached tile alone, and redraws its own tile in place":
+    var canvas = try Canvas(600, 300)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    let document = canvas.document else trap("bound")
+    var composer = canvas.composer else trap("bound")
+    discard(try composer.tile(document, 0, 0, 0))
+    discard(try composer.tile(document, 2, 0, 0))
+    discard(try composer.tile(document, 0, 0, 1))
+    let rendered = composer.renders
+    try canvas.set_brush(20.0, 0.5, 1.0, 1.0, 0.0, 0.0, 1.0, false)
+    try canvas.begin_stroke(layer, 50.0, 50.0)
+    try canvas.extend_stroke(90.0, 60.0)
+    try canvas.settle_stroke()
+    let tiles = (document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")
+    let first = tiles.tile(0, 0) else trap("painted tile")
+    let stamp = tiles.stamp(0, 0)
+    # Moves between frames only queue dabs.
+    try canvas.extend_stroke(120.0, 80.0)
+    assert(tiles.stamp(0, 0) == stamp)
+    try canvas.settle_stroke()
+    # The same tile, drawn again, with a new stamp.
+    let again = tiles.tile(0, 0) else trap("painted tile")
+    assert(again == first and tiles.stamp(0, 0) != stamp)
+    try canvas.end_stroke()
+    # Cell (2, 0) is still cached; (0, 0) and the coarser tile over it are not.
+    discard(try composer.tile(document, 2, 0, 0))
+    assert(composer.renders == rendered)
+    discard(try composer.tile(document, 0, 0, 0))
+    discard(try composer.tile(document, 0, 0, 1))
+    assert(composer.renders == rendered + 2)

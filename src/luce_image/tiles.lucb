@@ -12,10 +12,21 @@ from raster_errors import invalid, limit
 
 pub let tile_size: u32 = 256
 
-## One shared tile. Its texture is never written after publication.
+## One shared tile. Its texture is never written once shared; a stroke may
+## draw again into a tile only it holds (`redrawn`), which gives it a new stamp.
 pub struct Tile:
     var texture: gpu.Texture
     var references: usize
+    ## Unique among every tile's content so far: what the compositor's cache
+    ## keys on, so only the cells that changed are flattened again.
+    var stamp: u64
+
+## The last stamp handed out; tiles live on the main thread.
+var last_stamp: u64 = 0
+
+func next_stamp() -> u64:
+    last_stamp += 1
+    return last_stamp
 
 func retain(tile: Tile*) -> Tile*:
     tile.references += 1
@@ -134,10 +145,39 @@ pub struct Tiles:
         let index = try self.index(column, row)
         if (try texture.width()) != tile_size or (try texture.height()) != tile_size or (try texture.pixel_format()) != gpu.Format.rgba16_float:
             error(invalid, "a tile is a 256 by 256 rgba16_float texture")
-        let tile = try new Tile(texture = texture, references = 1) in memory.heap
+        let tile = try new Tile(texture = texture, references = 1, stamp = next_stamp()) in memory.heap
         if let previous = self.cells[index]:
             release(previous)
         self.cells[index] = tile
+
+    ## The cell's content stamp, 0 when transparent: it changes whenever the
+    ## cell's pixels do.
+    pub func stamp(column: u32, row: u32) -> u64:
+        let tile = self.tile(column, row) else return 0
+        return tile.stamp
+
+    ## Every cell's stamp folded into `seed`: it changes when any pixel does.
+    pub func stamps(seed: u64) -> u64:
+        var digest = seed
+        for cell in self.cells:
+            var stamp: u64 = 0
+            if let tile = cell:
+                stamp = tile.stamp
+            digest = (digest ^ stamp) *% 1099511628211
+        return digest
+
+    ## Whether this is the only holder of the cell's tile, so it may be drawn
+    ## into again in place (`redrawn`).
+    pub func owns(column: u32, row: u32) -> bool:
+        let tile = self.tile(column, row) else return false
+        return tile.references == 1
+
+    ## The cell's tile, held here alone, was drawn into again: a new stamp.
+    pub mutating func redrawn(column: u32, row: u32) -> !:
+        let tile = self.tile(column, row) else error(invalid, "no tile to redraw")
+        if tile.references != 1:
+            error(invalid, "a shared tile cannot be redrawn")
+        tile.stamp = next_stamp()
 
     ## Make a cell transparent again.
     pub mutating func clear(column: u32, row: u32) -> !:
@@ -364,7 +404,7 @@ pub struct Tiles:
             var dropped = texture
             dropped.destroy()
             return
-        let tile = try new Tile(texture = texture, references = 1) in memory.heap
+        let tile = try new Tile(texture = texture, references = 1, stamp = next_stamp()) in memory.heap
         defer release(tile)
         if keep_inside:
             let index = try self.index((u32)column, (u32)row)

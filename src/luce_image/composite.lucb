@@ -236,6 +236,8 @@ pub struct Composer:
         key = fnv_mix(key, layer.id)
         key = fnv_mix(key, layer.revision)
         key = fnv_mix(key, layer.style.digest())
+        if let tiles = layer.tiles():
+            key = tiles.stamps(key)
         for index in 0..<effects_budget:
             if self.effects[index].live and self.effects[index].key == key:
                 self.effects[index].used = self.tick
@@ -391,21 +393,33 @@ func hash_layers(seed: u64, layers: Layer*[], opacity: f64, first_column: u32, f
             digest = fnv_mix(digest, 1 if layer.mask_enabled else 0)
             continue
         let tiles = layer.tiles() else continue
+        # The cells in range, by content stamp: painting one cell leaves every
+        # other tile (and pyramid tile) cached.
         var touches = false
+        var cells = fnv_start()
         for row in first_row..<min_u32(first_row + span, tiles.rows()):
             for column in first_column..<min_u32(first_column + span, tiles.columns()):
-                if tiles.tile(column, row) != none:
+                let stamp = tiles.stamp(column, row)
+                if stamp != 0:
                     touches = true
+                cells = fnv_mix(cells, stamp)
         # A style's effects can reach cells the layer has no pixels in (a shadow, a glow).
         if not touches and not layer.style.any():
             continue
         digest = fnv_mix(digest, layer.id)
         digest = fnv_mix(digest, layer.revision)
+        digest = fnv_mix(digest, cells)
+        if let mask_tiles = layer.active_mask():
+            for row in first_row..<min_u32(first_row + span, mask_tiles.rows()):
+                for column in first_column..<min_u32(first_column + span, mask_tiles.columns()):
+                    digest = fnv_mix(digest, mask_tiles.stamp(column, row))
         digest = fnv_mix(digest, effective.bits())
         digest = fnv_mix(digest, (u64)layer.blend)
         digest = fnv_mix(digest, 1 if layer.clipped else 0)
         if layer.style.any():
+            # Effects reach across cells: every pixel of the layer counts.
             digest = fnv_mix(digest, layer.style.digest())
+            digest = tiles.stamps(digest)
     return digest
 
 func drop_effects(effects: Effects*):

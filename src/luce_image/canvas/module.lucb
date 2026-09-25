@@ -1359,6 +1359,7 @@ pub struct Canvas:
         if let warp = self.warp:
             try finish_warp(&self, warp)
             return
+        try self.settle_stroke()
         let stroke = self.stroke else error(invalid, "no stroke is in progress")
         self.stroke = none
         defer finish_boxed(stroke)
@@ -1367,6 +1368,14 @@ pub struct Canvas:
 
     pub func painting() -> bool:
         return self.stroke != none or self.warp != none
+
+    ## Stamp the dabs the stroke queued since the last draw: pointer moves
+    ## only queue them, so however many arrive, a frame stamps them once.
+    mutating func settle_stroke() -> !:
+        let stroke = self.stroke else return
+        let document = self.document else return
+        var painter = self.painter else return
+        try stroke.flush(&painter, document)
 
     # mark: Retouching ============================================================================
 
@@ -1425,6 +1434,7 @@ pub struct Canvas:
         try self.require_open()
         if x < 0 or y < 0 or x >= (i64)self.extent_x or y >= (i64)self.extent_y:
             error(invalid, "the picked pixel lies outside the document")
+        try self.settle_stroke()
         let document = self.document else error(invalid, "draw the document once before picking")
         let composer = self.composer else error(invalid, "draw the document once before picking")
         let texture = try composer.tile(document, (u32)(x // (i64)tile_size), (u32)(y // (i64)tile_size), 0)
