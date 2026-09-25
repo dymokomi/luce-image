@@ -112,7 +112,7 @@ func shrunk(pixels: const f32[], width: usize, height: usize, scale: f64) -> Wor
     add_sharpness(colors, w, h)
     return Work(width = w, height = h, colors = colors, solid = solid, lean = lean)
 
-## The fourth feature: the mean luma step to the neighbours, blurred over
+## The fourth feature: the mean step to the neighbours, blurred over
 ## 5×5 and scaled to count about as much as a color does.
 func add_sharpness(colors: f64[], width: i64, height: i64):
     let count = (usize)(width * height)
@@ -121,7 +121,7 @@ func add_sharpness(colors: f64[], width: i64, height: i64):
     defer free(steps) in memory.heap
     for y in 0..<height:
         for x in 0..<width:
-            let here = luma_at(colors, (usize)(y * width + x))
+            let here = (usize)(y * width + x)
             var total = 0.0
             var n = 0.0
             for dy in -1..<(i64)2:
@@ -129,7 +129,7 @@ func add_sharpness(colors: f64[], width: i64, height: i64):
                     let nx = x + dx
                     let ny = y + dy
                     if (dx != 0 or dy != 0) and nx >= 0 and ny >= 0 and nx < width and ny < height:
-                        total += math.abs(luma_at(colors, (usize)(ny * width + nx)) - here)
+                        total += channel_step(colors, here, (usize)(ny * width + nx))
                         n += 1.0
             steps[(usize)(y * width + x)] = total / math.max(n, 1.0)
     for y in 0..<height:
@@ -145,13 +145,52 @@ func add_sharpness(colors: f64[], width: i64, height: i64):
                         n += 1.0
             colors[(usize)(y * width + x) * features + 3] = math.min(1.0, total / n * 6.0)
 
-func luma_at(colors: const f64[], index: usize) -> f64:
-    return 0.2126 * colors[index * features] + 0.7152 * colors[index * features + 1] + 0.0722 * colors[index * features + 2]
+## The largest step in any channel between two pixels: detail shows in
+## whichever channel carries it, not only in brightness.
+func channel_step(colors: const f64[], a: usize, b: usize) -> f64:
+    var step = 0.0
+    for channel in 0..<(usize)3:
+        step = math.max(step, math.abs(colors[a * features + channel] - colors[b * features + channel]))
+    return step
+
+## How sharpness is spread over the box: its 10th and 90th percentiles, and
+## how much to trust it — none unless some of it is far sharper than the rest.
+struct Spread:
+    var low: f64
+    var high: f64
+    var weight: f64
+
+func sharpness_spread(work: const Work*, x0: i64, y0: i64, x1: i64, y1: i64) -> Spread!:
+    var counts: usize[64]
+    for slot in 0..<(usize)64:
+        counts[slot] = 0
+    var total: usize = 0
+    for y in y0..<y1:
+        for x in x0..<x1:
+            let value = work.colors[(usize)(y * work.width + x) * features + 3]
+            counts[(usize)math.min(63.0, math.floor(value * 64.0))] += 1
+            total += 1
+    var low = 0.0
+    var high = 1.0
+    var seen: usize = 0
+    var found_low = false
+    for slot in 0..<(usize)64:
+        seen += counts[slot]
+        if not found_low and seen * 10 >= total:
+            low = (f64)slot / 64.0
+            found_low = true
+        if seen * 10 >= total * 9:
+            high = ((f64)slot + 1.0) / 64.0
+            break
+    # Trusted only when it is starkly two-sided (crisp subject, heavy blur):
+    # grain of different strengths alone must not decide.
+    return Spread(low = low, high = high, weight = math.clamp(((high - low) / math.max(high, 1e-6) - 0.6) * 2.5, 0.0, 1.0))
 
 ## Each pixel in the box leaning to the subject (1) or the background (0).
 func lean_apart(work: Work*, x0: i64, y0: i64, x1: i64, y1: i64) -> !:
     var subject: f64[24]
     var background: f64[24]
+    let spread = try sharpness_spread(work, x0, y0, x1, y1)
     # Start: the background from outside the box, the subject from its middle half.
     try learn(work, &background, x0, y0, x1, y1, 0)
     try learn(work, &subject, x0, y0, x1, y1, 1)
@@ -166,6 +205,10 @@ func lean_apart(work: Work*, x0: i64, y0: i64, x1: i64, y1: i64) -> !:
                 let to_subject = nearest(&subject, work.colors, index)
                 let to_background = nearest(&background, work.colors, index)
                 var lean = to_background / math.max(to_subject + to_background, 1e-9)
+                # Sharpness votes directly, as much as it varies over the picture:
+                # a subject in focus on a blurred ground stands out by it alone.
+                let sharp = math.clamp((work.colors[index * features + 3] - spread.low) / math.max(spread.high - spread.low, 1e-6), 0.0, 1.0)
+                lean = lean * (1.0 - 0.5 * spread.weight) + sharp * 0.5 * spread.weight
                 # Nearer the middle, likelier the subject.
                 let dx = ((f64)x - (f64)(x0 + x1) * 0.5) / math.max(1.0, (f64)(x1 - x0) * 0.5)
                 let dy = ((f64)y - (f64)(y0 + y1) * 0.5) / math.max(1.0, (f64)(y1 - y0) * 0.5)

@@ -34,6 +34,9 @@ struct Work:
     var source: u8[]
     var sources: i32[]
     var source_count: usize
+    ## How often each source centre has been copied from: reused patches cost
+    ## more, so one distinctive thing is not stamped over and over.
+    var uses: u16[]
 
     mutating func destroy():
         free(self.pixels) in memory.heap
@@ -43,6 +46,7 @@ struct Work:
         free(self.came_y) in memory.heap
         free(self.source) in memory.heap
         free(self.sources) in memory.heap
+        free(self.uses) in memory.heap
 
 ## Fill `pixels` (premultiplied RGBA, 4 samples a pixel, `width` × `height`)
 ## where `hole` is non-zero, in place, from the rest; the same `seed` makes
@@ -139,6 +143,12 @@ func work_of(pixels: const f32[], width: usize, left: usize, top: usize, box_wid
     let h = (i64)box_height
     let source = try alloc u8[count] in memory.heap
     errdefer free(source) in memory.heap
+    # A source patch keeps `gap` pixels clear of the hole too: what the
+    # selection cut through (a rock's top, the edge of a figure) is not copied
+    # back in.
+    let near = try alloc u8[count] in memory.heap
+    defer free(near) in memory.heap
+    dilate(unknown, near, w, h, gap)
     var found: usize = 0
     for y in 0..<h:
         for x in 0..<w:
@@ -150,7 +160,7 @@ func work_of(pixels: const f32[], width: usize, left: usize, top: usize, box_wid
             while dy <= radius and clear:
                 var dx = -radius
                 while dx <= radius:
-                    if unknown[(usize)((y + dy) * w + x + dx)] != 0:
+                    if near[(usize)((y + dy) * w + x + dx)] != 0:
                         clear = false
                         break
                     dx += 1
@@ -164,13 +174,44 @@ func work_of(pixels: const f32[], width: usize, left: usize, top: usize, box_wid
         if source[index] != 0:
             sources[at] = (i32)index
             at += 1
+    let uses = try alloc u16[count] in memory.heap
+    for index in 0..<count:
+        uses[index] = 0
     return Work(width = w, height = h, pixels = copied, unknown = unknown, confidence = confidence, came_x = came_x, came_y = came_y,
-                source = source, sources = sources, source_count = found)
+                source = source, sources = sources, source_count = found, uses = uses)
 
 ## An edge pixel's priority for filling around it next: how much of its
 ## patch is known, times how strong the structure beside it is.
 func priority(work: const Work*, x: i64, y: i64) -> f64:
     return patch_confidence(work, x, y) * (0.05 + structure(work, x, y))
+
+## How far from the hole a source patch keeps.
+let gap: i64 = 6
+
+## `mask` grown by `reach` pixels every way into `grown` (a square's reach).
+func dilate(mask: const u8[], grown: u8[], width: i64, height: i64, reach: i64):
+    let across = alloc u8[mask.length] in memory.heap catch _:
+        memory.copy(grown, mask, mask.length)
+        return
+    defer free(across) in memory.heap
+    for y in 0..<height:
+        for x in 0..<width:
+            var hit: u8 = 0
+            for dx in -reach..<reach + 1:
+                let nx = x + dx
+                if nx >= 0 and nx < width and mask[(usize)(y * width + nx)] != 0:
+                    hit = 1
+                    break
+            across[(usize)(y * width + x)] = hit
+    for y in 0..<height:
+        for x in 0..<width:
+            var hit: u8 = 0
+            for dy in -reach..<reach + 1:
+                let ny = y + dy
+                if ny >= 0 and ny < height and across[(usize)(ny * width + x)] != 0:
+                    hit = 1
+                    break
+            grown[(usize)(y * width + x)] = hit
 
 ## The edge pixels by priority, highest first: a binary heap. A pixel whose
 ## priority changes is pushed again; the older entry is passed over when it
@@ -275,10 +316,10 @@ func structure(work: const Work*, x: i64, y: i64) -> f64:
     return strongest
 
 func luma_gap(work: const Work*, a: usize, b: usize) -> f64:
-    var gap = 0.0
+    var step = 0.0
     for channel in 0..<(usize)3:
-        gap += math.abs((f64)(work.pixels[a * 4 + channel] - work.pixels[b * 4 + channel]))
-    return gap
+        step += math.abs((f64)(work.pixels[a * 4 + channel] - work.pixels[b * 4 + channel]))
+    return step
 
 ## The best source patch centre, as an index, for the known pixels of the
 ## patch at (`x`, `y`): among where its filled neighbours' pixels came from
@@ -321,6 +362,8 @@ struct Search:
 ## horizon runs across.
 let nearness: f64 = 0.0000002
 let height_weight: f64 = 30.0
+## What each earlier copy from a source adds to its cost.
+let reuse_cost: f64 = 0.0015
 
 ## Keep source (`sx`, `sy`) when it is a source and matches better, nearer
 ## sources winning ties.
@@ -329,7 +372,7 @@ func try_source(work: const Work*, x: i64, y: i64, sx: i64, sy: i64, search: Sea
         return
     let dx = (f64)(sx - x)
     let dy = (f64)(sy - y)
-    let far = (dx * dx + dy * dy * height_weight) * nearness
+    let far = (dx * dx + dy * dy * height_weight) * nearness + (f64)work.uses[(usize)(sy * work.width + sx)] * reuse_cost
     if far >= search.cost:
         return
     let cost = distance(work, x, y, sx, sy, search.cost - far) + far
@@ -367,6 +410,9 @@ func distance(work: const Work*, x: i64, y: i64, sx: i64, sy: i64, bound: f64) -
 ## (`sx`, `sy`), now known with the patch's confidence.
 func copy_patch(work: Work*, x: i64, y: i64, sx: i64, sy: i64):
     let sure = (f32)patch_confidence(work, x, y)
+    let used = (usize)(sy * work.width + sx)
+    if work.uses[used] < 65535:
+        work.uses[used] += 1
     for dy in -radius..<radius + 1:
         for dx in -radius..<radius + 1:
             let tx = x + dx
