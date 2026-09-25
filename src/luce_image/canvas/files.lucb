@@ -156,6 +156,16 @@ func save_canvas_package(canvas: Canvas*, path: str) -> !:
             try set_integer(manifest.value(), element, "x", origin.left)
             try set_integer(manifest.value(), element, "y", origin.top)
         try note_mask(manifest.value(), element, try write_mask(canvas, layer, layers_dir, index))
+    # The guides, each vertical or not and where.
+    try manifest.value().add("/guides", "guides")
+    for index in 0..<canvas.guides.count:
+        var guide_buffer: u8[64]
+        let element = try format_path(guide_buffer, "/guides/guide", index)
+        try manifest.value().add(element, "guide")
+        try set_integer(manifest.value(), element, "vertical", 1 if canvas.guides.vertical[index] else 0)
+        let place = try prism.Value.number(canvas.guides.positions[index])
+        defer place.release()
+        try manifest.value().set(element, "position", place)
     try manifest.value().save(try paths.join(path, "document.prisma"), prism.Encoding.text)
 
 ## Layer `index`'s mask, if it has one, as `layerN.mask.png` in `layers_dir`
@@ -420,6 +430,11 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
             let enabled = get_integer(doc, element, "mask_enabled") catch _:
                 recover 1
             native.records[slot].mask_enabled = enabled != 0
+    # The guides.
+    let guide_total = doc.child_count("/guides")
+    for index in 0..<guide_total:
+        let element = doc.child_at("/guides", index) else break
+        discard(try native.add_guide((try get_integer(doc, element, "vertical")) != 0, try get_number(doc, element, "position")))
     # Groups come after their layers in the file, so layers go into them once all are read.
     for index in 0..<total:
         let element = doc.child_at("/layers", index) else error(invalid, "a layer element is missing")

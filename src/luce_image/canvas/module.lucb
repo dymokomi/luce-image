@@ -159,6 +159,8 @@ pub struct Canvas:
     ## many pixels, and with hard edges when not anti-aliased.
     var shape_feather: i64
     var shape_hard: bool
+    ## The guides, dragged out of the rulers.
+    var guides: Guides
     ## The free transform under way, if any.
     var transform_session: TransformSession*?
     ## What `measure_histogram` counted: luminosity, red, green and blue, 256
@@ -228,6 +230,7 @@ pub struct Canvas:
         self.edit_captured = false
         self.shape_feather = 0
         self.shape_hard = false
+        self.guides = Guides()
         self.preview_name = "Adjustment"
         self.serial = 0
         self.saved_version = 0
@@ -299,6 +302,11 @@ pub struct Canvas:
                 return
             error(failure.code, failure.message)
         try self.bind_device(acquired)
+
+    ## Whether the canvas is on a GPU device yet (drawn once, or bound headless):
+    ## what reads pixels back needs it.
+    pub func is_bound() -> bool:
+        return self.document != none
 
     ## Bind to a GPU device of the canvas's own, with no window or drawing:
     ## what scripts and tests run headless use before editing. Nothing when
@@ -1903,6 +1911,62 @@ pub struct Canvas:
         try resize_image(document, (u32)width, (u32)height, smooth)
         try self.adopt_extent((u32)width, (u32)height)
 
+    # mark: Guides ================================================================================
+
+    ## Add a guide across the document at `position` pixels: a vertical one
+    ## at that x, a horizontal one at that y. Its index. Undoable.
+    pub mutating func add_guide(vertical: bool, position: f64) -> i64!:
+        try self.require_open()
+        if not math.is_finite(position):
+            error(invalid, "a guide's place must be finite")
+        if self.guides.count == guide_limit:
+            error(limit, "a document holds at most 128 guides")
+        try self.remember_state("New Guide")
+        self.guides.positions[self.guides.count] = position
+        self.guides.vertical[self.guides.count] = vertical
+        self.guides.count += 1
+        return (i64)self.guides.count - 1
+
+    ## Move guide `index` to `position`; a drag of one guide is one step. Undoable.
+    pub mutating func move_guide(index: i64, position: f64) -> !:
+        try self.require_open()
+        let at = try self.guide_index(index)
+        if not math.is_finite(position):
+            error(invalid, "a guide's place must be finite")
+        try self.remember_state("Move Guide", (u64)(1000000 + index))
+        self.guides.positions[at] = position
+
+    pub mutating func remove_guide(index: i64) -> !:
+        try self.require_open()
+        let at = try self.guide_index(index)
+        try self.remember_state("Delete Guide")
+        for later in at..<(self.guides.count - 1):
+            self.guides.positions[later] = self.guides.positions[later + 1]
+            self.guides.vertical[later] = self.guides.vertical[later + 1]
+        self.guides.count -= 1
+
+    ## View › Clear Guides. Undoable.
+    pub mutating func clear_guides() -> !:
+        try self.require_open()
+        if self.guides.count == 0:
+            return
+        try self.remember_state("Clear Guides")
+        self.guides.count = 0
+
+    pub func guide_count() -> i64:
+        return (i64)self.guides.count
+
+    pub func guide_vertical(index: i64) -> bool!:
+        return self.guides.vertical[try self.guide_index(index)]
+
+    pub func guide_position(index: i64) -> f64!:
+        return self.guides.positions[try self.guide_index(index)]
+
+    func guide_index(index: i64) -> usize!:
+        if index < 0 or index >= (i64)self.guides.count:
+            error(invalid, "no such guide")
+        return (usize)index
+
     # mark: History ===============================================================================
 
     pub func can_undo() -> bool:
@@ -1973,7 +2037,7 @@ pub struct Canvas:
         errdefer tree.destroy()
         let records = try copy_records(self.records, self.count)
         errdefer release_records(records, self.count)
-        let state = try new DocumentState(tree = tree, records = records, count = self.count, next_id = self.next_id) in memory.heap
+        let state = try new DocumentState(tree = tree, records = records, count = self.count, next_id = self.next_id, guides = self.guides) in memory.heap
         errdefer free(state) in memory.heap
         self.make_room()
         let join = self.joining and self.history_count > 0
@@ -2006,6 +2070,9 @@ pub struct Canvas:
             let next_id = self.next_id
             self.next_id = state.next_id
             state.next_id = next_id
+            let guides = self.guides
+            self.guides = state.guides
+            state.guides = guides
             self.extent_x = document.width()
             self.extent_y = document.height()
             return entry

@@ -48,6 +48,16 @@ func average_around(pixels: f32[], width: usize, height: usize, x: i64, y: i64, 
     for channel in 0..<(usize)4:
         pixels[seed + channel] = (f32)(sum[channel] / count)
 
+## The most guides a document holds.
+let guide_limit: usize = 128
+
+## A document's guides: each a place in pixels and whether it runs down
+## (vertical, at an x) or across (at a y).
+struct Guides:
+    var positions: f64[128]
+    var vertical: bool[128]
+    var count: usize
+
 ## A color the brush, a fill, a gradient or text paints in: components in 0..1.
 func gpu_check_color(color: gpu.Color) -> !:
     if not (color.red >= 0.0 and color.red <= 1.0 and color.green >= 0.0 and color.green <= 1.0 and color.blue >= 0.0 and color.blue <= 1.0):

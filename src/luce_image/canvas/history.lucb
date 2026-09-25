@@ -18,6 +18,7 @@ struct DocumentState:
     var records: Record[]
     var count: usize
     var next_id: u64
+    var guides: Guides
 
 ## A layer's pixels (or its mask's) at one moment, shared with whatever else
 ## holds them, or the whole document (`state`). A joined snapshot belongs to

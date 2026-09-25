@@ -990,3 +990,30 @@ test "selection shapes feather or harden alone, and the wand samples a square or
     assert(canvas.selected_at(50, 20) == 255 and canvas.selected_at(10, 20) == 0)
     try canvas.select_wand(bottom, 10, 20, 10.0, true, 0, 5, false)
     assert(canvas.selected_at(10, 20) == 255 and canvas.selected_at(50, 20) == 255)
+
+test "guides are added, moved, removed and cleared undoably, and saved with the document":
+    var canvas = try Canvas(64, 48)
+    defer canvas.close()
+    discard(try canvas.add_layer("Paint"))
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    let across = try canvas.add_guide(false, 12.0)
+    let down = try canvas.add_guide(true, 30.5)
+    assert(canvas.guide_count() == 2 and not (try canvas.guide_vertical(across)) and (try canvas.guide_position(down)) == 30.5)
+    # A drag of one guide is one step.
+    try canvas.move_guide(down, 32.0)
+    try canvas.move_guide(down, 40.0)
+    assert(canvas.undo_name() == "Move Guide")
+    try canvas.undo()
+    assert((try canvas.guide_position(down)) == 30.5 and canvas.undo_name() == "New Guide")
+    try canvas.remove_guide(across)
+    assert(canvas.guide_count() == 1 and (try canvas.guide_vertical(0)))
+    try canvas.save_package("build/canvas-guides.l2d")
+    let reopened = try Canvas.open("build/canvas-guides.l2d")
+    defer reopened.release()
+    assert(reopened.value().guide_count() == 1 and (try reopened.value().guide_position(0)) == 30.5)
+    try canvas.clear_guides()
+    assert(canvas.guide_count() == 0)
+    try canvas.undo()
+    assert(canvas.guide_count() == 1)
