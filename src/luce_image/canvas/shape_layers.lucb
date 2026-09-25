@@ -152,8 +152,12 @@ func shape_svg(out: strings.Builder*, spec: ShapeSpec, width: u32, height: u32) 
     let fill = try hex_color(fill_text, spec.fill_red, spec.fill_green, spec.fill_blue) if spec.filled and spec.kind != 2 else "none"
     let stroked = spec.stroked or spec.kind == 2
     let stroke = try hex_color(stroke_text, spec.stroke_red, spec.stroke_green, spec.stroke_blue) if stroked else "none"
+    # The stroke width is in document pixels; SVG scales it by the transform, so it is
+    # written in shape space.
+    let scale = math.sqrt(math.abs(m[0] * m[3] - m[1] * m[2]))
+    let width_in_shape = spec.stroke_width / scale if scale > 1e-9 else spec.stroke_width
     var paint: u8[160]
-    let paints = try format(paint, f"fill=\"{fill}\" stroke=\"{stroke}\" stroke-width=\"{spec.stroke_width}\" stroke-linejoin=\"miter\"")
+    let paints = try format(paint, f"fill=\"{fill}\" stroke=\"{stroke}\" stroke-width=\"{width_in_shape}\" stroke-linejoin=\"miter\"")
     if spec.kind == 0:
         let rounding = math.min(spec.radius, math.min(math.abs(spec.width), math.abs(spec.height)) * 0.5)
         try out.put(try format(line, f"<rect x=\"{spec.x}\" y=\"{spec.y}\" width=\"{spec.width}\" height=\"{spec.height}\" rx=\"{rounding}\" {paints}/>"))
