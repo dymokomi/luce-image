@@ -466,6 +466,8 @@ pub struct Selection:
 
     ## Every cell of `tiles` from the coverage, converted a tile at a time straight to
     ## half floats (a byte's 256 values looked up), with no document-sized buffer.
+    ## Unselected cells get no tile (users read a missing cell as unselected) and
+    ## fully selected ones share one, so a big selection costs its edges.
     func fill_tiles(tiles: Tiles*) -> !:
         var halves: u16[256]
         for value in 0..<(usize)256:
@@ -473,9 +475,26 @@ pub struct Selection:
         let one = to_half(1.0)
         let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
         defer free(bytes) in memory.heap
+        var full_column: u32 = 0
+        var full_row: u32 = 0
+        var have_full = false
         for row in 0..<tiles.rows():
             for column in 0..<tiles.columns():
                 let area = tiles.region(column, row)
+                # What the cell holds: nothing, everything, or some.
+                var any = false
+                var all = area.width == tile_size and area.height == tile_size
+                for y in 0..<(usize)area.height:
+                    let line = ((usize)row * (usize)tile_size + y) * (usize)self.extent_x + (usize)column * (usize)tile_size
+                    for x in 0..<(usize)area.width:
+                        let value = self.coverage[line + x]
+                        any = any or value != 0
+                        all = all and value == 255
+                if not any:
+                    continue
+                if all and have_full:
+                    try tiles.share(column, row, full_column, full_row)
+                    continue
                 for index in 0..<bytes.length:
                     bytes[index] = 0
                 for y in 0..<(usize)area.height:
@@ -488,10 +507,14 @@ pub struct Selection:
                             bytes[at + channel * 2 + 1] = (u8)(half >> 8)
                         bytes[at + 6] = (u8)(one & 0xff)
                         bytes[at + 7] = (u8)(one >> 8)
-                var texture = try tiles.blank()
+                var texture = try gpu.Texture.create(tiles.device(), tile_size, tile_size, gpu.Format.rgba16_float)
                 errdefer texture.destroy()
-                try texture.upload(bytes[..<((usize)area.height * (usize)tile_size * 8)], gpu.Region(0, 0, tile_size, area.height))
+                try texture.upload(bytes)
                 try tiles.set(column, row, texture)
+                if all:
+                    full_column = column
+                    full_row = row
+                    have_full = true
 
     pub mutating func destroy():
         if let tiles = self.tiles:

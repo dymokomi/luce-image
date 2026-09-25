@@ -160,6 +160,17 @@ pub struct Composer:
         try self.cache.put(digest | 1, texture, tile_bytes)
         return texture
 
+    ## Cell (`column`, `row`) of any store at `level`, for drawing outside a
+    ## composite (thumbnails, marching ants, a layer being moved): borrowed
+    ## until the next `hold` or composite request; none where it is empty.
+    pub mutating func level_texture(tiles: const Tiles*, column: u32, row: u32, level: u32, mask: bool = false) -> gpu.Texture?!:
+        return try self.pyramid.texture(tiles, column, row, level, mask)
+
+    ## Begin a drawing request whose level tiles must stay until it is done.
+    pub mutating func hold():
+        self.cache.hold()
+        self.pyramid.hold()
+
     ## A layer's (or mask's) tile at the level being made; none where it is empty.
     mutating func source(tiles: const Tiles*, column: u32, row: u32, mask: bool = false) -> gpu.Texture?!:
         return try self.pyramid.texture(tiles, column, row, self.level, mask)

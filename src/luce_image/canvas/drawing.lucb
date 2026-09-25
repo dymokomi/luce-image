@@ -57,15 +57,22 @@ func draw_one_layer(canvas: Canvas*, target: interop.View[gpu.RenderTarget], ind
     let document = canvas.document else return
     let layer = document.find(record.id) else return
     let tiles = (layer.mask_tiles() else return) if mask else (layer.tiles() else return)
+    let composer = canvas.composer else return
     let scale_x = rectangle.width / (f64)canvas.extent_x
     let scale_y = rectangle.height / (f64)canvas.extent_y
-    for row in 0..<tiles.rows():
-        for column in 0..<tiles.columns():
-            let texture = tiles.texture(column, row) else continue
-            let area = tiles.region(column, row)
-            let destination = gpu.Rect(rectangle.x + (f64)(column * tile_size) * scale_x, rectangle.y + (f64)(row * tile_size) * scale_y,
-                                       (f64)area.width * scale_x, (f64)area.height * scale_y)
-            try gpu.draw_image(checked, texture, destination, area, 1.0, gpu.Filter.linear)
+    # From the layer's level about a texel a point: a thumbnail is a few cells at most.
+    let level = view_level(math.min(scale_x, scale_y))
+    let span = (f64)((u64)tile_size << level)
+    composer.hold()
+    for row in 0..<level_cells(canvas.extent_y, level):
+        for column in 0..<level_cells(canvas.extent_x, level):
+            let texture = (try composer.level_texture(tiles, column, row, level, mask)) else continue
+            let covered_x = covered_at(canvas.extent_x, column, level)
+            let covered_y = covered_at(canvas.extent_y, row, level)
+            let step = (f64)(1u64 << level)
+            let destination = gpu.Rect(rectangle.x + (f64)column * span * scale_x, rectangle.y + (f64)row * span * scale_y,
+                                       (f64)covered_x * step * scale_x, (f64)covered_y * step * scale_y)
+            try gpu.draw_image(checked, texture, destination, gpu.Region(0, 0, covered_x, covered_y), 1.0, gpu.Filter.linear)
 
 ## `Canvas.draw_moving`: the document with layer `id` shown moved by (`dx`, `dy`).
 func draw_canvas_moving(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, id: i64, dx: f64, dy: f64) -> !:
@@ -96,13 +103,34 @@ func draw_canvas_moving(canvas: Canvas*, target: interop.View[gpu.RenderTarget],
     let clipped = try checked.clipped(gpu.Rect(left, top, right - left, bottom - top))
     defer clipped.release()
     let tiles = layer.tiles() else return
+    let opacity = canvas.records[index].opacity
+    let filter = gpu.Filter.nearest if zoom >= 1.0 else gpu.Filter.linear
+    let level = view_level(zoom)
+    if level > 0:
+        # Zoomed out: the layer's level, cell by cell, only those that show (what
+        # it has past the canvas shows again at full size).
+        let composer = canvas.composer else return
+        composer.hold()
+        let span = (f64)((u64)tile_size << level)
+        let step = (f64)(1u64 << level)
+        for row in 0..<level_cells(canvas.extent_y, level):
+            for column in 0..<level_cells(canvas.extent_x, level):
+                let destination = gpu.Rect(rectangle.x + offset_x + ((f64)column * span + dx) * zoom, rectangle.y + offset_y + ((f64)row * span + dy) * zoom,
+                                           (f64)covered_at(canvas.extent_x, column, level) * step * zoom, (f64)covered_at(canvas.extent_y, row, level) * step * zoom)
+                if not overlaps(destination, left, top, right, bottom):
+                    continue
+                let texture = (try composer.level_texture(tiles, column, row, level)) else continue
+                try gpu.draw_image(clipped.value(), texture, destination, gpu.Region(0, 0, covered_at(canvas.extent_x, column, level), covered_at(canvas.extent_y, row, level)), opacity, filter)
+        return
     var parts = try pieces(tiles)
     defer parts.destroy()
     for at in 0..<parts.count:
         let piece = parts.at(at)
         let destination = gpu.Rect(rectangle.x + offset_x + ((f64)piece.x + dx) * zoom, rectangle.y + offset_y + ((f64)piece.y + dy) * zoom,
                                    (f64)piece.source.width * zoom, (f64)piece.source.height * zoom)
-        try gpu.draw_image(clipped.value(), piece.texture, destination, piece.source, canvas.records[index].opacity, gpu.Filter.nearest if zoom >= 1.0 else gpu.Filter.linear)
+        if not overlaps(destination, left, top, right, bottom):
+            continue
+        try gpu.draw_image(clipped.value(), piece.texture, destination, piece.source, opacity, filter)
 
 ## `Canvas.draw_selection`: marching ants along the selection's edge at screen resolution.
 func draw_canvas_selection(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, phase: f64) -> !:
@@ -122,23 +150,53 @@ func draw_canvas_selection(canvas: Canvas*, target: interop.View[gpu.RenderTarge
     let scale = size.pixel_width / size.width if size.width > 0.0 else 1.0
     # gl_FragCoord counts from the frame's corner, not this target's.
     let placement = try checked.placement()
-    for row in 0..<tiles.rows():
-        for column in 0..<tiles.columns():
-            let texture = tiles.texture(column, row) else continue
-            let covered = tiles.region(column, row)
-            let left = rectangle.x + offset_x + (f64)(column * tile_size) * zoom
-            let top = rectangle.y + offset_y + (f64)(row * tile_size) * zoom
-            let width = (f64)covered.width * zoom
-            let height = (f64)covered.height * zoom
+    # At the view's level: the ants follow the edge a texel a point, and the
+    # cells drawn are the screen's, whatever the document's size.
+    let composer = canvas.composer else return
+    composer.hold()
+    let level = view_level(zoom)
+    let span = (f64)((u64)tile_size << level)
+    let step = (f64)(1u64 << level)
+    for row in 0..<level_cells(canvas.extent_y, level):
+        for column in 0..<level_cells(canvas.extent_x, level):
+            let covered_x = covered_at(canvas.extent_x, column, level)
+            let covered_y = covered_at(canvas.extent_y, row, level)
+            let left = rectangle.x + offset_x + (f64)column * span * zoom
+            let top = rectangle.y + offset_y + (f64)row * span * zoom
+            let width = (f64)covered_x * step * zoom
+            let height = (f64)covered_y * step * zoom
             if left >= rectangle.x + rectangle.width or top >= rectangle.y + rectangle.height or left + width <= rectangle.x or top + height <= rectangle.y:
                 continue
-            let right_tile = tiles.texture(column + 1, row) else composer_blank(canvas)
-            let below_tile = tiles.texture(column, row + 1) else composer_blank(canvas)
-            let limit_x = (f64)canvas.extent_x - (f64)(column * tile_size)
-            let limit_y = (f64)canvas.extent_y - (f64)(row * tile_size)
-            var params: f32[8] = [(f32)((placement.x + left) * scale), (f32)((placement.y + top) * scale), (f32)(zoom * scale), (f32)phase, (f32)covered.width, (f32)covered.height, (f32)limit_x, (f32)limit_y]
+            # A cell with nothing selected still draws the edge with the cell after it.
+            let own = try composer.level_texture(tiles, column, row, level)
+            let right = try composer.level_texture(tiles, column + 1, row, level)
+            let below = try composer.level_texture(tiles, column, row + 1, level)
+            if own == none and right == none and below == none:
+                continue
+            let texture = own else composer_blank(canvas)
+            let right_tile = right else composer_blank(canvas)
+            let below_tile = below else composer_blank(canvas)
+            let limit_x = ((f64)canvas.extent_x - (f64)column * span) / step
+            let limit_y = ((f64)canvas.extent_y - (f64)row * span) / step
+            var params: f32[8] = [(f32)((placement.x + left) * scale), (f32)((placement.y + top) * scale), (f32)(zoom * step * scale), (f32)phase, (f32)covered_x, (f32)covered_y, (f32)limit_x, (f32)limit_y]
             try gpu.shade(area, pipeline, gpu.Rect(left, top, width, height), u8[]((u8*)&params[0], 32), [texture, right_tile, below_tile], gpu.Filter.nearest)
 
 ## A transparent texel for absent neighbor tiles.
 func composer_blank(canvas: Canvas*) -> gpu.Texture:
     return (canvas.painter else trap("bound")).black
+
+## The pyramid level whose texels are at most a point each at `zoom`.
+func view_level(zoom: f64) -> u32:
+    var level: u32 = 0
+    while level < 16 and zoom * (f64)(1u32 << (level + 1)) <= 1.0:
+        level += 1
+    return level
+
+## How many cells a side of `extent` pixels has at `level`.
+func level_cells(extent: u32, level: u32) -> u32:
+    let span = (u64)tile_size << level
+    return (u32)(((u64)extent + span - 1) // span)
+
+## Whether `box` reaches into `left`..`right`, `top`..`bottom`.
+func overlaps(box: gpu.Rect, left: f64, top: f64, right: f64, bottom: f64) -> bool:
+    return box.x < right and box.y < bottom and box.x + box.width > left and box.y + box.height > top

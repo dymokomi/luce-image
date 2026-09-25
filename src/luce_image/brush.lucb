@@ -63,8 +63,8 @@ pub struct Brush:
     pub var texture_depth: f64 = 0.5
 
     pub func check() -> !:
-        if not (self.diameter >= 1.0 and self.diameter <= 4096.0) or not (self.hardness >= 0.0 and self.hardness <= 1.0) or not (self.opacity >= 0.0 and self.opacity <= 1.0) or not (self.flow >= 0.0 and self.flow <= 1.0):
-            error(invalid, "brush diameter must be 1..4096 and hardness, opacity and flow 0..1")
+        if not (self.diameter >= 1.0 and self.diameter <= 5000.0) or not (self.hardness >= 0.0 and self.hardness <= 1.0) or not (self.opacity >= 0.0 and self.opacity <= 1.0) or not (self.flow >= 0.0 and self.flow <= 1.0):
+            error(invalid, "brush diameter must be 1..5000 and hardness, opacity and flow 0..1")
         if not (self.spacing >= 0.01 and self.spacing <= 5.0) or not math.is_finite(self.angle) or not (self.roundness >= 0.05 and self.roundness <= 1.0) or not (self.smoothing >= 0.0 and self.smoothing <= 4096.0):
             error(invalid, "brush spacing must be 0.01..5, roundness 0.05..1, smoothing 0..4096 and the angle finite")
         for fraction in [self.size_jitter, self.angle_jitter, self.roundness_jitter, self.flow_jitter, self.hue_jitter, self.saturation_jitter, self.brightness_jitter, self.texture_depth]:

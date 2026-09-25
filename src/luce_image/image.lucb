@@ -547,14 +547,44 @@ pub struct Image:
         let source_max = model.maximum(self.raster.channels[0].kind)
         let target_max = model.maximum(target.raster.channels[0].kind)
         let integer = (i64)target.raster.channels[0].kind <= 3
-        for y in 0..<self.raster.height:
-            for x in 0..<self.raster.width:
-                let pixel = try self.getpixel(x, y)
-                for c in 0..<target.raster.channels.length:
-                    let name = target.raster.channels[c].name
-                    let source = pixel.a if name == "A" else pixel.g if name == "G" else pixel.b if name == "B" else 0.299 * pixel.r + 0.587 * pixel.g + 0.114 * pixel.b if name == "Y" else pixel.r
-                    let value = source / source_max * target_max
-                    target.raster.pixels[(y * self.raster.width + x) * target.raster.channels.length + c] = math.floor(math.clamp(value, 0.0, target_max) + 0.5) if integer else value
+        # Which source sample feeds each color, worked out once as `getpixel` reads them.
+        var red: i64 = -1
+        var green: i64 = -1
+        var blue: i64 = -1
+        var alpha: i64 = -1
+        for c in 0..<self.raster.channels.length:
+            let name = self.raster.channels[c].name
+            if name == "Y":
+                red = (i64)c
+                green = (i64)c
+                blue = (i64)c
+            elif name == "R":
+                red = (i64)c
+            elif name == "G":
+                green = (i64)c
+            elif name == "B":
+                blue = (i64)c
+            elif name == "A":
+                alpha = (i64)c
+        # And what each target channel is: 0 red, 1 green, 2 blue, 3 alpha, 4 luma.
+        var wanted: u8[16]
+        let channels = target.raster.channels.length
+        for c in 0..<channels:
+            let name = target.raster.channels[c].name
+            wanted[c] = 3 if name == "A" else 1 if name == "G" else 2 if name == "B" else 4 if name == "Y" else 0
+        let source_stride = self.raster.channels.length
+        let scale = target_max / source_max
+        for index in 0..<self.raster.width * self.raster.height:
+            let at = index * source_stride
+            let r = self.raster.pixels[at + (usize)red] if red >= 0 else 0.0
+            let g = self.raster.pixels[at + (usize)green] if green >= 0 else 0.0
+            let b = self.raster.pixels[at + (usize)blue] if blue >= 0 else 0.0
+            let a = self.raster.pixels[at + (usize)alpha] if alpha >= 0 else source_max
+            for c in 0..<channels:
+                let kind = wanted[c]
+                let source = r if kind == 0 else g if kind == 1 else b if kind == 2 else a if kind == 3 else 0.299 * r + 0.587 * g + 0.114 * b
+                let value = source * scale
+                target.raster.pixels[index * channels + c] = math.floor(math.clamp(value, 0.0, target_max) + 0.5) if integer else value
         return out
 
     ## Nearest is appropriate for discrete IDs. Bilinear must never filter IDs.
