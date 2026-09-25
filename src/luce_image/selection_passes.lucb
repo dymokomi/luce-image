@@ -4,8 +4,11 @@
 ## covers it. Built once per device, like the other engine passes.
 import gpu
 import math
-from tiles import Tiles, tile_size, flatten
+from tiles import Tiles, tile_size
 from luce_image.document import Document
+from luce_image.extent import pieces
+from luce_image.transform_window import Footprint, gather
+from pyramid import Pyramid, tile_bytes
 from luce_image.shaders import lift_frag_words, lift_frag_msl, mask_mix_frag_words, mask_mix_frag_msl
 from raster_errors import invalid
 
@@ -38,11 +41,16 @@ pub struct SelectionPasses:
         let tiles = target.tiles() else error(invalid, "a group has no pixels to move")
         if dx == 0 and dy == 0:
             return
-        var flat = try flatten(self.owner, tiles)
-        defer flat.destroy()
-        var mask = try flatten(self.owner, selection)
-        defer mask.destroy()
-        var params: f32[8] = [0.0, 0.0, (f32)dx, (f32)dy, (f32)tiles.width(), (f32)tiles.height(), 1.0 if copy else 0.0, 0.0]
+        # Cells are replaced as they are made, so every window reads the layer as it was.
+        var before = try tiles.clone()
+        defer before.destroy()
+        var layer_parts = try pieces(&before)
+        defer layer_parts.destroy()
+        var mask_parts = try pieces(selection)
+        defer mask_parts.destroy()
+        var pyramid = try Pyramid.create(self.owner, tile_bytes)
+        defer pyramid.destroy()
+        let clear = gpu.Color(0.0, 0.0, 0.0, 0.0)
         for row in 0..<tiles.rows():
             for column in 0..<tiles.columns():
                 let x0 = (i64)(column * tile_size)
@@ -53,18 +61,35 @@ pub struct SelectionPasses:
                 let landing = x0 < right + dx and x1 > left + dx and y0 < bottom + dy and y1 > top + dy
                 if not (landing or (under and not copy)):
                     continue
-                params[0] = (f32)x0
-                params[1] = (f32)y0
-                var fresh = try tiles.blank()
-                errdefer fresh.destroy()
-                let frame = try fresh.frame()
-                defer frame.release()
-                let area = try frame.value().target()
-                defer area.release()
-                try gpu.shade(area.value(), self.lift, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 32), [flat, mask], gpu.Filter.nearest)
-                discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+                # A window holding the cell and where its moved pixels come from, within the document.
+                let reads = Footprint(left = (f64)math.imax(0, math.imin(x0, x0 - dx)), top = (f64)math.imax(0, math.imin(y0, y0 - dy)),
+                                      right = (f64)math.imin((i64)tiles.width(), math.imax(x1, x1 - dx)), bottom = (f64)math.imin((i64)tiles.height(), math.imax(y1, y1 - dy)))
+                var pixels = try gather(self.owner, &before, &layer_parts, &pyramid, reads, 0, false, clear)
+                var coverage = gather(self.owner, selection, &mask_parts, &pyramid, reads, 0, false, clear) catch failure:
+                    pixels.destroy()
+                    error(failure.code, failure.message)
+                # The lift shader reads the window as its whole document.
+                var params: f32[8] = [(f32)(x0 - pixels.left), (f32)(y0 - pixels.top), (f32)dx, (f32)dy,
+                                      (f32)(reads.right - (f64)pixels.left), (f32)(reads.bottom - (f64)pixels.top), 1.0 if copy else 0.0, 0.0]
+                let fresh = self.lift_cell(tiles, &params, pixels.texture, coverage.texture) catch failure:
+                    pixels.destroy()
+                    coverage.destroy()
+                    error(failure.code, failure.message)
+                pixels.destroy()
+                coverage.destroy()
                 try tiles.set(column, row, fresh)
         target.revision += 1
+
+    func lift_cell(tiles: const Tiles*, params: f32[8]*, pixels: gpu.Texture, coverage: gpu.Texture) -> gpu.Texture!:
+        var fresh = try tiles.blank()
+        errdefer fresh.destroy()
+        let frame = try fresh.frame()
+        defer frame.release()
+        let area = try frame.value().target()
+        defer area.release()
+        try gpu.shade(area.value(), self.lift, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&(*params)[0], 32), [pixels, coverage], gpu.Filter.nearest)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        return fresh
 
     ## Keep the edit just made to `layer` only where `selection` covers it: each
     ## tile becomes `before` and the edited pixels mixed by coverage.

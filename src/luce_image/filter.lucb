@@ -10,6 +10,9 @@ import memory
 import math
 from tiles import Tiles, tile_size, box, unbox, flatten
 from luce_image.document import Document
+from luce_image.extent import pieces
+from luce_image.transform_window import Footprint, gather
+from pyramid import Pyramid, tile_bytes
 from luce_image.shaders import blur_frag_words, blur_frag_msl, resample_frag_words, resample_frag_msl
 from raster_errors import invalid
 
@@ -70,27 +73,47 @@ pub struct Filters:
             error(invalid, "lens corrections are -1..1")
         try self.resampled(document, layer, 1.0, distortion, red_cyan, blue_yellow, on_mask)
 
-    ## Every cell of `layer` drawn anew by resample.frag's `kind` over the
-    ## whole layer.
+    ## Every cell of `layer` drawn anew by resample.frag's `kind`, each from a
+    ## window of the layer holding every place it reads: no texture the size of
+    ## the layer, so layers past 16384 pixels filter like small ones.
     func resampled(document: Document*, layer: u64, kind: f64, a: f64, b: f64, c: f64, on_mask: bool) -> !:
         let target = document.find(layer) else error(invalid, "no such layer")
         let tiles = try target.edited_tiles(on_mask)
         let empty = 1.0 if on_mask else 0.0
-        var whole = try flatten(self.owner, tiles, gpu.Color(empty, empty, empty, empty))
-        defer whole.destroy()
+        # Every window reads the layer as it was, while its cells are replaced.
+        var before = try tiles.clone()
+        defer before.destroy()
+        var parts = try pieces(&before)
+        defer parts.destroy()
+        var pyramid = try Pyramid.create(self.owner, tile_bytes)
+        defer pyramid.destroy()
+        let width = (f64)tiles.width()
+        let height = (f64)tiles.height()
         for row in 0..<tiles.rows():
             for column in 0..<tiles.columns():
-                var params: f32[8] = [(f32)kind, (f32)a, (f32)b, (f32)c, (f32)(column * tile_size), (f32)(row * tile_size), (f32)tiles.width(), (f32)tiles.height()]
-                var fresh = try tiles.blank()
-                errdefer fresh.destroy()
-                let frame = try fresh.frame()
-                defer frame.release()
-                let area = try frame.value().target()
-                defer area.release()
-                try gpu.shade(area.value(), self.resample, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 32), [whole], gpu.Filter.nearest)
-                discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+                let reads = resample_reads(kind, a, b, c, (f64)(column * tile_size), (f64)(row * tile_size), width, height)
+                var window = try gather(self.owner, &before, &parts, &pyramid, reads, 0, on_mask, gpu.Color(empty, empty, empty, empty))
+                let window_width = (f64)(try window.texture.width())
+                let window_height = (f64)(try window.texture.height())
+                var params: f32[12] = [(f32)kind, (f32)a, (f32)b, (f32)c, (f32)(column * tile_size), (f32)(row * tile_size), (f32)width, (f32)height,
+                                       (f32)window.left, (f32)window.top, (f32)window_width, (f32)window_height]
+                let fresh = self.resample_cell(tiles, &params, window.texture) catch failure:
+                    window.destroy()
+                    error(failure.code, failure.message)
+                window.destroy()
                 try tiles.set(column, row, fresh)
         target.revision += 1
+
+    func resample_cell(tiles: const Tiles*, params: f32[12]*, window: gpu.Texture) -> gpu.Texture!:
+        var fresh = try tiles.blank()
+        errdefer fresh.destroy()
+        let frame = try fresh.frame()
+        defer frame.release()
+        let area = try frame.value().target()
+        defer area.release()
+        try gpu.shade(area.value(), self.resample, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&(*params)[0], 48), [window], gpu.Filter.nearest)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        return fresh
 
     ## One direction over every tile that has pixels or a neighbour with pixels
     ## within reach; tiles that stay empty stay `none`.
@@ -304,3 +327,32 @@ test "a motion blur smears along its angle only; lens correction's stretch empti
     try filters.lens_correction(&document, layer, -1.0, 0.0, 0.0)
     try current.read(pixels)
     assert(pixels[(32 * 300 + 150) * 4 + 3] > 0.99 and pixels[(1 * 300 + 1) * 4 + 3] < 0.01)
+
+## The layer pixels resample.frag's `kind` reads for the cell at (`x0`, `y0`)
+## of a `width` by `height` layer, a margin for the taps, within the layer.
+func resample_reads(kind: f64, a: f64, b: f64, c: f64, x0: f64, y0: f64, width: f64, height: f64) -> Footprint:
+    var reads = Footprint(left = x0, top = y0, right = x0 + (f64)tile_size, bottom = y0 + (f64)tile_size)
+    if kind < 0.5:
+        # Motion blur: taps along the line, half the distance either way.
+        let half = b * 0.5 + 2.0
+        reads = Footprint(left = reads.left - half, top = reads.top - half, right = reads.right + half, bottom = reads.bottom + half)
+    else:
+        # Lens correction moves pixels along rays from the middle, and can fold
+        # near the corners: where a grid over the cell lands, for each channel.
+        var found = Footprint(left = 1.0e18, top = 1.0e18, right = -1.0e18, bottom = -1.0e18)
+        let centre_x = width * 0.5
+        let centre_y = height * 0.5
+        let reach = math.sqrt(centre_x * centre_x + centre_y * centre_y)
+        for step_y in 0..<(usize)17:
+            for step_x in 0..<(usize)17:
+                let x = x0 + (f64)step_x * (f64)tile_size / 16.0
+                let y = y0 + (f64)step_y * (f64)tile_size / 16.0
+                let dx = (x - centre_x) / reach
+                let dy = (y - centre_y) / reach
+                let scale = 1.0 - a * 0.5 * (dx * dx + dy * dy)
+                for shift in [0.0, b * 0.01, c * 0.01]:
+                    let px = centre_x + dx * (scale + shift) * reach
+                    let py = centre_y + dy * (scale + shift) * reach
+                    found = Footprint(left = math.min(found.left, px), top = math.min(found.top, py), right = math.max(found.right, px), bottom = math.max(found.bottom, py))
+        reads = Footprint(left = found.left - 4.0, top = found.top - 4.0, right = found.right + 4.0, bottom = found.bottom + 4.0)
+    return Footprint(left = math.max(0.0, reads.left), top = math.max(0.0, reads.top), right = math.min(width, reads.right), bottom = math.min(height, reads.bottom))

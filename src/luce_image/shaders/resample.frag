@@ -1,7 +1,8 @@
-// Filters that move pixels: each output tile samples the whole layer (image 1,
-// straight alpha, linear light, the layer's extent) at
-// places other than its own pixels. `place` is the tile's first pixel and the
-// layer's size.
+// Filters that move pixels: each output tile samples the layer (image 1,
+// straight alpha, linear light) at places other than its own pixels. `place`
+// is the tile's first pixel and the layer's size; image 1 is a window of the
+// layer, `window` its first pixel and size in layer pixels, holding every
+// place the tile reads.
 //   0 motion blur: p0 angle in radians, p1 distance in pixels: evenly spaced
 //     taps along the line through each pixel, averaged by coverage; taps past
 //     the canvas are left out rather than repeating its edge, which would
@@ -12,12 +13,13 @@
 #version 450
 layout(location = 0) in vec4 vertex_color;
 layout(location = 0) out vec4 fragment_color;
-layout(push_constant) uniform Params { float kind; float p[3]; vec4 place; } params;
+layout(push_constant) uniform Params { float kind; float p[3]; vec4 place; vec4 window; } params;
 layout(set = 0, binding = 1) uniform sampler2D layer;
 
 // One texel premultiplied, the nearest edge texel past the edges.
 vec4 texel(ivec2 p) {
-    vec4 t = texelFetch(layer, clamp(p, ivec2(0), ivec2(params.place.zw) - 1), 0);
+    ivec2 inside = clamp(p, ivec2(0), ivec2(params.place.zw) - 1);
+    vec4 t = texelFetch(layer, clamp(inside - ivec2(params.window.xy), ivec2(0), ivec2(params.window.zw) - 1), 0);
     return vec4(t.rgb * t.a, t.a);
 }
 // A premultiplied sample between texels at a layer pixel position: mixed
