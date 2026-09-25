@@ -1388,6 +1388,11 @@ pub struct Canvas:
         try gpu_check_color(brush.color)
         self.brush = brush
 
+    ## Hard whole-pixel dabs without anti-aliasing, as Photoshop's Pencil, or
+    ## the brush's soft ones.
+    pub mutating func set_brush_aliased(aliased: bool):
+        self.brush.aliased = aliased
+
     ## The tip's shape: dab spacing as a fraction of the diameter (Photoshop's
     ## 25 % is 0.25), angle in degrees, roundness 0.05..1, and the smoothing
     ## string in document pixels.

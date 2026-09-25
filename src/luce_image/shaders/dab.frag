@@ -2,6 +2,7 @@
 // direction) with a hard core and a linear falloff, emitting premultiplied
 // paint scaled by flow. Composited `over` into the paint tile, dabs build up
 // like real paint; the tip texture is applied to the whole stroke by paint.frag.
+// An aliased dab (the Pencil) covers a whole pixel or none, by its centre.
 #version 450
 layout(location = 0) in vec4 vertex_color;
 layout(location = 0) out vec4 fragment_color;
@@ -17,7 +18,7 @@ layout(push_constant) uniform Params {
     float red;
     float green;
     float blue;
-    float unused0;
+    float aliased;    // 1: whole pixels in or out, as the Pencil
     float unused1;
     float unused2;
     float unused3;
@@ -30,6 +31,7 @@ void main() {
     float d = length(q);
     float core = params.radius * params.hardness;
     float c = 1.0 - smoothstep(core, max(params.radius, core + 0.5), d);
+    if (params.aliased > 0.5) c = d <= max(params.radius, 0.5) ? 1.0 : 0.0;
     float a = c * params.flow * vertex_color.a;
     fragment_color = vec4(vec3(params.red, params.green, params.blue) * a, a);
 }

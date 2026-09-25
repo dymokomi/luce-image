@@ -63,8 +63,9 @@ pub func content_fill(pixels: f32[], width: usize, height: usize, hole: const u8
                 bottom = y + 1 if y + 1 > bottom else bottom
     if right == 0:
         return false
-    # The work box: the hole and as much again around it, where the texture to use most likely is.
-    let margin = math.max(48.0, (f64)math.max((f64)(right - left), (f64)(bottom - top)))
+    # The work box: the hole and as much again around it (at most 320 pixels),
+    # where the texture to use most likely is.
+    let margin = math.max(48.0, math.min(320.0, (f64)math.max((f64)(right - left), (f64)(bottom - top))))
     let box_left = (usize)math.max(0.0, (f64)left - margin)
     let box_top = (usize)math.max(0.0, (f64)top - margin)
     let box_right = (usize)math.min((f64)width, (f64)right + margin)
@@ -76,12 +77,28 @@ pub func content_fill(pixels: f32[], width: usize, height: usize, hole: const u8
     if work.source_count == 0:
         return false
     var random = seed | 1
-    while true:
-        let spot = next_patch(&work) else break
+    var queue = try Queue.create()
+    defer queue.destroy()
+    for y in 0..<work.height:
+        for x in 0..<work.width:
+            if work.unknown[(usize)(y * work.width + x)] != 0 and on_edge(&work, x, y):
+                try queue.push(priority(&work, x, y), y * work.width + x)
+    while queue.count > 0:
+        let (stored, spot) = queue.pop()
         let x = spot % work.width
         let y = spot // work.width
+        # Filled since, off the edge now, or pushed again since with a new priority.
+        if work.unknown[(usize)spot] == 0 or not on_edge(&work, x, y) or priority(&work, x, y) != stored:
+            continue
         let chosen = best_source(&work, x, y, &random)
         copy_patch(&work, x, y, chosen % work.width, chosen // work.width)
+        # Only the edge near the patch changed: its priorities go in afresh.
+        for near_y in y - radius - 3..<y + radius + 4:
+            for near_x in x - radius - 3..<x + radius + 4:
+                if near_x < 0 or near_y < 0 or near_x >= work.width or near_y >= work.height:
+                    continue
+                if work.unknown[(usize)(near_y * work.width + near_x)] != 0 and on_edge(&work, near_x, near_y):
+                    try queue.push(priority(&work, near_x, near_y), near_y * work.width + near_x)
     # The filled box back into the picture.
     for y in 0..<work.height:
         for x in 0..<work.width:
@@ -150,22 +167,75 @@ func work_of(pixels: const f32[], width: usize, left: usize, top: usize, box_wid
     return Work(width = w, height = h, pixels = copied, unknown = unknown, confidence = confidence, came_x = came_x, came_y = came_y,
                 source = source, sources = sources, source_count = found)
 
-## The edge pixel to fill around next, as an index: the highest priority —
-## how much of its patch is known, times how strong the structure beside it
-## is — or none when the hole is filled.
-func next_patch(work: const Work*) -> i64?:
-    var best = -1.0
-    var chosen: i64? = none
-    for y in 0..<work.height:
-        for x in 0..<work.width:
-            let index = y * work.width + x
-            if work.unknown[(usize)index] == 0 or not on_edge(work, x, y):
-                continue
-            let priority = patch_confidence(work, x, y) * (0.05 + structure(work, x, y))
-            if priority > best:
-                best = priority
-                chosen = index
-    return chosen
+## An edge pixel's priority for filling around it next: how much of its
+## patch is known, times how strong the structure beside it is.
+func priority(work: const Work*, x: i64, y: i64) -> f64:
+    return patch_confidence(work, x, y) * (0.05 + structure(work, x, y))
+
+## The edge pixels by priority, highest first: a binary heap. A pixel whose
+## priority changes is pushed again; the older entry is passed over when it
+## comes up, its priority no longer the pixel's.
+struct Queue:
+    var priorities: f64[]
+    var spots: i64[]
+    var count: usize
+
+    static func create() -> Queue!:
+        let priorities = try alloc f64[1024] in memory.heap
+        errdefer free(priorities) in memory.heap
+        let spots = try alloc i64[1024] in memory.heap
+        return Queue(priorities = priorities, spots = spots, count = 0)
+
+    mutating func push(value: f64, spot: i64) -> !:
+        if self.count == self.priorities.length:
+            let priorities = try alloc f64[self.count * 2] in memory.heap
+            errdefer free(priorities) in memory.heap
+            let spots = try alloc i64[self.count * 2] in memory.heap
+            memory.copy(priorities, self.priorities, self.count)
+            memory.copy(spots, self.spots, self.count)
+            free(self.priorities) in memory.heap
+            free(self.spots) in memory.heap
+            self.priorities = priorities
+            self.spots = spots
+        var at = self.count
+        self.count += 1
+        while at > 0:
+            let parent = (at - 1) // 2
+            if self.priorities[parent] >= value:
+                break
+            self.priorities[at] = self.priorities[parent]
+            self.spots[at] = self.spots[parent]
+            at = parent
+        self.priorities[at] = value
+        self.spots[at] = spot
+
+    ## The highest, taken out.
+    mutating func pop() -> (f64, i64):
+        let top = (self.priorities[0], self.spots[0])
+        self.count -= 1
+        let value = self.priorities[self.count]
+        let spot = self.spots[self.count]
+        var at: usize = 0
+        while true:
+            let left = at * 2 + 1
+            if left >= self.count:
+                break
+            var child = left
+            if left + 1 < self.count and self.priorities[left + 1] > self.priorities[left]:
+                child = left + 1
+            if self.priorities[child] <= value:
+                break
+            self.priorities[at] = self.priorities[child]
+            self.spots[at] = self.spots[child]
+            at = child
+        if self.count > 0:
+            self.priorities[at] = value
+            self.spots[at] = spot
+        return top
+
+    mutating func destroy():
+        free(self.priorities) in memory.heap
+        free(self.spots) in memory.heap
 
 ## Whether unknown pixel (`x`, `y`) touches a known one.
 func on_edge(work: const Work*, x: i64, y: i64) -> bool:
@@ -245,11 +315,21 @@ struct Search:
     var best: i64
     var cost: f64
 
-## Keep source (`sx`, `sy`) when it is a source and matches better.
+## How much a source's distance counts against it: texture from nearby is
+## likelier the same stuff (sky beside sky, not the city below it).
+let nearness: f64 = 0.0000002
+
+## Keep source (`sx`, `sy`) when it is a source and matches better, nearer
+## sources winning ties.
 func try_source(work: const Work*, x: i64, y: i64, sx: i64, sy: i64, search: Search*):
     if sx < 0 or sy < 0 or sx >= work.width or sy >= work.height or work.source[(usize)(sy * work.width + sx)] == 0:
         return
-    let cost = distance(work, x, y, sx, sy, search.cost)
+    let dx = (f64)(sx - x)
+    let dy = (f64)(sy - y)
+    let far = (dx * dx + dy * dy) * nearness
+    if far >= search.cost:
+        return
+    let cost = distance(work, x, y, sx, sy, search.cost - far) + far
     if cost < search.cost:
         search.cost = cost
         search.best = sy * work.width + sx

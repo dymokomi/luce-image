@@ -31,6 +31,8 @@ pub struct Brush:
     pub var color: gpu.Color = gpu.Color(0.0, 0.0, 0.0, 1.0)
     ## Erase instead of paint.
     pub var erase: bool
+    ## Hard, whole-pixel dabs with no anti-aliasing: the Pencil.
+    pub var aliased: bool
     # -- Tip shape.
     ## The distance between dabs as a fraction of the diameter, 0.01..5 (Photoshop's 25 %).
     pub var spacing: f64 = 0.25
@@ -374,7 +376,7 @@ pub struct Stroke:
             let radians = dab.angle * math.pi / 180.0
             var params: f32[20] = [0.0, 0.0, (f32)(dab.x - origin_x), (f32)(dab.y - origin_y), (f32)origin_x, (f32)origin_y, (f32)math.cos(radians), (f32)math.sin(radians),
                                    (f32)dab.radius, (f32)self.brush.hardness, (f32)dab.flow, (f32)dab.roundness,
-                                   (f32)dab.color.red, (f32)dab.color.green, (f32)dab.color.blue, 0.0, 0.0, 0.0, 0.0, 0.0]
+                                   (f32)dab.color.red, (f32)dab.color.green, (f32)dab.color.blue, 1.0 if self.brush.aliased else 0.0, 0.0, 0.0, 0.0, 0.0]
             let bounds = gpu.Rect(math.max(0.0, dab.x - origin_x - dab.radius - 1.0), math.max(0.0, dab.y - origin_y - dab.radius - 1.0), 0.0, 0.0)
             let right = math.min((f64)tile_size, dab.x - origin_x + dab.radius + 1.0)
             let bottom = math.min((f64)tile_size, dab.y - origin_y + dab.radius + 1.0)

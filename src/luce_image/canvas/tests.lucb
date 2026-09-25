@@ -1429,3 +1429,27 @@ test "select subject finds what stands out; object selection within a box":
     assert(canvas.current().at(48, 32) == 255 and canvas.current().at(4, 4) == 0)
     try canvas.select_subject(layer, 28, 12, 40, 40)
     assert(canvas.undo_name() == "Object Selection" and canvas.current().at(48, 32) == 255 and canvas.current().at(90, 60) == 0)
+
+test "the pencil paints whole pixels, with no soft edge":
+    var canvas = try Canvas(64, 32)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Lines")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try canvas.set_brush(7.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    canvas.set_brush_aliased(true)
+    try canvas.begin_stroke(layer, 5.3, 10.6)
+    try canvas.extend_stroke(50.7, 21.2)
+    try canvas.end_stroke()
+    let document = canvas.document else trap("bound")
+    let pixels = try alloc f32[64 * 32 * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    try ((document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")).read(pixels)
+    var painted = 0
+    for at in 0..<(usize)(64 * 32):
+        let alpha = pixels[at * 4 + 3]
+        assert(alpha < 0.001 or alpha > 0.999)
+        if alpha > 0.999:
+            painted += 1
+    assert(painted > 200)
