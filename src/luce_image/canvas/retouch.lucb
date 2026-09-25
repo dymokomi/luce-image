@@ -62,8 +62,10 @@ func begin_retouch(canvas: Canvas*, id: u64, x: f64, y: f64, pressure: f64) -> !
     let stroke = try begin_boxed(&painter, document, id, brush, x, y, false, pressure)
     errdefer finish_boxed(stroke)
     try canvas.remember(id, try stroke.original().clone(), name = retouch_name(kind))
+    # A clone is stamped over what is there; a blur replaces it by coverage,
+    # so softened edges thin out instead of piling up alpha with each pass.
     if let given = effect:
-        try stroke.use_effect(&painter, document, given, 1.0, brush.opacity)
+        try stroke.use_effect(&painter, document, given, 2.0 if kind == retouch_blur else 1.0, brush.opacity)
     canvas.stroke = stroke
 
 ## Continue a smudge or push to (`x`, `y`), showing it at once.

@@ -191,11 +191,10 @@ pub struct Tiles:
     pub func blank() -> gpu.Texture!:
         var texture = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
         errdefer texture.destroy()
-        let zeros = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
-        defer free(zeros) in memory.heap
-        for index in 0..<zeros.length:
-            zeros[index] = 0
-        try texture.upload(zeros)
+        # Cleared on the device: no zeros filled and copied up from memory.
+        let frame = try texture.frame()
+        defer frame.release()
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         return texture
 
     ## Replace every pixel from straight-alpha RGBA f32 samples, top-down, four

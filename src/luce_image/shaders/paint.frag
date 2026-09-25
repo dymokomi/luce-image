@@ -4,8 +4,8 @@
 // and, for a textured brush, modulated by a procedural pattern in document
 // space, as Photoshop textures a whole stroke rather than each dab. A
 // retouching stroke paints an effect image (image 4, straight alpha) instead
-// of a color: laid over the original through the coverage (clone stamp, blur
-// tool), or mixed with it (healing).
+// of a color: laid over the original through the coverage (clone stamp), or
+// mixed with it, replacing it by coverage (blur tool, healing).
 // Drawn with `replace`, so what is emitted is stored as is: straight alpha.
 #version 450
 layout(location = 0) in vec4 vertex_color;

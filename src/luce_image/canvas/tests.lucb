@@ -1153,3 +1153,38 @@ test "a gradient previews while its ends move, on pixels or on a mask, and keeps
     if kept.tile(0, 0) != none:
         try kept.read(pixels)
         assert(pixels[(8 * 64 + 1) * 4] > 0.9)
+
+test "the blur tool softens without piling up alpha, however many passes":
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Bar")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    let document = canvas.document else trap("bound")
+    # A black bar 8 pixels wide down the middle.
+    try canvas.set_brush(1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(28, 0, 8, 64)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    let pixels = try alloc f32[(usize)64 * 64 * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    var before: f64 = 0.0
+    let tiles = (document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")
+    try tiles.read(pixels)
+    for x in 0..<(usize)64:
+        before += (f64)pixels[(32 * 64 + x) * 4 + 3]
+    # Eight blur strokes across it with a wide brush.
+    try canvas.set_retouch(3)
+    try canvas.set_brush(40.0, 0.5, 1.0, 1.0, 0.0, 0.0, 0.0, false)
+    for pass in 0..<8:
+        try canvas.begin_stroke(layer, 10.0, 32.0)
+        try canvas.extend_stroke(54.0, 32.0)
+        try canvas.end_stroke()
+    let blurred = (document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")
+    try blurred.read(pixels)
+    var after: f64 = 0.0
+    for x in 0..<(usize)64:
+        after += (f64)pixels[(32 * 64 + x) * 4 + 3]
+    # Coverage spreads but its total does not grow much, and the middle thins.
+    assert(after < before * 1.3 and pixels[(32 * 64 + 32) * 4 + 3] < 0.99)
