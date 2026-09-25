@@ -1424,9 +1424,11 @@ pub struct Canvas:
         try gpu_check_color(to_color)
         if a0 < 0.0 or a0 > 1.0 or a1 < 0.0 or a1 > 1.0:
             error(invalid, "gradient alphas must be in 0..1")
-        var before = try fill_gradient(&painter, document, (u64)id, x0, y0, x1, y1, from_color, to_color, radial)
+        let index = try self.index((u64)id)
+        let on_mask = self.mask_editing and self.records[index].masked
+        var before = try fill_gradient(&painter, document, (u64)id, x0, y0, x1, y1, from_color, to_color, radial, on_mask)
         errdefer before.destroy()
-        try self.remember((u64)id, before, name = "Gradient")
+        try self.remember((u64)id, before, on_mask, name = "Gradient")
 
     ## The eyedropper: read the flattened document's color at a pixel into
     ## `picked_red` and friends (linear light, straight alpha).
@@ -1632,13 +1634,15 @@ pub struct Canvas:
     ## Start previewing edits to a layer: until `end_preview`, each
     ## `preview_adjust`, `preview_blur` or `preview_transform` shows its effect on the layer's
     ## pixels from before the preview began, not on the previous preview.
-    pub mutating func begin_preview(id: i64) -> !:
+    ## Start showing edits live on layer `id`'s pixels, or on its mask when
+    ## `mask` (a gradient there); `end_preview` keeps or drops them.
+    pub mutating func begin_preview(id: i64, mask: bool = false) -> !:
         try self.require_open()
         try self.require_idle()
         let document = self.document else error(invalid, "draw the document once before previewing")
         let layer = document.find((u64)id) else error(invalid, "no such layer")
-        let tiles = layer.tiles() else error(invalid, "a group cannot be previewed")
-        self.preview = Snapshot(layer = (u64)id, tiles = try tiles.clone(), mask = false)
+        let tiles = ((layer.mask_tiles() else error(invalid, "the layer has no mask")) if mask else (layer.tiles() else error(invalid, "a group cannot be previewed")))
+        self.preview = Snapshot(layer = (u64)id, tiles = try tiles.clone(), mask = mask)
 
     pub func previewing() -> bool:
         return self.preview != none
@@ -1654,6 +1658,23 @@ pub struct Canvas:
         let adjuster = self.adjuster else trap("preview without an adjuster")
         try adjuster.apply(document, layer, (u32)kind, self.adjustment[..<parameter_count], table)
         try self.restrict_preview(layer)
+
+    ## Show a gradient (as `fill_gradient`) over the layer, or its mask, as it
+    ## was when the preview began: its ends can move and it is drawn again.
+    pub mutating func preview_gradient(x0: f64, y0: f64, x1: f64, y1: f64, r0: f64, g0: f64, b0: f64, a0: f64, r1: f64, g1: f64, b1: f64, a1: f64, radial: bool = false) -> !:
+        self.preview_name = "Gradient"
+        let from_color = gpu.Color(r0, g0, b0, a0)
+        let to_color = gpu.Color(r1, g1, b1, a1)
+        try gpu_check_color(from_color)
+        try gpu_check_color(to_color)
+        if a0 < 0.0 or a0 > 1.0 or a1 < 0.0 or a1 > 1.0:
+            error(invalid, "gradient alphas must be in 0..1")
+        let mask = (self.preview else error(invalid, "no preview is in progress")).mask
+        let layer = try self.restore_preview()
+        let document = self.document else trap("preview without a document")
+        var painter = self.painter else trap("preview without a painter")
+        var drawn_over = try fill_gradient(&painter, document, layer, x0, y0, x1, y1, from_color, to_color, radial, mask)
+        drawn_over.destroy()
 
     ## Show a Gaussian blur of `radius` applied to the layer as it was when the preview began.
     pub mutating func preview_blur(radius: f64) -> !:
@@ -1672,7 +1693,10 @@ pub struct Canvas:
         self.preview = none
         let document = self.document else trap("preview without a document")
         if keep:
-            try self.remember(preview.layer, preview.tiles, name = self.preview_name)
+            try self.remember(preview.layer, preview.tiles, preview.mask, name = self.preview_name)
+        elif preview.mask:
+            var shown = try document.take_mask(preview.layer, preview.tiles)
+            shown.destroy()
         else:
             var shown = try document.take_tiles(preview.layer, preview.tiles)
             shown.destroy()
@@ -1682,7 +1706,11 @@ pub struct Canvas:
         try self.require_open()
         let preview = self.preview else error(invalid, "no preview is in progress")
         let document = self.document else trap("preview without a document")
-        try document.set_tiles(preview.layer, try preview.tiles.clone())
+        if preview.mask:
+            var shown = try document.take_mask(preview.layer, try preview.tiles.clone())
+            shown.destroy()
+        else:
+            try document.set_tiles(preview.layer, try preview.tiles.clone())
         return preview.layer
 
     ## Blur a layer's pixels with a Gaussian of `radius` pixels (0.5..250). Undoable.

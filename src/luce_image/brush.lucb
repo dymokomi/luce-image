@@ -596,12 +596,12 @@ pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brus
 
 ## Lay a linear gradient from `from_color` at (`x0`, `y0`) to `to_color` at
 ## (`x1`, `y1`) over `layer`, within the selection; the tiles from before.
-pub func fill_gradient(painter: Painter*, document: Document*, layer: u64, x0: f64, y0: f64, x1: f64, y1: f64, from_color: gpu.Color, to_color: gpu.Color, radial: bool = false) -> Tiles!:
+pub func fill_gradient(painter: Painter*, document: Document*, layer: u64, x0: f64, y0: f64, x1: f64, y1: f64, from_color: gpu.Color, to_color: gpu.Color, radial: bool = false, on_mask: bool = false) -> Tiles!:
     for value in [x0, y0, x1, y1]:
         if not math.is_finite(value):
             error(invalid, "gradient ends must be finite")
     let target = document.find(layer) else error(invalid, "no such layer")
-    let tiles = target.tiles() else error(invalid, "a group cannot be filled")
+    let tiles = (target.mask_tiles() else error(invalid, "the layer has no mask")) if on_mask else (target.tiles() else error(invalid, "a group cannot be filled"))
     var before = try tiles.clone()
     errdefer before.destroy()
     let selection = try document.selection_tiles()
@@ -625,6 +625,11 @@ pub func fill_gradient(painter: Painter*, document: Document*, layer: u64, x0: f
                 if not have_empty:
                     empty = try tiles.blank()
                     have_empty = true
+                    # A mask's missing cells reveal: they count as white.
+                    if on_mask:
+                        let frame = try empty.frame()
+                        defer frame.release()
+                        discard(try frame.value().present(gpu.Color(1.0, 1.0, 1.0, 1.0)))
                 source = empty
             var fresh = try tiles.blank()
             errdefer fresh.destroy()
