@@ -55,10 +55,10 @@ pub struct Adjuster:
     ## at most `parameter_count`, as `adjust.frag` lists them (the rest are 0);
     ## `curves` reads its 256×1 table from `table`. This is the destructive
     ## path: the pixels change once.
-    pub func apply(document: Document*, layer: u64, kind: u32, values: const f64[], table: gpu.Texture? = none) -> !:
+    pub func apply(document: Document*, layer: u64, kind: u32, values: const f64[], table: gpu.Texture? = none, on_mask: bool = false) -> !:
         try check(kind, values, table)
         let target = document.find(layer) else error(invalid, "no such layer")
-        let tiles = target.tiles() else error(invalid, "this layer has no pixels to adjust")
+        let tiles = try target.edited_tiles(on_mask)
         for row in 0..<tiles.rows():
             for column in 0..<tiles.columns():
                 let source = tiles.texture(column, row) else continue

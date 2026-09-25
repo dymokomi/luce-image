@@ -68,6 +68,8 @@ struct Record:
     var parent: u64 = 0
     ## A disabled mask is kept but hides nothing.
     var mask_enabled: bool = true
+    ## A linked mask moves and transforms with the pixels; an unlinked one stays.
+    var mask_linked: bool = true
     ## An adjustment layer's kind and parameters (no pixels), or -1.
     var adjustment: i64 = -1
     var adjustment_values: f64[23]
@@ -852,8 +854,6 @@ pub struct Canvas:
         try self.require_idle()
         try self.remember_state("Layer Mask")
         let index = try self.index((u64)id)
-        if self.records[index].group:
-            error(invalid, "a group cannot have a mask yet")
         if fill < 0 or fill > 2:
             error(invalid, "a mask is filled 0 white, 1 black or 2 from the selection")
         if let document = self.document:
@@ -878,6 +878,7 @@ pub struct Canvas:
             error(invalid, "draw the document once before filling a mask")
         self.records[index].masked = present
         self.records[index].mask_enabled = true
+        self.records[index].mask_linked = true
         if not present and self.mask_editing:
             self.mask_editing = false
 
@@ -897,6 +898,38 @@ pub struct Canvas:
 
     pub func layer_mask_enabled(index: i64) -> bool!:
         return (try self.record(index)).mask_enabled
+
+    ## Link a layer's mask to its pixels (the default: it moves and transforms
+    ## with them) or unlink it (it stays where it is). Undoable.
+    pub mutating func link_mask(id: i64, linked: bool) -> !:
+        try self.require_open()
+        let index = try self.index((u64)id)
+        if not self.records[index].masked:
+            error(invalid, "the layer has no mask")
+        try self.remember_state("Link Mask" if linked else "Unlink Mask")
+        self.records[index].mask_linked = linked
+
+    pub func layer_mask_linked(index: i64) -> bool!:
+        return (try self.record(index)).mask_linked
+
+    ## Give layer `target` a copy of layer `source`'s mask, replacing any it
+    ## has: Photoshop's Alt-drag of a mask thumbnail. Undoable.
+    pub mutating func copy_mask(source: i64, target: i64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        let source_index = try self.index((u64)source)
+        let target_index = try self.index((u64)target)
+        if not self.records[source_index].masked:
+            error(invalid, "the layer has no mask to copy")
+        let document = self.document else error(invalid, "draw the document once before copying a mask")
+        let copied = (document.find((u64)source) else trap("masked layer")).mask_tiles() else trap("masked layer without a mask")
+        try self.remember_state("Copy Mask")
+        try document.set_mask((u64)target, true)
+        var replaced = try document.take_mask((u64)target, try copied.clone())
+        replaced.destroy()
+        self.records[target_index].masked = true
+        self.records[target_index].mask_enabled = true
+        self.records[target_index].mask_linked = true
 
     ## Load a layer's transparency — or with `mask` its mask — as the
     ## selection, combined by `mode` (0 replace, 1 add, 2 subtract, 3
@@ -972,6 +1005,10 @@ pub struct Canvas:
     ## reveals, black hides.
     pub mutating func edit_mask(enabled: bool):
         self.mask_editing = enabled
+
+    ## Whether edits to layer `id` go to its mask: it has one and it is being edited.
+    mutating func editing_mask_of(id: i64) -> bool!:
+        return self.mask_editing and self.records[try self.index((u64)id)].masked
 
     pub func editing_mask() -> bool:
         return self.mask_editing
@@ -1237,16 +1274,16 @@ pub struct Canvas:
         try passes.move_selected(document, layer, mask, dx, dy, copy, selection.left, selection.top, selection.right, selection.bottom)
 
     ## Keep the edit just made to `layer` only inside the selection, when there is one.
-    mutating func restrict_to_selection(layer: u64, before: const Tiles*) -> !:
+    mutating func restrict_to_selection(layer: u64, before: const Tiles*, on_mask: bool = false) -> !:
         let document = self.document else return
         let passes = self.passes else return
-        let mask = try document.selection_tiles() else return
-        try passes.restrict(document, layer, before, mask)
+        let selection = try document.selection_tiles() else return
+        try passes.restrict(document, layer, before, selection, on_mask)
 
-    ## As `restrict_to_selection`, against the pixels the preview began from.
+    ## As `restrict_to_selection`, against the pixels (or mask) the preview began from.
     mutating func restrict_preview(layer: u64) -> !:
         let preview = self.preview else return
-        try self.restrict_to_selection(layer, &preview.tiles)
+        try self.restrict_to_selection(layer, &preview.tiles, preview.mask)
 
     # mark: Painting ==============================================================================
 
@@ -1545,7 +1582,7 @@ pub struct Canvas:
         let id = self.records[index].id
         let before = try translate(document, id, dx, dy, on_mask)
         try self.remember(id, before, on_mask, name = "Move")
-        if self.records[index].masked and not on_mask:
+        if self.records[index].masked and self.records[index].mask_linked and not on_mask:
             let mask_before = try translate(document, id, dx, dy, true)
             try self.remember(id, mask_before, true, joined = true, name = "Move")
 
@@ -1574,14 +1611,12 @@ pub struct Canvas:
         try self.require_idle()
         if kind < 0 or kind >= (i64)adjustment_count:
             error(invalid, "no such adjustment")
-        let document = self.document else error(invalid, "draw the document once before adjusting")
-        let adjuster = self.adjuster else error(invalid, "draw the document once before adjusting")
-        let layer = document.find((u64)id) else error(invalid, "no such layer")
-        let tiles = layer.tiles() else error(invalid, "a group cannot be adjusted")
-        let table = try self.curve_table((u32)kind)
-        try self.remember((u64)id, try tiles.clone(), name = adjustment_name(kind))
-        try adjuster.apply(document, (u64)id, (u32)kind, self.adjustment[..<parameter_count], table)
-        try self.restrict_to_selection((u64)id, &self.history[self.history_count - 1].tiles)
+        # Shown and kept at once: the mask when it is being edited, within the selection.
+        try self.begin_preview(id, try self.editing_mask_of(id))
+        self.preview_adjust(kind) catch failure:
+            discard(self.end_preview(false) catch: recover ())
+            error(failure.code, failure.message)
+        try self.end_preview(true)
 
     pub static func adjustment_count() -> i64:
         return (i64)adjustment_count
@@ -1654,9 +1689,10 @@ pub struct Canvas:
             error(invalid, "no such adjustment")
         let table = try self.curve_table((u32)kind)
         let layer = try self.restore_preview()
+        let mask = try self.whiten_previewed_mask()
         let document = self.document else trap("preview without a document")
         let adjuster = self.adjuster else trap("preview without an adjuster")
-        try adjuster.apply(document, layer, (u32)kind, self.adjustment[..<parameter_count], table)
+        try adjuster.apply(document, layer, (u32)kind, self.adjustment[..<parameter_count], table, mask)
         try self.restrict_preview(layer)
 
     ## Show a gradient (as `fill_gradient`) over the layer, or its mask, as it
@@ -1680,9 +1716,10 @@ pub struct Canvas:
     pub mutating func preview_blur(radius: f64) -> !:
         self.preview_name = "Gaussian Blur"
         let layer = try self.restore_preview()
+        let mask = try self.whiten_previewed_mask()
         let document = self.document else trap("preview without a document")
         let filters = self.filters else trap("preview without filters")
-        try filters.gaussian_blur(document, layer, radius)
+        try filters.gaussian_blur(document, layer, radius, mask)
         try self.restrict_preview(layer)
 
     ## Finish the preview: keep what it shows as one undoable edit, or put the
@@ -1700,6 +1737,27 @@ pub struct Canvas:
         else:
             var shown = try document.take_tiles(preview.layer, preview.tiles)
             shown.destroy()
+
+    ## When the preview is of a mask, fill its missing cells (which count as
+    ## white) with white tiles, so an adjustment or filter reaches them too;
+    ## whether it is a mask.
+    mutating func whiten_previewed_mask() -> bool!:
+        let preview = self.preview else return false
+        if not preview.mask:
+            return false
+        let document = self.document else trap("preview without a document")
+        let mask = (document.find(preview.layer) else trap("previewed layer")).mask_tiles() else trap("previewed mask")
+        for row in 0..<mask.rows():
+            for column in 0..<mask.columns():
+                if mask.tile(column, row) != none:
+                    continue
+                var white = try mask.blank()
+                errdefer white.destroy()
+                let frame = try white.frame()
+                defer frame.release()
+                discard(try frame.value().present(gpu.Color(1.0, 1.0, 1.0, 1.0)))
+                try mask.set(column, row, white)
+        return true
 
     ## Put the previewed layer's original pixels back; the layer's id.
     mutating func restore_preview() -> u64!:
@@ -1720,19 +1778,20 @@ pub struct Canvas:
     pub mutating func add_noise(id: i64, amount: f64, monochrome: bool, seed: i64) -> !:
         try self.require_open()
         try self.require_idle()
-        let document = self.document else error(invalid, "draw the document once before filtering")
-        let layer = document.find((u64)id) else error(invalid, "no such layer")
-        let tiles = layer.tiles() else error(invalid, "a group cannot be filtered")
-        try self.remember((u64)id, try tiles.clone(), name = "Add Noise")
-        try filtering.add_noise(document, (u64)id, amount, monochrome, (u64)seed)
-        try self.restrict_to_selection((u64)id, &self.history[self.history_count - 1].tiles)
+        try self.begin_preview(id, try self.editing_mask_of(id))
+        self.preview_noise(amount, monochrome, seed) catch failure:
+            discard(self.end_preview(false) catch: recover ())
+            error(failure.code, failure.message)
+        try self.end_preview(true)
 
     ## Show the noise `add_noise` would make on the layer as it was when the preview began.
     pub mutating func preview_noise(amount: f64, monochrome: bool, seed: i64) -> !:
         self.preview_name = "Add Noise"
         let layer = try self.restore_preview()
+        let mask = try self.whiten_previewed_mask()
         let document = self.document else trap("preview without a document")
-        try filtering.add_noise(document, layer, amount, monochrome, (u64)seed)
+        # A mask's grain is grey: one value for all three channels.
+        try filtering.add_noise(document, layer, amount, monochrome or mask, (u64)seed, mask)
         try self.restrict_preview(layer)
 
     ## Count layer `id`'s visible pixels by their encoded values for
@@ -1813,13 +1872,11 @@ pub struct Canvas:
     pub mutating func blur_layer(id: i64, radius: f64) -> !:
         try self.require_open()
         try self.require_idle()
-        let document = self.document else error(invalid, "draw the document once before filtering")
-        let filters = self.filters else error(invalid, "draw the document once before filtering")
-        let layer = document.find((u64)id) else error(invalid, "no such layer")
-        let tiles = layer.tiles() else error(invalid, "a group cannot be filtered")
-        try self.remember((u64)id, try tiles.clone(), name = "Gaussian Blur")
-        try filters.gaussian_blur(document, (u64)id, radius)
-        try self.restrict_to_selection((u64)id, &self.history[self.history_count - 1].tiles)
+        try self.begin_preview(id, try self.editing_mask_of(id))
+        self.preview_blur(radius) catch failure:
+            discard(self.end_preview(false) catch: recover ())
+            error(failure.code, failure.message)
+        try self.end_preview(true)
 
     # mark: Transforms ============================================================================
 

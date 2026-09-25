@@ -124,6 +124,7 @@ func save_canvas_package(canvas: Canvas*, path: str) -> !:
         try set_integer(manifest.value(), element, "clipped", 1 if record.clipped else 0)
         try set_integer(manifest.value(), element, "mask", 1 if record.masked else 0)
         try set_integer(manifest.value(), element, "mask_enabled", 1 if record.mask_enabled else 0)
+        try set_integer(manifest.value(), element, "mask_linked", 1 if record.mask_linked else 0)
         # A group holds no pixels; its layers name it by its place in the file, from 1.
         try set_integer(manifest.value(), element, "group", 1 if record.group else 0)
         var parent: i64 = 0
@@ -476,6 +477,7 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
             native.records[slot].mask_picture = mask
             native.records[slot].mask_x = get_integer(doc, element, "mask_x") catch _:
                 recover 0
+            native.records[slot].mask_linked = (get_integer(doc, element, "mask_linked") catch _: recover 1) != 0
             native.records[slot].mask_y = get_integer(doc, element, "mask_y") catch _:
                 recover 0
             let enabled = get_integer(doc, element, "mask_enabled") catch _:

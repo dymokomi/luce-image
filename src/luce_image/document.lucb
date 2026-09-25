@@ -234,6 +234,12 @@ pub struct Layer:
         return self.mask
 
     ## The mask as it hides pixels: `none` without one or while it is disabled.
+    ## What an edit works on: the pixels, or with `mask` the mask.
+    pub func edited_tiles(mask: bool) -> Tiles*!:
+        if mask:
+            return self.mask_tiles() else error(invalid, "the layer has no mask")
+        return self.tiles() else error(invalid, "a group has no pixels of its own")
+
     pub func active_mask() -> Tiles*?:
         return self.mask if self.mask_enabled else none
 
@@ -608,11 +614,9 @@ pub struct Document:
     pub mutating func selection_tiles() -> Tiles*?!:
         return try self.selection.gpu_tiles(self.owner)
 
-    ## Give a raster layer an empty mask (revealing everything) or take it away.
+    ## Give a layer or a group an empty mask (revealing everything) or take it away.
     pub mutating func set_mask(id: u64, present: bool) -> !:
         let layer = self.find(id) else error(invalid, "no such layer")
-        if layer.group:
-            error(invalid, "a group cannot have a mask")
         if present and layer.mask == none:
             let tiles = try Tiles.create(self.owner, self.extent_x, self.extent_y)
             layer.mask = try box(tiles)

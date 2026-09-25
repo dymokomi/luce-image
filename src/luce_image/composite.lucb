@@ -155,7 +155,10 @@ pub struct Composer:
                 continue
             let effective = opacity * layer.opacity
             if layer.group:
-                try self.flatten_layers(layer.layers(), effective, column, row, backdrop, owned)
+                if let group_mask = layer.active_mask():
+                    try self.masked_group(layer, group_mask, effective, column, row, backdrop, owned)
+                else:
+                    try self.flatten_layers(layer.layers(), effective, column, row, backdrop, owned)
                 base = none
                 base_missing = false
                 continue
@@ -195,6 +198,18 @@ pub struct Composer:
                     texture = effects.over.texture(column, row)
             let drawn = texture else continue
             try self.pass(backdrop, owned, drawn, mask, clip, area, effective, layer.blend)
+
+    ## A group with a mask: its layers flattened on their own, then laid over
+    ## the backdrop through the mask at the group's opacity.
+    mutating func masked_group(group: const Layer*, mask_tiles: const Tiles*, opacity: f64, column: u32, row: u32, backdrop: gpu.Texture*, owned: bool*) -> !:
+        var inside = self.blank
+        var inside_owned = false
+        defer drop_owned(&inside, inside_owned)
+        try self.flatten_layers(group.layers(), 1.0, column, row, &inside, &inside_owned)
+        if not inside_owned:
+            return
+        let mask = mask_tiles.texture(column, row) else self.white
+        try self.pass(backdrop, owned, inside, mask, self.white, mask_tiles.region(column, row), opacity, 0)
 
     ## One layer (or effects) tile composited over the backdrop so far.
     mutating func pass(backdrop: gpu.Texture*, owned: bool*, texture: gpu.Texture, mask: gpu.Texture, clip: gpu.Texture, area: gpu.Region, opacity: f64, blend: u32) -> !:
@@ -382,6 +397,15 @@ func hash_layers(seed: u64, layers: Layer*[], opacity: f64, first_column: u32, f
             continue
         let effective = opacity * layer.opacity
         if layer.group:
+            if let mask_tiles = layer.active_mask():
+                # Flattened on its own at full opacity, then laid down through its mask.
+                digest = fnv_mix(digest, layer.id)
+                digest = fnv_mix(digest, effective.bits())
+                for row in first_row..<min_u32(first_row + span, mask_tiles.rows()):
+                    for column in first_column..<min_u32(first_column + span, mask_tiles.columns()):
+                        digest = fnv_mix(digest, mask_tiles.stamp(column, row))
+                digest = hash_layers(digest, layer.layers(), 1.0, first_column, first_row, span)
+                continue
             digest = hash_layers(digest, layer.layers(), effective, first_column, first_row, span)
             continue
         if layer.adjustment >= 0:

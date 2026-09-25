@@ -1188,3 +1188,73 @@ test "the blur tool softens without piling up alpha, however many passes":
         after += (f64)pixels[(32 * 64 + x) * 4 + 3]
     # Coverage spreads but its total does not grow much, and the middle thins.
     assert(after < before * 1.3 and pixels[(32 * 64 + 32) * 4 + 3] < 0.99)
+
+test "masks: unlinked they stay when the layer moves, copy to another layer, and invert through a preview":
+    var canvas = try Canvas(64, 32)
+    defer canvas.close()
+    let first = try canvas.add_layer("First")
+    let second = try canvas.add_layer("Second")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    let document = canvas.document else trap("bound")
+    try canvas.set_brush(1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.fill(first, false)
+    # A mask hiding the left half.
+    try canvas.select_rectangle(0, 0, 32, 32)
+    try canvas.set_mask(first, true, 2)
+    try canvas.deselect()
+    let first_index = (i64)(try canvas.index((u64)first))
+    let second_index = (i64)(try canvas.index((u64)second))
+    assert(try canvas.layer_mask_linked(first_index))
+    # Unlinked, a move leaves the mask where it was.
+    try canvas.link_mask(first, false)
+    try canvas.move_layer(first, 8, 0)
+    let mask = (document.find((u64)first) else trap("layer")).mask_tiles() else trap("mask")
+    let pixels = try alloc f32[(usize)64 * 32 * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    try mask.read(pixels)
+    assert(pixels[(10 * 64 + 31) * 4] > 0.9 and pixels[(10 * 64 + 33) * 4] < 0.1)
+    try canvas.undo()
+    try canvas.undo()
+    assert(try canvas.layer_mask_linked(first_index))
+    # Copied to the second layer.
+    try canvas.copy_mask(first, second)
+    assert(try canvas.layer_masked(second_index))
+    let copied = (document.find((u64)second) else trap("layer")).mask_tiles() else trap("copied mask")
+    try copied.read(pixels)
+    assert(pixels[(10 * 64 + 5) * 4] > 0.9 and pixels[(10 * 64 + 60) * 4] < 0.1)
+    # Inverted through a preview of the mask; dropped, it is as it was.
+    try canvas.begin_preview(second, true)
+    try canvas.preview_adjust(2)
+    let shown = (document.find((u64)second) else trap("layer")).mask_tiles() else trap("mask")
+    try shown.read(pixels)
+    assert(pixels[(10 * 64 + 5) * 4] < 0.1 and pixels[(10 * 64 + 60) * 4] > 0.9)
+    try canvas.end_preview(false)
+    let kept = (document.find((u64)second) else trap("layer")).mask_tiles() else trap("mask")
+    try kept.read(pixels)
+    assert(pixels[(10 * 64 + 5) * 4] > 0.9)
+
+test "a group's mask hides what the group holds, the group flattened on its own":
+    var canvas = try Canvas(64, 32)
+    defer canvas.close()
+    let group = try canvas.add_group("Group")
+    let layer = try canvas.add_layer("Red")
+    try canvas.move_into(layer, group, 0)
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    let document = canvas.document else trap("bound")
+    try canvas.set_brush(1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.fill(layer, false)
+    # The group's mask reveals only the right half.
+    try canvas.select_rectangle(32, 0, 32, 32)
+    try canvas.set_mask(group, true, 2)
+    try canvas.deselect()
+    var composer = canvas.composer else trap("bound")
+    let flat = try composer.tile(document, 0, 0, 0)
+    var bytes: u8[8]
+    try flat.read(bytes, gpu.Region(10, 10, 1, 1))
+    assert(from_half((u16)bytes[6] | ((u16)bytes[7] << 8)) < 0.01)
+    try flat.read(bytes, gpu.Region(50, 10, 1, 1))
+    assert(from_half((u16)bytes[6] | ((u16)bytes[7] << 8)) > 0.99)

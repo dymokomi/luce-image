@@ -68,9 +68,9 @@ pub struct SelectionPasses:
 
     ## Keep the edit just made to `layer` only where `selection` covers it: each
     ## tile becomes `before` and the edited pixels mixed by coverage.
-    pub func restrict(document: Document*, layer: u64, before: const Tiles*, selection: const Tiles*) -> !:
+    pub func restrict(document: Document*, layer: u64, before: const Tiles*, selection: const Tiles*, on_mask: bool = false) -> !:
         let target = document.find(layer) else error(invalid, "no such layer")
-        let tiles = target.tiles() else error(invalid, "a group has no pixels to restrict")
+        let tiles = try target.edited_tiles(on_mask)
         var blank = try tiles.blank()
         defer blank.destroy()
         var no_uniforms: u8[]

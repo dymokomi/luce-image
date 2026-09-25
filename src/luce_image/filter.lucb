@@ -33,11 +33,11 @@ pub struct Filters:
 
     ## Blur `layer` with a Gaussian of `radius` pixels (0.5..250; taps reach
     ## three sigma, at most one tile).
-    pub func gaussian_blur(document: Document*, layer: u64, radius: f64) -> !:
+    pub func gaussian_blur(document: Document*, layer: u64, radius: f64, on_mask: bool = false) -> !:
         if not math.is_finite(radius) or radius < 0.5 or radius > 250.0:
             error(invalid, "blur radius must be 0.5..250 pixels")
         let target = document.find(layer) else error(invalid, "no such layer")
-        let tiles = target.tiles() else error(invalid, "a group cannot be blurred")
+        let tiles = try target.edited_tiles(on_mask)
         let sigma = radius
         let taps = math.min(255.0, math.ceil(sigma * 3.0))
         try self.pass(tiles, taps, sigma, true)
@@ -125,11 +125,11 @@ test "a gaussian blur spreads across tile edges and keeps alpha weight":
 ## a deviation of `amount` (0..1 of full scale), the same in every channel when
 ## `monochrome`; where the layer is transparent nothing changes. The same
 ## `seed` makes the same grain, so a preview holds still while it is tuned.
-pub func add_noise(document: Document*, layer: u64, amount: f64, monochrome: bool, seed: u64) -> !:
+pub func add_noise(document: Document*, layer: u64, amount: f64, monochrome: bool, seed: u64, on_mask: bool = false) -> !:
     if not math.is_finite(amount) or amount < 0.0 or amount > 1.0:
         error(invalid, "noise amount must be in 0..1")
     let target = document.find(layer) else error(invalid, "no such layer")
-    let tiles = target.tiles() else error(invalid, "a group has no pixels to add noise to")
+    let tiles = try target.edited_tiles(on_mask)
     let count = (usize)tiles.width() * (usize)tiles.height()
     let pixels = try alloc f32[count * 4] in memory.heap
     defer free(pixels) in memory.heap

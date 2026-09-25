@@ -68,8 +68,9 @@ func add_to_session(canvas: Canvas*, document: Document*, session: TransformSess
     let tiles = layer.tiles() else error(invalid, "a group has no pixels to transform")
     var entry = Transformed(id = id, pixels = try tiles.clone(), mask = Tiles(), masked = false)
     errdefer entry.pixels.destroy()
-    # A linked mask goes with the pixels; while editing a mask, the mask alone moves.
-    if canvas.records[index].masked and not session.floating:
+    # A linked mask goes with the pixels; while editing a mask, the mask alone
+    # moves; an unlinked mask stays unless it is the one being edited.
+    if canvas.records[index].masked and not session.floating and (canvas.records[index].mask_linked or canvas.mask_editing):
         if let mask = layer.mask_tiles():
             entry.mask = try mask.clone()
             entry.masked = true
