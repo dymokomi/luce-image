@@ -1803,23 +1803,23 @@ pub struct Canvas:
     ## Filter › Noise › Add Noise, made once: Gaussian grain of deviation
     ## `amount` (0..1), alike in every channel when `monochrome`; the same
     ## `seed` makes the same grain. Undoable.
-    pub mutating func add_noise(id: i64, amount: f64, monochrome: bool, seed: i64) -> !:
+    pub mutating func add_noise(id: i64, amount: f64, monochrome: bool, seed: i64, uniform: bool = false) -> !:
         try self.require_open()
         try self.require_idle()
         try self.begin_preview(id, try self.editing_mask_of(id))
-        self.preview_noise(amount, monochrome, seed) catch failure:
+        self.preview_noise(amount, monochrome, seed, uniform) catch failure:
             discard(self.end_preview(false) catch: recover ())
             error(failure.code, failure.message)
         try self.end_preview(true)
 
     ## Show the noise `add_noise` would make on the layer as it was when the preview began.
-    pub mutating func preview_noise(amount: f64, monochrome: bool, seed: i64) -> !:
+    pub mutating func preview_noise(amount: f64, monochrome: bool, seed: i64, uniform: bool = false) -> !:
         self.preview_name = "Add Noise"
         let layer = try self.restore_preview()
         let mask = try self.whiten_previewed_mask()
         let document = self.document else trap("preview without a document")
         # A mask's grain is grey: one value for all three channels.
-        try filtering.add_noise(document, layer, amount, monochrome or mask, (u64)seed, mask)
+        try filtering.add_noise(document, layer, amount, monochrome or mask, (u64)seed, mask, uniform)
         try self.restrict_preview(layer)
 
     ## Count layer `id`'s visible pixels by their encoded values for

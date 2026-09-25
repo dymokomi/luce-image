@@ -125,7 +125,9 @@ test "a gaussian blur spreads across tile edges and keeps alpha weight":
 ## a deviation of `amount` (0..1 of full scale), the same in every channel when
 ## `monochrome`; where the layer is transparent nothing changes. The same
 ## `seed` makes the same grain, so a preview holds still while it is tuned.
-pub func add_noise(document: Document*, layer: u64, amount: f64, monochrome: bool, seed: u64, on_mask: bool = false) -> !:
+## `uniform`: grain evenly spread over ±`amount`, as Photoshop's Uniform;
+## otherwise Gaussian with deviation `amount`.
+pub func add_noise(document: Document*, layer: u64, amount: f64, monochrome: bool, seed: u64, on_mask: bool = false, uniform: bool = false) -> !:
     if not math.is_finite(amount) or amount < 0.0 or amount > 1.0:
         error(invalid, "noise amount must be in 0..1")
     let target = document.find(layer) else error(invalid, "no such layer")
@@ -137,13 +139,19 @@ pub func add_noise(document: Document*, layer: u64, amount: f64, monochrome: boo
     for at in 0..<count:
         if pixels[at * 4 + 3] <= 0.0:
             continue
-        let shared = gaussian(seed, (u64)at, 0) * amount
+        let shared = grain(seed, (u64)at, 0, uniform) * amount
         for channel in 0..<(usize)3:
-            let offset = shared if monochrome else gaussian(seed, (u64)at, (u64)channel + 1) * amount
+            let offset = shared if monochrome else grain(seed, (u64)at, (u64)channel + 1, uniform) * amount
             let encoded = math.clamp(encode((f64)pixels[at * 4 + channel]) + offset, 0.0, 1.0)
             pixels[at * 4 + channel] = (f32)decode(encoded)
     try tiles.write(pixels)
     target.revision += 1
+
+## One grain sample: uniform in -1..1, or a standard normal one.
+func grain(seed: u64, at: u64, stream: u64, uniform: bool) -> f64:
+    if uniform:
+        return (f64)(mix_bits(seed, at, stream * 2) >> 11) / 9007199254740992.0 * 2.0 - 1.0
+    return gaussian(seed, at, stream)
 
 ## A standard normal sample for pixel `at` in stream `stream`: Box-Muller over two hashed uniforms.
 func gaussian(seed: u64, at: u64, stream: u64) -> f64:
