@@ -1479,3 +1479,31 @@ test "the clone preview shows the source under the brush, cut to a circle":
     # The middle is the red source; a corner is outside the circle.
     let middle = (10 * 21 + 10) * 4
     assert(preview[middle] == 255 and preview[middle + 1] == 0 and preview[middle + 3] == 255 and preview[3] == 0)
+
+test "dodge lightens and burn darkens where they are brushed, each one step":
+    var canvas = try Canvas(64, 32)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Grey")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.2140, 0.2140, 0.2140, false)
+    try canvas.fill(layer, false)
+    let document = canvas.document else trap("bound")
+    let pixels = try alloc f32[64 * 32 * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    try canvas.set_brush(12.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, false)
+    try canvas.set_tone(1, 0.8)
+    try canvas.set_retouch(6)
+    try canvas.begin_stroke(layer, 16.0, 16.0)
+    try canvas.end_stroke()
+    assert(canvas.undo_name() == "Dodge")
+    try canvas.set_retouch(7)
+    try canvas.begin_stroke(layer, 48.0, 16.0)
+    try canvas.end_stroke()
+    assert(canvas.undo_name() == "Burn")
+    try ((document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")).read(pixels)
+    let dodged = pixels[(16 * 64 + 16) * 4]
+    let burned = pixels[(16 * 64 + 48) * 4]
+    let untouched = pixels[(2 * 64 + 32) * 4]
+    assert(dodged > untouched + 0.05 and burned < untouched - 0.05 and math.abs((f64)untouched - 0.2140) < 0.01)

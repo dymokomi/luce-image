@@ -45,7 +45,7 @@ from luce_image.warp import WarpStroke, warp_smudge, warp_push
 from luce_image.document import Style, Document, Layer, TreeState, release_snapshot, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
 from luce_image.composite import Composer, box_composer, unbox_composer
 from luce_image.brush import Brush, Painter, Stroke, begin_boxed, finish_boxed, fill_selection, fill_gradient
-from luce_image.adjust import Adjuster, adjustment_count, parameter_count, curves
+from luce_image.adjust import Adjuster, adjustment_count, parameter_count, curves, levels
 from luce_image.curves import Curves, lut_size
 from luce_image.filter import Filters
 import luce_image.filter as filtering
@@ -159,6 +159,9 @@ pub struct Canvas:
     var clone_offset_set: bool
     var clone_aligned: bool
     var clone_all: bool
+    ## Dodge and Burn's range and exposure (`set_tone`).
+    var tone_range: i64
+    var tone_exposure: f64
     ## The last Clone Stamp preview's bytes (`clone_preview`), kept for reuse.
     var preview_bytes: u8[]
     var warp: WarpStroke*?
@@ -243,6 +246,8 @@ pub struct Canvas:
         self.clone_offset_set = false
         self.clone_aligned = true
         self.clone_all = false
+        self.tone_range = 1
+        self.tone_exposure = 0.5
         var no_bytes: u8[]
         self.preview_bytes = no_bytes
         self.warp = none
@@ -1505,9 +1510,17 @@ pub struct Canvas:
     ## healing, 3 blur, 4 smudge, 5 push (Liquify's forward warp). Retouching
     ## takes the brush's diameter, hardness and opacity (strength).
     pub mutating func set_retouch(kind: i64) -> !:
-        if kind < retouch_paint or kind > retouch_push:
-            error(invalid, "retouching tools are 0 paint, 1 clone, 2 heal, 3 blur, 4 smudge, 5 push")
+        if kind < retouch_paint or kind > retouch_burn:
+            error(invalid, "retouching tools are 0 paint, 1 clone, 2 heal, 3 blur, 4 smudge, 5 push, 6 dodge, 7 burn")
         self.retouch = kind
+
+    ## Dodge and Burn's range (0 shadows, 1 midtones, 2 highlights) and
+    ## exposure (0..1), as their header's.
+    pub mutating func set_tone(range: i64, exposure: f64) -> !:
+        if range < 0 or range > 2 or not math.is_finite(exposure):
+            error(invalid, "a tone range is 0..2 and its exposure finite")
+        self.tone_range = range
+        self.tone_exposure = math.clamp(exposure, 0.0, 1.0)
 
     ## Where the clone stamp copies from (Alt-click): a new source starts a new alignment.
     pub mutating func set_clone_source(x: f64, y: f64):
