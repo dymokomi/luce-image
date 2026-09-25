@@ -29,6 +29,7 @@ import c as c_api
 import clipboard
 import files
 import jpeg
+import raw
 import gpu
 import interop
 import math
@@ -61,7 +62,7 @@ import fonts
 from luce_image.geometry import resize_canvas, resize_image
 from luce_image.selection import Selection, Mode
 from luce_image.shaders import ants_frag_words, ants_frag_msl
-from half import from_half
+from half import from_half, to_half
 from binary import Buffer
 from raster_errors import invalid, limit
 
@@ -690,12 +691,18 @@ pub struct Canvas:
         let device = self.device else error(invalid, "the document is not bound to a device")
         let width = try picture.value().width()
         let height = try picture.value().height()
-        let pixels = try alloc f32[width * height * 4] in memory.heap
-        defer free(pixels) in memory.heap
-        try picture.value().linear_rgba(pixels)
-        var whole = try Tiles.create(device, (u32)width, (u32)height)
+        var whole = Tiles()
+        if picture.value().is_camera_raw() and not picture.value().is_loaded():
+            # A raw develops a tile at a time straight into the grid.
+            whole = try raw_tiles(device, picture)
+        else:
+            let pixels = try alloc f32[width * height * 4] in memory.heap
+            defer free(pixels) in memory.heap
+            try picture.value().linear_rgba(pixels)
+            whole = try Tiles.create(device, (u32)width, (u32)height)
+            errdefer whole.destroy()
+            try whole.write(pixels)
         errdefer whole.destroy()
-        try whole.write(pixels)
         if x == 0 and y == 0 and width == (usize)self.extent_x and height == (usize)self.extent_y:
             return whole
         defer whole.destroy()

@@ -8,6 +8,7 @@ transforming.lucb
 type_layers.lucb
 shape_layers.lucb
 ranging.lucb
+raw_tiles.lucb
 history.lucb
 support.lucb
 tests.lucb

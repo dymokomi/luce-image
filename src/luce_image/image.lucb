@@ -220,6 +220,19 @@ pub struct Image:
             return "RGBA" if kind == .uint8 else "RGBAF" if kind == .float32 else "MULTI"
         return "MULTI"
 
+    ## Whether the file is a camera raw luce-raw develops (so its pixels can come
+    ## straight from `raw.develop`, a tile at a time).
+    pub func is_camera_raw() -> bool:
+        return not self.closed and is_raw_format(self.raster.file_format)
+
+    ## The file's bytes as read, for decoders working from them directly.
+    pub func encoded_bytes() -> const u8[]:
+        return self.raster.encoded
+
+    ## How many threads decoding uses.
+    pub func thread_count() -> usize:
+        return self.threads
+
     ## Whether the pixels are decoded; most reads decode them on first use.
     pub func is_loaded() -> bool:
         return not self.closed and self.raster.pixels.length > 0

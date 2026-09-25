@@ -1,0 +1,67 @@
+#==============================================================================================
+#
+#   canvas/raw_tiles - A camera raw developed straight into the canvas's tiles
+#
+#   DESCRIPTION:
+#       luce-raw develops a raw a 256-pixel tile at a time, on its own threads, on the
+#       canvas's own grid. Each tile it hands over becomes half floats in a staging slot there
+#       and then; the main thread uploads the slots once the develop is done (the GPU is the
+#       main thread's). No image of the whole picture is ever made in 64-bit or 32-bit floats,
+#       which is what made opening a raw cost several times its develop.
+#
+#==============================================================================================
+
+## Where the develop's tiles land: one staging slot of half floats a cell.
+struct RawStaging:
+    var columns: usize
+    var slots: u8[]
+    var painted: bool[]
+
+## `develop`'s sink, on a worker thread: tile `tile` into its cell's slot.
+func stage_raw_tile(context: void*?, tile: const raw.Tile*) -> !:
+    let staging = (RawStaging*)(context else error(invalid, "a raw develop lost its staging"))
+    if tile.channels != 4 or tile.x % (usize)tile_size != 0 or tile.y % (usize)tile_size != 0:
+        error(invalid, "a raw develop's tiles must be RGBA on the canvas grid")
+    let cell = (tile.y // (usize)tile_size) * staging.columns + tile.x // (usize)tile_size
+    let per_tile = (usize)tile_size * (usize)tile_size * 8
+    let bytes = staging.slots[cell * per_tile..<(cell + 1) * per_tile]
+    for index in 0..<bytes.length:
+        bytes[index] = 0
+    for y in 0..<tile.height:
+        for x in 0..<tile.width:
+            let source = (y * tile.width + x) * 4
+            let destination = (y * (usize)tile_size + x) * 8
+            for channel in 0..<(usize)4:
+                let half = to_half(tile.pixels[source + channel])
+                bytes[destination + channel * 2] = (u8)(half & 0xff)
+                bytes[destination + channel * 2 + 1] = (u8)(half >> 8)
+    staging.painted[cell] = true
+
+## `picture` (a camera raw not yet decoded) developed into tiles on `device`.
+func raw_tiles(device: gpu.Device, picture: interop.Reference[Image]) -> Tiles!:
+    let width = try picture.value().width()
+    let height = try picture.value().height()
+    var tiles = try Tiles.create(device, (u32)width, (u32)height)
+    errdefer tiles.destroy()
+    let columns = (usize)tiles.columns()
+    let cells = columns * (usize)tiles.rows()
+    let per_tile = (usize)tile_size * (usize)tile_size * 8
+    let slots = try alloc u8[cells * per_tile] in memory.heap
+    defer free(slots) in memory.heap
+    let painted = try alloc bool[cells] in memory.heap
+    defer free(painted) in memory.heap
+    for index in 0..<cells:
+        painted[index] = false
+    var staging = RawStaging(columns = columns, slots = slots, painted = painted)
+    try raw.develop(picture.value().encoded_bytes(), raw.Options(alpha = true, tile = (usize)tile_size, threads = 0),
+                    (void*)&staging, stage_raw_tile)
+    for row in 0..<tiles.rows():
+        for column in 0..<tiles.columns():
+            let cell = (usize)row * columns + (usize)column
+            if not painted[cell]:
+                continue
+            var texture = try gpu.Texture.create(device, tile_size, tile_size, gpu.Format.rgba16_float)
+            errdefer texture.destroy()
+            try texture.upload(slots[cell * per_tile..<(cell + 1) * per_tile])
+            try tiles.set(column, row, texture)
+    return tiles
