@@ -1,0 +1,368 @@
+## Select Subject and Object Selection without a trained model: inside a box
+## the subject is told from the background by color, GrabCut's idea without
+## its graph cut. The colors past the box (or its edge, for the whole picture)
+## are the background's; the middle of the box starts as the subject's; each
+## side becomes a few color clusters, every pixel leans to the side whose
+## cluster is nearer (nudged toward the box's middle), and the clusters are
+## learnt again from that lean, three times over. The lean is smoothed, the
+## largest connected piece kept with its holes filled, and the edge softened.
+## On the CPU at most 512 pixels a side, then scaled back up.
+import math
+import memory
+from raster_errors import invalid
+
+let clusters: usize = 6
+let work_size: f64 = 512.0
+
+## A work-size copy of the picture: encoded colors, and whether a pixel is opaque enough to count.
+struct Work:
+    var width: i64
+    var height: i64
+    var colors: f64[]
+    var solid: u8[]
+    var lean: f64[]
+
+    mutating func destroy():
+        free(self.colors) in memory.heap
+        free(self.solid) in memory.heap
+        free(self.lean) in memory.heap
+
+## The subject within box (`left`, `top`, `box_width`, `box_height`) of
+## `pixels` (straight RGBA in linear light, `width` × `height`) as coverage
+## 0..255 in `coverage` (one byte a pixel, zero outside the box). A box of no
+## size means the whole picture, the subject whatever stands out from its
+## edge. False when nothing stood out.
+pub func find_subject(pixels: const f32[], width: usize, height: usize, left: i64, top: i64, box_width: i64, box_height: i64, coverage: u8[]) -> bool!:
+    if pixels.length != width * height * 4 or coverage.length != width * height:
+        error(invalid, "a subject needs RGBA pixels and a coverage byte each")
+    var x0 = left
+    var y0 = top
+    var x1 = left + box_width
+    var y1 = top + box_height
+    if box_width <= 0 or box_height <= 0:
+        # The whole picture: the background is what lies along its edge.
+        let inset = math.max(2.0, math.floor(math.min((f64)width, (f64)height) * 0.04))
+        x0 = (i64)inset
+        y0 = (i64)inset
+        x1 = (i64)width - (i64)inset
+        y1 = (i64)height - (i64)inset
+    x0 = clamp_i64(x0, 0, (i64)width)
+    y0 = clamp_i64(y0, 0, (i64)height)
+    x1 = clamp_i64(x1, 0, (i64)width)
+    y1 = clamp_i64(y1, 0, (i64)height)
+    for index in 0..<coverage.length:
+        coverage[index] = 0
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return false
+    let scale = math.min(1.0, work_size / math.max((f64)width, (f64)height))
+    var work = try shrunk(pixels, width, height, scale)
+    defer work.destroy()
+    let bx0 = (i64)math.floor((f64)x0 * scale)
+    let by0 = (i64)math.floor((f64)y0 * scale)
+    let bx1 = math.min((f64)work.width, math.ceil((f64)x1 * scale))
+    let by1 = math.min((f64)work.height, math.ceil((f64)y1 * scale))
+    try lean_apart(&work, bx0, by0, (i64)bx1, (i64)by1)
+    smooth(&work)
+    smooth(&work)
+    if not (try keep_largest(&work, bx0, by0, (i64)bx1, (i64)by1)):
+        return false
+    smooth(&work)
+    # Back to full size, the smoothed lean read between work pixels and made a soft edge.
+    for y in (usize)y0..<(usize)y1:
+        for x in (usize)x0..<(usize)x1:
+            let value = sample(&work, ((f64)x + 0.5) * scale - 0.5, ((f64)y + 0.5) * scale - 0.5)
+            coverage[y * width + x] = (u8)(math.clamp((value - 0.35) / 0.3, 0.0, 1.0) * 255.0 + 0.5)
+    return true
+
+## The picture at `scale`, box-averaged.
+func shrunk(pixels: const f32[], width: usize, height: usize, scale: f64) -> Work!:
+    let small_width = math.max(1.0, math.floor((f64)width * scale))
+    let small_height = math.max(1.0, math.floor((f64)height * scale))
+    let w = (i64)small_width
+    let h = (i64)small_height
+    let count = (usize)(w * h)
+    let colors = try alloc f64[count * 3] in memory.heap
+    errdefer free(colors) in memory.heap
+    let solid = try alloc u8[count] in memory.heap
+    errdefer free(solid) in memory.heap
+    let lean = try alloc f64[count] in memory.heap
+    for y in 0..<h:
+        for x in 0..<w:
+            let sx0 = (usize)((f64)x / scale)
+            let sy0 = (usize)((f64)y / scale)
+            let sx1 = math.min((f64)width, math.max((f64)sx0 + 1.0, math.floor((f64)(x + 1) / scale)))
+            let sy1 = math.min((f64)height, math.max((f64)sy0 + 1.0, math.floor((f64)(y + 1) / scale)))
+            var sum: f64[4] = [0.0, 0.0, 0.0, 0.0]
+            var n = 0.0
+            for sy in sy0..<(usize)sy1:
+                for sx in sx0..<(usize)sx1:
+                    let at = (sy * width + sx) * 4
+                    for channel in 0..<(usize)4:
+                        sum[channel] += (f64)pixels[at + channel]
+                    n += 1.0
+            let index = (usize)(y * w + x)
+            for channel in 0..<(usize)3:
+                colors[index * 3 + channel] = encode(sum[channel] / n)
+            solid[index] = 1 if sum[3] / n >= 0.5 else 0
+            lean[index] = 0.0
+    return Work(width = w, height = h, colors = colors, solid = solid, lean = lean)
+
+## Each pixel in the box leaning to the subject (1) or the background (0).
+func lean_apart(work: Work*, x0: i64, y0: i64, x1: i64, y1: i64) -> !:
+    var subject: f64[18]
+    var background: f64[18]
+    # Start: the background from outside the box, the subject from its middle half.
+    try learn(work, &background, x0, y0, x1, y1, 0)
+    try learn(work, &subject, x0, y0, x1, y1, 1)
+    var round = 0
+    while round < 3:
+        for y in y0..<y1:
+            for x in x0..<x1:
+                let index = (usize)(y * work.width + x)
+                if work.solid[index] == 0:
+                    work.lean[index] = 0.0
+                    continue
+                let to_subject = nearest(&subject, work.colors, index)
+                let to_background = nearest(&background, work.colors, index)
+                var lean = to_background / math.max(to_subject + to_background, 1e-9)
+                # Nearer the middle, likelier the subject.
+                let dx = ((f64)x - (f64)(x0 + x1) * 0.5) / math.max(1.0, (f64)(x1 - x0) * 0.5)
+                let dy = ((f64)y - (f64)(y0 + y1) * 0.5) / math.max(1.0, (f64)(y1 - y0) * 0.5)
+                let prior = math.clamp(1.0 - math.sqrt(dx * dx + dy * dy), 0.0, 1.0)
+                lean = lean * 0.8 + prior * 0.2
+                work.lean[index] = lean
+        try learn(work, &background, x0, y0, x1, y1, 2)
+        try learn(work, &subject, x0, y0, x1, y1, 3)
+        round += 1
+
+## Cluster centres (k-means, a few steps) for one side, from: 0 outside the
+## box; 1 the box's middle half; 2 outside plus inside leaning away; 3 inside leaning in.
+func learn(work: Work*, centres: f64[18]*, x0: i64, y0: i64, x1: i64, y1: i64, source: i64) -> !:
+    let count = (usize)(work.width * work.height)
+    let chosen = try alloc u32[count] in memory.heap
+    defer free(chosen) in memory.heap
+    var used: usize = 0
+    let mx0 = x0 + (x1 - x0) // 4
+    let mx1 = x1 - (x1 - x0) // 4
+    let my0 = y0 + (y1 - y0) // 4
+    let my1 = y1 - (y1 - y0) // 4
+    for y in 0..<work.height:
+        for x in 0..<work.width:
+            let index = (usize)(y * work.width + x)
+            if work.solid[index] == 0:
+                continue
+            let inside = x >= x0 and x < x1 and y >= y0 and y < y1
+            var take = false
+            if source == 0:
+                take = not inside
+            elif source == 1:
+                take = x >= mx0 and x < mx1 and y >= my0 and y < my1
+            elif source == 2:
+                take = not inside or work.lean[index] < 0.5
+            else:
+                take = inside and work.lean[index] >= 0.5
+            if take:
+                chosen[used] = (u32)index
+                used += 1
+    if used == 0:
+        # Nothing to learn from: a centre no color is near, so this side never wins.
+        for index in 0..<(usize)18:
+            (*centres)[index] = 1.0e6
+        return
+    # Spread the first centres over the chosen pixels, then a few k-means steps.
+    for k in 0..<clusters:
+        let pick = (usize)chosen[(k * used) // clusters]
+        for channel in 0..<(usize)3:
+            (*centres)[k * 3 + channel] = work.colors[pick * 3 + channel]
+    for step in 0..<(usize)4:
+        var sums: f64[18]
+        var counts: f64[6]
+        for k in 0..<clusters:
+            counts[k] = 0.0
+            for channel in 0..<(usize)3:
+                sums[k * 3 + channel] = 0.0
+        for at in 0..<used:
+            let index = (usize)chosen[at]
+            let k = nearest_index(centres, work.colors, index)
+            counts[k] += 1.0
+            for channel in 0..<(usize)3:
+                sums[k * 3 + channel] += work.colors[index * 3 + channel]
+        for k in 0..<clusters:
+            if counts[k] > 0.0:
+                for channel in 0..<(usize)3:
+                    (*centres)[k * 3 + channel] = sums[k * 3 + channel] / counts[k]
+
+func nearest_index(centres: const f64[18]*, colors: const f64[], index: usize) -> usize:
+    var best: usize = 0
+    var best_distance = 1.0e30
+    for k in 0..<clusters:
+        var d = 0.0
+        for channel in 0..<(usize)3:
+            let difference = colors[index * 3 + channel] - (*centres)[k * 3 + channel]
+            d += difference * difference
+        if d < best_distance:
+            best_distance = d
+            best = k
+    return best
+
+## How far the pixel's color is from the side's nearest cluster.
+func nearest(centres: const f64[18]*, colors: const f64[], index: usize) -> f64:
+    let k = nearest_index(centres, colors, index)
+    var d = 0.0
+    for channel in 0..<(usize)3:
+        let difference = colors[index * 3 + channel] - (*centres)[k * 3 + channel]
+        d += difference * difference
+    return math.sqrt(d)
+
+## A 3×3 average of the lean.
+func smooth(work: Work*):
+    let count = (usize)(work.width * work.height)
+    let copy = try alloc f64[count] in memory.heap catch _:
+        return
+    defer free(copy) in memory.heap
+    memory.copy(copy, work.lean, count)
+    for y in 0..<work.height:
+        for x in 0..<work.width:
+            var sum = 0.0
+            var n = 0.0
+            for dy in -1..<(i64)2:
+                for dx in -1..<(i64)2:
+                    let nx = x + dx
+                    let ny = y + dy
+                    if nx >= 0 and ny >= 0 and nx < work.width and ny < work.height:
+                        sum += copy[(usize)(ny * work.width + nx)]
+                        n += 1.0
+            work.lean[(usize)(y * work.width + x)] = sum / n
+
+## Only the largest connected piece leaning in, with its holes filled, as 1;
+## everything else 0. False when no piece leans in.
+func keep_largest(work: Work*, x0: i64, y0: i64, x1: i64, y1: i64) -> bool!:
+    let count = (usize)(work.width * work.height)
+    let label = try alloc i32[count] in memory.heap
+    defer free(label) in memory.heap
+    let stack = try alloc u32[count] in memory.heap
+    defer free(stack) in memory.heap
+    for index in 0..<count:
+        let x = (i64)index % work.width
+        let y = (i64)index // work.width
+        let inside = x >= x0 and x < x1 and y >= y0 and y < y1
+        label[index] = 0 if inside and work.lean[index] >= 0.5 else -1
+    var best_label: i32 = 0
+    var best_size: usize = 0
+    var next: i32 = 1
+    for start in 0..<count:
+        if label[start] != 0:
+            continue
+        var size: usize = 0
+        var top: usize = 1
+        stack[0] = (u32)start
+        label[start] = next
+        while top > 0:
+            top -= 1
+            let at = (usize)stack[top]
+            size += 1
+            let x = (i64)at % work.width
+            let y = (i64)at // work.width
+            for dy in -1..<(i64)2:
+                for dx in -1..<(i64)2:
+                    let nx = x + dx
+                    let ny = y + dy
+                    if nx < 0 or ny < 0 or nx >= work.width or ny >= work.height:
+                        continue
+                    let neighbour = (usize)(ny * work.width + nx)
+                    if label[neighbour] == 0:
+                        label[neighbour] = next
+                        stack[top] = (u32)neighbour
+                        top += 1
+        if size > best_size:
+            best_size = size
+            best_label = next
+        next += 1
+    if best_size == 0:
+        return false
+    # Holes: what the outside cannot reach without crossing the piece.
+    let reached = try alloc u8[count] in memory.heap
+    defer free(reached) in memory.heap
+    var top: usize = 0
+    for index in 0..<count:
+        reached[index] = 0
+        let x = (i64)index % work.width
+        let y = (i64)index // work.width
+        if (x == 0 or y == 0 or x == work.width - 1 or y == work.height - 1) and label[index] != best_label:
+            reached[index] = 1
+            stack[top] = (u32)index
+            top += 1
+    while top > 0:
+        top -= 1
+        let at = (usize)stack[top]
+        let x = (i64)at % work.width
+        let y = (i64)at // work.width
+        for dy in -1..<(i64)2:
+            for dx in -1..<(i64)2:
+                if (dx == 0) == (dy == 0):
+                    continue
+                let nx = x + dx
+                let ny = y + dy
+                if nx < 0 or ny < 0 or nx >= work.width or ny >= work.height:
+                    continue
+                let neighbour = (usize)(ny * work.width + nx)
+                if reached[neighbour] == 0 and label[neighbour] != best_label:
+                    reached[neighbour] = 1
+                    stack[top] = (u32)neighbour
+                    top += 1
+    for index in 0..<count:
+        let x = (i64)index % work.width
+        let y = (i64)index // work.width
+        let inside = x >= x0 and x < x1 and y >= y0 and y < y1
+        work.lean[index] = 1.0 if inside and reached[index] == 0 else 0.0
+    return true
+
+## The lean between work pixels, clamped to the edges.
+func sample(work: const Work*, x: f64, y: f64) -> f64:
+    let fx = math.clamp(x, 0.0, (f64)(work.width - 1))
+    let fy = math.clamp(y, 0.0, (f64)(work.height - 1))
+    let ix = (i64)math.floor(fx)
+    let iy = (i64)math.floor(fy)
+    let jx = math.min((f64)(ix + 1), (f64)(work.width - 1))
+    let jy = math.min((f64)(iy + 1), (f64)(work.height - 1))
+    let tx = fx - (f64)ix
+    let ty = fy - (f64)iy
+    let a = work.lean[(usize)(iy * work.width + ix)]
+    let b = work.lean[(usize)(iy * work.width + (i64)jx)]
+    let c = work.lean[(usize)((i64)jy * work.width + ix)]
+    let d = work.lean[(usize)((i64)jy * work.width + (i64)jx)]
+    return (a * (1.0 - tx) + b * tx) * (1.0 - ty) + (c * (1.0 - tx) + d * tx) * ty
+
+func clamp_i64(value: i64, low: i64, high: i64) -> i64:
+    return low if value < low else (high if value > high else value)
+
+func encode(linear: f64) -> f64:
+    let v = math.clamp(linear, 0.0, 1.0)
+    return v * 12.92 if v <= 0.0031308 else 1.055 * math.pow(v, 1.0 / 2.4) - 0.055
+
+test "a red disc on a blue ground is found whole, in a box or in the whole picture":
+    let width: usize = 120
+    let height: usize = 90
+    let pixels = try alloc f32[width * height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    let coverage = try alloc u8[width * height] in memory.heap
+    defer free(coverage) in memory.heap
+    for y in 0..<height:
+        for x in 0..<width:
+            let dx = (f64)x - 60.0
+            let dy = (f64)y - 45.0
+            let disc = dx * dx + dy * dy < 20.0 * 20.0
+            let at = (y * width + x) * 4
+            # A little texture so neither side is one flat color.
+            let grain = (f32)((x * 7 + y * 13) % 5) * 0.02
+            pixels[at] = 0.8 + grain if disc else 0.05
+            pixels[at + 1] = 0.1 if disc else 0.1 + grain
+            pixels[at + 2] = 0.05 if disc else 0.7 + grain
+            pixels[at + 3] = 1.0
+    assert(try find_subject(pixels, width, height, 30, 15, 60, 60, coverage))
+    assert(coverage[45 * width + 60] == 255 and coverage[45 * width + 45] == 255)
+    assert(coverage[20 * width + 35] == 0 and coverage[5 * width + 5] == 0)
+    for index in 0..<coverage.length:
+        coverage[index] = 0
+    assert(try find_subject(pixels, width, height, 0, 0, 0, 0, coverage))
+    assert(coverage[45 * width + 60] == 255 and coverage[80 * width + 110] == 0)

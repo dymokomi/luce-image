@@ -40,6 +40,7 @@ from luce_image.image import Image, Pixel
 from luce_image.tiles import Tiles, Bounds, tile_size, tile_columns, min_u32, flatten
 from luce_image.heal import heal
 from luce_image.content_fill import content_fill
+from luce_image.subject import find_subject
 from luce_image.warp import WarpStroke, warp_smudge, warp_push
 from luce_image.document import Style, Document, Layer, TreeState, release_snapshot, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
 from luce_image.composite import Composer, box_composer, unbox_composer
@@ -1178,6 +1179,36 @@ pub struct Canvas:
         var shape = try Selection.create(self.extent_x, self.extent_y)
         defer shape.destroy()
         try shape.wand(pixels, x, y, tolerance, contiguous, Mode.replace)
+        try self.merge_shape(&shape, mode)
+
+    ## Select Subject (a box of no size) or Object Selection (the box
+    ## `left`, `top`, `width`, `height`): the subject of layer `id` — or of the
+    ## whole picture with `all_layers` — found by color, combined by `mode`.
+    pub mutating func select_subject(id: i64, left: i64, top: i64, width: i64, height: i64, mode: i64 = 0, all_layers: bool = false) -> !:
+        try self.require_open()
+        try self.remember_state("Select Subject" if width <= 0 else "Object Selection")
+        var pixels: f32[]
+        if all_layers:
+            pixels = try flattened_pixels(&self)
+        else:
+            let document = self.document else error(invalid, "draw the document once before selecting a subject")
+            let layer = document.find((u64)id) else error(invalid, "no such layer")
+            let tiles = layer.tiles() else error(invalid, "a group has no pixels to look at")
+            pixels = try alloc f32[(usize)self.extent_x * (usize)self.extent_y * 4] in memory.heap
+            tiles.read(pixels) catch failure:
+                free(pixels) in memory.heap
+                error(failure.code, failure.message)
+        defer free(pixels) in memory.heap
+        let found = try alloc u8[(usize)self.extent_x * (usize)self.extent_y] in memory.heap
+        defer free(found) in memory.heap
+        if not (try find_subject(pixels, (usize)self.extent_x, (usize)self.extent_y, left, top, width, height, found)):
+            error(invalid, "no subject stands out there")
+        if not self.shaping():
+            try self.live().from_coverage(found, try selection_mode(mode))
+            return
+        var shape = try Selection.create(self.extent_x, self.extent_y)
+        defer shape.destroy()
+        try shape.from_coverage(found, Mode.replace)
         try self.merge_shape(&shape, mode)
 
     ## Collect a polygon point for `select_polygon`.

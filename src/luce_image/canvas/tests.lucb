@@ -1402,3 +1402,22 @@ test "content-aware fill replaces a selected blot with what is around it, as one
         assert(failure.code == invalid)
         rejected = true
     assert(rejected)
+
+test "select subject finds what stands out; object selection within a box":
+    var canvas = try Canvas(96, 64)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Scene")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, false)
+    try canvas.fill(layer, false)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.8, 0.0, false)
+    try canvas.select_ellipse(33, 17, 30, 30, 0)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    try canvas.select_subject(layer, 0, 0, 0, 0)
+    assert(canvas.undo_name() == "Select Subject" and canvas.has_selection())
+    assert(canvas.current().at(48, 32) == 255 and canvas.current().at(4, 4) == 0)
+    try canvas.select_subject(layer, 28, 12, 40, 40)
+    assert(canvas.undo_name() == "Object Selection" and canvas.current().at(48, 32) == 255 and canvas.current().at(90, 60) == 0)
