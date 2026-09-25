@@ -10,6 +10,8 @@ import png
 import jpeg
 import tiff
 import exr
+import raw
+import heic
 import luce_image.parallel as parallel
 from luce_image.svg_import import is_svg, render_svg
 from binary import Buffer
@@ -41,10 +43,28 @@ func probe(raster: model.Raster*) -> !:
         try jpeg.probe(raster)
     elif data[0] == 118 and data[1] == 47:
         try exr.probe(raster)
+    elif heic.is_heic(data):
+        try heic.probe(raster)
+    elif raw_signature(data) and raw.detect(data):
+        # Camera raws before TIFF: most of them are TIFF files underneath.
+        try raw.probe(raster)
     elif (data[0] == 'I' and data[1] == 'I') or (data[0] == 'M' and data[1] == 'M'):
         try tiff.probe(raster)
     else:
         error(unsupported, "unrecognized image signature")
+
+## Whether `data` could be a camera raw: it starts with a TIFF byte order or as Fujifilm's RAF.
+func raw_signature(data: const u8[]) -> bool:
+    if (data[0] == 'I' and data[1] == 'I') or (data[0] == 'M' and data[1] == 'M'):
+        return true
+    return data.length >= 8 and (str)data[..<8] == "FUJIFILM"
+
+## Whether a probed file is a camera raw luce-raw develops.
+func is_raw_format(name: str) -> bool:
+    for format_name in ["DNG", "CR2", "NEF", "ARW", "ORF", "RW2", "PEF", "RAF"]:
+        if name == format_name:
+            return true
+    return false
 
 func configure_mode(raster: model.Raster*, mode: str) -> !:
     let nc: usize = 3 if mode == "RGB" or mode == "RGBF" else 4 if mode == "RGBA" or mode == "RGBAF" else 2 if mode == "LA" else 1
@@ -78,7 +98,7 @@ pub struct Image:
             error(invalid, "image is closed")
 
     ## Snapshot the encoded file now; decode pixels lazily on load/access/save.
-    pub static func open(path: str, threads: usize = 4, frame: usize = 0, max_bytes: usize = 1073741824, max_pixels: usize = 268435456) -> interop.Reference[Image]!:
+    pub static func open(path: str, threads: usize = 4, frame: usize = 0, max_bytes: usize = 4294967296, max_pixels: usize = 268435456) -> interop.Reference[Image]!:
         try check_path(path)
         if threads < 1 or threads > 64:
             error(invalid, "thread count must be in 1-64")
@@ -96,7 +116,7 @@ pub struct Image:
         return try Image.own(raster, threads)
 
     ## As `open`, from encoded bytes held in memory; the bytes are copied.
-    pub static func open_bytes(data: const u8[], threads: usize = 4, frame: usize = 0, max_bytes: usize = 1073741824, max_pixels: usize = 268435456) -> interop.Reference[Image]!:
+    pub static func open_bytes(data: const u8[], threads: usize = 4, frame: usize = 0, max_bytes: usize = 4294967296, max_pixels: usize = 268435456) -> interop.Reference[Image]!:
         if threads < 1 or threads > 64 or data.length > max_bytes:
             error(invalid, "invalid threads or encoded byte limit")
         var raster = model.Raster(max_bytes = max_bytes, max_pixels = max_pixels, frame = frame)
@@ -108,7 +128,7 @@ pub struct Image:
 
     ## A new image in a Pillow mode ("L", "LA", "RGB", "RGBA", "I;16", "I", "F",
     ## "RGBF", "RGBAF"), every pixel `color` or opaque black.
-    pub static func create(mode: str, width: usize, height: usize, color: Pixel? = none, max_bytes: usize = 1073741824) -> interop.Reference[Image]!:
+    pub static func create(mode: str, width: usize, height: usize, color: Pixel? = none, max_bytes: usize = 4294967296) -> interop.Reference[Image]!:
         var raster = model.Raster(width = width, height = height, max_bytes = max_bytes)
         errdefer raster.close()
         try configure_mode(&raster, mode)
@@ -121,7 +141,7 @@ pub struct Image:
         return try Image.own(raster)
 
     ## Named channels are used for AOVs and Cryptomatte; default storage is FLOAT.
-    pub static func create_channels(width: usize, height: usize, names: const str[], kind: SampleType = .float32, max_bytes: usize = 1073741824) -> interop.Reference[Image]!:
+    pub static func create_channels(width: usize, height: usize, names: const str[], kind: SampleType = .float32, max_bytes: usize = 4294967296) -> interop.Reference[Image]!:
         var raster = model.Raster(width = width, height = height, max_bytes = max_bytes)
         errdefer raster.close()
         for name in names:
@@ -210,7 +230,7 @@ pub struct Image:
     pub func workers_used() -> usize:
         return self.active_workers
 
-    ## Decode the pixels now, in parallel for TIFF and EXR.
+    ## Decode the pixels now, in parallel for TIFF, EXR, HEIC and camera raws.
     pub mutating func load() -> !:
         try self.ensure_open()
         if self.is_loaded():
@@ -223,6 +243,13 @@ pub struct Image:
         elif self.raster.file_format == "JPEG":
             try jpeg.decode(&self.raster)
             self.active_workers = 1
+        elif self.raster.file_format == "HEIC":
+            try heic.decode(&self.raster, self.threads)
+            self.active_workers = self.threads
+        elif is_raw_format(self.raster.file_format):
+            # A raw develops whole, on its own threads.
+            try raw.decode(&self.raster, raw.Options(threads = self.threads))
+            self.active_workers = self.threads
         elif self.raster.file_format == "TIFF":
             self.active_workers = try parallel.decode(&self.raster, tiff.decode_chunk, self.threads)
         else:

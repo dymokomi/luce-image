@@ -25,6 +25,18 @@ pub func main(arguments: list[str]) -> int!:
     assert(tiff.getpixel(3, 4).r == 200.0)
     # How many of the four workers reach a chunk before the others drain them is timing; the benchmark measures participation.
     assert(tiff.workers_used() >= 1 and tiff.workers_used() <= 4)
+    # HEIC decodes through luce-heic (a 64×64 picture sips wrote).
+    let photo = Image.open("tests/fixtures/sips_64x64.heic")
+    assert(photo.size() == (64, 64) and photo.mode() == "RGB")
+    assert(photo.getpixel(32, 32).a == 255.0)
+    # A camera raw is probed through luce-raw, when luce-raw's samples are fetched;
+    # the TIFF above, with the same byte order mark, stayed a TIFF.
+    var no_samples = false
+    let dng = Image.open("../luce-raw/build/samples/pixel4a.dng") catch:
+        no_samples = true
+        recover image
+    if not no_samples:
+        assert(dng.size() == (4016, 3008) and dng.mode() == "RGBF")
     image.save(arguments[0] + "/api.jpg", quality = 95)
     let jpeg = Image.open(arguments[0] + "/api.jpg")
     assert(jpeg.size() == image.size())
