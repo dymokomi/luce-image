@@ -1416,3 +1416,47 @@ test "the pencil paints whole pixels, with no soft edge":
         if alpha > 0.999:
             painted += 1
     assert(painted > 200)
+
+test "shape layers stay shapes: drawn, moved, scaled crisp, saved, and pixels once painted":
+    var canvas = try Canvas(64, 48)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Rectangle")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    let document = canvas.document else trap("bound")
+    let pixels = try alloc f32[64 * 48 * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    # A red square with a blue 2-pixel stroke.
+    try canvas.set_shape(layer, 0, 8.0, 8.0, 16.0, 16.0, 5, 0.0, true, 1.0, 0.0, 0.0, true, 0.0, 0.0, 1.0, 2.0)
+    assert((try canvas.layer_shaped(0)) and canvas.undo_name() == "Shape")
+    try ((document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")).read(pixels)
+    assert(pixels[(16 * 64 + 16) * 4] > 0.99 and pixels[(8 * 64 + 16) * 4 + 2] > 0.5 and pixels[(30 * 64 + 30) * 4 + 3] < 0.01)
+    # Moved 20 right: still a shape, drawn where it went.
+    try canvas.move_layer(layer, 20, 0)
+    assert((try canvas.layer_shaped(0)) and (try canvas.layer_shape_value(0, 20)) == 20.0)
+    try ((document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")).read(pixels)
+    assert(pixels[(16 * 64 + 36) * 4] > 0.99 and pixels[(16 * 64 + 16) * 4 + 3] < 0.01)
+    # Scaled 2× about its corner: the edge stays a hard two-pixel stroke, not a blur.
+    try canvas.begin_transform(layer)
+    try canvas.preview_transform(2.0, 2.0, 0.0, 0.0, 0.0, 28.0, 8.0)
+    try canvas.end_transform(true)
+    assert((try canvas.layer_shaped(0)) and math.abs((try canvas.layer_shape_value(0, 16)) - 2.0) < 1e-9)
+    try ((document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")).read(pixels)
+    assert(pixels[(30 * 64 + 45) * 4] > 0.99 and pixels[(30 * 64 + 45) * 4 + 3] > 0.99)
+    # Restyled: no stroke now, the place kept.
+    let offset = try canvas.layer_shape_value(0, 20)
+    try canvas.restyle_shape(layer, true, 0.0, 1.0, 0.0, false, 0.0, 0.0, 0.0, 1.0, 4.0, 5)
+    assert((try canvas.layer_shape_value(0, 11)) == 0.0 and (try canvas.layer_shape_value(0, 20)) == offset)
+    # Saved and opened again, it is still that shape.
+    try canvas.save_package("build/canvas-shape.l2d")
+    let reopened = try Canvas.open("build/canvas-shape.l2d")
+    defer reopened.release()
+    assert((try reopened.value().layer_shaped(0)) and (try reopened.value().layer_shape_value(0, 9)) == 1.0 and (try reopened.value().layer_shape_value(0, 20)) == offset)
+    # Painted on: pixels from then on.
+    try canvas.set_brush(4.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, false)
+    try canvas.begin_stroke(layer, 40.0, 20.0)
+    try canvas.end_stroke()
+    assert(not (try canvas.layer_shaped(0)))
+    try canvas.undo()
+    assert(try canvas.layer_shaped(0))

@@ -129,9 +129,24 @@ func end_session(canvas: Canvas*, keep: bool) -> !:
     try canvas.begin_edit(session.name)
     defer canvas.end_edit()
     try warp_session(canvas, document, transformer, session)
-    # Transformed text is pixels.
+    # Transformed text is pixels; a shape follows an affine map and is drawn
+    # again, crisp, or else is pixels too.
     for at in 0..<session.count:
-        rasterize_type(canvas, session.entries[at].id)
+        let id = session.entries[at].id
+        rasterize_type(canvas, id)
+        let index = canvas.index(id) catch _:
+            continue
+        if not canvas.records[index].shaped:
+            continue
+        let forward = session.warp.forward((f64)canvas.extent_x * 0.5, (f64)canvas.extent_y * 0.5) catch _:
+            recover session.warp
+        if session.floating:
+            rasterize_shape(canvas, id)
+        elif let moved = transformed_shape(canvas.records[index].shape, forward):
+            canvas.records[index].shape = moved
+            try redraw_shape(canvas, index)
+        else:
+            rasterize_shape(canvas, id)
     if session.floating:
         try canvas.live().warp(session.warp)
 

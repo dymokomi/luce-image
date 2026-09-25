@@ -143,6 +143,8 @@ func save_canvas_package(canvas: Canvas*, path: str) -> !:
                 try write_curves(manifest.value(), element, record.curves)
         if record.typed:
             try write_type(manifest.value(), element, record.typeset)
+        if record.shaped:
+            try write_shape(manifest.value(), element, record.shape)
         if record.style.any():
             let names = style_field_names()
             for field in 0..<style_field_count:
@@ -242,6 +244,27 @@ func read_type(doc: prism.Document*, element: str, canvas: Canvas*, id: i64) -> 
     release_type(&canvas.records[index])
     canvas.records[index].typeset = spec
     canvas.records[index].typed = true
+
+## A shape layer's shape as numbered values (`shape_values`), `shape_0`…
+func write_shape(manifest: prism.Document*, element: str, spec: ShapeSpec) -> !:
+    let values = shape_values(spec)
+    var key_buffer: u8[32]
+    for at in 0..<(usize)22:
+        let number = try prism.Value.number(values[at])
+        defer number.release()
+        try manifest.set(element, try format_file(key_buffer, "shape_", at, ""), number)
+
+## The shape a layer's element holds, if any: the layer is a shape again.
+func read_shape(doc: prism.Document*, element: str, canvas: Canvas*, id: i64) -> !:
+    var key_buffer: u8[32]
+    discard(get_number(doc, element, try format_file(key_buffer, "shape_", 0, "")) catch _:
+        return)
+    var values: f64[22]
+    for at in 0..<(usize)22:
+        values[at] = try get_number(doc, element, try format_file(key_buffer, "shape_", at, ""))
+    let index = try canvas.index((u64)id)
+    canvas.records[index].shape = try shape_from_values(values)
+    canvas.records[index].shaped = true
 
 func type_value_names() -> str[10]:
     return ["type_size", "type_red", "type_green", "type_blue", "type_x", "type_y", "box_width", "alignment", "tracking", "leading"]
@@ -499,6 +522,7 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
                 recover 0
             try native.place((u64)id, picture, x, y)
             try read_type(doc, element, native, id)
+            try read_shape(doc, element, native, id)
         if (try get_integer(doc, element, "mask")) != 0:
             try native.set_mask(id, true)
             let mask = try Image.open(try paths.join(layers_dir, try format_file(file_buffer, "layer", index, ".mask.png")))

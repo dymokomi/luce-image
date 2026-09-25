@@ -170,6 +170,9 @@ func add_clip_records(canvas: Canvas*, clip: const LayerClip*, layer: const Laye
     if record.typed:
         record.typeset.x += dx
         record.typeset.y += dy
+    if record.shaped:
+        record.shape.matrix[4] += dx
+        record.shape.matrix[5] += dy
     canvas.records[canvas.count] = record
     canvas.count += 1
     *next += 1

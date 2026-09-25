@@ -36,6 +36,7 @@ import ownership
 import paths
 import prism
 import strings
+import svg
 from luce_image.image import Image, Pixel
 from luce_image.tiles import Tiles, Bounds, tile_size, tile_columns, min_u32, flatten
 from luce_image.heal import heal
@@ -86,6 +87,9 @@ struct Record:
     ## A text layer's words and how they are set (type_layers.lucb).
     var typed: bool = false
     var typeset: TypeSpec = TypeSpec()
+    ## A shape layer's shape (shape_layers.lucb).
+    var shaped: bool = false
+    var shape: ShapeSpec = ShapeSpec()
     ## A picture waiting to become tiles once a device is bound, and a mask
     ## likewise, each with the document pixel its top-left goes at (a picture
     ## may reach past the canvas).
@@ -1580,6 +1584,55 @@ pub struct Canvas:
         try set_layer_type(&self, (u64)id, TypeSpec(text = text, family = family, style = style, size = size, red = red, green = green, blue = blue, x = x, y = y,
                                                     box_width = box_width, alignment = alignment, tracking = tracking, leading = leading))
 
+    ## Make layer `id` a shape layer — `kind` 0 a rectangle (corners rounded
+    ## by `radius`), 1 an ellipse, 2 a line from (`x`, `y`) by (`width`,
+    ## `height`), 3 a regular polygon of `sides` — in the box (`x`, `y`,
+    ## `width`, `height`), filled and stroked as given (linear colors; a line
+    ## is its stroke). It stays a shape, crisp however it is moved, scaled or
+    ## turned. One step.
+    pub mutating func set_shape(id: i64, kind: i64, x: f64, y: f64, width: f64, height: f64, sides: i64, radius: f64,
+                                filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
+                                stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64) -> !:
+        let values: f64[22] = [(f64)kind, x, y, width, height, (f64)sides, radius, 1.0 if filled else 0.0, fill_red, fill_green, fill_blue,
+                               1.0 if stroked else 0.0, stroke_red, stroke_green, stroke_blue, stroke_width, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+        try set_layer_shape(&self, (u64)id, try shape_from_values(values))
+
+    ## A shape layer's fill, stroke, corner radius and sides changed, its
+    ## geometry and transform kept. One step.
+    pub mutating func restyle_shape(id: i64, filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
+                                    stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64, radius: f64, sides: i64) -> !:
+        let index = try self.index((u64)id)
+        if not self.records[index].shaped:
+            error(invalid, "the layer is not a shape")
+        var values = shape_values(self.records[index].shape)
+        values[5] = (f64)sides
+        values[6] = radius
+        values[7] = 1.0 if filled else 0.0
+        values[8] = fill_red
+        values[9] = fill_green
+        values[10] = fill_blue
+        values[11] = 1.0 if stroked else 0.0
+        values[12] = stroke_red
+        values[13] = stroke_green
+        values[14] = stroke_blue
+        values[15] = stroke_width
+        try set_layer_shape(&self, (u64)id, try shape_from_values(values))
+
+    ## Whether the layer at `index` is a shape layer.
+    pub func layer_shaped(index: i64) -> bool!:
+        return (try self.record(index)).shaped
+
+    ## Value `field` of a shape layer's shape: 0 kind, 1..4 the box, 5 sides,
+    ## 6 radius, 7 filled, 8..10 the fill, 11 stroked, 12..14 the stroke, 15
+    ## its width, 16..21 the transform.
+    pub func layer_shape_value(index: i64, field: i64) -> f64!:
+        let record = try self.record(index)
+        if not record.shaped:
+            error(invalid, "the layer is not a shape")
+        if field < 0 or field >= 22:
+            error(invalid, "a shape has values 0..21")
+        return shape_values(record.shape)[(usize)field]
+
     ## Whether the layer at `index` is a text layer, and what it is set from.
     pub func layer_typed(index: i64) -> bool!:
         return (try self.record(index)).typed
@@ -1646,6 +1699,15 @@ pub struct Canvas:
             try self.shift_layer(document, index, dx, dy, false)
             self.records[index].typeset.x += (f64)dx
             self.records[index].typeset.y += (f64)dy
+            return
+        # A shape layer is drawn again where it went: past the canvas and back it stays whole.
+        if not on_mask and self.records[index].shaped:
+            try self.begin_edit("Move")
+            defer self.end_edit()
+            try self.remember_state("Move")
+            self.records[index].shape.matrix[4] += (f64)dx
+            self.records[index].shape.matrix[5] += (f64)dy
+            try redraw_shape(&self, index)
             return
         try self.shift_layer(document, index, dx, dy, on_mask)
 
@@ -2203,6 +2265,7 @@ pub struct Canvas:
         let document = self.document else error(invalid, "draw the document once before resizing")
         try resize_canvas(document, (u32)width, (u32)height, offset_x, offset_y)
         shift_type(&self, (f64)offset_x, (f64)offset_y)
+        shift_shapes(&self, (f64)offset_x, (f64)offset_y)
         try self.adopt_extent((u32)width, (u32)height)
 
     ## Crop the canvas to the selection's bounding box.
@@ -2245,10 +2308,18 @@ pub struct Canvas:
             error(invalid, "image dimensions must be in 1..65536")
         let document = self.document else error(invalid, "draw the document once before resizing")
         try resize_image(document, (u32)width, (u32)height, smooth)
-        # Resampled text is pixels.
+        # Resampled text is pixels; shapes scale and are drawn again, crisp.
+        let scale_x = (f64)width / (f64)self.extent_x
+        let scale_y = (f64)height / (f64)self.extent_y
         for index in 0..<self.count:
             release_type(&self.records[index])
         try self.adopt_extent((u32)width, (u32)height)
+        for index in 0..<self.count:
+            if self.records[index].shaped:
+                for at in [0, 2, 4]:
+                    self.records[index].shape.matrix[(usize)at] *= scale_x
+                    self.records[index].shape.matrix[(usize)at + 1] *= scale_y
+                try redraw_shape(&self, index)
 
     # mark: Guides ================================================================================
 
@@ -2354,13 +2425,14 @@ pub struct Canvas:
         if not mask and name != "Move":
             let index = self.index(layer) catch _:
                 recover self.count
-            if index < self.count and self.records[index].typed:
+            if index < self.count and (self.records[index].typed or self.records[index].shaped):
                 let document = self.document else trap("pixels changed without a document")
                 var now = try document.take_tiles(layer, owned)
                 try self.remember_state(name)
                 var before = try document.take_tiles(layer, now)
                 before.destroy()
                 rasterize_type(&self, layer)
+                rasterize_shape(&self, layer)
                 return
         # Inside an edit that recorded the whole document, its step already holds these pixels.
         if self.edit_depth > 0 and self.edit_captured:

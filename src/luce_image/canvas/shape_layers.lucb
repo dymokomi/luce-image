@@ -1,0 +1,186 @@
+#==============================================================================================
+#
+#   canvas/shape_layers - Shape layers that stay shapes
+#
+#   DESCRIPTION:
+#       A rectangle (with rounded corners), an ellipse, a line or a regular polygon kept as
+#       what it is — its box, its fill and stroke, and a 2×3 transform — and drawn again from
+#       that, through luce-svg, on every change: moved, scaled or turned it stays crisp, as
+#       Photoshop's shape layers. Painting, filtering or distorting its pixels turns it into
+#       an ordinary layer, as with text.
+#
+#==============================================================================================
+
+## What a shape layer is drawn from.
+struct ShapeSpec:
+    ## 0 rectangle, 1 ellipse, 2 line, 3 polygon.
+    var kind: i64
+    ## The box in the shape's own space; a line runs from its top-left to its bottom-right.
+    var x: f64
+    var y: f64
+    var width: f64
+    var height: f64
+    ## A polygon's corners and a rectangle's corner radius.
+    var sides: i64 = 5
+    var radius: f64
+    ## The fill and the stroke, colors in linear light.
+    var filled: bool = true
+    var fill_red: f64
+    var fill_green: f64
+    var fill_blue: f64
+    var stroked: bool
+    var stroke_red: f64
+    var stroke_green: f64
+    var stroke_blue: f64
+    var stroke_width: f64 = 1.0
+    ## Shape space to document pixels: (a·x + c·y + e, b·x + d·y + f).
+    var matrix: f64[6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+
+## The number of a spec's values `layer_shape_value` reads, in `shape_values` order.
+let shape_value_count: i64 = 23
+
+## A spec's values by number: kind, x, y, width, height, sides, radius,
+## filled, the fill color, stroked, the stroke color, the stroke width, then
+## the six of the matrix.
+func shape_values(spec: ShapeSpec) -> f64[23]:
+    return [(f64)spec.kind, spec.x, spec.y, spec.width, spec.height, (f64)spec.sides, spec.radius,
+            1.0 if spec.filled else 0.0, spec.fill_red, spec.fill_green, spec.fill_blue,
+            1.0 if spec.stroked else 0.0, spec.stroke_red, spec.stroke_green, spec.stroke_blue, spec.stroke_width,
+            spec.matrix[0], spec.matrix[1], spec.matrix[2], spec.matrix[3], spec.matrix[4], spec.matrix[5], 0.0]
+
+## The spec from values in `shape_values` order.
+func shape_from_values(values: const f64[]) -> ShapeSpec!:
+    if values.length < 22:
+        error(invalid, "a shape takes 22 values")
+    for value in values:
+        if not math.is_finite(value):
+            error(invalid, "shape values must be finite")
+    let kind = (i64)values[0]
+    if kind < 0 or kind > 3:
+        error(invalid, "a shape is 0 a rectangle, 1 an ellipse, 2 a line or 3 a polygon")
+    return ShapeSpec(kind = kind, x = values[1], y = values[2], width = values[3], height = values[4], sides = (i64)math.max(3.0, math.min(64.0, values[5])),
+                     radius = math.max(0.0, values[6]), filled = values[7] != 0.0, fill_red = values[8], fill_green = values[9], fill_blue = values[10],
+                     stroked = values[11] != 0.0, stroke_red = values[12], stroke_green = values[13], stroke_blue = values[14], stroke_width = math.max(0.0, values[15]),
+                     matrix = [values[16], values[17], values[18], values[19], values[20], values[21]])
+
+## `Canvas.set_shape`: layer `id` made (or kept) a shape layer drawn from `spec`, as one step.
+func set_layer_shape(canvas: Canvas*, id: u64, spec: ShapeSpec) -> !:
+    try canvas.require_open()
+    try canvas.require_idle()
+    let index = try canvas.index(id)
+    let record = canvas.records[index]
+    if record.group or record.adjustment >= 0:
+        error(invalid, "only a pixel layer can hold a shape")
+    let document = canvas.document else error(invalid, "draw the document once before drawing a shape")
+    # Drawn first, so a shape that will not draw changes nothing.
+    var tiles = try rendered_shape(canvas, spec)
+    errdefer tiles.destroy()
+    try canvas.remember_state("Shape", id)
+    release_type(&canvas.records[index])
+    canvas.records[index].shaped = true
+    canvas.records[index].shape = spec
+    try document.set_tiles(id, tiles)
+
+## Draw the shape layer at `index` again from its spec (after a move or transform).
+func redraw_shape(canvas: Canvas*, index: usize) -> !:
+    let document = canvas.document else error(invalid, "draw the document once before drawing a shape")
+    var tiles = try rendered_shape(canvas, canvas.records[index].shape)
+    errdefer tiles.destroy()
+    try document.set_tiles(canvas.records[index].id, tiles)
+
+## Pixels of layer `id` about to change as pixels: it is no longer a shape.
+func rasterize_shape(canvas: Canvas*, id: u64):
+    let index = canvas.index(id) catch _:
+        return
+    canvas.records[index].shaped = false
+
+## Every shape layer's shape moved by (`dx`, `dy`), with its pixels.
+func shift_shapes(canvas: Canvas*, dx: f64, dy: f64):
+    for index in 0..<canvas.count:
+        if canvas.records[index].shaped:
+            canvas.records[index].shape.matrix[4] += dx
+            canvas.records[index].shape.matrix[5] += dy
+
+## `spec` with the document map `forward` (an affine map, source to
+## destination) applied after its own; false in `ok` when the map is not
+## affine, which a shape cannot follow.
+func transformed_shape(spec: ShapeSpec, forward: Warp) -> ShapeSpec?:
+    let m = forward.m
+    if math.abs(m[6]) > 1e-9 or math.abs(m[7]) > 1e-9 or math.abs(m[8]) < 1e-12:
+        return none
+    let a = m[0] / m[8]
+    let c = m[1] / m[8]
+    let e = m[2] / m[8]
+    let b = m[3] / m[8]
+    let d = m[4] / m[8]
+    let f = m[5] / m[8]
+    let old = spec.matrix
+    var moved = spec
+    moved.matrix = [a * old[0] + c * old[1], b * old[0] + d * old[1],
+                    a * old[2] + c * old[3], b * old[2] + d * old[3],
+                    a * old[4] + c * old[5] + e, b * old[4] + d * old[5] + f]
+    return moved
+
+## The layer's pixels for `spec`: the shape as SVG, drawn by luce-svg over the canvas.
+func rendered_shape(canvas: Canvas*, spec: ShapeSpec) -> Tiles!:
+    let device = canvas.device else error(invalid, "draw the document once before drawing a shape")
+    var text = try strings.Builder.create()
+    defer text.destroy()
+    try shape_svg(&text, spec, canvas.extent_x, canvas.extent_y)
+    let drawing = try svg.parse(text.view())
+    defer drawing.release()
+    let count = (usize)canvas.extent_x * (usize)canvas.extent_y
+    let pixels = try alloc f32[count * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    for at in 0..<pixels.length:
+        pixels[at] = 0.0
+    try svg.rasterize_rgba(drawing.value(), canvas.extent_x, canvas.extent_y, pixels, svg.Color(r = 0.0, g = 0.0, b = 0.0))
+    var tiles = try Tiles.create(device, canvas.extent_x, canvas.extent_y)
+    errdefer tiles.destroy()
+    try tiles.write(pixels)
+    return tiles
+
+## `spec` as a one-element SVG document the canvas's size.
+func shape_svg(out: strings.Builder*, spec: ShapeSpec, width: u32, height: u32) -> !:
+    var line: u8[512]
+    let m = spec.matrix
+    try out.put(try format(line, f"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width} {height}\"><g transform=\"matrix({m[0]} {m[1]} {m[2]} {m[3]} {m[4]} {m[5]})\">"))
+    var fill_text: u8[16]
+    var stroke_text: u8[16]
+    let fill = try hex_color(fill_text, spec.fill_red, spec.fill_green, spec.fill_blue) if spec.filled and spec.kind != 2 else "none"
+    let stroked = spec.stroked or spec.kind == 2
+    let stroke = try hex_color(stroke_text, spec.stroke_red, spec.stroke_green, spec.stroke_blue) if stroked else "none"
+    var paint: u8[160]
+    let paints = try format(paint, f"fill=\"{fill}\" stroke=\"{stroke}\" stroke-width=\"{spec.stroke_width}\" stroke-linejoin=\"miter\"")
+    if spec.kind == 0:
+        let rounding = math.min(spec.radius, math.min(math.abs(spec.width), math.abs(spec.height)) * 0.5)
+        try out.put(try format(line, f"<rect x=\"{spec.x}\" y=\"{spec.y}\" width=\"{spec.width}\" height=\"{spec.height}\" rx=\"{rounding}\" {paints}/>"))
+    elif spec.kind == 1:
+        try out.put(try format(line, f"<ellipse cx=\"{spec.x + spec.width * 0.5}\" cy=\"{spec.y + spec.height * 0.5}\" rx=\"{spec.width * 0.5}\" ry=\"{spec.height * 0.5}\" {paints}/>"))
+    elif spec.kind == 2:
+        try out.put(try format(line, f"<line x1=\"{spec.x}\" y1=\"{spec.y}\" x2=\"{spec.x + spec.width}\" y2=\"{spec.y + spec.height}\" stroke-linecap=\"round\" {paints}/>"))
+    else:
+        try out.put("<polygon points=\"")
+        for corner in 0..<spec.sides:
+            let angle = -math.pi / 2.0 + (f64)corner * 2.0 * math.pi / (f64)spec.sides
+            let px = spec.x + spec.width * 0.5 + math.cos(angle) * spec.width * 0.5
+            let py = spec.y + spec.height * 0.5 + math.sin(angle) * spec.height * 0.5
+            try out.put(try format(line, f"{px},{py} "))
+        try out.put(try format(line, f"\" {paints}/>"))
+    try out.put("</g></svg>")
+
+## A linear color as `#rrggbb` in sRGB, the way SVG reads it.
+func hex_color(buffer: u8[], red: f64, green: f64, blue: f64) -> str!:
+    let digits = "0123456789abcdef"
+    buffer[0] = '#'
+    var at: usize = 1
+    for value in [red, green, blue]:
+        let byte = (usize)math.round(encode_srgb(value) * 255.0)
+        buffer[at] = digits.bytes[byte // 16]
+        buffer[at + 1] = digits.bytes[byte % 16]
+        at += 2
+    return (str)buffer[..<7]
+
+func encode_srgb(linear: f64) -> f64:
+    let v = math.clamp(linear, 0.0, 1.0)
+    return v * 12.92 if v <= 0.0031308 else 1.055 * math.pow(v, 1.0 / 2.4) - 0.055
