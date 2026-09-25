@@ -68,6 +68,7 @@ pub func find_subject(pixels: const f32[], width: usize, height: usize, left: i6
     try lean_apart(&work, bx0, by0, (i64)bx1, (i64)by1)
     smooth(&work)
     smooth(&work)
+    try keep_near_sharp(&work, bx0, by0, (i64)bx1, (i64)by1)
     if not (try keep_largest(&work, bx0, by0, (i64)bx1, (i64)by1)):
         return false
     smooth(&work)
@@ -152,6 +153,43 @@ func channel_step(colors: const f64[], a: usize, b: usize) -> f64:
     for channel in 0..<(usize)3:
         step = math.max(step, math.abs(colors[a * features + channel] - colors[b * features + channel]))
     return step
+
+## Where the picture is starkly split into crisp and blurred, the subject
+## keeps only to what lies near crisp detail: orange bokeh beside an orange
+## petal is not taken for the petal. (A flat middle inside a crisp outline
+## is filled in afterwards, as any hole.)
+func keep_near_sharp(work: Work*, x0: i64, y0: i64, x1: i64, y1: i64) -> !:
+    let spread = try sharpness_spread(work, x0, y0, x1, y1)
+    if spread.weight < 0.5:
+        return
+    let count = (usize)(work.width * work.height)
+    let crisp = try alloc u8[count] in memory.heap
+    defer free(crisp) in memory.heap
+    let floor = spread.low + (spread.high - spread.low) * 0.35
+    for index in 0..<count:
+        crisp[index] = 1 if work.colors[index * features + 3] >= floor else 0
+    let near = try alloc u8[count] in memory.heap
+    defer free(near) in memory.heap
+    # Within a few work pixels of crisp detail.
+    let reach: i64 = 4
+    for y in 0..<work.height:
+        for x in 0..<work.width:
+            var hit: u8 = 0
+            var dy = -reach
+            while dy <= reach and hit == 0:
+                var dx = -reach
+                while dx <= reach:
+                    let nx = x + dx
+                    let ny = y + dy
+                    if nx >= 0 and ny >= 0 and nx < work.width and ny < work.height and crisp[(usize)(ny * work.width + nx)] != 0:
+                        hit = 1
+                        break
+                    dx += 1
+                dy += 1
+            near[(usize)(y * work.width + x)] = hit
+    for index in 0..<count:
+        if near[index] == 0:
+            work.lean[index] = 0.0
 
 ## How sharpness is spread over the box: its 10th and 90th percentiles, and
 ## how much to trust it — none unless some of it is far sharper than the rest.
