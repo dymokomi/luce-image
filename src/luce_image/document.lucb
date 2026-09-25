@@ -9,6 +9,7 @@ import memory
 import strings
 from luce_image.tiles import Tiles, box, unbox
 from luce_image.selection import Selection
+from luce_image.curves import Curves
 from raster_errors import invalid, limit
 
 pub let blend_mode_count: u32 = 26
@@ -220,6 +221,8 @@ pub struct Layer:
     ## it has no pixels and adjusts what is below it, live, through its mask.
     pub var adjustment: i64 = -1
     pub var adjustment_values: f64[23]
+    ## A Curves adjustment layer's curves (no points: values pass through).
+    pub var curves: Curves
     var children: Layer*[]
     var child_count: usize
     ## Bumps whenever the pixels are replaced.
@@ -314,6 +317,7 @@ func clone_layer(layer: const Layer*) -> Layer*!:
     copy.mask_enabled = layer.mask_enabled
     copy.adjustment = layer.adjustment
     copy.adjustment_values = layer.adjustment_values
+    copy.curves = layer.curves
     if let mask = layer.mask:
         copy.mask = try box(try mask.clone())
     if layer.child_count > 0:
@@ -377,6 +381,15 @@ pub struct Document:
         let id = try self.add(name, parent, false, none)
         try self.set_adjustment(id, kind, values)
         return id
+
+    ## Give Curves adjustment layer `id` its curves anew.
+    pub mutating func set_curves(id: u64, curves: Curves) -> !:
+        let layer = self.find(id) else error(invalid, "no such layer")
+        if layer.adjustment < 0:
+            error(invalid, "only an adjustment layer takes curves")
+        layer.curves = curves
+        layer.revision += 1
+        self.revision += 1
 
     ## Give adjustment layer `id` its kind and parameters anew.
     pub mutating func set_adjustment(id: u64, kind: i64, values: const f64[]) -> !:

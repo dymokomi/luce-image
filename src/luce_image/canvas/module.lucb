@@ -73,6 +73,8 @@ struct Record:
     ## An adjustment layer's kind and parameters (no pixels), or -1.
     var adjustment: i64 = -1
     var adjustment_values: f64[23]
+    ## A Curves adjustment layer's curves.
+    var curves: Curves
     var visible: bool
     var opacity: f64
     var blend: i64
@@ -343,6 +345,8 @@ pub struct Canvas:
                 discard(try document.add_group(record.name))
             elif record.adjustment >= 0:
                 discard(try document.add_adjustment(record.name, record.adjustment, record.adjustment_values[..<parameter_count]))
+                if record.adjustment == (i64)curves:
+                    try document.set_curves(record.id, record.curves)
             else:
                 discard(try document.add_layer(record.name))
             try document.set_appearance(record.id, record.visible, record.opacity, (u32)record.blend)
@@ -483,11 +487,11 @@ pub struct Canvas:
     ## Add an adjustment layer of `kind` on top, with the staged parameters
     ## (`set_adjustment`); returns its id. It has no pixels: it adjusts what
     ## is below it live, through its mask, clipped to the layer below when
-    ## clipped — the non-destructive twin of `adjust_layer`. Any kind but
-    ## curves.
+    ## clipped — the non-destructive twin of `adjust_layer`. A Curves layer
+    ## takes the staged curves (`add_curve_point`).
     pub mutating func add_adjustment_layer(name: str, kind: i64) -> i64!:
         try self.remember_state("New Adjustment Layer")
-        if kind < 0 or kind >= (i64)adjustment_count or kind == (i64)curves:
+        if kind < 0 or kind >= (i64)adjustment_count:
             error(invalid, "no such adjustment for a layer")
         return try self.add_record(name, false, kind)
 
@@ -500,8 +504,20 @@ pub struct Canvas:
         if kind < 0:
             error(invalid, "not an adjustment layer")
         self.records[index].adjustment_values = self.adjustment
+        if kind == (i64)curves:
+            self.records[index].curves = self.curves
         if let document = self.document:
             try document.set_adjustment((u64)id, kind, self.adjustment[..<parameter_count])
+            if kind == (i64)curves:
+                try document.set_curves((u64)id, self.curves)
+
+    ## Stage the curves of Curves layer `id` (`add_curve_point` and the rest
+    ## then edit them), for editing it.
+    pub mutating func stage_layer_curves(id: i64) -> !:
+        let index = try self.index((u64)id)
+        if self.records[index].adjustment != (i64)curves:
+            error(invalid, "not a Curves adjustment layer")
+        self.curves = self.records[index].curves
 
     ## The adjustment kind of the layer at `index`, or -1 for a layer with pixels or a group.
     pub func layer_adjustment(index: i64) -> i64!:
@@ -535,12 +551,15 @@ pub struct Canvas:
                 created = try document.add_group(name)
             elif adjustment >= 0:
                 created = try document.add_adjustment(name, adjustment, self.adjustment[..<parameter_count])
+                if adjustment == (i64)curves:
+                    try document.set_curves(created, self.curves)
             else:
                 created = try document.add_layer(name)
             assert(created == id)
         self.records[self.count] = Record(id = id, name = copied, group = group, adjustment = adjustment, visible = true, opacity = 1.0, blend = 0, masked = false, clipped = false, picture = none, mask_picture = none)
         if adjustment >= 0:
             self.records[self.count].adjustment_values = self.adjustment
+            self.records[self.count].curves = self.curves
         self.count += 1
         self.next_id += 1
         return (i64)id
@@ -1626,6 +1645,10 @@ pub struct Canvas:
     ## 0..1; a point at an existing x replaces it; at most 16 per channel.
     pub mutating func add_curve_point(channel: i64, x: f64, y: f64) -> !:
         try self.curves.add(try curve_channel(channel), x, y)
+
+    ## Empty a channel's curve before its points are added one by one.
+    pub mutating func clear_curve(channel: i64) -> !:
+        try self.curves.clear(try curve_channel(channel))
 
     ## Reset a channel's curve to the identity.
     pub mutating func reset_curve(channel: i64) -> !:

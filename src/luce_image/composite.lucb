@@ -14,7 +14,8 @@ from luce_image.style import Styler
 from raster_errors import invalid, limit
 from luce_image.half import from_half
 from luce_image.shaders import composite_frag_words, composite_frag_msl, adjust_mix_frag_words, adjust_mix_frag_msl
-from luce_image.adjust import Adjuster
+from luce_image.adjust import Adjuster, curves
+from luce_image.curves import lut_size
 
 struct Entry:
     var digest: u64
@@ -32,6 +33,15 @@ struct Effects:
     var has_over: bool
     var used: u64
     var live: bool
+
+## A Curves adjustment layer's lookup table, kept while its curves stand.
+struct CurveTable:
+    var key: u64
+    var texture: gpu.Texture
+    var live: bool
+
+## How many Curves layers keep their tables at once.
+let curve_table_budget: usize = 4
 
 ## How many styled layers keep their effects rendered at once.
 let effects_budget: usize = 8
@@ -52,6 +62,8 @@ pub struct Composer:
     var mix_shader: gpu.Shader
     var mix: gpu.Pipeline
     var effects: Effects[8]
+    var curve_tables: CurveTable[4]
+    var next_curve_table: usize
     ## How many tiles were rendered rather than found, for tests and tuning.
     pub var renders: u64
 
@@ -89,8 +101,11 @@ pub struct Composer:
         var effects: Effects[8]
         for index in 0..<effects_budget:
             effects[index] = Effects(key = 0, tiles = Tiles(), over = Tiles(), has_over = false, used = 0, live = false)
+        var tables: CurveTable[4]
+        for index in 0..<curve_table_budget:
+            tables[index] = CurveTable(key = 0, texture = gpu.Texture(), live = false)
         return Composer(owner = device, entries = entries, count = 0, budget = budget, tick = 0, shader = shader, pipeline = pipeline, blank = blank, white = white, styler = styler,
-                        adjuster = adjuster, mix_shader = mix_shader, mix = mix, effects = effects, renders = 0)
+                        adjuster = adjuster, mix_shader = mix_shader, mix = mix, effects = effects, curve_tables = tables, next_curve_table = 0, renders = 0)
 
     ## The flattened tile at `column`, `row` of pyramid `level`, borrowed until
     ## the next call. Straight-alpha rgba16_float, transparent where nothing is.
@@ -231,7 +246,8 @@ pub struct Composer:
     mutating func adjust(backdrop: gpu.Texture*, owned: bool*, layer: const Layer*, mask: gpu.Texture, clip: gpu.Texture, opacity: f64) -> !:
         if not *owned:
             return
-        var adjusted = try self.adjuster.adjusted(*backdrop, (u32)layer.adjustment, layer.adjustment_values[..<23])
+        let table = try self.curve_table_for(layer)
+        var adjusted = try self.adjuster.adjusted(*backdrop, (u32)layer.adjustment, layer.adjustment_values[..<23], table)
         defer adjusted.destroy()
         var params: f32[1] = [(f32)opacity]
         var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
@@ -244,6 +260,29 @@ pub struct Composer:
         discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         backdrop.destroy()
         *backdrop = fresh
+
+    ## A Curves layer's lookup table, made once per state of its curves; none
+    ## for any other kind.
+    mutating func curve_table_for(layer: const Layer*) -> gpu.Texture?!:
+        if layer.adjustment != (i64)curves:
+            return none
+        var key = fnv_start()
+        key = fnv_mix(key, layer.id)
+        key = fnv_mix(key, layer.revision)
+        for index in 0..<curve_table_budget:
+            if self.curve_tables[index].live and self.curve_tables[index].key == key:
+                return self.curve_tables[index].texture
+        var texture = try gpu.Texture.create(self.owner, (u32)lut_size, 1, gpu.Format.rgba8_linear)
+        errdefer texture.destroy()
+        var bytes: u8[1024]
+        try layer.curves.fill(bytes)
+        try texture.upload(bytes)
+        let slot = self.next_curve_table
+        self.next_curve_table = (slot + 1) % curve_table_budget
+        if self.curve_tables[slot].live:
+            self.curve_tables[slot].texture.destroy()
+        self.curve_tables[slot] = CurveTable(key = key, texture = texture, live = true)
+        return texture
 
     ## The effects tiles for a styled layer, rendered once per pixels-and-style state.
     mutating func effects_for(layer: const Layer*) -> const Effects*!:
@@ -368,6 +407,10 @@ pub struct Composer:
         var empty: Entry[]
         self.entries = empty
         self.budget = 0
+        for index in 0..<curve_table_budget:
+            if self.curve_tables[index].live:
+                self.curve_tables[index].texture.destroy()
+                self.curve_tables[index].live = false
         self.styler.destroy()
         self.mix.destroy()
         self.mix_shader.destroy()

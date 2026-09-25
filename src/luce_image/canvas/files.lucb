@@ -139,6 +139,8 @@ func save_canvas_package(canvas: Canvas*, path: str) -> !:
                 let number = try prism.Value.number(record.adjustment_values[parameter])
                 defer number.release()
                 try manifest.value().set(element, try format_file(key_buffer, "a", parameter, ""), number)
+            if record.adjustment == (i64)curves:
+                try write_curves(manifest.value(), element, record.curves)
         if record.typed:
             try write_type(manifest.value(), element, record.typeset)
         if record.style.any():
@@ -193,6 +195,31 @@ func write_type(manifest: prism.Document*, element: str, spec: TypeSpec) -> !:
 
 ## The text a layer's element carries, if any: the layer is a text layer again
 ## (its pixels, already read, are what it was set as).
+## A Curves layer's points: each channel's count (`cn0`..`cn3`), then every
+## point's input and output (`cx`/`cy`, numbered channel * 16 + point).
+func write_curves(manifest: prism.Document*, element: str, shape: Curves) -> !:
+    for channel in 0..<(usize)4:
+        let curve = try shape.channel(channel)
+        var key_buffer: u8[32]
+        try set_integer(manifest, element, try format_file(key_buffer, "cn", channel, ""), (i64)curve.length())
+        for point in 0..<curve.length():
+            for (prefix, value) in [("cx", curve.x(point)), ("cy", curve.y(point))]:
+                let number = try prism.Value.number(value)
+                defer number.release()
+                try manifest.set(element, try format_file(key_buffer, prefix, channel * 16 + point, ""), number)
+
+## Stage the curves a Curves layer's element holds (`write_curves`).
+func read_curves(doc: prism.Document*, element: str, canvas: Canvas*) -> !:
+    for channel in 0..<(usize)4:
+        var key_buffer: u8[32]
+        let count = get_integer(doc, element, try format_file(key_buffer, "cn", channel, "")) catch _:
+            continue
+        try canvas.clear_curve((i64)channel)
+        for point in 0..<(usize)count:
+            let x = try get_number(doc, element, try format_file(key_buffer, "cx", channel * 16 + point, ""))
+            let y = try get_number(doc, element, try format_file(key_buffer, "cy", channel * 16 + point, ""))
+            try canvas.add_curve_point((i64)channel, x, y)
+
 func read_type(doc: prism.Document*, element: str, canvas: Canvas*, id: i64) -> !:
     let text_value = doc.get(element, "text") catch _:
         return
@@ -437,6 +464,8 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
             for parameter in 0..<parameter_count:
                 var key_buffer: u8[32]
                 try native.set_adjustment((i64)parameter, try get_number(doc, element, try format_file(key_buffer, "a", parameter, "")))
+            if adjustment == (i64)curves:
+                try read_curves(doc, element, native)
             id = try native.add_adjustment_layer(try name_value.value().text_at(), adjustment)
             native.clear_adjustments()
         elif group:
