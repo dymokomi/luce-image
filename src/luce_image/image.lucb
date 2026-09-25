@@ -45,25 +45,19 @@ func probe(raster: model.Raster*) -> !:
         try exr.probe(raster)
     elif heic.is_heic(data):
         try heic.probe(raster)
-    elif raw_signature(data) and (raw.detect(data) or raw.recognize(data)):
-        # Camera raws before TIFF: most of them are TIFF files underneath. One
-        # luce-raw knows but cannot develop yet says so, rather than being read
-        # as a TIFF.
+    elif raw.detect(data) or raw.recognize(data):
+        # Camera raws before TIFF: most of them are TIFF files underneath (CR3 is
+        # ISO media, RAF and CRW their own). One luce-raw knows but cannot develop
+        # yet says so, rather than being read as a TIFF.
         try raw.probe(raster)
     elif (data[0] == 'I' and data[1] == 'I') or (data[0] == 'M' and data[1] == 'M'):
         try tiff.probe(raster)
     else:
         error(unsupported, "unrecognized image signature")
 
-## Whether `data` could be a camera raw: it starts with a TIFF byte order or as Fujifilm's RAF.
-func raw_signature(data: const u8[]) -> bool:
-    if (data[0] == 'I' and data[1] == 'I') or (data[0] == 'M' and data[1] == 'M'):
-        return true
-    return data.length >= 8 and (str)data[..<8] == "FUJIFILM"
-
 ## Whether a probed file is a camera raw luce-raw develops.
 func is_raw_format(name: str) -> bool:
-    for format_name in ["DNG", "CR2", "NEF", "ARW", "ORF", "RW2", "PEF", "RAF"]:
+    for format_name in ["DNG", "CR2", "CR3", "NEF", "ARW", "ORF", "RW2", "PEF", "RAF"]:
         if name == format_name:
             return true
     return false
