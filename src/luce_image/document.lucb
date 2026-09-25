@@ -8,6 +8,7 @@ import math
 import memory
 import strings
 from luce_image.tiles import Tiles, box, unbox
+from luce_image.extent import relocate
 from luce_image.selection import Selection
 from luce_image.curves import Curves
 from raster_errors import invalid, limit
@@ -317,6 +318,10 @@ pub struct TreeState:
         layer_destroy(self.root)
         self.selection.destroy()
 
+## Free a `Document.snapshot`.
+pub func release_snapshot(layer: Layer*):
+    layer_destroy(layer)
+
 ## A copy of `layer` and all it holds, sharing their tiles.
 func clone_layer(layer: const Layer*) -> Layer*!:
     var copied: str = ""
@@ -503,6 +508,82 @@ pub struct Document:
         while parent.children[index].id != id:
             index += 1
         return index
+
+    ## A copy of layer `id` and all it holds, its tiles shared (cheap), for
+    ## the layer clipboard; `release_snapshot` frees it.
+    pub func snapshot(id: u64) -> Layer*!:
+        let layer = self.find(id) else error(invalid, "no such layer")
+        return try clone_layer(layer)
+
+    ## Put a copy of `layer` — a snapshot from this document or another, with
+    ## all it holds — into group `parent` (the top level when none) at
+    ## `position`, its pixels and mask moved by (`offset_x`, `offset_y`) onto
+    ## this document's canvas. Every layer in it gets a new id, in pre-order
+    ## from the one returned.
+    pub mutating func adopt(layer: const Layer*, parent: u64?, position: usize, offset_x: f64, offset_y: f64) -> u64!:
+        var target = self.root
+        if let parent_id = parent:
+            target = self.find(parent_id) else error(invalid, "no such parent layer")
+            if not target.group:
+                error(invalid, "only a group can hold layers")
+        try make_room(target)
+        let first = self.next_id
+        let copy = try self.transplant(layer, offset_x, offset_y)
+        let at = position if position < target.child_count else target.child_count
+        var shift = target.child_count
+        while shift > at:
+            target.children[shift] = target.children[shift - 1]
+            shift -= 1
+        target.children[at] = copy
+        target.child_count += 1
+        self.revision += 1
+        return first
+
+    ## `layer` copied onto this canvas with new ids: tiles shared when they
+    ## land as they are, else drawn anew where they land.
+    mutating func transplant(layer: const Layer*, offset_x: f64, offset_y: f64) -> Layer*!:
+        var copied: str = ""
+        with memory.heap:
+            copied = try strings.copy(layer.name)
+        errdefer strings.release(copied)
+        var pixels: Tiles*? = none
+        if let tiles = layer.pixels:
+            pixels = try box(try self.landed(tiles, offset_x, offset_y, false))
+        errdefer release_tiles(&pixels)
+        let copy = try new Layer(id = self.next_id, name = copied, group = layer.group, pixels = pixels, revision = 1) in memory.heap
+        self.next_id += 1
+        errdefer layer_destroy(copy)
+        copy.visible = layer.visible
+        copy.opacity = layer.opacity
+        copy.blend = layer.blend
+        copy.clipped = layer.clipped
+        copy.style = layer.style
+        copy.mask_enabled = layer.mask_enabled
+        copy.adjustment = layer.adjustment
+        copy.adjustment_values = layer.adjustment_values
+        copy.curves = layer.curves
+        if let mask = layer.mask:
+            copy.mask = try box(try self.landed(mask, offset_x, offset_y, true))
+        if layer.child_count > 0:
+            copy.children = try alloc Layer*[layer.child_count] in memory.heap
+            for index in 0..<layer.child_count:
+                copy.children[index] = try self.transplant(layer.children[index], offset_x, offset_y)
+                copy.child_count += 1
+        return copy
+
+    ## `tiles` as they land on this canvas moved by (`offset_x`, `offset_y`);
+    ## a `mask` reads white where nothing lands.
+    func landed(tiles: const Tiles*, offset_x: f64, offset_y: f64, mask: bool) -> Tiles!:
+        let device = tiles.device()
+        if not device.same(&self.owner):
+            error(invalid, "layers move only between documents on one GPU device")
+        if tiles.width() == self.extent_x and tiles.height() == self.extent_y and offset_x == 0.0 and offset_y == 0.0:
+            return try tiles.clone()
+        var moved = try Tiles.create(self.owner, self.extent_x, self.extent_y)
+        errdefer moved.destroy()
+        let empty = 1.0 if mask else 0.0
+        try relocate(tiles, &moved, 1.0, 1.0, offset_x, offset_y, false, gpu.Color(empty, empty, empty, empty))
+        return moved
 
     ## Keep a layer's mask but stop it hiding anything, or bring it back.
     pub mutating func enable_mask(id: u64, enabled: bool) -> !:

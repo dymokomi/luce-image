@@ -40,7 +40,7 @@ from luce_image.image import Image, Pixel
 from luce_image.tiles import Tiles, Bounds, tile_size, tile_columns, min_u32, flatten
 from luce_image.heal import heal
 from luce_image.warp import WarpStroke, warp_smudge, warp_push
-from luce_image.document import Style, Document, Layer, TreeState, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
+from luce_image.document import Style, Document, Layer, TreeState, release_snapshot, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
 from luce_image.composite import Composer, box_composer, unbox_composer
 from luce_image.brush import Brush, Painter, Stroke, begin_boxed, finish_boxed, fill_selection, fill_gradient
 from luce_image.adjust import Adjuster, adjustment_count, parameter_count, curves
@@ -331,6 +331,18 @@ pub struct Canvas:
             return
         try self.bind_device(try gpu.Device.open())
 
+    ## Bind headless to the device `other` is bound to, so layers copy
+    ## between them: several documents open at once without a window.
+    pub mutating func bind_beside(other: interop.Reference[Canvas]) -> !:
+        try self.bind_sharing(try other.get())
+
+    mutating func bind_sharing(other: const Canvas*) -> !:
+        try self.require_open()
+        if self.document != none:
+            return
+        let device = other.device else error(invalid, "bind the other canvas first")
+        try self.bind_device(try device.share())
+
     ## Bind to `acquired`, which the canvas owns from here (on failure too).
     mutating func bind_device(acquired: gpu.Device) -> !:
         var binding = Binding(device = acquired)
@@ -532,14 +544,7 @@ pub struct Canvas:
     ## A layer, a group or an adjustment layer on top, its record and (bound) its tree node.
     mutating func add_record(name: str, group: bool, adjustment: i64) -> i64!:
         try self.require_open()
-        if self.count == self.records.length:
-            let capacity = 8 if self.records.length == 0 else self.records.length * 2
-            let grown = try alloc Record[capacity] in memory.heap
-            if self.count > 0:
-                memory.copy(grown, self.records, self.count)
-            if self.records.length > 0:
-                free(self.records) in memory.heap
-            self.records = grown
+        try self.record_room()
         var copied: str = ""
         with memory.heap:
             copied = try strings.copy(name)
@@ -563,6 +568,18 @@ pub struct Canvas:
         self.count += 1
         self.next_id += 1
         return (i64)id
+
+    ## Room for one more record.
+    mutating func record_room() -> !:
+        if self.count < self.records.length:
+            return
+        let capacity = 8 if self.records.length == 0 else self.records.length * 2
+        let grown = try alloc Record[capacity] in memory.heap
+        if self.count > 0:
+            memory.copy(grown, self.records, self.count)
+        if self.records.length > 0:
+            free(self.records) in memory.heap
+        self.records = grown
 
     ## Move a layer — a group with everything in it — into group `parent` (0
     ## the top level) at `position` among its layers, 0 the bottom, or on top
@@ -2060,6 +2077,43 @@ pub struct Canvas:
         try self.begin_edit("Layer via Copy")
         defer self.end_edit()
         return try layer_from_selection(&self, id, cut)
+
+    ## Copy layer `id` whole — pixels, mask, style, text, a group with all it
+    ## holds — on top of the layers copied so far, to paste here or into
+    ## another document; `forget_copied_layers` starts afresh. Their names go
+    ## on the system clipboard unless `quietly` (a drag between documents).
+    pub mutating func copy_layer(id: i64, quietly: bool = false) -> !:
+        try copy_layer_to_clip(&self, id, not quietly)
+
+    ## Forget the copied layers.
+    pub static func forget_copied_layers():
+        clear_layer_clip()
+
+    ## Whether Paste should take the copied layers: the system clipboard still
+    ## holds what copying them put there.
+    pub static func layers_on_clipboard() -> bool!:
+        return try clip_on_clipboard()
+
+    ## How many layers are copied.
+    pub static func copied_layers() -> i64:
+        let clip = layer_clip else return 0
+        return (i64)clip.layer_count
+
+    ## The copied layers into group `parent` (0 the top level) from `position`
+    ## up among its layers (negative: on top), as one step; the topmost's id.
+    ## They land where they were on a canvas of the same size or `in_place`,
+    ## else centred.
+    pub mutating func paste_layers(parent: i64, position: i64, in_place: bool = false) -> i64!:
+        try self.begin_edit("Paste Layers")
+        defer self.end_edit()
+        return try paste_layer_clip(&self, parent, position, in_place)
+
+    ## The clipboard's image where it was copied from when it is what this
+    ## process copied last, else centred; its layer's id.
+    pub mutating func paste_in_place() -> i64!:
+        try self.begin_edit("Paste in Place")
+        defer self.end_edit()
+        return try paste_from_clipboard(&self, 0, 0, in_place = true)
 
     # mark: Canvas and image size =================================================================
 

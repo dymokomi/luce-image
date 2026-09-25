@@ -1305,3 +1305,45 @@ test "a PSD opens with its groups and its layers' masks":
     assert(group_index >= 0 and kid_index >= 0)
     assert((try canvas.layer_parent(kid_index)) == (try canvas.layer_id(group_index)))
     assert(try canvas.layer_masked(kid_index))
+
+test "whole layers copy and paste: a group with its masked, styled layer, here or centred on another document":
+    var first = try Canvas(64, 32)
+    defer first.close()
+    let group = try first.add_group("Group")
+    let red = try first.add_layer("Red")
+    try first.move_into(red, group, 0)
+    first.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try first.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, false)
+    try first.fill(red, false)
+    # The mask reveals the left half; the layer has a drop shadow.
+    try first.select_rectangle(0, 0, 32, 32, 0)
+    try first.set_mask(red, true, 2)
+    try first.deselect()
+    try first.set_style_value(red, 0, 1.0)
+    Canvas.forget_copied_layers()
+    try first.copy_layer(group)
+    assert(Canvas.copied_layers() == 1)
+    # Pasted on top of the same document: a second group holding a copy, one step.
+    let pasted = try first.paste_layers(0, -1)
+    assert(first.layer_count() == 4 and (try first.layer_id(3)) == pasted and (try first.layer_is_group(3)))
+    assert((try first.layer_parent(2)) == pasted and (try first.layer_name(2)) == "Red" and (try first.layer_masked(2)) and (try first.style_value(2, 0)) == 1.0)
+    try first.undo()
+    assert(first.layer_count() == 2)
+    # Into a document twice the size: centred, the mask moving with the pixels.
+    var second = try Canvas(128, 64)
+    defer second.close()
+    try second.bind_sharing(&first)
+    let landed = try second.paste_layers(0, -1)
+    assert(second.layer_count() == 2 and (try second.layer_id(1)) == landed)
+    let document = second.document else trap("bound")
+    let child = document.find((u64)(try second.layer_id(0))) else trap("pasted layer")
+    let pixels = try alloc f32[128 * 64 * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    try (child.tiles() else trap("pixels")).read(pixels)
+    assert(pixels[(20 * 128 + 40) * 4 + 3] > 0.99 and pixels[(20 * 128 + 10) * 4 + 3] < 0.01 and pixels[(10 * 128 + 40) * 4 + 3] < 0.01)
+    try (child.mask_tiles() else trap("mask")).read(pixels)
+    assert(pixels[(20 * 128 + 40) * 4] > 0.99 and pixels[(20 * 128 + 80) * 4] < 0.01 and pixels[(20 * 128 + 10) * 4] > 0.99)
+    Canvas.forget_copied_layers()
+    assert(Canvas.copied_layers() == 0)

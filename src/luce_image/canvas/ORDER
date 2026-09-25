@@ -2,6 +2,7 @@ module.lucb
 drawing.lucb
 files.lucb
 clipboard.lucb
+layer_clip.lucb
 retouch.lucb
 transforming.lucb
 type_layers.lucb

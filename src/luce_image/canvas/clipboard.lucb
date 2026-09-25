@@ -10,6 +10,12 @@
 #
 #==============================================================================================
 
+## Where the last copy this process made came from, for Paste in Place.
+var copied_left: i64 = 0
+var copied_top: i64 = 0
+var copied_width: u32 = 0
+var copied_height: u32 = 0
+
 ## `Canvas.copy_selection`: the selected pixels of layer `id`, or of the flattened
 ## document when `merged`, to the clipboard; with `cut` they also leave the layer.
 ## Without a selection the whole layer (or document) goes.
@@ -55,12 +61,18 @@ func copy_to_clipboard(canvas: Canvas*, id: i64, merged: bool, cut: bool) -> !:
     let rgba = try picture.value().rgba8()
     defer free(rgba) in memory.heap
     try clipboard.write_image(png, (u32)width, (u32)height, rgba)
+    copied_left = left
+    copied_top = top
+    copied_width = (u32)width
+    copied_height = (u32)height
     if cut:
         try erase_selected(canvas, (u64)id)
 
 ## `Canvas.paste`: the clipboard's image on a new top layer named "Pasted",
-## centred on a document point; the new layer's id.
-func paste_from_clipboard(canvas: Canvas*, center_x: i64, center_y: i64) -> i64!:
+## centred on a document point — or, `in_place`, where it was copied from when
+## it is what this process copied last, else on the canvas's centre; the new
+## layer's id.
+func paste_from_clipboard(canvas: Canvas*, center_x: i64, center_y: i64, in_place: bool = false) -> i64!:
     try canvas.require_open()
     try canvas.require_idle()
     let found = try clipboard.read_image() else error(invalid, "the clipboard holds no image")
@@ -68,8 +80,16 @@ func paste_from_clipboard(canvas: Canvas*, center_x: i64, center_y: i64) -> i64!
     defer image.destroy()
     let picture = try Image.open_bytes(image.encoded) if image.encoded.length > 0 else try Image.from_rgba8((usize)image.width, (usize)image.height, image.rgba)
     defer picture.release()
+    var x = center_x
+    var y = center_y
+    if in_place:
+        x = (i64)canvas.extent_x // 2
+        y = (i64)canvas.extent_y // 2
+        if image.width == copied_width and image.height == copied_height:
+            x = copied_left + (i64)(copied_width // 2)
+            y = copied_top + (i64)(copied_height // 2)
     let id = try canvas.add_layer("Pasted")
-    try place_image_at(canvas, id, picture, center_x, center_y)
+    try place_image_at(canvas, id, picture, x, y)
     return id
 
 ## `Canvas.layer_via_copy`: a new layer holding the selected pixels of layer

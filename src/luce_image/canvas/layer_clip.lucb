@@ -1,0 +1,177 @@
+#==============================================================================================
+#
+#   canvas/layer_clip - The layer clipboard
+#
+#   DESCRIPTION:
+#       Whole layers — pixels past the canvas too, masks, styles, adjustments, text, groups
+#       with all they hold — copied from one document and pasted into it or another, as
+#       Photoshop's Copy and Paste with layers selected and its drag of a layer onto
+#       another document. The layers are snapshots whose tiles are shared, so copying costs
+#       little; they live for the process beside the system clipboard's pixels, and pasting
+#       gives every layer a new id in the document it lands in. The system clipboard gets
+#       their pixels (the workspace copies those after) or, for layers without any, their
+#       names: Paste takes the layers while the clipboard still holds what copying them put
+#       there, and anything another program copies since wins.
+#
+#==============================================================================================
+
+struct LayerClip:
+    ## Snapshots of the copied layers, bottom to top.
+    var layers: Layer*[]
+    var layer_count: usize
+    ## The records of the copied layers and all they hold, with the ids they had.
+    var records: Record[]
+    var record_count: usize
+    ## The canvas they came from, to centre them on one of another size.
+    var width: u32
+    var height: u32
+    ## Their names, a line each, as put on the system clipboard.
+    var names: str
+
+var layer_clip: LayerClip*? = none
+
+## Forget the copied layers.
+func clear_layer_clip():
+    let clip = layer_clip else return
+    layer_clip = none
+    for layer in clip.layers[..<clip.layer_count]:
+        release_snapshot(layer)
+    if clip.layers.length > 0:
+        free(clip.layers) in memory.heap
+    release_records(clip.records, clip.record_count)
+    strings.release(clip.names)
+    free(clip) in memory.heap
+
+## `Canvas.copy_layer`: layer `id` of `canvas`, with all it holds, added on top
+## of the copied layers; copying from another canvas starts afresh. With
+## `announce` their names go on the system clipboard.
+func copy_layer_to_clip(canvas: Canvas*, id: i64, announce: bool) -> !:
+    try canvas.require_open()
+    try canvas.require_idle()
+    let document = canvas.document else error(invalid, "draw the document once before copying layers")
+    if let clip = layer_clip:
+        if clip.width != canvas.extent_x or clip.height != canvas.extent_y:
+            clear_layer_clip()
+    if layer_clip == none:
+        let records = try alloc Record[8] in memory.heap
+        errdefer free(records) in memory.heap
+        let layers = try alloc Layer*[4] in memory.heap
+        errdefer free(layers) in memory.heap
+        var names: str = ""
+        with memory.heap:
+            names = try strings.copy("")
+        layer_clip = try new LayerClip(layers = layers, layer_count = 0, records = records, record_count = 0, width = canvas.extent_x, height = canvas.extent_y, names = names) in memory.heap
+        # No pixels copied with these yet.
+        copied_width = 0
+        copied_height = 0
+    let clip = layer_clip else trap("just made")
+    if clip.layer_count == clip.layers.length:
+        let grown = try alloc Layer*[clip.layers.length * 2] in memory.heap
+        memory.copy(grown, clip.layers, clip.layer_count)
+        free(clip.layers) in memory.heap
+        clip.layers = grown
+    let snapshot = try document.snapshot((u64)id)
+    errdefer release_snapshot(snapshot)
+    try keep_records(canvas, clip, snapshot)
+    clip.layers[clip.layer_count] = snapshot
+    clip.layer_count += 1
+    var names: str = ""
+    with memory.heap:
+        if clip.names.length > 0:
+            let parts: str[2] = [clip.names, snapshot.name]
+            names = try strings.join(parts, "\n")
+        else:
+            names = try strings.copy(snapshot.name)
+    strings.release(clip.names)
+    clip.names = names
+    if not announce:
+        return
+    clipboard.write_text(names) catch _:
+        # A clipboard without text (Linux, for now): the layers still paste here.
+        return
+
+## `Canvas.layers_on_clipboard`: whether some layers are copied and the system
+## clipboard still holds what copying them put there — their pixels or their names.
+func clip_on_clipboard() -> bool!:
+    let clip = layer_clip else return false
+    let found = clipboard.read_image() catch _:
+        return true
+    if let held = found:
+        var image = held
+        defer image.destroy()
+        return copied_width != 0 and image.width == copied_width and image.height == copied_height
+    let text = clipboard.read_text() catch _:
+        return true
+    defer text.release()
+    return text.value == clip.names
+
+## The records of `layer` and all it holds, copied into `clip`.
+func keep_records(canvas: Canvas*, clip: LayerClip*, layer: const Layer*) -> !:
+    if clip.record_count == clip.records.length:
+        let grown = try alloc Record[clip.records.length * 2] in memory.heap
+        memory.copy(grown, clip.records, clip.record_count)
+        free(clip.records) in memory.heap
+        clip.records = grown
+    let index = try canvas.index(layer.id)
+    clip.records[clip.record_count] = try copied_record(canvas.records[index])
+    clip.record_count += 1
+    for child in layer.layers():
+        try keep_records(canvas, clip, child)
+
+## A record with its own name and text, and no picture waiting.
+func copied_record(record: Record) -> Record!:
+    var copy = record
+    copy.picture = none
+    copy.mask_picture = none
+    with memory.heap:
+        copy.name = try strings.copy(record.name)
+    copy_type(&copy) catch failure:
+        strings.release(copy.name)
+        error(failure.code, failure.message)
+    return copy
+
+## `Canvas.paste_layers`: the copied layers into group `parent` (0 the top
+## level) from `position` up (negative: on top), each with a new id; the
+## topmost's id. They land where they were when the canvases are the same
+## size or `in_place`, else centred.
+func paste_layer_clip(canvas: Canvas*, parent: i64, position: i64, in_place: bool) -> i64!:
+    try canvas.require_open()
+    try canvas.require_idle()
+    let clip = layer_clip else error(invalid, "no layers are copied")
+    let document = canvas.document else error(invalid, "draw the document once before pasting layers")
+    var dx = 0.0
+    var dy = 0.0
+    if not in_place:
+        dx = math.floor(((f64)canvas.extent_x - (f64)clip.width) / 2.0)
+        dy = math.floor(((f64)canvas.extent_y - (f64)clip.height) / 2.0)
+    var top: i64 = 0
+    for at in 0..<clip.layer_count:
+        let place = (usize)position + at if position >= 0 else (usize)1 << 40
+        let first = try document.adopt(clip.layers[at], none if parent == 0 else (u64)parent, place, dx, dy)
+        var next = first
+        try add_clip_records(canvas, clip, clip.layers[at], (u64)parent, &next, dx, dy)
+        canvas.next_id = next
+        top = (i64)first
+    try canvas.sync_records()
+    return top
+
+## Records for `layer` and all it holds as `Document.adopt` numbered them, in
+## pre-order from `*next`, under `parent`.
+func add_clip_records(canvas: Canvas*, clip: const LayerClip*, layer: const Layer*, parent: u64, next: u64*, dx: f64, dy: f64) -> !:
+    var found: usize = 0
+    while found < clip.record_count and clip.records[found].id != layer.id:
+        found += 1
+    if found == clip.record_count:
+        error(invalid, "a copied layer lost its record")
+    try canvas.record_room()
+    var record = try copied_record(clip.records[found])
+    record.id = *next
+    record.parent = parent
+    if record.typed:
+        record.typeset.x += dx
+        record.typeset.y += dy
+    canvas.records[canvas.count] = record
+    canvas.count += 1
+    *next += 1
+    for child in layer.layers():
+        try add_clip_records(canvas, clip, child, record.id, next, dx, dy)
