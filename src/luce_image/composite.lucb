@@ -1,7 +1,9 @@
 ## The compositor: answers a request for one tile of the flattened document at
 ## a pyramid level, from a cache keyed on what the tile depends on. Level 0 is
 ## document pixels; level L covers 2^L by 2^L level-0 tiles in one 256 by 256
-## texture. The key is an identity digest over the contributing layers (id,
+## texture, composited from every layer's own level-L tiles (luce-canvas's
+## pyramid), so a zoomed-out view costs what it shows, not what the document
+## holds. The key is an identity digest over the contributing layers (id,
 ## revision, visibility, effective opacity) plus the cell and level, so a change
 ## to one layer invalidates only the tiles it touches, and a change to a top
 ## layer's opacity never re-renders what lies below it in another tile. There is
@@ -12,6 +14,8 @@
 import gpu
 import memory
 from tiles import Tiles, Tile, tile_size, min_u32
+from pyramid import Pyramid, covered_at, tile_bytes
+from tile_cache import TileCache
 from luce_image.document import Document, Layer, fnv_start, fnv_mix
 from luce_image.style import Styler
 from raster_errors import invalid, limit
@@ -20,12 +24,6 @@ from luce_image.shaders import composite_frag_words, composite_frag_msl, adjust_
 from luce_image.adjust import Adjuster, Place, curves, blur
 from luce_image.filter import Filters
 from luce_image.curves import lut_size
-
-struct Entry:
-    var digest: u64
-    var texture: gpu.Texture
-    var used: u64
-    var live: bool
 
 ## A styled layer's rendered effects, kept while its pixels and style stand.
 struct Effects:
@@ -52,9 +50,11 @@ let effects_budget: usize = 8
 
 pub struct Composer:
     var owner: gpu.Device
-    var entries: Entry[]
-    var count: usize
-    var budget: usize
+    ## Composited tiles by what they depend on, and every layer's levels.
+    var cache: TileCache
+    var pyramid: Pyramid
+    ## The level the tile being made is at.
+    var level: u32
     var tick: u64
     var shader: gpu.Shader
     var pipeline: gpu.Pipeline
@@ -80,14 +80,15 @@ pub struct Composer:
     var stop_at: u64
     var stopped: bool
 
-    ## A compositor keeping at most `budget` rendered tiles (1 MiB each).
-    pub static func create(device: gpu.Device, budget: usize = 512) -> Composer!:
+    ## A compositor keeping at most `budget` composited tiles (512 KiB each),
+    ## and as many bytes again of layer levels.
+    pub static func create(device: gpu.Device, budget: usize = 1536) -> Composer!:
         if budget == 0 or budget > 65536:
             error(invalid, "the tile budget must be in 1..65536")
-        let entries = try alloc Entry[budget] in memory.heap
-        errdefer free(entries) in memory.heap
-        for index in 0..<budget:
-            entries[index] = Entry(digest = 0, texture = gpu.Texture(), used = 0, live = false)
+        var cache = try TileCache.create(budget * tile_bytes, tile_bytes)
+        errdefer cache.destroy()
+        var pyramid = try Pyramid.create(device, budget * tile_bytes)
+        errdefer pyramid.destroy()
         var shader = try gpu.Shader.create(device, composite_frag_words, composite_frag_msl)
         errdefer shader.destroy()
         var pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.replace, gpu.Format.rgba16_float)
@@ -119,7 +120,7 @@ pub struct Composer:
         var tables: CurveTable[4]
         for index in 0..<curve_table_budget:
             tables[index] = CurveTable(key = 0, texture = gpu.Texture(), live = false)
-        return Composer(owner = device, entries = entries, count = 0, budget = budget, tick = 0, shader = shader, pipeline = pipeline, blank = blank, white = white, styler = styler,
+        return Composer(owner = device, cache = cache, pyramid = pyramid, level = 0, tick = 0, shader = shader, pipeline = pipeline, blank = blank, white = white, styler = styler,
                         adjuster = adjuster, mix_shader = mix_shader, mix = mix, effects = effects, curve_tables = tables, next_curve_table = 0, renders = 0, extent_x = 0, extent_y = 0,
                         drawing = none, filters = filters, stop_at = 0, stopped = false)
 
@@ -135,6 +136,10 @@ pub struct Composer:
         self.extent_x = document.width()
         self.extent_y = document.height()
         self.drawing = document
+        self.level = level
+        # What this tile fetches stays until the next request.
+        self.cache.hold()
+        self.pyramid.hold()
         var digest = fnv_start()
         digest = fnv_mix(digest, (u64)level)
         digest = fnv_mix(digest, (u64)column)
@@ -148,27 +153,20 @@ pub struct Composer:
             digest = hash_layers(digest, document.layers(), 1.0, first_column, first_row, span + 2)
         else:
             digest = hash_layers(digest, document.layers(), 1.0, column * span, row * span, span)
-        if let found = self.lookup(digest):
+        if let found = self.cache.find(digest | 1):
             return found
-        var texture = gpu.Texture()
-        if level == 0:
-            texture = try self.flatten(document, column, row)
-        else:
-            texture = try self.halve(document, column, row, level)
-        errdefer texture.destroy()
+        let texture = try self.flatten(document, column, row)
         self.renders += 1
-        let slot = self.slot()
-        if self.entries[slot].live:
-            self.entries[slot].texture.destroy()
-        self.entries[slot] = Entry(digest = digest, texture = texture, used = self.tick, live = true)
+        try self.cache.put(digest | 1, texture, tile_bytes)
         return texture
 
-    mutating func lookup(digest: u64) -> gpu.Texture?:
-        for index in 0..<self.count:
-            if self.entries[index].live and self.entries[index].digest == digest:
-                self.entries[index].used = self.tick
-                return self.entries[index].texture
-        return none
+    ## A layer's (or mask's) tile at the level being made; none where it is empty.
+    mutating func source(tiles: const Tiles*, column: u32, row: u32, mask: bool = false) -> gpu.Texture?!:
+        return try self.pyramid.texture(tiles, column, row, self.level, mask)
+
+    ## The texels a cell covers at the level being made.
+    func region_at(column: u32, row: u32) -> gpu.Region:
+        return gpu.Region(0, 0, covered_at(self.extent_x, column, self.level), covered_at(self.extent_y, row, self.level))
 
     ## A level-0 tile: every contributing layer composited in turn over the
     ## result so far, through the blend shader, each pass into a fresh tile.
@@ -212,7 +210,7 @@ pub struct Composer:
                 # (clipped) the base's alpha. It is never a clipping base itself.
                 var mask = self.white
                 if let mask_tiles = layer.active_mask():
-                    if let mask_texture = mask_tiles.texture(column, row):
+                    if let mask_texture = try self.source(mask_tiles, column, row, true):
                         mask = mask_texture
                 var clip = self.white
                 if layer.clipped:
@@ -221,26 +219,26 @@ pub struct Composer:
                 continue
             let tiles = layer.tiles() else continue
             if not layer.clipped:
-                base = tiles.texture(column, row)
+                base = try self.source(tiles, column, row)
                 base_missing = base == none
-            let area = tiles.region(column, row)
+            let area = self.region_at(column, row)
             var clip = self.blank if layer.clipped and base_missing else (base else self.blank)
             if not layer.clipped:
                 clip = self.white
             var mask = self.white
             if let mask_tiles = layer.active_mask():
-                if let mask_texture = mask_tiles.texture(column, row):
+                if let mask_texture = try self.source(mask_tiles, column, row, true):
                     mask = mask_texture
             # The layer's effects go under it, with its opacity and mask, blended
             # normally; those inside it (overlay, inner shadow, an inside stroke)
             # come as the layer itself, recolored.
-            var texture = tiles.texture(column, row)
+            var texture = try self.source(tiles, column, row)
             if layer.style.any():
                 let effects = try self.effects_for(layer)
-                if let effect = effects.tiles.texture(column, row):
+                if let effect = try self.source(&effects.tiles, column, row):
                     try self.pass(backdrop, owned, effect, mask, clip, area, effective, 0)
                 if effects.has_over:
-                    texture = effects.over.texture(column, row)
+                    texture = try self.source(&effects.over, column, row)
             let drawn = texture else continue
             try self.pass(backdrop, owned, drawn, mask, clip, area, effective, layer.blend)
 
@@ -260,8 +258,8 @@ pub struct Composer:
             return
         if not inside_owned:
             return
-        let mask = mask_tiles.texture(column, row) else self.white
-        try self.pass(backdrop, owned, inside, mask, self.white, mask_tiles.region(column, row), opacity, 0)
+        let mask = (try self.source(mask_tiles, column, row, true)) else self.white
+        try self.pass(backdrop, owned, inside, mask, self.white, self.region_at(column, row), opacity, 0)
 
     ## One layer (or effects) tile composited over the backdrop so far.
     mutating func pass(backdrop: gpu.Texture*, owned: bool*, texture: gpu.Texture, mask: gpu.Texture, clip: gpu.Texture, area: gpu.Region, opacity: f64, blend: u32) -> !:
@@ -289,7 +287,9 @@ pub struct Composer:
             adjusted = try self.blurred(*backdrop, layer, column, row)
         else:
             let table = try self.curve_table_for(layer)
-            let place = Place(x = column * tile_size, y = row * tile_size, width = self.extent_x, height = self.extent_y)
+            # Where the tile lies, in the level's pixels.
+            let place = Place(x = column * tile_size, y = row * tile_size, width = (u32)(((u64)self.extent_x + (1u64 << self.level) - 1) >> self.level),
+                              height = (u32)(((u64)self.extent_y + (1u64 << self.level) - 1) >> self.level))
             adjusted = try self.adjuster.adjusted(*backdrop, (u32)layer.adjustment, layer.adjustment_values[..<23], table, place)
         defer adjusted.destroy()
         var params: f32[1] = [(f32)opacity]
@@ -318,7 +318,7 @@ pub struct Composer:
             while dx <= 1:
                 let x = (i64)column + dx
                 let y = (i64)row + dy
-                if x >= 0 and y >= 0 and x * (i64)tile_size < (i64)self.extent_x and y * (i64)tile_size < (i64)self.extent_y:
+                if x >= 0 and y >= 0 and ((x * (i64)tile_size) << (i64)self.level) < (i64)self.extent_x and ((y * (i64)tile_size) << (i64)self.level) < (i64)self.extent_y:
                     var texture = gpu.Texture()
                     if dx == 0 and dy == 0:
                         texture = try block.blank()
@@ -329,7 +329,8 @@ pub struct Composer:
                     try block.set((u32)(dx + 1), (u32)(dy + 1), texture)
                 dx += 1
             dy += 1
-        try self.filters.blur_tiles(&block, clamp_radius(layer.adjustment_values[0]))
+        # A coarser level blurs by as many of its own, larger, texels.
+        try self.filters.blur_tiles(&block, clamp_radius(layer.adjustment_values[0] / (f64)(1u64 << self.level)))
         var result = try block.blank()
         errdefer result.destroy()
         if let blurred = block.texture(1, 1):
@@ -409,41 +410,6 @@ pub struct Composer:
         self.effects[slot] = Effects(key = key, tiles = rendered.under, over = rendered.over, has_over = rendered.has_over, used = self.tick, live = true)
         return &self.effects[slot]
 
-    ## A coarser tile: the four tiles of the level below, each drawn at half size.
-    mutating func halve(document: const Document*, column: u32, row: u32, level: u32) -> gpu.Texture!:
-        var texture = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
-        errdefer texture.destroy()
-        let half = (f64)tile_size * 0.5
-        let below = 1u32 << (level - 1)
-        # Drawing into a fresh frame while fetching finer tiles may evict cache
-        # entries, so the frame is recorded after all four are looked up.
-        var parts: gpu.Texture[4]
-        var count: usize = 0
-        var positions: gpu.Rect[4]
-        var regions: gpu.Region[4]
-        for dy in 0..<(u32)2:
-            for dx in 0..<(u32)2:
-                let fine_column = column * 2 + dx
-                let fine_row = row * 2 + dy
-                if fine_column * below * tile_size >= document.width() or fine_row * below * tile_size >= document.height():
-                    continue
-                let source = try self.tile(document, fine_column, fine_row, level - 1)
-                # The finer tile covers this many texels of the document at its level.
-                let covered_x = min_u32(tile_size, (document.width() - fine_column * below * tile_size + below - 1) // below)
-                let covered_y = min_u32(tile_size, (document.height() - fine_row * below * tile_size + below - 1) // below)
-                parts[count] = source
-                positions[count] = gpu.Rect(x = (f64)dx * half, y = (f64)dy * half, width = (f64)covered_x * 0.5, height = (f64)covered_y * 0.5)
-                regions[count] = gpu.Region(0, 0, covered_x, covered_y)
-                count += 1
-        let frame = try texture.frame()
-        defer frame.release()
-        let target = try frame.value().target()
-        defer target.release()
-        for index in 0..<count:
-            try gpu.copy_image(target.value(), parts[index], positions[index], regions[index], gpu.Filter.linear)
-        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
-        return texture
-
     ## Merge `upper` into the layer directly below it: every tile of the lower
     ## layer becomes the two composited with the upper's opacity, blend, mask
     ## and clipping; the upper layer is then removed.
@@ -477,24 +443,10 @@ pub struct Composer:
         lower.revision += 1
         try document.remove(upper)
 
-    ## The next free slot, or the least recently used one when full.
-    mutating func slot() -> usize:
-        if self.count < self.budget:
-            self.count += 1
-            return self.count - 1
-        var oldest: usize = 0
-        for index in 1..<self.count:
-            if self.entries[index].used < self.entries[oldest].used:
-                oldest = index
-        return oldest
-
     ## Forget every rendered tile.
     pub mutating func clear():
-        for index in 0..<self.count:
-            if self.entries[index].live:
-                self.entries[index].texture.destroy()
-                self.entries[index].live = false
-        self.count = 0
+        self.cache.clear()
+        self.pyramid.clear()
         for index in 0..<effects_budget:
             if self.effects[index].live:
                 drop_effects(&self.effects[index])
@@ -502,11 +454,8 @@ pub struct Composer:
 
     pub mutating func destroy():
         self.clear()
-        if self.entries.length > 0:
-            free(self.entries) in memory.heap
-        var empty: Entry[]
-        self.entries = empty
-        self.budget = 0
+        self.cache.destroy()
+        self.pyramid.destroy()
         for index in 0..<curve_table_budget:
             if self.curve_tables[index].live:
                 self.curve_tables[index].texture.destroy()
