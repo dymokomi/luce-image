@@ -1761,6 +1761,11 @@ pub struct Canvas:
             var shown = try document.take_tiles(preview.layer, preview.tiles)
             shown.destroy()
 
+    ## Show the previewed layer (or mask) as it was when the preview began, the
+    ## edit still under way: a dialog's Preview unchecked.
+    pub mutating func show_preview_original() -> !:
+        discard(try self.restore_preview())
+
     ## When the preview is of a mask, fill its missing cells (which count as
     ## white) with white tiles, so an adjustment or filter reaches them too;
     ## whether it is a mask.
