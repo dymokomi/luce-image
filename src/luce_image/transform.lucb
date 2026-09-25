@@ -6,7 +6,7 @@ import gpu
 import interop
 import math
 import memory
-from luce_image.tiles import Tiles, tile_size, flatten
+from tiles import Tiles, tile_size, flatten
 from luce_image.extent import relocate, flatten_all, landing_cells, canvas_part, reaches_past_part
 from luce_image.projective import Warp, affine_warp, multiply
 from luce_image.document import Document

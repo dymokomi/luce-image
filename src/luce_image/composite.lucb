@@ -11,11 +11,11 @@
 ## document has one every key covers those neighbours.
 import gpu
 import memory
-from luce_image.tiles import Tiles, Tile, tile_size, min_u32
+from tiles import Tiles, Tile, tile_size, min_u32
 from luce_image.document import Document, Layer, fnv_start, fnv_mix
 from luce_image.style import Styler
 from raster_errors import invalid, limit
-from luce_image.half import from_half
+from half import from_half
 from luce_image.shaders import composite_frag_words, composite_frag_msl, adjust_mix_frag_words, adjust_mix_frag_msl
 from luce_image.adjust import Adjuster, Place, curves, blur
 from luce_image.filter import Filters

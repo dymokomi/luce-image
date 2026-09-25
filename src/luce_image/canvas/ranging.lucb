@@ -1,0 +1,115 @@
+#==============================================================================================
+#
+#   canvas/ranging - Select › Color Range while its dialog is up
+#
+#   DESCRIPTION:
+#       The dialog shows its selection live as samples, Fuzziness and the range change. Each
+#       change is worked out on a small copy of the picture — the compositor's pyramid level
+#       no wider than 2048 pixels, with every pixel's Lab kept — and scaled up into the
+#       selection, so a change costs a fraction of a second on any document. None of it is
+#       history: OK works the range out once at full size and records one step from the
+#       selection the dialog opened on; Cancel puts that selection back.
+#
+#==============================================================================================
+
+## What the dialog works on: the selection it opened on, and the small copy.
+struct RangeSession:
+    var before: Selection
+    var width: usize
+    var height: usize
+    ## Document pixels a copy pixel spans across.
+    var scale: u32
+    var pixels: f32[]
+    var labs: f32[]
+
+    mutating func destroy():
+        self.before.destroy()
+        free(self.pixels) in memory.heap
+        free(self.labs) in memory.heap
+
+## The longest side the dialog's copy of the picture has.
+let range_preview_side: u32 = 2048
+
+## `Canvas.begin_color_range`: remember the selection and make the small copy.
+func begin_range(canvas: Canvas*) -> !:
+    try canvas.require_open()
+    end_range(canvas)
+    let document = canvas.document else error(invalid, "draw the document once before selecting a color range")
+    let composer = canvas.composer else error(invalid, "draw the document once before selecting a color range")
+    var level: u32 = 0
+    while (max_u32(canvas.extent_x, canvas.extent_y) >> level) > range_preview_side:
+        level += 1
+    let scale = 1u32 << level
+    let width = (usize)((canvas.extent_x + scale - 1) >> level)
+    let height = (usize)((canvas.extent_y + scale - 1) >> level)
+    let pixels = try alloc f32[width * height * 4] in memory.heap
+    errdefer free(pixels) in memory.heap
+    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    defer free(bytes) in memory.heap
+    let span = tile_size * scale
+    for row in 0..<(canvas.extent_y + span - 1) // span:
+        for column in 0..<(canvas.extent_x + span - 1) // span:
+            let texture = try composer.tile(document, column, row, level)
+            try texture.read(bytes)
+            let x0 = (usize)column * (usize)tile_size
+            let y0 = (usize)row * (usize)tile_size
+            for y in 0..<min_usize((usize)tile_size, height - y0):
+                for x in 0..<min_usize((usize)tile_size, width - x0):
+                    let source = (y * (usize)tile_size + x) * 8
+                    let destination = ((y0 + y) * width + x0 + x) * 4
+                    for channel in 0..<(usize)4:
+                        pixels[destination + channel] = from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8))
+    let labs = try alloc f32[width * height * 3] in memory.heap
+    errdefer free(labs) in memory.heap
+    try range_labs(pixels, labs)
+    let session = try new RangeSession(before = try canvas.current().copy(), width = width, height = height, scale = scale, pixels = pixels, labs = labs) in memory.heap
+    canvas.range_session = session
+
+## `Canvas.preview_color_range`: the dialog's selection now, worked out on the
+## small copy and scaled up; no history.
+func preview_range(canvas: Canvas*, range: i64, fuzziness: f64, invert: bool) -> !:
+    let session = canvas.range_session else error(invalid, "begin the color range first")
+    let small = try alloc u8[session.width * session.height] in memory.heap
+    defer free(small) in memory.heap
+    try range_coverage(session.pixels, canvas.range_samples[..<canvas.range_count], range, fuzziness, invert, small, session.labs)
+    let found = try alloc u8[(usize)canvas.extent_x * (usize)canvas.extent_y] in memory.heap
+    defer free(found) in memory.heap
+    enlarge(small, session.width, session.height, session.scale, found, (usize)canvas.extent_x, (usize)canvas.extent_y)
+    try canvas.live().from_coverage(found, Mode.replace)
+
+## `Canvas.finish_color_range`: OK (`keep`) works the range out at full size
+## as one step from the selection the dialog opened on; Cancel puts that back.
+func finish_range(canvas: Canvas*, keep: bool, range: i64, fuzziness: f64, invert: bool) -> !:
+    let session = canvas.range_session else error(invalid, "begin the color range first")
+    try canvas.live().merge(&session.before, Mode.replace)
+    end_range(canvas)
+    if keep:
+        try canvas.select_color_range(0, range, fuzziness, invert)
+
+## Drop the dialog's session, if any.
+func end_range(canvas: Canvas*):
+    let session = canvas.range_session else return
+    canvas.range_session = none
+    session.destroy()
+    free(session) in memory.heap
+
+## `small` (`width` by `height`, one byte a pixel, each spanning `scale`
+## document pixels) read between its pixels into every byte of `found`.
+func enlarge(small: const u8[], width: usize, height: usize, scale: u32, found: u8[], extent_x: usize, extent_y: usize):
+    let step = 1.0 / (f64)scale
+    for y in 0..<extent_y:
+        let sy = math.clamp(((f64)y + 0.5) * step - 0.5, 0.0, (f64)(height - 1))
+        let y0 = (usize)sy
+        let y1 = min_usize(y0 + 1, height - 1)
+        let fy = sy - (f64)y0
+        for x in 0..<extent_x:
+            let sx = math.clamp(((f64)x + 0.5) * step - 0.5, 0.0, (f64)(width - 1))
+            let x0 = (usize)sx
+            let x1 = min_usize(x0 + 1, width - 1)
+            let fx = sx - (f64)x0
+            let top = (f64)small[y0 * width + x0] * (1.0 - fx) + (f64)small[y0 * width + x1] * fx
+            let bottom = (f64)small[y1 * width + x0] * (1.0 - fx) + (f64)small[y1 * width + x1] * fx
+            found[y * extent_x + x] = (u8)(top * (1.0 - fy) + bottom * fy + 0.5)
+
+func min_usize(a: usize, b: usize) -> usize:
+    return a if a < b else b

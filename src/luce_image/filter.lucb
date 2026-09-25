@@ -8,7 +8,7 @@
 import gpu
 import memory
 import math
-from luce_image.tiles import Tiles, tile_size, box, unbox, flatten
+from tiles import Tiles, tile_size, box, unbox, flatten
 from luce_image.document import Document
 from luce_image.shaders import blur_frag_words, blur_frag_msl, resample_frag_words, resample_frag_msl
 from raster_errors import invalid

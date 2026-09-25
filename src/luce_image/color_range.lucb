@@ -33,35 +33,57 @@ pub func range_sample(red: f64, green: f64, blue: f64, subtract: bool) -> RangeS
 ## Coverage 0..255 for every pixel of `pixels` (straight RGBA, linear light):
 ## how far each is in `range` — by `samples` within `fuzziness` (0..200 ΔE)
 ## for the sampled range — turned around by `invert`. Transparent pixels are
-## never selected.
-pub func range_coverage(pixels: const f32[], samples: const RangeSample[], range: i64, fuzziness: f64, invert: bool, coverage: u8[]) -> !:
+## never selected. `labs`, when given, holds each pixel's CIELAB (three a
+## pixel, `range_labs`), so a dialog changing only the fuzziness or the
+## samples does not convert every pixel again.
+pub func range_coverage(pixels: const f32[], samples: const RangeSample[], range: i64, fuzziness: f64, invert: bool, coverage: u8[], labs: const f32[]? = none) -> !:
     if pixels.length != coverage.length * 4:
         error(invalid, "color range needs RGBA pixels and a coverage byte each")
     if range < range_sampled or range > range_shadows:
         error(invalid, "a color range is 0 sampled, 1..6 a hue, 7 highlights, 8 midtones or 9 shadows")
     if not math.is_finite(fuzziness) or fuzziness < 0.0 or fuzziness > 200.0:
         error(invalid, "fuzziness is 0..200")
+    if let known = labs:
+        if known.length != coverage.length * 3:
+            error(invalid, "color range needs three Lab values a pixel")
     for index in 0..<coverage.length:
+        let alpha = math.clamp((f64)pixels[index * 4 + 3], 0.0, 1.0)
+        if alpha <= 0.0:
+            coverage[index] = 0
+            continue
         let red = math.max(0.0, (f64)pixels[index * 4])
         let green = math.max(0.0, (f64)pixels[index * 4 + 1])
         let blue = math.max(0.0, (f64)pixels[index * 4 + 2])
         var value = 0.0
         if range == range_sampled:
-            value = sampled(red, green, blue, samples, fuzziness)
+            var here = lab.Lab(l = 0.0, a = 0.0, b = 0.0)
+            if let known = labs:
+                here = lab.Lab(l = (f64)known[index * 3], a = (f64)known[index * 3 + 1], b = (f64)known[index * 3 + 2])
+            else:
+                here = lab_of(red, green, blue)
+            value = sampled(here, samples, fuzziness)
         elif range < range_highlights:
             value = hue_weight(red, green, blue, range)
         else:
             value = tone_weight(red, green, blue, range)
         if invert:
             value = 1.0 - value
-        value *= math.clamp((f64)pixels[index * 4 + 3], 0.0, 1.0)
-        coverage[index] = (u8)(math.clamp(value, 0.0, 1.0) * 255.0 + 0.5)
+        coverage[index] = (u8)(math.clamp(value * alpha, 0.0, 1.0) * 255.0 + 0.5)
+
+## Every pixel's CIELAB, three values a pixel, for `range_coverage`.
+pub func range_labs(pixels: const f32[], labs: f32[]) -> !:
+    if labs.length * 4 != pixels.length * 3:
+        error(invalid, "Lab values need three a pixel")
+    for index in 0..<pixels.length // 4:
+        let value = lab_of(math.max(0.0, (f64)pixels[index * 4]), math.max(0.0, (f64)pixels[index * 4 + 1]), math.max(0.0, (f64)pixels[index * 4 + 2]))
+        labs[index * 3] = (f32)value.l
+        labs[index * 3 + 1] = (f32)value.a
+        labs[index * 3 + 2] = (f32)value.b
 
 ## Nearest to an added sample, less nearest to a subtracted one.
-func sampled(red: f64, green: f64, blue: f64, samples: const RangeSample[], fuzziness: f64) -> f64:
+func sampled(here: lab.Lab, samples: const RangeSample[], fuzziness: f64) -> f64:
     if samples.length == 0:
         return 0.0
-    let here = lab_of(red, green, blue)
     var keep = 0.0
     var away = 0.0
     for sample in samples:

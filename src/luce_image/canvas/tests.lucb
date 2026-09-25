@@ -1395,6 +1395,37 @@ test "color range selects the sampled color, and the shadows":
     try canvas.select_color_range(layer, 9, 40.0, false, all_layers = false)
     assert(canvas.current().at(48, 32) == 0 and canvas.current().at(4, 4) == 255)
 
+test "the color range dialog previews out of history; OK is one step, Cancel leaves nothing to redo":
+    var canvas = try Canvas(600, 400)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Scene")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, false)
+    try canvas.fill(layer, false)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.8, 0.0, false)
+    try canvas.select_ellipse(200, 100, 200, 200, 0)
+    try canvas.fill(layer, false)
+    try canvas.select_rectangle(0, 0, 20, 20, 0)
+    let before = canvas.undo_name()
+    try canvas.begin_color_range()
+    canvas.clear_range_samples()
+    try canvas.add_range_sample(1.0, 0.8, 0.0, false)
+    try canvas.preview_color_range(0, 40.0, false)
+    assert(canvas.undo_name() == before and canvas.selected_at(300, 200) == 255 and canvas.selected_at(5, 5) == 0)
+    try canvas.preview_color_range(0, 40.0, true)
+    assert(canvas.selected_at(300, 200) == 0 and canvas.selected_at(5, 5) == 255)
+    try canvas.finish_color_range(false, 0, 40.0, true)
+    assert(canvas.undo_name() == before and not canvas.can_redo() and canvas.selected_at(5, 5) == 255 and canvas.selected_at(300, 200) == 0)
+    assert(canvas.selected_at(30, 30) == 0)
+    try canvas.begin_color_range()
+    try canvas.preview_color_range(0, 40.0, false)
+    try canvas.finish_color_range(true, 0, 40.0, false)
+    assert(canvas.undo_name() == "Color Range" and canvas.selected_at(300, 200) == 255 and canvas.selected_at(5, 5) == 0)
+    try canvas.undo()
+    assert(canvas.undo_name() == before and canvas.selected_at(5, 5) == 255 and canvas.selected_at(300, 200) == 0)
+
 test "the pencil paints whole pixels, with no soft edge":
     var canvas = try Canvas(64, 32)
     defer canvas.close()

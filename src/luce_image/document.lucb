@@ -7,7 +7,7 @@ import gpu
 import math
 import memory
 import strings
-from luce_image.tiles import Tiles, box, unbox
+from tiles import Tiles, box, unbox
 from luce_image.extent import relocate
 from luce_image.selection import Selection
 from luce_image.curves import Curves

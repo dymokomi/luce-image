@@ -10,7 +10,7 @@
 ##   each step, sampled back from behind the brush (bilinear).
 import math
 import memory
-from luce_image.tiles import Tiles, tile_size
+from tiles import Tiles, tile_size
 from raster_errors import invalid
 
 pub let warp_smudge: i64 = 0

@@ -45,8 +45,10 @@ func probe(raster: model.Raster*) -> !:
         try exr.probe(raster)
     elif heic.is_heic(data):
         try heic.probe(raster)
-    elif raw_signature(data) and raw.detect(data):
-        # Camera raws before TIFF: most of them are TIFF files underneath.
+    elif raw_signature(data) and (raw.detect(data) or raw.recognize(data)):
+        # Camera raws before TIFF: most of them are TIFF files underneath. One
+        # luce-raw knows but cannot develop yet says so, rather than being read
+        # as a TIFF.
         try raw.probe(raster)
     elif (data[0] == 'I' and data[1] == 'I') or (data[0] == 'M' and data[1] == 'M'):
         try tiff.probe(raster)

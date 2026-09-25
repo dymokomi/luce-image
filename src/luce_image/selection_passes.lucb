@@ -4,7 +4,7 @@
 ## covers it. Built once per device, like the other engine passes.
 import gpu
 import math
-from luce_image.tiles import Tiles, tile_size, flatten
+from tiles import Tiles, tile_size, flatten
 from luce_image.document import Document
 from luce_image.shaders import lift_frag_words, lift_frag_msl, mask_mix_frag_words, mask_mix_frag_msl
 from raster_errors import invalid

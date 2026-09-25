@@ -7,7 +7,7 @@
 import gpu
 import math
 import memory
-from luce_image.tiles import Tiles, tile_size, flatten
+from tiles import Tiles, tile_size, flatten
 from luce_image.document import Document, Layer, Style
 from luce_image.shaders import spread_frag_words, spread_frag_msl, style_frag_words, style_frag_msl
 from raster_errors import invalid, limit

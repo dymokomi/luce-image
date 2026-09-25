@@ -11,7 +11,7 @@
 import gpu
 import memory
 import math
-from luce_image.tiles import Tiles, tile_size
+from tiles import Tiles, tile_size
 from luce_image.document import Document, Layer
 from luce_image.selection import Mode
 from luce_image.shaders import dab_frag_words, dab_frag_msl, paint_frag_words, paint_frag_msl, gradient_frag_words, gradient_frag_msl

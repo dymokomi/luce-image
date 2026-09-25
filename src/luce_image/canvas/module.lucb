@@ -38,9 +38,9 @@ import prism
 import strings
 import svg
 from luce_image.image import Image, Pixel
-from luce_image.tiles import Tiles, Bounds, tile_size, tile_columns, min_u32, flatten
+from tiles import Tiles, Bounds, tile_size, tile_columns, min_u32, max_u32, flatten
 from luce_image.heal import heal
-from luce_image.color_range import RangeSample, range_sample, range_coverage
+from luce_image.color_range import RangeSample, range_sample, range_coverage, range_labs
 from luce_image.warp import WarpStroke, warp_smudge, warp_push
 from luce_image.document import Style, Document, Layer, TreeState, release_snapshot, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
 from luce_image.composite import Composer, box_composer, unbox_composer
@@ -59,7 +59,7 @@ import fonts
 from luce_image.geometry import resize_canvas, resize_image
 from luce_image.selection import Selection, Mode
 from luce_image.shaders import ants_frag_words, ants_frag_msl
-from luce_image.half import from_half
+from half import from_half
 from raster_errors import invalid, limit
 
 struct Record:
@@ -129,6 +129,8 @@ pub struct Canvas:
     ## Color Range's sampled colors (`add_range_sample`).
     var range_samples: RangeSample[32]
     var range_count: usize
+    ## The Color Range dialog's session while it is up (ranging.lucb).
+    var range_session: RangeSession*?
     var ants_shader: gpu.Shader?
     var ants: gpu.Pipeline?
     var history: Snapshot[]
@@ -228,6 +230,7 @@ pub struct Canvas:
         var no_samples: RangeSample[32]
         self.range_samples = no_samples
         self.range_count = 0
+        self.range_session = none
         self.ants_shader = none
         self.ants = none
         var no_history: Snapshot[]
@@ -462,6 +465,7 @@ pub struct Canvas:
             var owned = shader
             owned.destroy()
             self.ants_shader = none
+        end_range(&self)
         self.selection.destroy()
         if self.polygon.length > 0:
             free(self.polygon) in memory.heap
@@ -888,6 +892,7 @@ pub struct Canvas:
         return (try self.record(index)).opacity
 
     mutating func adopt_extent(width: u32, height: u32) -> !:
+        end_range(&self)
         self.extent_x = width
         self.extent_y = height
         var replacement = try Selection.create(width, height)
@@ -1215,6 +1220,21 @@ pub struct Canvas:
             error(limit, "Color Range keeps at most 32 samples")
         self.range_samples[self.range_count] = range_sample(red, green, blue, subtract)
         self.range_count += 1
+
+    ## The Color Range dialog opened: remember the selection, and make the small
+    ## copy of the picture its changes are worked out on.
+    pub mutating func begin_color_range() -> !:
+        try begin_range(&self)
+
+    ## The dialog's selection for these settings and the samples added, shown at
+    ## once and kept out of history.
+    pub mutating func preview_color_range(range: i64, fuzziness: f64, invert: bool) -> !:
+        try preview_range(&self, range, fuzziness, invert)
+
+    ## The dialog closed: OK (`keep`) selects the range at full size as one step;
+    ## Cancel puts back the selection it opened on.
+    pub mutating func finish_color_range(keep: bool, range: i64, fuzziness: f64, invert: bool) -> !:
+        try finish_range(&self, keep, range, fuzziness, invert)
 
     ## Select › Color Range: the pixels of layer `id` — or of the whole picture
     ## with `all_layers` — in `range` (0 the sampled colors within `fuzziness`,

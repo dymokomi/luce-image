@@ -5,7 +5,7 @@
 import gpu
 import memory
 import math
-from luce_image.tiles import Tiles
+from tiles import Tiles
 from luce_image.document import Document
 from luce_image.filter import Filters
 from raster_errors import invalid

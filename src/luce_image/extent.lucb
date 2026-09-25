@@ -8,7 +8,7 @@ import gpu
 import interop
 import math
 import memory
-from luce_image.tiles import Tiles, CellRange, Bounds, tile_size, min_i64, max_i64
+from tiles import Tiles, CellRange, Bounds, tile_size, min_i64, max_i64
 from raster_errors import invalid
 
 ## Texels `source` of `texture` (borrowed), their top-left at document pixel (`x`, `y`).

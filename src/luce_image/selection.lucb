@@ -5,7 +5,8 @@
 import gpu
 import math
 import memory
-from luce_image.tiles import Tiles, tile_size, box, unbox
+from tiles import Tiles, tile_size, box, unbox
+from half import to_half
 from luce_image.projective import Warp
 from raster_errors import invalid
 
@@ -453,24 +454,44 @@ pub struct Selection:
         if self.owner == none:
             self.owner = device
         if not self.uploaded or self.tiles == none:
-            let count = (usize)self.extent_x * (usize)self.extent_y * 4
-            let pixels = try alloc f32[count] in memory.heap
-            defer free(pixels) in memory.heap
-            for index in 0..<self.coverage.length:
-                let value = (f32)self.coverage[index] / 255.0
-                pixels[index * 4] = value
-                pixels[index * 4 + 1] = value
-                pixels[index * 4 + 2] = value
-                pixels[index * 4 + 3] = 1.0
             var fresh = try Tiles.create(device, self.extent_x, self.extent_y)
             errdefer fresh.destroy()
-            try fresh.write(pixels)
+            try self.fill_tiles(&fresh)
             let boxed = try box(fresh)
             if let previous = self.tiles:
                 unbox(previous)
             self.tiles = boxed
             self.uploaded = true
         return self.tiles
+
+    ## Every cell of `tiles` from the coverage, converted a tile at a time straight to
+    ## half floats (a byte's 256 values looked up), with no document-sized buffer.
+    func fill_tiles(tiles: Tiles*) -> !:
+        var halves: u16[256]
+        for value in 0..<(usize)256:
+            halves[value] = to_half((f32)value / 255.0)
+        let one = to_half(1.0)
+        let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+        defer free(bytes) in memory.heap
+        for row in 0..<tiles.rows():
+            for column in 0..<tiles.columns():
+                let area = tiles.region(column, row)
+                for index in 0..<bytes.length:
+                    bytes[index] = 0
+                for y in 0..<(usize)area.height:
+                    let line = ((usize)row * (usize)tile_size + y) * (usize)self.extent_x + (usize)column * (usize)tile_size
+                    for x in 0..<(usize)area.width:
+                        let half = halves[(usize)self.coverage[line + x]]
+                        let at = (y * (usize)tile_size + x) * 8
+                        for channel in 0..<(usize)3:
+                            bytes[at + channel * 2] = (u8)(half & 0xff)
+                            bytes[at + channel * 2 + 1] = (u8)(half >> 8)
+                        bytes[at + 6] = (u8)(one & 0xff)
+                        bytes[at + 7] = (u8)(one >> 8)
+                var texture = try tiles.blank()
+                errdefer texture.destroy()
+                try texture.upload(bytes[..<((usize)area.height * (usize)tile_size * 8)], gpu.Region(0, 0, tile_size, area.height))
+                try tiles.set(column, row, texture)
 
     pub mutating func destroy():
         if let tiles = self.tiles:

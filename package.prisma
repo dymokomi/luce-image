@@ -93,7 +93,7 @@ def package "luce-image" {
 
     def dependency "luce-raw" {
         str owner = "dymokomi"
-        str version = "^0.1.0"
+        str version = "^0.2.0"
         str path = "../luce-raw"
     }
 
@@ -101,6 +101,12 @@ def package "luce-image" {
         str owner = "dymokomi"
         str version = "^0.4.2"
         str path = "../luce-svg"
+    }
+
+    def dependency "luce-canvas" {
+        str owner = "dymokomi"
+        str version = "^0.1.0"
+        str path = "../luce-canvas"
     }
 
     def dependency "luce-gpu" {
