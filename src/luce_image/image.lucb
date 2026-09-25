@@ -5,6 +5,8 @@ import interop
 import memory
 import math
 import strings
+import os
+import thread
 import raster as model
 import png
 import jpeg
@@ -446,14 +448,34 @@ pub struct Image:
         if pixels.length != self.raster.width * self.raster.height * 4:
             error(invalid, "pixel buffer must hold width * height RGBA samples")
         let kind = self.raster.channels[0].kind
-        let scale = 1.0 / model.maximum(kind)
-        let encoded = kind != .float16 and kind != .float32 and kind != .float64
-        for index in 0..<self.raster.width * self.raster.height:
-            let pixel = try self.getpixel(index % self.raster.width, index // self.raster.width)
-            pixels[index * 4] = (f32)(decode_srgb(pixel.r * scale) if encoded else pixel.r * scale)
-            pixels[index * 4 + 1] = (f32)(decode_srgb(pixel.g * scale) if encoded else pixel.g * scale)
-            pixels[index * 4 + 2] = (f32)(decode_srgb(pixel.b * scale) if encoded else pixel.b * scale)
-            pixels[index * 4 + 3] = (f32)(pixel.a * scale)
+        # Which sample is which, worked out once as `getpixel` reads them.
+        var job = LinearJob(source = self.raster.pixels, pixels = pixels, stride = self.raster.channels.length, width = self.raster.width,
+                            red = -1, green = -1, blue = -1, alpha = -1, scale = 1.0 / model.maximum(kind), encoded = kind != .float16 and kind != .float32 and kind != .float64,
+                            table = none, first = 0, last = self.raster.height)
+        for c in 0..<self.raster.channels.length:
+            let name = self.raster.channels[c].name
+            if name == "Y":
+                job.red = (i64)c
+                job.green = (i64)c
+                job.blue = (i64)c
+            elif name == "R":
+                job.red = (i64)c
+            elif name == "G":
+                job.green = (i64)c
+            elif name == "B":
+                job.blue = (i64)c
+            elif name == "A":
+                job.alpha = (i64)c
+        # 8 and 16-bit samples decode through a table rather than a pow each.
+        if kind != .uint8 and kind != .uint16:
+            try linear_bands(&job)
+            return
+        let table = try alloc f32[256 if kind == .uint8 else 65536] in memory.heap
+        defer free(table) in memory.heap
+        for value in 0..<table.length:
+            table[value] = (f32)decode_srgb((f64)value * job.scale)
+        job.table = table
+        try linear_bands(&job)
 
     ## An 8-bit RGBA image from straight-alpha linear-light RGBA f32 samples,
     ## sRGB-encoded and clamped. Base only.
@@ -581,6 +603,70 @@ pub let image_type: interop.Type[Image] = interop.Type[Image]("Image", Image.clo
 func decode_srgb(value: f64) -> f64:
     let clamped = math.clamp(value, 0.0, 1.0)
     return clamped / 12.92 if clamped <= 0.04045 else math.pow((clamped + 0.055) / 1.055, 2.4)
+
+## Rows `first..<last` of an image for `linear_rgba`.
+struct LinearJob:
+    var source: const f64[]
+    var pixels: f32[]
+    var stride: usize
+    var width: usize
+    ## Each color's sample within a pixel; -1 when absent.
+    var red: i64
+    var green: i64
+    var blue: i64
+    var alpha: i64
+    var scale: f64
+    var encoded: bool
+    var table: const f32[]?
+    var first: usize
+    var last: usize
+
+func linear_entry(context: void*?):
+    linear_rows((LinearJob*)(context else return))
+
+func linear_rows(job: LinearJob*):
+    for index in job.first * job.width..<job.last * job.width:
+        let at = index * job.stride
+        job.pixels[index * 4] = linear_sample(job, at, job.red)
+        job.pixels[index * 4 + 1] = linear_sample(job, at, job.green)
+        job.pixels[index * 4 + 2] = linear_sample(job, at, job.blue)
+        job.pixels[index * 4 + 3] = (f32)(job.source[at + (usize)job.alpha] * job.scale) if job.alpha >= 0 else 1.0
+
+func linear_sample(job: const LinearJob*, at: usize, channel: i64) -> f32:
+    if channel < 0:
+        return 0.0
+    let value = job.source[at + (usize)channel]
+    if let table = job.table:
+        return table[(usize)math.clamp(value, 0.0, (f64)(table.length - 1))]
+    return (f32)(decode_srgb(value * job.scale) if job.encoded else value * job.scale)
+
+func min_rows(a: usize, b: usize) -> usize:
+    return a if a < b else b
+
+## `job`'s rows in bands over the processors.
+func linear_bands(job: LinearJob*) -> !:
+    let rows = job.last
+    let workers = math.imin(16, math.imax(1, (i64)os.cpus())) if rows * job.width >= 262144 else 1
+    if workers <= 1:
+        linear_rows(job)
+        return
+    var bands: LinearJob[16]
+    var handles: thread.Handle[16]
+    var started: usize = 0
+    let per = (rows + (usize)workers - 1) // (usize)workers
+    for band in 0..<(usize)workers:
+        bands[band] = *job
+        bands[band].first = min_rows(rows, band * per)
+        bands[band].last = min_rows(rows, band * per + per)
+    for band in 1..<(usize)workers:
+        handles[started] = thread.spawn(linear_entry, (void*)&bands[band], name = "linear-rgba") catch failure:
+            for other in band..<(usize)workers:
+                linear_rows(&bands[other])
+            break
+        started += 1
+    linear_rows(&bands[0])
+    for index in 0..<started:
+        try handles[index].join()
 
 ## The 8-bit sRGB encoding of a linear component.
 func encode_srgb(value: f64) -> f64:
