@@ -35,6 +35,11 @@
 //     midtones, the same in every channel, as film's
 //   14 noise: p0 deviation (0..1 of full scale), p1 monochrome, p2 uniform
 //     (evenly over ±p0; else Gaussian), each pixel its own, as Add Noise
+//   15 blur: drawn by the compositor itself (composite.lucb); left as it is here
+//   16 camera raw: p0 temperature and p1 tint (-1..1, a white balance in
+//     linear light), p2 exposure in stops; then on the encoded values p3
+//     contrast, p4 highlights, p5 shadows, p6 whites, p7 blacks, p8 vibrance
+//     (saturation mostly where there is little), p9 saturation (-1..1 each)
 // `place` is where the tile lies: its first pixel and the canvas's size, for
 // the kinds that depend on where a pixel is (vignette, grain, noise); a grain
 // hashed from the pixel's position lands the same on every tile and redraw.
@@ -148,8 +153,14 @@ void main() {
         fragment_color = vec4(clamp(light, 0.0, 1.0), o.a);
         return;
     }
+    vec3 light = o.rgb;
+    if (kind == 16) {
+        // White balance and exposure on light itself.
+        light *= vec3(1.0 + 0.3 * params.p[0] + 0.15 * params.p[1], 1.0 - 0.3 * params.p[1], 1.0 - 0.3 * params.p[0] + 0.15 * params.p[1]);
+        light *= exp2(params.p[2]);
+    }
     // The others act on the encoded values, as Photoshop's do.
-    vec3 c = to_srgb(clamp(o.rgb, 0.0, 1.0));
+    vec3 c = to_srgb(clamp(light, 0.0, 1.0));
     if (kind == 0) {
         c = c + params.p[0];
         float k = params.p[1] < 0.0 ? 1.0 + params.p[1] : 1.0 / max(1.0 - params.p[1], 1e-3);
@@ -227,6 +238,18 @@ void main() {
             float own = uniform_noise ? hash(at, float(channel + 1)) * 2.0 - 1.0 : gaussian(at, float(channel + 1));
             c[channel] += (params.p[1] > 0.5 ? shared_sample : own) * params.p[0];
         }
+    } else if (kind == 16) {
+        float l = luma601(c);
+        c += params.p[4] * 0.3 * smoothstep(0.5, 1.0, l);
+        c += params.p[5] * 0.3 * (1.0 - smoothstep(0.0, 0.5, l));
+        c += params.p[6] * 0.2 * smoothstep(0.75, 1.0, l);
+        c += params.p[7] * 0.2 * (1.0 - smoothstep(0.0, 0.25, l));
+        c = clamp(c, 0.0, 1.0);
+        float contrast = params.p[3];
+        c = contrast >= 0.0 ? mix(c, c * c * (3.0 - 2.0 * c), contrast) : mix(c, 0.5 + (c - 0.5) * 0.5, -contrast);
+        vec3 h = rgb_to_hsl(clamp(c, 0.0, 1.0));
+        h.y = clamp(h.y * (1.0 + params.p[9]) + params.p[8] * (1.0 - h.y) * h.y, 0.0, 1.0);
+        c = hsl_to_rgb(h);
     } else if (kind == 11) {
         float t = dot(c, vec3(0.2126, 0.7152, 0.0722));
         if (params.p[0] > 0.5) t = 1.0 - t;

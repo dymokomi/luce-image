@@ -1,0 +1,457 @@
+## Content-Aware Fill, after Photoshop's: the hole filled with texture from
+## the rest of the picture so that every patch of the result looks like some
+## patch outside it — Wexler, Shechtman and Irani's completion over Barnes et
+## al.'s PatchMatch. Coarse to fine: at the smallest scale the hole starts as
+## the tone flowing in from its edge; at each scale nearest-neighbour fields
+## (each hole-touching patch's best match outside) are improved by propagation
+## and random search, and every hole pixel becomes the average of what the
+## matches covering it say; the fields go up a scale to start the next. On the
+## CPU, once per fill.
+import math
+import memory
+from raster_errors import invalid, limit
+
+## Patches are (2 × radius + 1) pixels square.
+let radius: i64 = 3
+## Past this many pixels in the work box the fill refuses.
+let work_limit: usize = 6000000
+
+## One scale: premultiplied RGBA pixels, which are unknown (the hole), and
+## which pixels may centre a source patch (it and all its patch known).
+struct Level:
+    var width: i64
+    var height: i64
+    var pixels: f32[]
+    var unknown: u8[]
+    var source: u8[]
+    ## Every source centre, for random picks.
+    var sources: i32[]
+    var source_count: usize
+
+    mutating func destroy():
+        free(self.pixels) in memory.heap
+        free(self.unknown) in memory.heap
+        free(self.source) in memory.heap
+        free(self.sources) in memory.heap
+
+## The scales, finest first.
+struct Pyramid:
+    var levels: Level[8]
+    var count: usize
+
+    mutating func destroy():
+        for index in 0..<self.count:
+            self.levels[index].destroy()
+        self.count = 0
+
+## The nearest-neighbour field of one scale: each pixel's matching source
+## centre, and the distance, for pixels whose patch touches the hole.
+struct Field:
+    var match_x: i32[]
+    var match_y: i32[]
+    var cost: f32[]
+    var target: u8[]
+
+    mutating func destroy():
+        free(self.match_x) in memory.heap
+        free(self.match_y) in memory.heap
+        free(self.cost) in memory.heap
+        free(self.target) in memory.heap
+
+## Fill `pixels` (premultiplied RGBA, 4 samples a pixel, `width` × `height`)
+## where `hole` is non-zero, in place, from the rest; the same `seed` makes
+## the same fill. False when there is no hole or nothing outside it to use.
+pub func content_fill(pixels: f32[], width: usize, height: usize, hole: const u8[], seed: u64) -> bool!:
+    if pixels.length != width * height * 4 or hole.length != width * height:
+        error(invalid, "a fill needs RGBA pixels and one hole byte each")
+    var left = width
+    var top = height
+    var right: usize = 0
+    var bottom: usize = 0
+    for y in 0..<height:
+        for x in 0..<width:
+            if hole[y * width + x] != 0:
+                left = x if x < left else left
+                top = y if y < top else top
+                right = x + 1 if x + 1 > right else right
+                bottom = y + 1 if y + 1 > bottom else bottom
+    if right == 0:
+        return false
+    # The work box: the hole and as much again around it, where the texture to use most likely is.
+    let margin = math.max(64.0, (f64)math.max((f64)(right - left), (f64)(bottom - top)))
+    let box_left = (usize)math.max(0.0, (f64)left - margin)
+    let box_top = (usize)math.max(0.0, (f64)top - margin)
+    let box_right = (usize)math.min((f64)width, (f64)right + margin)
+    let box_bottom = (usize)math.min((f64)height, (f64)bottom + margin)
+    let box_width = box_right - box_left
+    let box_height = box_bottom - box_top
+    if box_width * box_height > work_limit:
+        error(limit, "the area to fill is too large; select less")
+    var finest = try level_of(pixels, width, box_left, box_top, box_width, box_height, hole)
+    if finest.source_count == 0:
+        finest.destroy()
+        return false
+    var pyramid = Pyramid(count = 1)
+    pyramid.levels[0] = finest
+    defer pyramid.destroy()
+    # Down while the hole is wider than a few patches and there are sources left.
+    while pyramid.count < 8 and hole_span(&pyramid.levels[pyramid.count - 1]) > radius * 6 and pyramid.levels[pyramid.count - 1].width > 32 and pyramid.levels[pyramid.count - 1].height > 32:
+        var coarser = try halved(&pyramid.levels[pyramid.count - 1])
+        if coarser.source_count < 16:
+            coarser.destroy()
+            break
+        pyramid.levels[pyramid.count] = coarser
+        pyramid.count += 1
+    let count = pyramid.count
+    var random = seed | 1
+    diffuse(&pyramid.levels[count - 1])
+    var field = try field_of(&pyramid.levels[count - 1])
+    defer field.destroy()
+    randomize(&field, &pyramid.levels[count - 1], &random)
+    var at = count
+    while at > 0:
+        at -= 1
+        let scale = &pyramid.levels[at]
+        if at < count - 1:
+            var finer = try field_of(scale)
+            upsample(&finer, &field, scale, &pyramid.levels[at + 1], &random)
+            field.destroy()
+            field = finer
+            vote(scale, &field)
+        # Fewer rounds at the fine scales, where each costs most.
+        let rounds = 3 if at == 0 else 5
+        for round in 0..<rounds:
+            improve(&field, scale, &random, round % 2 == 1)
+            vote(scale, &field)
+    # The finest scale's hole back into the picture.
+    let scale = &pyramid.levels[0]
+    for y in 0..<scale.height:
+        for x in 0..<scale.width:
+            let spot = y * scale.width + x
+            if scale.unknown[(usize)spot] == 0:
+                continue
+            let global = ((y + (i64)box_top) * (i64)width + x + (i64)box_left) * 4
+            for channel in 0..<(usize)4:
+                pixels[(usize)global + channel] = scale.pixels[(usize)spot * 4 + channel]
+    return true
+
+## The work box of the picture as a scale.
+func level_of(pixels: const f32[], width: usize, left: usize, top: usize, box_width: usize, box_height: usize, hole: const u8[]) -> Level!:
+    let count = box_width * box_height
+    let copied = try alloc f32[count * 4] in memory.heap
+    errdefer free(copied) in memory.heap
+    let unknown = try alloc u8[count] in memory.heap
+    errdefer free(unknown) in memory.heap
+    for y in 0..<box_height:
+        for x in 0..<box_width:
+            let origin = (top + y) * width + left + x
+            unknown[y * box_width + x] = 1 if hole[origin] != 0 else 0
+            for channel in 0..<(usize)4:
+                copied[(y * box_width + x) * 4 + channel] = 0.0 if hole[origin] != 0 else pixels[origin * 4 + channel]
+    return try with_sources(copied, unknown, (i64)box_width, (i64)box_height)
+
+## A scale's source map and list, from its pixels and unknowns (which it takes).
+func with_sources(pixels: f32[], unknown: u8[], width: i64, height: i64) -> Level!:
+    let count = (usize)(width * height)
+    let source = try alloc u8[count] in memory.heap
+    errdefer free(source) in memory.heap
+    var found: usize = 0
+    for y in 0..<height:
+        for x in 0..<width:
+            source[(usize)(y * width + x)] = 0
+            if x < radius or y < radius or x >= width - radius or y >= height - radius:
+                continue
+            var clear = true
+            var dy = -radius
+            while dy <= radius and clear:
+                var dx = -radius
+                while dx <= radius:
+                    if unknown[(usize)((y + dy) * width + x + dx)] != 0:
+                        clear = false
+                        break
+                    dx += 1
+                dy += 1
+            if clear:
+                source[(usize)(y * width + x)] = 1
+                found += 1
+    let sources = try alloc i32[found if found > 0 else 1] in memory.heap
+    var at: usize = 0
+    for index in 0..<count:
+        if source[index] != 0:
+            sources[at] = (i32)index
+            at += 1
+    return Level(width = width, height = height, pixels = pixels, unknown = unknown, source = source, sources = sources, source_count = found)
+
+## Half the size: known pixels average their known children; a pixel is
+## unknown when any child is.
+func halved(finer: const Level*) -> Level!:
+    let width = (finer.width + 1) // 2
+    let height = (finer.height + 1) // 2
+    let count = (usize)(width * height)
+    let pixels = try alloc f32[count * 4] in memory.heap
+    errdefer free(pixels) in memory.heap
+    let unknown = try alloc u8[count] in memory.heap
+    errdefer free(unknown) in memory.heap
+    for y in 0..<height:
+        for x in 0..<width:
+            var sum: f32[4] = [0.0, 0.0, 0.0, 0.0]
+            var known = 0
+            var missing = false
+            for sy in 0..<(i64)2:
+                for sx in 0..<(i64)2:
+                    let fx = x * 2 + sx
+                    let fy = y * 2 + sy
+                    if fx >= finer.width or fy >= finer.height:
+                        continue
+                    let index = (usize)(fy * finer.width + fx)
+                    if finer.unknown[index] != 0:
+                        missing = true
+                        continue
+                    for channel in 0..<(usize)4:
+                        sum[channel] += finer.pixels[index * 4 + channel]
+                    known += 1
+            let index = (usize)(y * width + x)
+            unknown[index] = 1 if missing else 0
+            for channel in 0..<(usize)4:
+                pixels[index * 4 + channel] = sum[channel] / (f32)known if known > 0 and not missing else 0.0
+    return try with_sources(pixels, unknown, width, height)
+
+## How wide the hole's box is, the larger side.
+func hole_span(scale: const Level*) -> i64:
+    var left = scale.width
+    var top = scale.height
+    var right: i64 = -1
+    var bottom: i64 = -1
+    for y in 0..<scale.height:
+        for x in 0..<scale.width:
+            if scale.unknown[(usize)(y * scale.width + x)] != 0:
+                left = x if x < left else left
+                top = y if y < top else top
+                right = x if x > right else right
+                bottom = y if y > bottom else bottom
+    return 0 if right < 0 else (right - left + 1 if right - left > bottom - top else bottom - top + 1)
+
+## The hole filled with the tone flowing in from its edge, ring by ring.
+func diffuse(scale: Level*):
+    let count = (usize)(scale.width * scale.height)
+    let filled = try alloc u8[count] in memory.heap catch _:
+        return
+    defer free(filled) in memory.heap
+    for index in 0..<count:
+        filled[index] = 1 if scale.unknown[index] == 0 else 0
+    var changed = true
+    while changed:
+        changed = false
+        for y in 0..<scale.height:
+            for x in 0..<scale.width:
+                let index = (usize)(y * scale.width + x)
+                if filled[index] != 0:
+                    continue
+                var sum: f32[4] = [0.0, 0.0, 0.0, 0.0]
+                var known = 0
+                for dy in -1..<(i64)2:
+                    for dx in -1..<(i64)2:
+                        let nx = x + dx
+                        let ny = y + dy
+                        if nx < 0 or ny < 0 or nx >= scale.width or ny >= scale.height:
+                            continue
+                        let neighbour = (usize)(ny * scale.width + nx)
+                        if filled[neighbour] != 1:
+                            continue
+                        for channel in 0..<(usize)4:
+                            sum[channel] += scale.pixels[neighbour * 4 + channel]
+                        known += 1
+                if known > 0:
+                    for channel in 0..<(usize)4:
+                        scale.pixels[index * 4 + channel] = sum[channel] / (f32)known
+                    # Filled this ring: counted as known from the next ring on.
+                    filled[index] = 2
+                    changed = true
+        for index in 0..<count:
+            if filled[index] == 2:
+                filled[index] = 1
+
+## An empty field for `scale`: its targets are the pixels whose patch touches the hole.
+func field_of(scale: const Level*) -> Field!:
+    let count = (usize)(scale.width * scale.height)
+    let match_x = try alloc i32[count] in memory.heap
+    errdefer free(match_x) in memory.heap
+    let match_y = try alloc i32[count] in memory.heap
+    errdefer free(match_y) in memory.heap
+    let cost = try alloc f32[count] in memory.heap
+    errdefer free(cost) in memory.heap
+    let target = try alloc u8[count] in memory.heap
+    for index in 0..<count:
+        target[index] = 0
+        match_x[index] = 0
+        match_y[index] = 0
+        cost[index] = 1.0e30
+    for y in 0..<scale.height:
+        for x in 0..<scale.width:
+            if scale.unknown[(usize)(y * scale.width + x)] == 0:
+                continue
+            for dy in -radius..<radius + 1:
+                for dx in -radius..<radius + 1:
+                    let tx = x + dx
+                    let ty = y + dy
+                    if tx >= 0 and ty >= 0 and tx < scale.width and ty < scale.height:
+                        target[(usize)(ty * scale.width + tx)] = 1
+    return Field(match_x = match_x, match_y = match_y, cost = cost, target = target)
+
+## Every target matched to a random source.
+func randomize(field: Field*, scale: const Level*, random: u64*):
+    for index in 0..<field.target.length:
+        if field.target[index] == 0:
+            continue
+        let pick = (usize)scale.sources[(usize)(next(random) % (u64)scale.source_count)]
+        field.match_x[index] = (i32)((i64)pick % scale.width)
+        field.match_y[index] = (i32)((i64)pick // scale.width)
+        field.cost[index] = (f32)distance(scale, (i64)index % scale.width, (i64)index // scale.width, (i64)field.match_x[index], (i64)field.match_y[index], 1.0e30)
+
+## The coarser field doubled onto `scale`, each target's match its coarse
+## pixel's, shifted by where it lies in that pixel; random where that is no source.
+func upsample(field: Field*, coarse: const Field*, scale: const Level*, coarser: const Level*, random: u64*):
+    for y in 0..<scale.height:
+        for x in 0..<scale.width:
+            let index = (usize)(y * scale.width + x)
+            if field.target[index] == 0:
+                continue
+            let cx = math.min((f64)(x // 2), (f64)(coarser.width - 1))
+            let cy = math.min((f64)(y // 2), (f64)(coarser.height - 1))
+            let origin = (usize)((i64)cy * coarser.width + (i64)cx)
+            var sx = (i64)coarse.match_x[origin] * 2 + x % 2
+            var sy = (i64)coarse.match_y[origin] * 2 + y % 2
+            if coarse.target[origin] == 0 or sx >= scale.width or sy >= scale.height or scale.source[(usize)(sy * scale.width + sx)] == 0:
+                let pick = (i64)scale.sources[(usize)(next(random) % (u64)scale.source_count)]
+                sx = pick % scale.width
+                sy = pick // scale.width
+            field.match_x[index] = (i32)sx
+            field.match_y[index] = (i32)sy
+            field.cost[index] = (f32)distance(scale, x, y, sx, sy, 1.0e30)
+
+## One PatchMatch sweep: each target tries its neighbours' matches shifted
+## (propagation), then random sources ever nearer its own (search).
+func improve(field: Field*, scale: const Level*, random: u64*, backwards: bool):
+    let step: i64 = -1 if backwards else 1
+    var y = scale.height - 1 if backwards else 0
+    while y >= 0 and y < scale.height:
+        var x = scale.width - 1 if backwards else 0
+        while x >= 0 and x < scale.width:
+            let index = (usize)(y * scale.width + x)
+            if field.target[index] != 0:
+                # From the neighbour already swept, horizontally and vertically.
+                try_neighbour(field, scale, x, y, x - step, y)
+                try_neighbour(field, scale, x, y, x, y - step)
+                var reach = (f64)math.max((f64)scale.width, (f64)scale.height)
+                while reach >= 1.0:
+                    let sx = (i64)field.match_x[index] + (i64)(((f64)(next(random) % 2001) / 1000.0 - 1.0) * reach)
+                    let sy = (i64)field.match_y[index] + (i64)(((f64)(next(random) % 2001) / 1000.0 - 1.0) * reach)
+                    consider(field, scale, x, y, sx, sy)
+                    reach *= 0.5
+            x += step
+        y += step
+
+## Target (`x`, `y`) tries the match of its neighbour (`nx`, `ny`) shifted by where it lies.
+func try_neighbour(field: Field*, scale: const Level*, x: i64, y: i64, nx: i64, ny: i64):
+    if nx < 0 or ny < 0 or nx >= scale.width or ny >= scale.height:
+        return
+    let neighbour = (usize)(ny * scale.width + nx)
+    if field.target[neighbour] == 0:
+        return
+    consider(field, scale, x, y, (i64)field.match_x[neighbour] + x - nx, (i64)field.match_y[neighbour] + y - ny)
+
+## Keep source (`sx`, `sy`) for target (`x`, `y`) when it is a source and matches better.
+func consider(field: Field*, scale: const Level*, x: i64, y: i64, sx: i64, sy: i64):
+    if sx < 0 or sy < 0 or sx >= scale.width or sy >= scale.height or scale.source[(usize)(sy * scale.width + sx)] == 0:
+        return
+    let index = (usize)(y * scale.width + x)
+    let cost = distance(scale, x, y, sx, sy, (f64)field.cost[index])
+    if cost < (f64)field.cost[index]:
+        field.cost[index] = (f32)cost
+        field.match_x[index] = (i32)sx
+        field.match_y[index] = (i32)sy
+
+## The squared difference between the patches at target (`x`, `y`) and source
+## (`sx`, `sy`), given up past `bound`; the target's patch is clamped to the scale.
+func distance(scale: const Level*, x: i64, y: i64, sx: i64, sy: i64, bound: f64) -> f64:
+    var total = 0.0
+    for dy in -radius..<radius + 1:
+        let ty = math.clamp((f64)(y + dy), 0.0, (f64)(scale.height - 1))
+        for dx in -radius..<radius + 1:
+            let tx = math.clamp((f64)(x + dx), 0.0, (f64)(scale.width - 1))
+            let target = (usize)((i64)ty * scale.width + (i64)tx) * 4
+            let source = (usize)((sy + dy) * scale.width + sx + dx) * 4
+            for channel in 0..<(usize)4:
+                let difference = (f64)(scale.pixels[target + channel] - scale.pixels[source + channel])
+                total += difference * difference
+        if total > bound:
+            return total
+    return total
+
+## Every hole pixel the average of what the matches of the patches over it say it is.
+func vote(scale: Level*, field: const Field*):
+    for y in 0..<scale.height:
+        for x in 0..<scale.width:
+            let index = (usize)(y * scale.width + x)
+            if scale.unknown[index] == 0:
+                continue
+            var sum: f64[4] = [0.0, 0.0, 0.0, 0.0]
+            var votes = 0.0
+            for dy in -radius..<radius + 1:
+                for dx in -radius..<radius + 1:
+                    let tx = x + dx
+                    let ty = y + dy
+                    if tx < 0 or ty < 0 or tx >= scale.width or ty >= scale.height:
+                        continue
+                    let target = (usize)(ty * scale.width + tx)
+                    if field.target[target] == 0:
+                        continue
+                    let sx = (i64)field.match_x[target] - dx
+                    let sy = (i64)field.match_y[target] - dy
+                    let source = (usize)(sy * scale.width + sx) * 4
+                    for channel in 0..<(usize)4:
+                        sum[channel] += (f64)scale.pixels[source + channel]
+                    votes += 1.0
+            if votes > 0.0:
+                for channel in 0..<(usize)4:
+                    scale.pixels[index * 4 + channel] = (f32)(sum[channel] / votes)
+
+## xorshift64*.
+func next(state: u64*) -> u64:
+    var v = *state
+    v ^= v >> 12
+    v ^= v << 25
+    v ^= v >> 27
+    *state = v
+    return v *% 2685821657736338717
+
+test "a hole in stripes is filled with stripes":
+    let width: usize = 96
+    let height: usize = 64
+    let pixels = try alloc f32[width * height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    let hole = try alloc u8[width * height] in memory.heap
+    defer free(hole) in memory.heap
+    # Vertical stripes four pixels wide, black and white, opaque.
+    for y in 0..<height:
+        for x in 0..<width:
+            let value: f32 = 1.0 if (x // 4) % 2 == 0 else 0.0
+            for channel in 0..<(usize)3:
+                pixels[(y * width + x) * 4 + channel] = value
+            pixels[(y * width + x) * 4 + 3] = 1.0
+            hole[y * width + x] = 1 if x >= 40 and x < 56 and y >= 20 and y < 44 else 0
+    assert(try content_fill(pixels, width, height, hole, 7))
+    # Inside the hole the stripes carry on: each column stays one tone down its length.
+    var matched = 0
+    for x in 40..<(usize)56:
+        let top = pixels[(20 * width + x) * 4]
+        let bottom = pixels[(43 * width + x) * 4]
+        if math.abs((f64)(top - bottom)) < 0.2 and (top < 0.2 or top > 0.8):
+            matched += 1
+    assert(matched >= 12)
+    # Alpha is opaque throughout the fill.
+    assert(pixels[(30 * width + 48) * 4 + 3] > 0.99)
+    # No hole: nothing to do.
+    for index in 0..<hole.length:
+        hole[index] = 0
+    assert(not (try content_fill(pixels, width, height, hole, 7)))

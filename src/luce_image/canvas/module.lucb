@@ -39,6 +39,7 @@ import strings
 from luce_image.image import Image, Pixel
 from luce_image.tiles import Tiles, Bounds, tile_size, tile_columns, min_u32, flatten
 from luce_image.heal import heal
+from luce_image.content_fill import content_fill
 from luce_image.warp import WarpStroke, warp_smudge, warp_push
 from luce_image.document import Style, Document, Layer, TreeState, release_snapshot, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
 from luce_image.composite import Composer, box_composer, unbox_composer
@@ -1961,6 +1962,22 @@ pub struct Canvas:
         else:
             try light_filters.tonal_contrast(&filters, document, layer, a, b, mask)
         try self.restrict_preview(layer)
+
+    ## Edit › Content-Aware Fill: the selection on layer `id` filled with
+    ## texture from the rest of the layer, faded in by the selection's
+    ## coverage, as one step. `seed` picks among equally good fills.
+    pub mutating func content_aware_fill(id: i64, seed: i64 = 1) -> !:
+        try self.require_open()
+        try self.require_idle()
+        if self.current().is_empty():
+            error(invalid, "select what to fill first")
+        try self.begin_preview(id, false)
+        self.preview_name = "Content-Aware Fill"
+        fill_from_around(&self, (u64)id, (u64)seed) catch failure:
+            discard(self.end_preview(false) catch: recover ())
+            error(failure.code, failure.message)
+        try self.restrict_preview((u64)id)
+        try self.end_preview(true)
 
     # mark: Transforms ============================================================================
 

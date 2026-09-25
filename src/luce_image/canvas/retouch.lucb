@@ -205,3 +205,32 @@ func retouch_name(kind: i64) -> str:
     if kind == retouch_heal:
         return "Spot Healing"
     return "Blur Tool"
+
+## `Canvas.content_aware_fill`'s pixels: layer `layer`'s selected part filled
+## from the rest, in place (the preview then fades it in by the selection).
+func fill_from_around(canvas: Canvas*, layer: u64, seed: u64) -> !:
+    let document = canvas.document else trap("fill without a document")
+    let target = document.find(layer) else error(invalid, "no such layer")
+    let tiles = target.tiles() else error(invalid, "a group has no pixels to fill")
+    let width = (usize)canvas.extent_x
+    let height = (usize)canvas.extent_y
+    let pixels = try alloc f32[width * height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    try tiles.read(pixels)
+    for at in 0..<width * height:
+        for channel in 0..<(usize)3:
+            pixels[at * 4 + channel] *= pixels[at * 4 + 3]
+    let hole = try alloc u8[width * height] in memory.heap
+    defer free(hole) in memory.heap
+    let selection = canvas.current()
+    for y in 0..<height:
+        for x in 0..<width:
+            hole[y * width + x] = 1 if selection.at((i64)x, (i64)y) > 0 else 0
+    if not (try content_fill(pixels, width, height, hole, seed)):
+        error(invalid, "nothing outside the selection to fill it from")
+    for at in 0..<width * height:
+        let alpha = pixels[at * 4 + 3]
+        for channel in 0..<(usize)3:
+            pixels[at * 4 + channel] = pixels[at * 4 + channel] / alpha if alpha > 0.0 else 0.0
+    try tiles.write(pixels)
+    target.revision += 1

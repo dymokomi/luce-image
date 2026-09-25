@@ -29,7 +29,8 @@ pub let noise: u32 = 14
 ## ever a layer, which the compositor draws itself (composite.lucb) since it
 ## needs the neighbouring cells; the adjust pass leaves pixels as they are.
 pub let blur: u32 = 15
-pub let adjustment_count: u32 = 16
+pub let camera_raw: u32 = 16
+pub let adjustment_count: u32 = 17
 ## How many parameters an adjustment takes at most.
 pub let parameter_count: usize = 23
 
@@ -276,3 +277,19 @@ test "vignette, grain and noise depend on where a pixel is, the same across tile
         if pixels[at] != pixels[at + 1]:
             apart += 1
     assert(apart >= 12)
+
+test "camera raw warms with temperature, brightens with exposure and leaves grey grey at rest":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var adjuster = try Adjuster.create(device)
+    defer adjuster.destroy()
+    let pixels = try alloc f32[16] in memory.heap
+    defer free(pixels) in memory.heap
+    let rest: f64[10] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    try adjusted(device, &adjuster, camera_raw, rest, pixels)
+    assert(math.abs((f64)pixels[12] - 0.2140) < 0.003 and math.abs((f64)pixels[14] - 0.2140) < 0.003)
+    let warm: f64[10] = [1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    try adjusted(device, &adjuster, camera_raw, warm, pixels)
+    assert(pixels[12] > pixels[14] + 0.05 and pixels[13] > 0.3)
