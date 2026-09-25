@@ -10,6 +10,12 @@ from half import to_half
 from luce_image.projective import Warp
 from raster_errors import invalid
 
+## How many selections share one coverage buffer: a copy (an undo step's) shares
+## it until either changes, so each structural step costs no copy of a document-
+## sized buffer.
+struct Holders:
+    var count: usize
+
 ## How a new shape combines with the selection so far.
 pub enum Mode as u8:
     replace = 0
@@ -21,6 +27,8 @@ pub struct Selection:
     var extent_x: u32
     var extent_y: u32
     var coverage: u8[]
+    ## Shared with copies until one of them changes (`own`).
+    var holders: Holders*
     var tiles: Tiles*?
     var owner: gpu.Device?
     var uploaded: bool
@@ -35,16 +43,48 @@ pub struct Selection:
         if width == 0 or height == 0 or width > 65536 or height > 65536:
             error(invalid, "selection dimensions must be in 1..65536")
         let coverage = try alloc u8[(usize)width * (usize)height] in memory.heap
+        errdefer free(coverage) in memory.heap
         for index in 0..<coverage.length:
             coverage[index] = 0
-        return Selection(extent_x = width, extent_y = height, coverage = coverage, tiles = none, owner = none, uploaded = false, empty = true)
+        let holders = try new Holders(count = 1) in memory.heap
+        return Selection(extent_x = width, extent_y = height, coverage = coverage, holders = holders, tiles = none, owner = none, uploaded = false, empty = true)
 
-    ## A copy of the coverage (its GPU tiles are made again when wanted).
+    ## A copy of the selection, sharing its coverage until either changes (its
+    ## GPU tiles are made again when wanted).
     pub func copy() -> Selection!:
-        let coverage = try alloc u8[self.coverage.length] in memory.heap
+        self.holders.count += 1
+        return Selection(extent_x = self.extent_x, extent_y = self.extent_y, coverage = self.coverage, holders = self.holders, tiles = none, owner = none,
+                         uploaded = false, empty = self.empty, left = self.left, top = self.top, right = self.right, bottom = self.bottom)
+
+    ## The coverage this selection alone holds, copied first if shared: every
+    ## change starts here.
+    mutating func own():
+        if self.holders.count == 1:
+            return
+        let coverage = alloc u8[self.coverage.length] in memory.heap catch failure:
+            trap("out of memory copying the selection")
         memory.copy(coverage, self.coverage, self.coverage.length)
-        return Selection(extent_x = self.extent_x, extent_y = self.extent_y, coverage = coverage, tiles = none, owner = none, uploaded = false,
-                         empty = self.empty, left = self.left, top = self.top, right = self.right, bottom = self.bottom)
+        let holders = new Holders(count = 1) in memory.heap catch failure:
+            trap("out of memory copying the selection")
+        self.holders.count -= 1
+        self.coverage = coverage
+        self.holders = holders
+
+    ## Take `coverage` (fresh, held by nobody else) in place of this selection's.
+    mutating func adopt(coverage: u8[]):
+        self.release_coverage()
+        self.coverage = coverage
+        self.holders = new Holders(count = 1) in memory.heap catch failure:
+            trap("out of memory replacing the selection")
+
+    ## Let go of the coverage, freeing it with its last holder.
+    mutating func release_coverage():
+        if self.coverage.length == 0:
+            return
+        self.holders.count -= 1
+        if self.holders.count == 0:
+            free(self.coverage) in memory.heap
+            free(self.holders) in memory.heap
 
     pub func is_empty() -> bool:
         return self.empty
@@ -64,16 +104,19 @@ pub struct Selection:
         return self.coverage[(usize)y * (usize)self.extent_x + (usize)x]
 
     pub mutating func clear():
+        self.own()
         for index in 0..<self.coverage.length:
             self.coverage[index] = 0
         self.finish()
 
     pub mutating func select_all():
+        self.own()
         for index in 0..<self.coverage.length:
             self.coverage[index] = 255
         self.finish()
 
     pub mutating func invert():
+        self.own()
         for index in 0..<self.coverage.length:
             self.coverage[index] = 255 - self.coverage[index]
         self.finish()
@@ -90,8 +133,7 @@ pub struct Selection:
         for row in math.imax(0, dy)..<math.imin(height, height + dy):
             for column in math.imax(0, dx)..<math.imin(width, width + dx):
                 moved[(usize)(row * width + column)] = self.coverage[(usize)((row - dy) * width + column - dx)]
-        free(self.coverage) in memory.heap
-        self.coverage = moved
+        self.adopt(moved)
         self.finish()
 
     ## Take the selection through `warp` (a backwards map, as free transform
@@ -118,8 +160,7 @@ pub struct Selection:
                     let bottom = (f64)self.sample(x0, y0 + 1) * (1.0 - fx) + (f64)self.sample(x0 + 1, y0 + 1) * fx
                     value = top * (1.0 - fy) + bottom * fy
                 moved[(usize)(row * width + column)] = (u8)math.clamp(math.round(value), 0.0, 255.0)
-        free(self.coverage) in memory.heap
-        self.coverage = moved
+        self.adopt(moved)
         self.finish()
 
     ## Coverage at a pixel, nothing past the document.
@@ -137,6 +178,7 @@ pub struct Selection:
         self.shape(x, y, width, height, mode, true)
 
     mutating func shape(x: i64, y: i64, width: i64, height: i64, mode: Mode, round: bool):
+        self.own()
         if mode == Mode.replace:
             for index in 0..<self.coverage.length:
                 self.coverage[index] = 0
@@ -169,6 +211,7 @@ pub struct Selection:
     ## samples covering the document, 0..1, combined by `mode`: a layer's
     ## transparency, or its mask, loaded as a selection.
     pub mutating func from_samples(samples: const f32[], channel: usize, mode: Mode) -> !:
+        self.own()
         if samples.length != self.coverage.length * 4 or channel > 3:
             error(invalid, "samples must be RGBA for every document pixel")
         if mode == Mode.replace:
@@ -182,6 +225,7 @@ pub struct Selection:
     ## Coverage bytes, one for every document pixel, combined by `mode`: a
     ## color range (color_range.lucb).
     pub mutating func from_coverage(values: const u8[], mode: Mode) -> !:
+        self.own()
         if values.length != self.coverage.length:
             error(invalid, "coverage must have a byte for every document pixel")
         if mode == Mode.replace:
@@ -194,6 +238,7 @@ pub struct Selection:
     ## A polygon from `points` (x, y pairs in document pixels), even-odd filled,
     ## combined by `mode`.
     pub mutating func polygon(points: const f64[], mode: Mode) -> !:
+        self.own()
         if points.length < 6 or points.length % 2 != 0:
             error(invalid, "a polygon needs at least three points")
         for value in points:
@@ -264,6 +309,7 @@ pub struct Selection:
     ## (0..255, in sRGB, alpha included) of the one at (`x`, `y`), reachable
     ## through such pixels when `contiguous`, combined by `mode`.
     pub mutating func wand(pixels: const f32[], x: i64, y: i64, tolerance: f64, contiguous: bool, mode: Mode) -> !:
+        self.own()
         let width = (usize)self.extent_x
         let height = (usize)self.extent_y
         if pixels.length != width * height * 4:
@@ -339,6 +385,7 @@ pub struct Selection:
     ## Grow (positive) or shrink (negative) the selection by `pixels` with a
     ## square structuring element, then soften its edge over `feather` pixels.
     pub mutating func adjust(pixels: i64, feather: i64) -> !:
+        self.own()
         if pixels < -512 or pixels > 512 or feather < 0 or feather > 512:
             error(invalid, "expand and contract are limited to 512 pixels, feather to 0..512")
         if pixels != 0:
@@ -407,6 +454,7 @@ pub struct Selection:
     ## Every pixel of `other` (a shape made alone) combined in by `mode`, as
     ## a shape drawn here would be.
     pub mutating func merge(other: const Selection*, mode: Mode) -> !:
+        self.own()
         if other.coverage.length != self.coverage.length:
             error(invalid, "selections must be the same size to merge")
         if mode == Mode.replace:
@@ -418,6 +466,7 @@ pub struct Selection:
 
     ## Hard edges: each pixel wholly in or out, at half coverage (anti-alias off).
     pub mutating func harden():
+        self.own()
         for index in 0..<self.coverage.length:
             self.coverage[index] = 255 if self.coverage[index] >= 128 else 0
         self.finish()
@@ -520,8 +569,7 @@ pub struct Selection:
         if let tiles = self.tiles:
             unbox(tiles)
             self.tiles = none
-        if self.coverage.length > 0:
-            free(self.coverage) in memory.heap
+        self.release_coverage()
         var empty: u8[]
         self.coverage = empty
 
@@ -591,3 +639,18 @@ test "the wand selects like colors, contiguously or not":
         assert(failure.code == invalid)
         rejected = true
     assert(rejected)
+
+test "a copy shares the coverage until one of them changes, and each keeps what it had":
+    var first = try Selection.create(64, 64)
+    first.rectangle(0, 0, 32, 32, Mode.replace)
+    var second = try first.copy()
+    assert(first.holders == second.holders and first.holders.count == 2)
+    # Changing the first leaves the copy as it was.
+    first.rectangle(32, 32, 32, 32, Mode.add)
+    assert(first.holders != second.holders and first.at(40, 40) == 255 and second.at(40, 40) == 0 and second.at(10, 10) == 255)
+    var third = try second.copy()
+    third.invert()
+    assert(second.at(10, 10) == 255 and third.at(10, 10) == 0)
+    first.destroy()
+    second.destroy()
+    third.destroy()
