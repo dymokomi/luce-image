@@ -159,6 +159,9 @@ pub struct Canvas:
     var warp: WarpStroke*?
     var warped: u64
     var heal_opacity: f64
+    ## Spot healing fills from a patch beside the spot (Proximity Match), or
+    ## with texture from all around it (Content-Aware).
+    var heal_content_aware: bool
     ## Inside `begin_edit`: changes record nothing more, the edit's first snapshot covers them.
     var edit_depth: i64
     ## What a kept preview is called in the history.
@@ -242,6 +245,7 @@ pub struct Canvas:
         self.warped = 0
         self.transform_session = none
         self.heal_opacity = 1.0
+        self.heal_content_aware = false
         self.edit_depth = 0
         self.edit_captured = false
         self.shape_feather = 0
@@ -2009,6 +2013,11 @@ pub struct Canvas:
             error(failure.code, failure.message)
         try self.restrict_preview((u64)id)
         try self.end_preview(true)
+
+    ## Spot Healing's mode: Content-Aware (texture from all around the spot,
+    ## as Content-Aware Fill) or Proximity Match (a patch from beside it).
+    pub mutating func set_heal_mode(content_aware: bool):
+        self.heal_content_aware = content_aware
 
     # mark: Transforms ============================================================================
 

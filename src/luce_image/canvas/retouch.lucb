@@ -115,7 +115,8 @@ func finish_heal(canvas: Canvas*, stroke: Stroke*) -> !:
                     let half = (u16)bytes[(y * (usize)tile_size + x) * 8 + 6] | ((u16)bytes[(y * (usize)tile_size + x) * 8 + 7] << 8)
                     if from_half(half) > 0.01:
                         painted[((usize)row * (usize)tile_size + y) * width + (usize)column * (usize)tile_size + x] = 1
-    if not (try heal(pixels, width, height, painted)):
+    let filled = try (content_fill(pixels, width, height, painted, 1) if canvas.heal_content_aware else heal(pixels, width, height, painted))
+    if not filled:
         return
     # Back to straight alpha for the effect tiles.
     for at in 0..<width * height:

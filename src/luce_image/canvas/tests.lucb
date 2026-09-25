@@ -701,6 +701,14 @@ test "retouching: clone stamp copies from its source, blur softens, healing fill
     try canvas.end_stroke()
     let healed = (try shown_at(&canvas, &target, 41, 41))[0]
     assert(healed > 120 and healed < 135)
+    # Content-Aware heals the same spot from texture all around it.
+    try canvas.undo()
+    assert((try shown_at(&canvas, &target, 41, 41))[0] < 5)
+    canvas.set_heal_mode(true)
+    try canvas.begin_stroke(layer, 42.0, 42.0)
+    try canvas.end_stroke()
+    let filled = (try shown_at(&canvas, &target, 41, 41))[0]
+    assert(filled > 120 and filled < 135)
 
 test "everything undoes: layers, properties, styles, masks, selections and the canvas size, each a named step":
     var device = gpu.Device.open() catch failure:
