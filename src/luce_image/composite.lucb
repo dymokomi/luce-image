@@ -14,7 +14,7 @@ from luce_image.style import Styler
 from raster_errors import invalid, limit
 from luce_image.half import from_half
 from luce_image.shaders import composite_frag_words, composite_frag_msl, adjust_mix_frag_words, adjust_mix_frag_msl
-from luce_image.adjust import Adjuster, curves
+from luce_image.adjust import Adjuster, Place, curves
 from luce_image.curves import lut_size
 
 struct Entry:
@@ -66,6 +66,9 @@ pub struct Composer:
     var next_curve_table: usize
     ## How many tiles were rendered rather than found, for tests and tuning.
     pub var renders: u64
+    ## The document being drawn's size, for adjustments that depend on where a pixel is.
+    var extent_x: u32
+    var extent_y: u32
 
     ## A compositor keeping at most `budget` rendered tiles (1 MiB each).
     pub static func create(device: gpu.Device, budget: usize = 512) -> Composer!:
@@ -105,7 +108,7 @@ pub struct Composer:
         for index in 0..<curve_table_budget:
             tables[index] = CurveTable(key = 0, texture = gpu.Texture(), live = false)
         return Composer(owner = device, entries = entries, count = 0, budget = budget, tick = 0, shader = shader, pipeline = pipeline, blank = blank, white = white, styler = styler,
-                        adjuster = adjuster, mix_shader = mix_shader, mix = mix, effects = effects, curve_tables = tables, next_curve_table = 0, renders = 0)
+                        adjuster = adjuster, mix_shader = mix_shader, mix = mix, effects = effects, curve_tables = tables, next_curve_table = 0, renders = 0, extent_x = 0, extent_y = 0)
 
     ## The flattened tile at `column`, `row` of pyramid `level`, borrowed until
     ## the next call. Straight-alpha rgba16_float, transparent where nothing is.
@@ -116,6 +119,8 @@ pub struct Composer:
         if column * span * tile_size >= document.width() or row * span * tile_size >= document.height():
             error(invalid, "the requested tile lies outside the document")
         self.tick += 1
+        self.extent_x = document.width()
+        self.extent_y = document.height()
         var digest = fnv_start()
         digest = fnv_mix(digest, (u64)level)
         digest = fnv_mix(digest, (u64)column)
@@ -187,7 +192,7 @@ pub struct Composer:
                 var clip = self.white
                 if layer.clipped:
                     clip = self.blank if base_missing else (base else self.blank)
-                try self.adjust(backdrop, owned, layer, mask, clip, effective)
+                try self.adjust(backdrop, owned, layer, mask, clip, effective, column, row)
                 continue
             let tiles = layer.tiles() else continue
             if not layer.clipped:
@@ -243,11 +248,12 @@ pub struct Composer:
         *owned = true
 
     ## An adjustment layer applied to the backdrop so far; nothing below, nothing to adjust.
-    mutating func adjust(backdrop: gpu.Texture*, owned: bool*, layer: const Layer*, mask: gpu.Texture, clip: gpu.Texture, opacity: f64) -> !:
+    mutating func adjust(backdrop: gpu.Texture*, owned: bool*, layer: const Layer*, mask: gpu.Texture, clip: gpu.Texture, opacity: f64, column: u32, row: u32) -> !:
         if not *owned:
             return
         let table = try self.curve_table_for(layer)
-        var adjusted = try self.adjuster.adjusted(*backdrop, (u32)layer.adjustment, layer.adjustment_values[..<23], table)
+        let place = Place(x = column * tile_size, y = row * tile_size, width = self.extent_x, height = self.extent_y)
+        var adjusted = try self.adjuster.adjusted(*backdrop, (u32)layer.adjustment, layer.adjustment_values[..<23], table, place)
         defer adjusted.destroy()
         var params: f32[1] = [(f32)opacity]
         var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)

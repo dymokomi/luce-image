@@ -26,13 +26,25 @@
 //     value; p9 keeps the luminosity (Rec.601 luma put back)
 //   11 gradient map: p0 reversed, p1..p3 the color for black, p4..p6 for
 //     white (encoded), along Rec.709 luma
+//   12 vignette: p0 amount (-1 darkens the edges to black, 1 lightens them to
+//     white), p1 midpoint (0..1 of the way to the corner where it starts),
+//     p2 roundness (-1 a rounded rectangle, 0 the frame's ellipse, 1 a
+//     circle), p3 feather (0..1)
+//   13 grain: p0 amount (0..1), p1 size (the grain's width in pixels), p2
+//     roughness (0 smooth clumps, 1 a pixel's own speckle), stronger in the
+//     midtones, the same in every channel, as film's
+//   14 noise: p0 deviation (0..1 of full scale), p1 monochrome, p2 uniform
+//     (evenly over ±p0; else Gaussian), each pixel its own, as Add Noise
+// `place` is where the tile lies: its first pixel and the canvas's size, for
+// the kinds that depend on where a pixel is (vignette, grain, noise); a grain
+// hashed from the pixel's position lands the same on every tile and redraw.
 // The formulas follow Compositor's (Document/HueSaturation.swift,
 // Rendering/AdjustPixels.c), which the same dialogs and layers share.
 // Noise is not here: it is a filter, made once (filter.lucb), not an adjustment.
 #version 450
 layout(location = 0) in vec4 vertex_color;
 layout(location = 0) out vec4 fragment_color;
-layout(push_constant) uniform Params { float kind; float p[23]; } params;
+layout(push_constant) uniform Params { float kind; float p[23]; vec4 place; } params;
 layout(set = 0, binding = 1) uniform sampler2D tile;
 layout(set = 0, binding = 2) uniform sampler2D lut;
 
@@ -86,6 +98,39 @@ vec3 shadows(vec3 v) { return clamp((v - 0.333) / -0.25 + 0.5, 0.0, 1.0) * 0.7; 
 vec3 midtones(vec3 v) { return clamp((v - 0.333) / 0.25 + 0.5, 0.0, 1.0) * clamp((v + 0.333 - 1.0) / -0.25 + 0.5, 0.0, 1.0) * 0.7; }
 vec3 highlights(vec3 v) { return clamp((v + 0.333 - 1.0) / 0.25 + 0.5, 0.0, 1.0) * 0.7; }
 float luma601(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+// A hash of a pixel position and a stream to 0..1, the same everywhere it runs.
+float hash(vec2 at, float stream) {
+    uvec3 v = uvec3(ivec3(ivec2(floor(at)), int(stream)) + 65536);
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    return float(v.x & 0xFFFFFFu) / 16777216.0;
+}
+// Smooth value noise in -1..1 over cells `size` pixels wide.
+float value_noise(vec2 at, float size) {
+    vec2 q = at / max(size, 1.0);
+    vec2 i = floor(q), f = q - i;
+    f = f * f * (3.0 - 2.0 * f);
+    float a = hash(i, 7.0), b = hash(i + vec2(1.0, 0.0), 7.0), c = hash(i + vec2(0.0, 1.0), 7.0), d = hash(i + vec2(1.0), 7.0);
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y) * 2.0 - 1.0;
+}
+// A standard normal sample for a pixel and stream (Box-Muller).
+float gaussian(vec2 at, float stream) {
+    float u = max(hash(at, stream * 2.0), 1e-7), v = hash(at, stream * 2.0 + 1.0);
+    return sqrt(-2.0 * log(u)) * cos(6.2831853 * v);
+}
+// How far out a pixel is for the vignette: 0 at the centre, 1 at the frame's
+// edge midpoints (roundness 0), shaped by roundness.
+float vignette_distance(vec2 at) {
+    vec2 size = max(params.place.zw, vec2(1.0));
+    vec2 u = (at - size * 0.5) / (size * 0.5);
+    float roundness = params.p[2];
+    if (roundness > 0.0) u *= mix(vec2(1.0), size / min(size.x, size.y), roundness);
+    float n = 2.0 + max(-roundness, 0.0) * 6.0;
+    return pow(pow(abs(u.x), n) + pow(abs(u.y), n), 1.0 / n);
+}
 
 void main() {
     vec4 o = texture(tile, gl_FragCoord.xy / 256.0);
@@ -162,6 +207,26 @@ void main() {
         c = clamp(moved, 0.0, 1.0);
         float after = luma601(c);
         if (params.p[9] > 0.5 && after > 1e-5) c = clamp(c * (before / after), 0.0, 1.0);
+    } else if (kind == 12) {
+        vec2 at = params.place.xy + gl_FragCoord.xy;
+        float start = params.p[1] * 1.4142;
+        float weight = smoothstep(start, start + max(params.p[3], 0.01) * (1.6 - start * 0.5), vignette_distance(at));
+        float amount = params.p[0] * weight;
+        c = amount < 0.0 ? c * (1.0 + amount) : mix(c, vec3(1.0), amount);
+    } else if (kind == 13) {
+        vec2 at = params.place.xy + gl_FragCoord.xy;
+        float speckle = hash(at, 3.0) * 2.0 - 1.0;
+        float grain = mix(value_noise(at, params.p[1]), speckle, clamp(params.p[2], 0.0, 1.0));
+        float l = luma601(c);
+        c = c + grain * params.p[0] * 0.5 * (0.25 + 3.0 * l * (1.0 - l));
+    } else if (kind == 14) {
+        vec2 at = params.place.xy + gl_FragCoord.xy;
+        bool uniform_noise = params.p[2] > 0.5;
+        float shared_sample = uniform_noise ? hash(at, 0.0) * 2.0 - 1.0 : gaussian(at, 0.0);
+        for (int channel = 0; channel < 3; channel++) {
+            float own = uniform_noise ? hash(at, float(channel + 1)) * 2.0 - 1.0 : gaussian(at, float(channel + 1));
+            c[channel] += (params.p[1] > 0.5 ? shared_sample : own) * params.p[0];
+        }
     } else if (kind == 11) {
         float t = dot(c, vec3(0.2126, 0.7152, 0.0722));
         if (params.p[0] > 0.5) t = 1.0 - t;

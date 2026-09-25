@@ -1347,3 +1347,29 @@ test "whole layers copy and paste: a group with its masked, styled layer, here o
     assert(pixels[(20 * 128 + 40) * 4] > 0.99 and pixels[(20 * 128 + 80) * 4] < 0.01 and pixels[(20 * 128 + 10) * 4] > 0.99)
     Canvas.forget_copied_layers()
     assert(Canvas.copied_layers() == 0)
+
+test "filters preview and keep as one step: motion blur, lens correction, bloom, tonal contrast":
+    var canvas = try Canvas(64, 32)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, false)
+    try canvas.select_rectangle(28, 12, 8, 8, 0)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    var kind: i64 = 0
+    while kind < Canvas.filter_count():
+        let steps = canvas.history_count
+        let a = [0.0, 0.5, 0.5, 1.0][(usize)kind]
+        let b = [12.0, 0.2, 4.0, 6.0][(usize)kind]
+        try canvas.filter_layer(layer, kind, a, b, 1.0)
+        assert(canvas.history_count == steps + 1)
+        try canvas.undo()
+        kind += 1
+    var rejected = false
+    canvas.filter_layer(layer, 9, 0.0, 0.0, 0.0) catch failure:
+        assert(failure.code == invalid)
+        rejected = true
+    assert(rejected)

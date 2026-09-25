@@ -123,6 +123,6 @@ func bin_of(encoded: f64) -> usize:
 
 ## An adjustment's name for the history, by kind.
 func adjustment_name(kind: i64) -> str:
-    let names: str[12] = ["Brightness/Contrast", "Hue/Saturation", "Invert", "Levels", "Desaturate", "Threshold", "Posterize", "Curves",
-                          "Exposure", "Black & White", "Color Balance", "Gradient Map"]
-    return names[(usize)kind] if kind >= 0 and kind < 12 else "Adjustment"
+    let names: str[15] = ["Brightness/Contrast", "Hue/Saturation", "Invert", "Levels", "Desaturate", "Threshold", "Posterize", "Curves",
+                          "Exposure", "Black & White", "Color Balance", "Gradient Map", "Vignette", "Grain", "Noise"]
+    return names[(usize)kind] if kind >= 0 and kind < 15 else "Adjustment"

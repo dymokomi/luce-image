@@ -22,7 +22,10 @@ pub let exposure: u32 = 8
 pub let black_white: u32 = 9
 pub let color_balance: u32 = 10
 pub let gradient_map: u32 = 11
-pub let adjustment_count: u32 = 12
+pub let vignette: u32 = 12
+pub let grain: u32 = 13
+pub let noise: u32 = 14
+pub let adjustment_count: u32 = 15
 ## How many parameters an adjustment takes at most.
 pub let parameter_count: usize = 23
 
@@ -38,6 +41,14 @@ func check(kind: u32, values: const f64[], table: gpu.Texture?) -> !:
     for value in values:
         if not math.is_finite(value):
             error(invalid, "adjustment parameters must be finite")
+
+## Where a tile lies: its first pixel and the canvas's size, for the kinds
+## that depend on where a pixel is (vignette, grain, noise).
+pub struct Place:
+    pub var x: u32
+    pub var y: u32
+    pub var width: u32
+    pub var height: u32
 
 pub struct Adjuster:
     var owner: gpu.Device
@@ -62,22 +73,27 @@ pub struct Adjuster:
         for row in 0..<tiles.rows():
             for column in 0..<tiles.columns():
                 let source = tiles.texture(column, row) else continue
-                var fresh = try self.adjusted(source, kind, values, table)
+                let place = Place(x = column * tile_size, y = row * tile_size, width = tiles.width(), height = tiles.height())
+                var fresh = try self.adjusted(source, kind, values, table, place)
                 errdefer fresh.destroy()
                 try tiles.set(column, row, fresh)
         target.revision += 1
 
     ## A new tile holding `source` adjusted: the destructive path's pass, and
     ## how the compositor evaluates an adjustment layer over what is below it.
-    pub func adjusted(source: gpu.Texture, kind: u32, values: const f64[], table: gpu.Texture? = none) -> gpu.Texture!:
+    pub func adjusted(source: gpu.Texture, kind: u32, values: const f64[], table: gpu.Texture? = none, place: Place = Place(x = 0, y = 0, width = tile_size, height = tile_size)) -> gpu.Texture!:
         try check(kind, values, table)
-        # The kind, then the parameters.
-        var params: f32[24]
-        for index in 0..<(usize)24:
+        # The kind, the parameters, then where the tile lies.
+        var params: f32[28]
+        for index in 0..<(usize)28:
             params[index] = 0.0
         params[0] = (f32)kind
         for index in 0..<values.length:
             params[index + 1] = (f32)values[index]
+        params[24] = (f32)place.x
+        params[25] = (f32)place.y
+        params[26] = (f32)place.width
+        params[27] = (f32)place.height
         # Binding 2 is read only by curves; the others get the tile again.
         let images: gpu.Texture[2] = [source, table else source]
         var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
@@ -86,7 +102,7 @@ pub struct Adjuster:
         defer frame.release()
         let area = try frame.value().target()
         defer area.release()
-        try gpu.shade(area.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 96), images, gpu.Filter.nearest)
+        try gpu.shade(area.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 112), images, gpu.Filter.nearest)
         discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         return fresh
 
@@ -198,3 +214,61 @@ test "the wider adjustments: levels by channel, hue ranges, exposure, black and 
     # Gradient map from black to red: the grey becomes a darker red.
     try adjusted(device, &adjuster, gradient_map, [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0], pixels)
     assert(pixels[12] > 0.0 and near(pixels[13], 0.0) and near(pixels[14], 0.0) and near(pixels[1], 0.0))
+
+test "vignette, grain and noise depend on where a pixel is, the same across tiles":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var document = try Document.create(device, 512, 64)
+    defer document.destroy()
+    let layer = try document.add_layer("Grey")
+    let count = (usize)512 * 64 * 4
+    let pixels = try alloc f32[count] in memory.heap
+    defer free(pixels) in memory.heap
+    for at in 0..<(usize)512 * 64:
+        for channel in 0..<(usize)3:
+            pixels[at * 4 + channel] = 0.2140
+        pixels[at * 4 + 3] = 1.0
+    var tiles = try Tiles.create(device, 512, 64)
+    try tiles.write(pixels)
+    try document.set_tiles(layer, tiles)
+    var adjuster = try Adjuster.create(device)
+    defer adjuster.destroy()
+    # A dark vignette leaves the centre and darkens the corners, symmetrically across the tile edge.
+    let darken: f64[4] = [-1.0, 0.2, 0.0, 0.5]
+    try adjuster.apply(&document, layer, vignette, darken)
+    let current = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
+    try current.read(pixels)
+    let centre = pixels[(32 * 512 + 256) * 4]
+    let corner = pixels[(1 * 512 + 1) * 4]
+    let mirrored = pixels[(1 * 512 + 510) * 4]
+    assert(math.abs((f64)centre - 0.2140) < 0.01 and corner < 0.02 and math.abs((f64)corner - (f64)mirrored) < 0.002)
+    # Grain moves greys in step across the channels; noise moves them apart.
+    for at in 0..<(usize)512 * 64:
+        for channel in 0..<(usize)3:
+            pixels[at * 4 + channel] = 0.2140
+    try current.write(pixels)
+    let grainy: f64[3] = [0.5, 1.0, 1.0]
+    try adjuster.apply(&document, layer, grain, grainy)
+    try current.read(pixels)
+    var moved = 0
+    for x in 250..<(usize)262:
+        let at = (10 * 512 + x) * 4
+        assert(pixels[at] == pixels[at + 1] and pixels[at + 1] == pixels[at + 2])
+        if math.abs((f64)pixels[at] - 0.2140) > 0.002:
+            moved += 1
+    assert(moved >= 8)
+    for at in 0..<(usize)512 * 64:
+        for channel in 0..<(usize)3:
+            pixels[at * 4 + channel] = 0.2140
+    try current.write(pixels)
+    let noisy: f64[3] = [0.2, 0.0, 0.0]
+    try adjuster.apply(&document, layer, noise, noisy)
+    try current.read(pixels)
+    var apart = 0
+    for x in 0..<(usize)16:
+        let at = (5 * 512 + x) * 4
+        if pixels[at] != pixels[at + 1]:
+            apart += 1
+    assert(apart >= 12)

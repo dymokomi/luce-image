@@ -1,0 +1,150 @@
+## Filters that mix a blurred copy of a layer back into it, on the CPU over
+## the GPU's Gaussian (filter.lucb): Bloom, where bright parts glow into their
+## surroundings, and Tonal Contrast, where the detail against a wide blur is
+## pushed, strongest in the midtones — the look of Nik's and Luminar's.
+import gpu
+import memory
+import math
+from luce_image.tiles import Tiles
+from luce_image.document import Document
+from luce_image.filter import Filters
+from raster_errors import invalid
+
+## Filter › Stylize › Bloom: what is brighter than `threshold` (0..1 of
+## luminance) blurred `radius` pixels (1..250) and screened over `layer` by
+## `strength` (0..2).
+pub func bloom(filters: const Filters*, document: Document*, layer: u64, threshold: f64, radius: f64, strength: f64, on_mask: bool = false) -> !:
+    if not math.is_finite(threshold) or threshold < 0.0 or threshold > 1.0 or not math.is_finite(strength) or strength < 0.0 or strength > 2.0:
+        error(invalid, "bloom takes a threshold in 0..1 and a strength in 0..2")
+    let target = document.find(layer) else error(invalid, "no such layer")
+    let tiles = try target.edited_tiles(on_mask)
+    var copy = try Copy.of(tiles)
+    defer copy.destroy()
+    # The bright parts alone, faded in over a tenth above the threshold.
+    for at in 0..<copy.count:
+        let light = luma(copy.pixels, at)
+        copy.glow[at * 4 + 3] *= (f32)smooth(threshold, threshold + 0.1, light)
+    try copy.blurred(filters, radius)
+    for at in 0..<copy.count:
+        let alpha = (f64)copy.pixels[at * 4 + 3]
+        let glow_alpha = math.min(1.0, (f64)copy.glow[at * 4 + 3] * strength)
+        if glow_alpha <= 0.0:
+            continue
+        let out_alpha = alpha + (1.0 - alpha) * glow_alpha
+        for channel in 0..<(usize)3:
+            let base = (f64)copy.pixels[at * 4 + channel] * alpha
+            let glow = (f64)copy.glow[at * 4 + channel] * glow_alpha
+            copy.pixels[at * 4 + channel] = (f32)math.clamp((base + (out_alpha - base) * glow / math.max(out_alpha, 1e-6)) / out_alpha, 0.0, 1.0)
+        copy.pixels[at * 4 + 3] = (f32)out_alpha
+    try tiles.write(copy.pixels)
+    target.revision += 1
+
+## Filter › Other › Tonal Contrast: the difference between `layer` and its blur
+## of `radius` pixels (1..250) added back `amount` times (0..2), in encoded
+## values, mostly in the midtones; transparency is kept.
+pub func tonal_contrast(filters: const Filters*, document: Document*, layer: u64, amount: f64, radius: f64, on_mask: bool = false) -> !:
+    if not math.is_finite(amount) or amount < 0.0 or amount > 2.0:
+        error(invalid, "tonal contrast takes an amount in 0..2")
+    let target = document.find(layer) else error(invalid, "no such layer")
+    let tiles = try target.edited_tiles(on_mask)
+    var copy = try Copy.of(tiles)
+    defer copy.destroy()
+    try copy.blurred(filters, radius)
+    for at in 0..<copy.count:
+        if copy.pixels[at * 4 + 3] <= 0.0:
+            continue
+        let tone = encode(luma(copy.pixels, at))
+        let weight = 0.35 + 0.65 * (1.0 - (2.0 * tone - 1.0) * (2.0 * tone - 1.0))
+        for channel in 0..<(usize)3:
+            let value = encode((f64)copy.pixels[at * 4 + channel])
+            let around = encode((f64)copy.glow[at * 4 + channel])
+            copy.pixels[at * 4 + channel] = (f32)decode(math.clamp(value + (value - around) * amount * weight, 0.0, 1.0))
+    try tiles.write(copy.pixels)
+    target.revision += 1
+
+## A layer's pixels and a second copy to blur, read once.
+struct Copy:
+    var pixels: f32[]
+    var glow: f32[]
+    var count: usize
+    var width: u32
+    var height: u32
+    var device: gpu.Device
+
+    static func of(tiles: const Tiles*) -> Copy!:
+        let count = (usize)tiles.width() * (usize)tiles.height()
+        let pixels = try alloc f32[count * 4] in memory.heap
+        errdefer free(pixels) in memory.heap
+        try tiles.read(pixels)
+        let glow = try alloc f32[count * 4] in memory.heap
+        memory.copy(glow, pixels, count * 4)
+        return Copy(pixels = pixels, glow = glow, count = count, width = tiles.width(), height = tiles.height(), device = tiles.device())
+
+    ## `glow` blurred `radius` pixels on the device.
+    mutating func blurred(filters: const Filters*, radius: f64) -> !:
+        if not math.is_finite(radius) or radius < 1.0 or radius > 250.0:
+            error(invalid, "the radius must be 1..250 pixels")
+        var tiles = try Tiles.create(self.device, self.width, self.height)
+        defer tiles.destroy()
+        try tiles.write(self.glow)
+        try filters.blur_tiles(&tiles, radius)
+        try tiles.read(self.glow)
+
+    mutating func destroy():
+        free(self.pixels) in memory.heap
+        free(self.glow) in memory.heap
+
+func luma(pixels: const f32[], at: usize) -> f64:
+    return 0.2126 * (f64)pixels[at * 4] + 0.7152 * (f64)pixels[at * 4 + 1] + 0.0722 * (f64)pixels[at * 4 + 2]
+
+func smooth(low: f64, high: f64, value: f64) -> f64:
+    let t = math.clamp((value - low) / (high - low), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+func encode(linear: f64) -> f64:
+    let v = math.clamp(linear, 0.0, 1.0)
+    return v * 12.92 if v <= 0.0031308 else 1.055 * math.pow(v, 1.0 / 2.4) - 0.055
+
+func decode(encoded: f64) -> f64:
+    return encoded / 12.92 if encoded <= 0.04045 else math.pow((encoded + 0.055) / 1.055, 2.4)
+
+test "bloom spreads a bright spot's light around it; tonal contrast pushes an edge apart":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var document = try Document.create(device, 64, 64)
+    defer document.destroy()
+    let layer = try document.add_layer("Scene")
+    let count = (usize)64 * 64
+    let pixels = try alloc f32[count * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    # Dark grey, a white square in the middle.
+    for y in 0..<(usize)64:
+        for x in 0..<(usize)64:
+            let at = (y * 64 + x) * 4
+            let lit = x >= 28 and x < 36 and y >= 28 and y < 36
+            for channel in 0..<(usize)3:
+                pixels[at + channel] = 1.0 if lit else 0.02
+            pixels[at + 3] = 1.0
+    var tiles = try Tiles.create(device, 64, 64)
+    try tiles.write(pixels)
+    try document.set_tiles(layer, tiles)
+    var filters = try Filters.create(device)
+    defer filters.destroy()
+    try bloom(&filters, &document, layer, 0.8, 6.0, 1.0)
+    let current = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
+    try current.read(pixels)
+    # Just outside the square it glows; far away it is as dark as it was.
+    assert(pixels[(32 * 64 + 38) * 4] > 0.1 and math.abs((f64)pixels[(2 * 64 + 2) * 4] - 0.02) < 0.005 and pixels[(32 * 64 + 38) * 4 + 3] == 1.0)
+    # Tonal contrast: the dark side of an edge gets darker, the light side lighter.
+    for y in 0..<(usize)64:
+        for x in 0..<(usize)64:
+            let at = (y * 64 + x) * 4
+            for channel in 0..<(usize)3:
+                pixels[at + channel] = 0.1 if x < 32 else 0.4
+            pixels[at + 3] = 1.0
+    try current.write(pixels)
+    try tonal_contrast(&filters, &document, layer, 1.0, 8.0)
+    try current.read(pixels)
+    assert(pixels[(10 * 64 + 30) * 4] < 0.095 and pixels[(10 * 64 + 34) * 4] > 0.405 and math.abs((f64)pixels[(10 * 64 + 2) * 4] - 0.1) < 0.005)

@@ -1,20 +1,24 @@
 ## Destructive filters over a layer's tiles, made once when applied (and for
 ## a dialog's preview), never re-evaluated. A Gaussian blur is two separable
 ## passes; each output tile samples its own input tile and the two neighbours
-## along the pass, so the radius is limited to one tile (256 pixels). Noise is
-## made on the CPU, the same for the same seed.
+## along the pass, so the radius is limited to one tile (256 pixels). Motion
+## Blur and Lens Correction sample the whole layer flattened into one texture
+## (resample.frag). Noise is made on the CPU, the same for the same seed;
+## Bloom and Tonal Contrast (light_filters.lucb) mix a blurred copy back in.
 import gpu
 import memory
 import math
-from luce_image.tiles import Tiles, tile_size, box, unbox
+from luce_image.tiles import Tiles, tile_size, box, unbox, flatten
 from luce_image.document import Document
-from luce_image.shaders import blur_frag_words, blur_frag_msl
+from luce_image.shaders import blur_frag_words, blur_frag_msl, resample_frag_words, resample_frag_msl
 from raster_errors import invalid
 
 pub struct Filters:
     var owner: gpu.Device
     var blur_shader: gpu.Shader
     var blur: gpu.Pipeline
+    var resample_shader: gpu.Shader
+    var resample: gpu.Pipeline
     var blank: gpu.Texture
 
     pub static func create(device: gpu.Device) -> Filters!:
@@ -22,6 +26,10 @@ pub struct Filters:
         errdefer blur_shader.destroy()
         var blur = try gpu.Pipeline.create(device, blur_shader, gpu.Blend.replace, gpu.Format.rgba16_float)
         errdefer blur.destroy()
+        var resample_shader = try gpu.Shader.create(device, resample_frag_words, resample_frag_msl)
+        errdefer resample_shader.destroy()
+        var resample = try gpu.Pipeline.create(device, resample_shader, gpu.Blend.replace, gpu.Format.rgba16_float)
+        errdefer resample.destroy()
         var blank = try gpu.Texture.create(device, tile_size, tile_size, gpu.Format.rgba16_float)
         errdefer blank.destroy()
         let zeros = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
@@ -29,7 +37,7 @@ pub struct Filters:
         for index in 0..<zeros.length:
             zeros[index] = 0
         try blank.upload(zeros)
-        return Filters(owner = device, blur_shader = blur_shader, blur = blur, blank = blank)
+        return Filters(owner = device, blur_shader = blur_shader, blur = blur, resample_shader = resample_shader, resample = resample, blank = blank)
 
     ## Blur `layer` with a Gaussian of `radius` pixels (0.5..250; taps reach
     ## three sigma, at most one tile).
@@ -37,11 +45,51 @@ pub struct Filters:
         if not math.is_finite(radius) or radius < 0.5 or radius > 250.0:
             error(invalid, "blur radius must be 0.5..250 pixels")
         let target = document.find(layer) else error(invalid, "no such layer")
-        let tiles = try target.edited_tiles(on_mask)
+        try self.blur_tiles(try target.edited_tiles(on_mask), radius)
+        target.revision += 1
+
+    ## `tiles` blurred with a Gaussian of `radius` pixels (0.5..250).
+    pub func blur_tiles(tiles: Tiles*, radius: f64) -> !:
         let sigma = radius
         let taps = math.min(255.0, math.ceil(sigma * 3.0))
         try self.pass(tiles, taps, sigma, true)
         try self.pass(tiles, taps, sigma, false)
+
+    ## Filter › Blur › Motion Blur: `layer` smeared `distance` pixels (1..999)
+    ## along `angle` degrees (0 is left to right, 90 upwards).
+    pub func motion_blur(document: Document*, layer: u64, angle: f64, distance: f64, on_mask: bool = false) -> !:
+        if not math.is_finite(angle) or not math.is_finite(distance) or distance < 1.0 or distance > 999.0:
+            error(invalid, "a motion blur goes 1..999 pixels at a finite angle")
+        try self.resampled(document, layer, 0.0, angle * math.pi / 180.0, distance, 0.0, on_mask)
+
+    ## Filter › Lens Correction: barrel (positive `distortion`, -1..1) or
+    ## pincushion straightened, and red-cyan and blue-yellow fringes (-1..1)
+    ## moved back into line.
+    pub func lens_correction(document: Document*, layer: u64, distortion: f64, red_cyan: f64, blue_yellow: f64, on_mask: bool = false) -> !:
+        if not within_one(distortion) or not within_one(red_cyan) or not within_one(blue_yellow):
+            error(invalid, "lens corrections are -1..1")
+        try self.resampled(document, layer, 1.0, distortion, red_cyan, blue_yellow, on_mask)
+
+    ## Every cell of `layer` drawn anew by resample.frag's `kind` over the
+    ## whole layer.
+    func resampled(document: Document*, layer: u64, kind: f64, a: f64, b: f64, c: f64, on_mask: bool) -> !:
+        let target = document.find(layer) else error(invalid, "no such layer")
+        let tiles = try target.edited_tiles(on_mask)
+        let empty = 1.0 if on_mask else 0.0
+        var whole = try flatten(self.owner, tiles, gpu.Color(empty, empty, empty, empty))
+        defer whole.destroy()
+        for row in 0..<tiles.rows():
+            for column in 0..<tiles.columns():
+                var params: f32[8] = [(f32)kind, (f32)a, (f32)b, (f32)c, (f32)(column * tile_size), (f32)(row * tile_size), (f32)tiles.width(), (f32)tiles.height()]
+                var fresh = try tiles.blank()
+                errdefer fresh.destroy()
+                let frame = try fresh.frame()
+                defer frame.release()
+                let area = try frame.value().target()
+                defer area.release()
+                try gpu.shade(area.value(), self.resample, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 32), [whole], gpu.Filter.nearest)
+                discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+                try tiles.set(column, row, fresh)
         target.revision += 1
 
     ## One direction over every tile that has pixels or a neighbour with pixels
@@ -81,8 +129,13 @@ pub struct Filters:
 
     pub mutating func destroy():
         self.blank.destroy()
+        self.resample.destroy()
+        self.resample_shader.destroy()
         self.blur.destroy()
         self.blur_shader.destroy()
+
+func within_one(value: f64) -> bool:
+    return math.is_finite(value) and value >= -1.0 and value <= 1.0
 
 test "a gaussian blur spreads across tile edges and keeps alpha weight":
     var device = gpu.Device.open() catch failure:
@@ -214,3 +267,40 @@ test "noise moves an opaque grey the same way for the same seed and leaves trans
     try add_noise(&document, layer, 0.2, true, 7)
     try current.read(pixels)
     assert(pixels[0] == pixels[1] and pixels[1] == pixels[2])
+
+test "a motion blur smears along its angle only; lens correction's stretch empties the corners":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var document = try Document.create(device, 300, 64)
+    defer document.destroy()
+    let layer = try document.add_layer("Dot")
+    let count = (usize)300 * 64 * 4
+    let pixels = try alloc f32[count] in memory.heap
+    defer free(pixels) in memory.heap
+    for index in 0..<count:
+        pixels[index] = 0.0
+    # An opaque red square across the tile edge at x 256.
+    for y in 28..<(usize)36:
+        for x in 252..<(usize)260:
+            pixels[(y * 300 + x) * 4] = 1.0
+            pixels[(y * 300 + x) * 4 + 3] = 1.0
+    var tiles = try Tiles.create(device, 300, 64)
+    try tiles.write(pixels)
+    try document.set_tiles(layer, tiles)
+    var filters = try Filters.create(device)
+    defer filters.destroy()
+    try filters.motion_blur(&document, layer, 0.0, 20.0)
+    let current = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
+    try current.read(pixels)
+    # Sideways it spreads, across the tile edge; above and below it does not.
+    assert(pixels[(32 * 300 + 266) * 4 + 3] > 0.05 and pixels[(32 * 300 + 245) * 4 + 3] > 0.05 and pixels[(24 * 300 + 256) * 4 + 3] < 0.01)
+    assert(pixels[(32 * 300 + 266) * 4] > 0.99)
+    # A full-frame layer keeps its size under a barrel correction, its corners emptied.
+    for index in 0..<count:
+        pixels[index] = 1.0
+    try current.write(pixels)
+    try filters.lens_correction(&document, layer, -1.0, 0.0, 0.0)
+    try current.read(pixels)
+    assert(pixels[(32 * 300 + 150) * 4 + 3] > 0.99 and pixels[(1 * 300 + 1) * 4 + 3] < 0.01)

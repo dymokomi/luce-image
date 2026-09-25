@@ -47,6 +47,7 @@ from luce_image.adjust import Adjuster, adjustment_count, parameter_count, curve
 from luce_image.curves import Curves, lut_size
 from luce_image.filter import Filters
 import luce_image.filter as filtering
+import luce_image.light_filters as light_filters
 from luce_image.transform import translate, Transformer, Landed, sampling_nearest, sampling_smooth, sampling_high
 from luce_image.projective import Warp, affine_warp, quad_warp
 from luce_image.extent import full_bounds, pieces, relocate
@@ -1922,6 +1923,44 @@ pub struct Canvas:
             discard(self.end_preview(false) catch: recover ())
             error(failure.code, failure.message)
         try self.end_preview(true)
+
+    ## Filter kinds for `filter_layer` and `preview_filter`, with what `a`, `b`
+    ## and `c` are: 0 Motion Blur (angle in degrees, distance in pixels), 1
+    ## Lens Correction (distortion, red-cyan, blue-yellow; -1..1 each), 2 Bloom
+    ## (threshold 0..1, radius, strength 0..2), 3 Tonal Contrast (amount 0..2,
+    ## radius).
+    pub static func filter_count() -> i64:
+        return 4
+
+    ## Filter `kind` on layer `id` (or its mask while editing it), as one step.
+    pub mutating func filter_layer(id: i64, kind: i64, a: f64, b: f64, c: f64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        try self.begin_preview(id, try self.editing_mask_of(id))
+        self.preview_filter(kind, a, b, c) catch failure:
+            discard(self.end_preview(false) catch: recover ())
+            error(failure.code, failure.message)
+        try self.end_preview(true)
+
+    ## Show filter `kind` on the layer as it was when the preview began.
+    pub mutating func preview_filter(kind: i64, a: f64, b: f64, c: f64) -> !:
+        let names: str[4] = ["Motion Blur", "Lens Correction", "Bloom", "Tonal Contrast"]
+        if kind < 0 or kind >= 4:
+            error(invalid, "no such filter")
+        self.preview_name = names[(usize)kind]
+        let layer = try self.restore_preview()
+        let mask = try self.whiten_previewed_mask()
+        let document = self.document else trap("preview without a document")
+        let filters = self.filters else trap("preview without filters")
+        if kind == 0:
+            try filters.motion_blur(document, layer, a, b, mask)
+        elif kind == 1:
+            try filters.lens_correction(document, layer, a, b, c, mask)
+        elif kind == 2:
+            try light_filters.bloom(&filters, document, layer, a, b, c, mask)
+        else:
+            try light_filters.tonal_contrast(&filters, document, layer, a, b, mask)
+        try self.restrict_preview(layer)
 
     # mark: Transforms ============================================================================
 
