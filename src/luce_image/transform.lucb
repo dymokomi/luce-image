@@ -6,8 +6,10 @@ import gpu
 import interop
 import math
 import memory
-from tiles import Tiles, tile_size, flatten
-from luce_image.extent import relocate, flatten_all, landing_cells, canvas_part, reaches_past_part
+from tiles import Tiles, tile_size
+from luce_image.extent import relocate, pieces, landing_cells, canvas_part, reaches_past_part
+from luce_image.transform_window import Footprint, Window, footprint, level_for, gather, window_map
+from pyramid import Pyramid, tile_bytes
 from luce_image.projective import Warp, affine_warp, multiply
 from luce_image.document import Document
 from luce_image.shaders import warp_frag_words, warp_frag_msl
@@ -61,28 +63,40 @@ pub struct Transformer:
         let target = document.find(layer) else error(invalid, "no such layer")
         let tiles = (target.mask_tiles() else error(invalid, "the layer has no mask")) if on_mask else (target.tiles() else error(invalid, "a group cannot be transformed"))
         # Nothing painted: no pixels to move, or a mask revealing everything wherever it goes.
-        if tiles.occupied() == none:
-            return
-        # The whole layer, past the canvas too, in one texture the shader can
-        # sample anywhere; a mask's unpainted cells are white.
+        let occupied = tiles.occupied() else return
         let outside = 1.0 if on_mask else 0.0
-        var flat = try flatten_all(self.owner, tiles, gpu.Color(outside, outside, outside, outside))
-        defer flat.destroy()
-        let width = (f64)(try flat.texture.width())
-        let height = (f64)(try flat.texture.height())
-        let box = source else Landed(left = (f64)flat.left, top = (f64)flat.top, right = (f64)flat.left + width, bottom = (f64)flat.top + height)
+        let empty = gpu.Color(outside, outside, outside, outside)
+        # Where the layer has pixels, past the canvas too.
+        let limit = Footprint(left = (f64)(occupied.left * (i64)tile_size), top = (f64)(occupied.top * (i64)tile_size),
+                              right = (f64)(occupied.right * (i64)tile_size), bottom = (f64)(occupied.bottom * (i64)tile_size))
+        let box = source else Landed(left = limit.left, top = limit.top, right = limit.right, bottom = limit.bottom)
         let landed = try landing(warp, box.left, box.top, box.right, box.bottom)
         var fresh = try Tiles.create(self.owner, tiles.width(), tiles.height())
         errdefer fresh.destroy()
         let range = landing_cells(landed.left, landed.top, landed.right, landed.bottom)
         if landed.left < 0.0 or landed.top < 0.0 or landed.right > (f64)tiles.width() or landed.bottom > (f64)tiles.height():
             try fresh.cover(range)
-        # Into the flat texture's texels.
-        let shift = Warp(m = [1.0, 0.0, (f64)-flat.left, 0.0, 1.0, (f64)-flat.top, 0.0, 0.0, 1.0])
-        var params = shader_params(multiply(shift, warp), width, height, outside, false, sampling)
+        # Each output cell reads only the source pixels its map reaches, gathered
+        # into a small window (at a coarser level where it shrinks a lot).
+        var parts = try pieces(tiles)
+        defer parts.destroy()
+        var pyramid = try Pyramid.create(self.owner, 256 * tile_bytes)
+        defer pyramid.destroy()
+        let reachable = Footprint(left = math.max(limit.left, box.left - 2.0), top = math.max(limit.top, box.top - 2.0),
+                                  right = math.min(limit.right, box.right + 2.0), bottom = math.min(limit.bottom, box.bottom + 2.0))
         for row in range.top..<range.bottom:
             for column in range.left..<range.right:
-                let texture = try self.shade_cell(&fresh, &params, column, row, flat.texture, flat.texture)
+                let reads = footprint(warp, column, row, reachable) else continue
+                pyramid.hold()
+                var window = try gather(self.owner, tiles, &parts, &pyramid, reads, level_for(reads), on_mask, empty)
+                let width = (f64)(try window.texture.width())
+                let height = (f64)(try window.texture.height())
+                var params = shader_params(window_map(warp, &window), width, height, outside, false, sampling)
+                let texture = self.shade_cell(&fresh, &params, (f64)(column * (i64)tile_size), (f64)(row * (i64)tile_size), window.texture, window.texture) catch failure:
+                    window.destroy()
+                    error(failure.code, failure.message)
+                # The pass holds what it samples; the window can go now.
+                window.destroy()
                 # Which parts of the cell the landed box reaches.
                 let x = landed.left - (f64)(column * (i64)tile_size)
                 let y = landed.top - (f64)(row * (i64)tile_size)
@@ -105,12 +119,18 @@ pub struct Transformer:
         let tiles = target.tiles() else error(invalid, "a group cannot be transformed")
         if right <= left or bottom <= top:
             return
-        var flat = try flatten(self.owner, tiles)
-        defer flat.destroy()
-        var mask = try flatten(self.owner, selection)
-        defer mask.destroy()
+        # Cells are replaced as they are made, so every window reads the layer as it was.
+        var before = try tiles.clone()
+        defer before.destroy()
+        var layer_parts = try pieces(&before)
+        defer layer_parts.destroy()
+        var mask_parts = try pieces(selection)
+        defer mask_parts.destroy()
+        var pyramid = try Pyramid.create(self.owner, tile_bytes)
+        defer pyramid.destroy()
+        let lifted = Footprint(left = (f64)left, top = (f64)top, right = (f64)right, bottom = (f64)bottom)
+        let clear = gpu.Color(0.0, 0.0, 0.0, 0.0)
         let landed = try landing(warp, (f64)left, (f64)top, (f64)right, (f64)bottom)
-        var params = shader_params(warp, (f64)tiles.width(), (f64)tiles.height(), 0.0, true, sampling)
         for row in 0..<tiles.rows():
             for column in 0..<tiles.columns():
                 let x0 = (f64)(column * tile_size)
@@ -122,14 +142,32 @@ pub struct Transformer:
                 let landing_here = x0 < landed.right and x1 > landed.left and y0 < landed.bottom and y1 > landed.top
                 if not under and not landing_here:
                     continue
-                let texture = try self.shade_cell(tiles, &params, (i64)column, (i64)row, flat, mask)
-                try tiles.set(column, row, texture)
+                # The window holds what lands here and what is left under it, at full size.
+                var reads = Footprint(left = x0, top = y0, right = x1, bottom = y1)
+                if let far = footprint(warp, (i64)column, (i64)row, lifted):
+                    reads = Footprint(left = math.min(reads.left, far.left), top = math.min(reads.top, far.top),
+                                      right = math.max(reads.right, far.right), bottom = math.max(reads.bottom, far.bottom))
+                var pixels = try gather(self.owner, &before, &layer_parts, &pyramid, reads, 0, false, clear)
+                var coverage = gather(self.owner, selection, &mask_parts, &pyramid, reads, 0, false, clear) catch failure:
+                    pixels.destroy()
+                    error(failure.code, failure.message)
+                # The output pixel, and where it reads, both in the window's texels.
+                let back = Warp(m = [1.0, 0.0, (f64)pixels.left, 0.0, 1.0, (f64)pixels.top, 0.0, 0.0, 1.0])
+                var params = shader_params(multiply(window_map(warp, &pixels), back), (f64)(try pixels.texture.width()), (f64)(try pixels.texture.height()), 0.0, true, sampling)
+                let shaded = self.shade_cell(tiles, &params, x0 - (f64)pixels.left, y0 - (f64)pixels.top, pixels.texture, coverage.texture) catch failure:
+                    pixels.destroy()
+                    coverage.destroy()
+                    error(failure.code, failure.message)
+                pixels.destroy()
+                coverage.destroy()
+                try tiles.set(column, row, shaded)
         target.revision += 1
 
     ## One output cell of `tiles` shaded with `params`, as a fresh tile texture.
-    func shade_cell(tiles: const Tiles*, params: f32[16]*, column: i64, row: i64, source: gpu.Texture, selection: gpu.Texture) -> gpu.Texture!:
-        (*params)[6] = (f32)(column * (i64)tile_size)
-        (*params)[7] = (f32)(row * (i64)tile_size)
+    ## `origin_x`, `origin_y`: the cell's first pixel, in the coordinates `params`' map reads.
+    func shade_cell(tiles: const Tiles*, params: f32[16]*, origin_x: f64, origin_y: f64, source: gpu.Texture, selection: gpu.Texture) -> gpu.Texture!:
+        (*params)[6] = (f32)origin_x
+        (*params)[7] = (f32)origin_y
         var texture = try tiles.blank()
         errdefer texture.destroy()
         let frame = try texture.frame()
@@ -292,3 +330,40 @@ test "translating a layer moves its pixels across tiles, and what leaves the can
     defer kept.destroy()
     assert(kept.has_outside() and not far.has_outside())
     far.destroy()
+
+test "a large shrink reads a coarser level and keeps the picture, with no texture the size of the layer":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    # 6000 by 1024: the left half opaque red, the right half opaque blue.
+    var document = try Document.create(device, 6000, 1024)
+    defer document.destroy()
+    let layer = try document.add_layer("Wide")
+    let count = (usize)6000 * 1024 * 4
+    let pixels = try alloc f32[count] in memory.heap
+    defer free(pixels) in memory.heap
+    for y in 0..<(usize)1024:
+        for x in 0..<(usize)6000:
+            let at = (y * 6000 + x) * 4
+            pixels[at] = 1.0 if x < 3000 else 0.0
+            pixels[at + 1] = 0.0
+            pixels[at + 2] = 0.0 if x < 3000 else 1.0
+            pixels[at + 3] = 1.0
+    var tiles = try Tiles.create(device, 6000, 1024)
+    try tiles.write(pixels)
+    try document.set_tiles(layer, tiles)
+    var transformer = try Transformer.create(device)
+    defer transformer.destroy()
+    # A tenth the size about the top-left: 600 by 102, red then blue.
+    try transformer.apply(&document, layer, try affine_warp(0.1, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0))
+    let result = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
+    let back = try alloc f32[count] in memory.heap
+    defer free(back) in memory.heap
+    try result.read(back)
+    let red = (50 * 6000 + 100) * 4
+    let blue = (50 * 6000 + 500) * 4
+    let beyond = (50 * 6000 + 800) * 4
+    assert(back[red] > 0.95 and back[red + 2] < 0.05 and back[red + 3] > 0.95)
+    assert(back[blue] < 0.05 and back[blue + 2] > 0.95 and back[blue + 3] > 0.95)
+    assert(back[beyond + 3] == 0.0)

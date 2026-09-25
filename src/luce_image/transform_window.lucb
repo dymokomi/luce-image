@@ -1,0 +1,123 @@
+#==============================================================================================
+#
+#   transform_window - The part of a layer one output tile of a transform reads
+#
+#   DESCRIPTION:
+#       A free transform or distort makes each output tile from the source pixels its map
+#       reaches: the output tile's corners taken back through the map, a margin for the
+#       resampling around them. Those pixels are gathered into a small window texture — at
+#       the pyramid level where the window is at most `window_side` texels, so a heavy
+#       shrink reads a properly reduced copy — and the tile is drawn from it. No texture is
+#       ever the size of the layer, so a 24000-pixel layer transforms like a small one.
+#
+#==============================================================================================
+
+import gpu
+import math
+from tiles import Tiles, tile_size, min_i64, max_i64
+from pyramid import Pyramid, covered_at, cell_exists
+from luce_image.extent import Pieces
+from luce_image.projective import Warp, multiply
+from raster_errors import invalid
+
+## The longest side a window has, in texels of its level.
+let window_side: f64 = 1024.0
+
+## Pixels of margin around what a tile reads: bicubic sampling reaches two
+## texels out, and a texel either way for rounding.
+let reach: f64 = 3.0
+
+## A box of document pixels, fractional (see transform.lucb's Landed).
+pub struct Footprint:
+    pub var left: f64
+    pub var top: f64
+    pub var right: f64
+    pub var bottom: f64
+
+## Source pixels gathered for one output tile: `texture`'s texel (0, 0) is
+## texel (`left`, `top`) of pyramid `level` (document pixels at level 0).
+pub struct Window:
+    pub var texture: gpu.Texture
+    pub var left: i64
+    pub var top: i64
+    pub var level: u32
+
+    pub mutating func destroy():
+        self.texture.destroy()
+
+## What output cell (`column`, `row`) reads through `warp` (a backwards map,
+## output to source), a margin around it, within `limit` (where the source has
+## pixels); none when it reads nothing there. Behind a distortion's horizon the
+## corners do not map, and the whole `limit` is taken.
+pub func footprint(warp: Warp, column: i64, row: i64, limit: Footprint) -> Footprint?:
+    let x0 = (f64)(column * (i64)tile_size)
+    let y0 = (f64)(row * (i64)tile_size)
+    var box = Footprint(left = 1.0e18, top = 1.0e18, right = -1.0e18, bottom = -1.0e18)
+    for corner in 0..<(usize)4:
+        var x = 0.0
+        var y = 0.0
+        if not warp.map(x0 + (0.0 if corner % 2 == 0 else (f64)tile_size), y0 + (0.0 if corner < 2 else (f64)tile_size), &x, &y):
+            box = limit
+            break
+        box.left = math.min(box.left, x - reach)
+        box.top = math.min(box.top, y - reach)
+        box.right = math.max(box.right, x + reach)
+        box.bottom = math.max(box.bottom, y + reach)
+    box.left = math.max(box.left, limit.left)
+    box.top = math.max(box.top, limit.top)
+    box.right = math.min(box.right, limit.right)
+    box.bottom = math.min(box.bottom, limit.bottom)
+    if box.right <= box.left or box.bottom <= box.top:
+        return none
+    return box
+
+## The pyramid level at which `box` fits a window.
+pub func level_for(box: Footprint) -> u32:
+    var level: u32 = 0
+    let side = math.max(box.right - box.left, box.bottom - box.top)
+    while level < 12 and side / (f64)(1u32 << level) > window_side:
+        level += 1
+    return level
+
+## `box` of `tiles` gathered at `level` into a window texture, `empty` where
+## the layer has nothing (a mask's white). Level 0 takes the layer's pieces,
+## past the canvas too; coarser levels the canvas's pyramid.
+pub func gather(device: gpu.Device, tiles: const Tiles*, parts: const Pieces*, pyramid: Pyramid*, box: Footprint, level: u32, mask: bool, empty: gpu.Color) -> Window!:
+    let scale = (f64)(1u32 << level)
+    let left = (i64)math.floor(box.left / scale)
+    let top = (i64)math.floor(box.top / scale)
+    let right = (i64)math.ceil(box.right / scale)
+    let bottom = (i64)math.ceil(box.bottom / scale)
+    if right - left > 16384 or bottom - top > 16384:
+        error(invalid, "a transform window cannot exceed 16384 texels")
+    var texture = try gpu.Texture.create(device, (u32)(right - left), (u32)(bottom - top), gpu.Format.rgba16_float)
+    errdefer texture.destroy()
+    let frame = try texture.frame()
+    defer frame.release()
+    let whole = try frame.value().target()
+    defer whole.release()
+    if level == 0:
+        for index in 0..<parts.count:
+            let piece = parts.at(index)
+            if piece.x >= right or piece.y >= bottom or piece.x + (i64)piece.source.width <= left or piece.y + (i64)piece.source.height <= top:
+                continue
+            try gpu.copy_image(whole.value(), piece.texture, gpu.Rect((f64)(piece.x - left), (f64)(piece.y - top), (f64)piece.source.width, (f64)piece.source.height), piece.source)
+    else:
+        let span = (i64)tile_size
+        for row in max_i64(0, top // span)..<(bottom + span - 1) // span:
+            for column in max_i64(0, left // span)..<(right + span - 1) // span:
+                if not cell_exists(tiles, (u32)column, (u32)row, level):
+                    continue
+                let cell = (try pyramid.texture(tiles, (u32)column, (u32)row, level, mask)) else continue
+                let width = covered_at(tiles.width(), (u32)column, level)
+                let height = covered_at(tiles.height(), (u32)row, level)
+                try gpu.copy_image(whole.value(), cell, gpu.Rect((f64)(column * span - left), (f64)(row * span - top), (f64)width, (f64)height), gpu.Region(0, 0, width, height))
+    discard(try frame.value().present(empty))
+    return Window(texture = texture, left = left, top = top, level = level)
+
+## `warp` read into `window`'s texels: document pixels scaled to its level and
+## moved to its corner.
+pub func window_map(warp: Warp, window: const Window*) -> Warp:
+    let scale = 1.0 / (f64)(1u32 << window.level)
+    let shift = Warp(m = [scale, 0.0, (f64)-window.left, 0.0, scale, (f64)-window.top, 0.0, 0.0, 1.0])
+    return multiply(shift, warp)
