@@ -318,8 +318,9 @@ func smooth(work: Work*):
                         n += 1.0
             work.lean[(usize)(y * work.width + x)] = sum / n
 
-## Only the largest connected piece leaning in, with its holes filled, as 1;
-## everything else 0. False when no piece leans in.
+## The pieces leaning in that matter — the largest, and any other at least
+## a sixth its size (a second flower beside the first) — with their holes
+## filled, as 1; everything else 0. False when no piece leans in.
 func keep_largest(work: Work*, x0: i64, y0: i64, x1: i64, y1: i64) -> bool!:
     let count = (usize)(work.width * work.height)
     let label = try alloc i32[count] in memory.heap
@@ -331,7 +332,8 @@ func keep_largest(work: Work*, x0: i64, y0: i64, x1: i64, y1: i64) -> bool!:
         let y = (i64)index // work.width
         let inside = x >= x0 and x < x1 and y >= y0 and y < y1
         label[index] = 0 if inside and work.lean[index] >= 0.5 else -1
-    var best_label: i32 = 0
+    let sizes = try alloc usize[count + 2] in memory.heap
+    defer free(sizes) in memory.heap
     var best_size: usize = 0
     var next: i32 = 1
     for start in 0..<count:
@@ -358,13 +360,18 @@ func keep_largest(work: Work*, x0: i64, y0: i64, x1: i64, y1: i64) -> bool!:
                         label[neighbour] = next
                         stack[top] = (u32)neighbour
                         top += 1
+        sizes[(usize)next] = size
         if size > best_size:
             best_size = size
-            best_label = next
         next += 1
     if best_size == 0:
         return false
-    # Holes: what the outside cannot reach without crossing the piece.
+    # Which labels stay: a piece a sixth of the largest or more.
+    let least = math.max(8.0, (f64)best_size / 6.0)
+    for index in 0..<count:
+        if label[index] > 0 and (f64)sizes[(usize)label[index]] < least:
+            label[index] = -1
+    # Holes: what the outside cannot reach without crossing a kept piece.
     let reached = try alloc u8[count] in memory.heap
     defer free(reached) in memory.heap
     var top: usize = 0
@@ -372,7 +379,7 @@ func keep_largest(work: Work*, x0: i64, y0: i64, x1: i64, y1: i64) -> bool!:
         reached[index] = 0
         let x = (i64)index % work.width
         let y = (i64)index // work.width
-        if (x == 0 or y == 0 or x == work.width - 1 or y == work.height - 1) and label[index] != best_label:
+        if (x == 0 or y == 0 or x == work.width - 1 or y == work.height - 1) and label[index] <= 0:
             reached[index] = 1
             stack[top] = (u32)index
             top += 1
@@ -390,7 +397,7 @@ func keep_largest(work: Work*, x0: i64, y0: i64, x1: i64, y1: i64) -> bool!:
                 if nx < 0 or ny < 0 or nx >= work.width or ny >= work.height:
                     continue
                 let neighbour = (usize)(ny * work.width + nx)
-                if reached[neighbour] == 0 and label[neighbour] != best_label:
+                if reached[neighbour] == 0 and label[neighbour] <= 0:
                     reached[neighbour] = 1
                     stack[top] = (u32)neighbour
                     top += 1
@@ -486,3 +493,23 @@ test "a sharp subject is told from a blurred ground of the same hue":
                     outside += 1
     # Most of the disc, little of the ground.
     assert(inside > 1800 and outside < 600)
+
+test "two subjects of a size are both found":
+    let width: usize = 160
+    let height: usize = 100
+    let pixels = try alloc f32[width * height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    let coverage = try alloc u8[width * height] in memory.heap
+    defer free(coverage) in memory.heap
+    for y in 0..<height:
+        for x in 0..<width:
+            let a = ((f64)x - 50.0) * ((f64)x - 50.0) + ((f64)y - 50.0) * ((f64)y - 50.0) < 18.0 * 18.0
+            let b = ((f64)x - 110.0) * ((f64)x - 110.0) + ((f64)y - 50.0) * ((f64)y - 50.0) < 15.0 * 15.0
+            let at = (y * width + x) * 4
+            let grain = (f32)((x * 7 + y * 13) % 5) * 0.02
+            pixels[at] = 0.85 + grain if a or b else 0.05
+            pixels[at + 1] = 0.15 if a or b else 0.1 + grain
+            pixels[at + 2] = 0.05 if a or b else 0.6 + grain
+            pixels[at + 3] = 1.0
+    assert(try find_subject(pixels, width, height, 0, 0, 0, 0, coverage))
+    assert(coverage[50 * width + 50] == 255 and coverage[50 * width + 110] == 255 and coverage[50 * width + 80] == 0)
