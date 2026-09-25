@@ -6,6 +6,11 @@
 
 ## `Canvas.save`: the flattened document as a picture, the format from `path`'s extension.
 func save_flattened(canvas: Canvas*, path: str, quality: i64, matte_red: f64, matte_green: f64, matte_blue: f64) -> !:
+    let lower = try strings.to_lower(path)
+    defer strings.release(lower)
+    if matte_red >= 0.0 and (strings.ends_with(lower, ".jpg") or strings.ends_with(lower, ".jpeg")):
+        try save_jpeg_streamed(canvas, path, quality, matte_red, matte_green, matte_blue)
+        return
     let pixels = try flattened_pixels(canvas)
     defer free(pixels) in memory.heap
     # Under a matte (linear light; a negative red means none) the picture comes out
@@ -26,6 +31,56 @@ func save_flattened(canvas: Canvas*, path: str, quality: i64, matte_red: f64, ma
         try opaque.value().save(path, quality = quality)
         return
     try picture.value().save(path, quality = quality)
+
+## A JPEG of the flattened document over the matte, made a row of cells at a
+## time: each row of composited tiles becomes sRGB bytes and goes straight to the
+## encoder, so no buffer the size of the document is ever held.
+func save_jpeg_streamed(canvas: Canvas*, path: str, quality: i64, matte_red: f64, matte_green: f64, matte_blue: f64) -> !:
+    try canvas.require_open()
+    let document = canvas.document else error(invalid, "draw the document once before saving it")
+    let composer = canvas.composer else error(invalid, "draw the document once before saving it")
+    let width = (usize)canvas.extent_x
+    # Linear light to 8-bit sRGB, 4096 steps across 0..1.
+    var encode_table: u8[4097]
+    for step in 0..<(usize)4097:
+        encode_table[step] = (u8)(srgb_byte((f64)step / 4096.0))
+    let matte: f64[3] = [matte_red, matte_green, matte_blue]
+    var encoded = Buffer(maximum = (usize)1 << 40)
+    defer encoded.close()
+    var encoder = try jpeg.Encoder.begin(width, (usize)canvas.extent_y, jpeg.Input.rgba, &encoded, jpeg.EncodeOptions(quality = quality))
+    defer encoder.close()
+    let band = try alloc u8[width * (usize)tile_size * 4] in memory.heap
+    defer free(band) in memory.heap
+    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    defer free(bytes) in memory.heap
+    for row in 0..<tile_columns(canvas.extent_y):
+        let rows = (usize)min_u32(tile_size, canvas.extent_y - row * tile_size)
+        for column in 0..<tile_columns(canvas.extent_x):
+            let texture = try composer.tile(document, column, row, 0)
+            let columns = (usize)min_u32(tile_size, canvas.extent_x - column * tile_size)
+            try texture.read(bytes[..<columns * rows * 8], gpu.Region(0, 0, (u32)columns, (u32)rows))
+            for y in 0..<rows:
+                for x in 0..<columns:
+                    let source = (y * columns + x) * 8
+                    let alpha = (f64)from_half((u16)bytes[source + 6] | ((u16)bytes[source + 7] << 8))
+                    let clamped = alpha if alpha < 1.0 else 1.0
+                    let destination = (y * width + (usize)column * (usize)tile_size + x) * 4
+                    for channel in 0..<(usize)3:
+                        let value = (f64)from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8))
+                        let over = value * clamped + matte[channel] * (1.0 - clamped)
+                        band[destination + channel] = encode_table[(usize)(math.clamp(over, 0.0, 1.0) * 4096.0 + 0.5)]
+                    band[destination + 3] = 255
+        try encoder.write_rows(band[..<width * rows * 4], rows)
+    try encoder.finish()
+    let destination = try strings.copy(path)
+    defer strings.release(destination)
+    try files.write_atomic((c_api.str)destination, encoded.view())
+
+## A linear component as an 8-bit sRGB value.
+func srgb_byte(linear: f64) -> u8:
+    let v = math.clamp(linear, 0.0, 1.0)
+    let encoded = v * 12.92 if v <= 0.0031308 else 1.055 * math.pow(v, 1.0 / 2.4) - 0.055
+    return (u8)math.floor(encoded * 255.0 + 0.5)
 
 ## The flattened document as straight-alpha linear RGBA f32 samples, top-down,
 ## four per pixel: heap storage the caller frees.

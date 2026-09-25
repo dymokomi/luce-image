@@ -28,6 +28,7 @@
 import c as c_api
 import clipboard
 import files
+import jpeg
 import gpu
 import interop
 import math
@@ -61,6 +62,7 @@ from luce_image.geometry import resize_canvas, resize_image
 from luce_image.selection import Selection, Mode
 from luce_image.shaders import ants_frag_words, ants_frag_msl
 from half import from_half
+from binary import Buffer
 from raster_errors import invalid, limit
 
 struct Record:
