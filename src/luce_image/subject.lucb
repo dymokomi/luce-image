@@ -12,6 +12,10 @@ import memory
 from raster_errors import invalid
 
 let clusters: usize = 6
+## What each pixel is told apart by: its three encoded channels, and how
+## sharp the picture is around it — a subject in focus against a blurred
+## ground of the same hue is still told apart.
+let features: usize = 4
 let work_size: f64 = 512.0
 
 ## A work-size copy of the picture: encoded colors, and whether a pixel is opaque enough to count.
@@ -81,7 +85,7 @@ func shrunk(pixels: const f32[], width: usize, height: usize, scale: f64) -> Wor
     let w = (i64)small_width
     let h = (i64)small_height
     let count = (usize)(w * h)
-    let colors = try alloc f64[count * 3] in memory.heap
+    let colors = try alloc f64[count * features] in memory.heap
     errdefer free(colors) in memory.heap
     let solid = try alloc u8[count] in memory.heap
     errdefer free(solid) in memory.heap
@@ -102,15 +106,52 @@ func shrunk(pixels: const f32[], width: usize, height: usize, scale: f64) -> Wor
                     n += 1.0
             let index = (usize)(y * w + x)
             for channel in 0..<(usize)3:
-                colors[index * 3 + channel] = encode(sum[channel] / n)
+                colors[index * features + channel] = encode(sum[channel] / n)
             solid[index] = 1 if sum[3] / n >= 0.5 else 0
             lean[index] = 0.0
+    add_sharpness(colors, w, h)
     return Work(width = w, height = h, colors = colors, solid = solid, lean = lean)
+
+## The fourth feature: the mean luma step to the neighbours, blurred over
+## 5×5 and scaled to count about as much as a color does.
+func add_sharpness(colors: f64[], width: i64, height: i64):
+    let count = (usize)(width * height)
+    let steps = alloc f64[count] in memory.heap catch _:
+        return
+    defer free(steps) in memory.heap
+    for y in 0..<height:
+        for x in 0..<width:
+            let here = luma_at(colors, (usize)(y * width + x))
+            var total = 0.0
+            var n = 0.0
+            for dy in -1..<(i64)2:
+                for dx in -1..<(i64)2:
+                    let nx = x + dx
+                    let ny = y + dy
+                    if (dx != 0 or dy != 0) and nx >= 0 and ny >= 0 and nx < width and ny < height:
+                        total += math.abs(luma_at(colors, (usize)(ny * width + nx)) - here)
+                        n += 1.0
+            steps[(usize)(y * width + x)] = total / math.max(n, 1.0)
+    for y in 0..<height:
+        for x in 0..<width:
+            var total = 0.0
+            var n = 0.0
+            for dy in -2..<(i64)3:
+                for dx in -2..<(i64)3:
+                    let nx = x + dx
+                    let ny = y + dy
+                    if nx >= 0 and ny >= 0 and nx < width and ny < height:
+                        total += steps[(usize)(ny * width + nx)]
+                        n += 1.0
+            colors[(usize)(y * width + x) * features + 3] = math.min(1.0, total / n * 6.0)
+
+func luma_at(colors: const f64[], index: usize) -> f64:
+    return 0.2126 * colors[index * features] + 0.7152 * colors[index * features + 1] + 0.0722 * colors[index * features + 2]
 
 ## Each pixel in the box leaning to the subject (1) or the background (0).
 func lean_apart(work: Work*, x0: i64, y0: i64, x1: i64, y1: i64) -> !:
-    var subject: f64[18]
-    var background: f64[18]
+    var subject: f64[24]
+    var background: f64[24]
     # Start: the background from outside the box, the subject from its middle half.
     try learn(work, &background, x0, y0, x1, y1, 0)
     try learn(work, &subject, x0, y0, x1, y1, 1)
@@ -137,7 +178,7 @@ func lean_apart(work: Work*, x0: i64, y0: i64, x1: i64, y1: i64) -> !:
 
 ## Cluster centres (k-means, a few steps) for one side, from: 0 outside the
 ## box; 1 the box's middle half; 2 outside plus inside leaning away; 3 inside leaning in.
-func learn(work: Work*, centres: f64[18]*, x0: i64, y0: i64, x1: i64, y1: i64, source: i64) -> !:
+func learn(work: Work*, centres: f64[24]*, x0: i64, y0: i64, x1: i64, y1: i64, source: i64) -> !:
     let count = (usize)(work.width * work.height)
     let chosen = try alloc u32[count] in memory.heap
     defer free(chosen) in memory.heap
@@ -172,33 +213,33 @@ func learn(work: Work*, centres: f64[18]*, x0: i64, y0: i64, x1: i64, y1: i64, s
     # Spread the first centres over the chosen pixels, then a few k-means steps.
     for k in 0..<clusters:
         let pick = (usize)chosen[(k * used) // clusters]
-        for channel in 0..<(usize)3:
-            (*centres)[k * 3 + channel] = work.colors[pick * 3 + channel]
+        for channel in 0..<features:
+            (*centres)[k * features + channel] = work.colors[pick * features + channel]
     for step in 0..<(usize)4:
-        var sums: f64[18]
+        var sums: f64[24]
         var counts: f64[6]
         for k in 0..<clusters:
             counts[k] = 0.0
-            for channel in 0..<(usize)3:
-                sums[k * 3 + channel] = 0.0
+            for channel in 0..<features:
+                sums[k * features + channel] = 0.0
         for at in 0..<used:
             let index = (usize)chosen[at]
             let k = nearest_index(centres, work.colors, index)
             counts[k] += 1.0
-            for channel in 0..<(usize)3:
-                sums[k * 3 + channel] += work.colors[index * 3 + channel]
+            for channel in 0..<features:
+                sums[k * features + channel] += work.colors[index * features + channel]
         for k in 0..<clusters:
             if counts[k] > 0.0:
-                for channel in 0..<(usize)3:
-                    (*centres)[k * 3 + channel] = sums[k * 3 + channel] / counts[k]
+                for channel in 0..<features:
+                    (*centres)[k * features + channel] = sums[k * features + channel] / counts[k]
 
-func nearest_index(centres: const f64[18]*, colors: const f64[], index: usize) -> usize:
+func nearest_index(centres: const f64[24]*, colors: const f64[], index: usize) -> usize:
     var best: usize = 0
     var best_distance = 1.0e30
     for k in 0..<clusters:
         var d = 0.0
-        for channel in 0..<(usize)3:
-            let difference = colors[index * 3 + channel] - (*centres)[k * 3 + channel]
+        for channel in 0..<features:
+            let difference = colors[index * features + channel] - (*centres)[k * features + channel]
             d += difference * difference
         if d < best_distance:
             best_distance = d
@@ -206,11 +247,11 @@ func nearest_index(centres: const f64[18]*, colors: const f64[], index: usize) -
     return best
 
 ## How far the pixel's color is from the side's nearest cluster.
-func nearest(centres: const f64[18]*, colors: const f64[], index: usize) -> f64:
+func nearest(centres: const f64[24]*, colors: const f64[], index: usize) -> f64:
     let k = nearest_index(centres, colors, index)
     var d = 0.0
-    for channel in 0..<(usize)3:
-        let difference = colors[index * 3 + channel] - (*centres)[k * 3 + channel]
+    for channel in 0..<features:
+        let difference = colors[index * features + channel] - (*centres)[k * features + channel]
         d += difference * difference
     return math.sqrt(d)
 
@@ -366,3 +407,39 @@ test "a red disc on a blue ground is found whole, in a box or in the whole pictu
         coverage[index] = 0
     assert(try find_subject(pixels, width, height, 0, 0, 0, 0, coverage))
     assert(coverage[45 * width + 60] == 255 and coverage[80 * width + 110] == 0)
+
+test "a sharp subject is told from a blurred ground of the same hue":
+    let width: usize = 160
+    let height: usize = 120
+    let pixels = try alloc f32[width * height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    let coverage = try alloc u8[width * height] in memory.heap
+    defer free(coverage) in memory.heap
+    for y in 0..<height:
+        for x in 0..<width:
+            let dx = (f64)x - 80.0
+            let dy = (f64)y - 60.0
+            let at = (y * width + x) * 4
+            # Orange everywhere; the disc crisp and speckled, the ground a soft glow.
+            let glow = (f32)(0.35 + 0.25 * math.sin((f64)x / 30.0) * math.cos((f64)y / 25.0))
+            let fleck: f32 = 0.35 if (x + y * 3) % 4 < 2 else 0.0
+            let disc = dx * dx + dy * dy < 28.0 * 28.0
+            let base = glow + fleck if disc else glow
+            pixels[at] = base
+            pixels[at + 1] = base * 0.45
+            pixels[at + 2] = base * 0.08
+            pixels[at + 3] = 1.0
+    assert(try find_subject(pixels, width, height, 0, 0, 0, 0, coverage))
+    var inside = 0
+    var outside = 0
+    for y in 0..<height:
+        for x in 0..<width:
+            let dx = (f64)x - 80.0
+            let dy = (f64)y - 60.0
+            if coverage[y * width + x] > 127:
+                if dx * dx + dy * dy < 28.0 * 28.0:
+                    inside += 1
+                elif dx * dx + dy * dy > 36.0 * 36.0:
+                    outside += 1
+    # Most of the disc, little of the ground.
+    assert(inside > 1800 and outside < 600)

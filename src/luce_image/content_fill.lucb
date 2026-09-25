@@ -316,11 +316,11 @@ struct Search:
     var cost: f64
 
 ## How much a source's distance counts against it: texture from nearby is
-## likelier the same stuff. Height counts eight times as much as breadth:
+## likelier the same stuff. Height counts thirty times as much as breadth:
 ## the same height is sky beside sky and sea beside sea, where a photo's
 ## horizon runs across.
 let nearness: f64 = 0.0000002
-let height_weight: f64 = 8.0
+let height_weight: f64 = 30.0
 
 ## Keep source (`sx`, `sy`) when it is a source and matches better, nearer
 ## sources winning ties.
