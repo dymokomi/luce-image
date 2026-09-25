@@ -57,10 +57,17 @@ pub struct Style:
     pub var inner_green: f64 = 0.0
     pub var inner_blue: f64 = 0.0
     pub var inner_opacity: f64 = 0.75
+    ## Inner glow: a color spreading inward from the edge, `inner_glow_size` pixels.
+    pub var inner_glow: bool = false
+    pub var inner_glow_size: f64 = 8.0
+    pub var inner_glow_red: f64 = 1.0
+    pub var inner_glow_green: f64 = 1.0
+    pub var inner_glow_blue: f64 = 0.75
+    pub var inner_glow_opacity: f64 = 0.75
 
     ## Whether any effect is on.
     pub func any() -> bool:
-        return self.shadow or self.stroke or self.glow or self.overlay or self.inner
+        return self.shadow or self.stroke or self.glow or self.overlay or self.inner or self.inner_glow
 
     ## Whether an effect goes under the layer's pixels.
     pub func under() -> bool:
@@ -68,7 +75,7 @@ pub struct Style:
 
     ## Whether an effect changes the layer's own colors.
     pub func over() -> bool:
-        return self.overlay or self.inner or (self.stroke and self.stroke_position > 0.5)
+        return self.overlay or self.inner or self.inner_glow or (self.stroke and self.stroke_position > 0.5)
 
     ## A digest of every setting, for caches.
     pub func digest() -> u64:
@@ -115,6 +122,12 @@ pub struct Style:
         if index == 31: return self.inner_green
         if index == 32: return self.inner_blue
         if index == 33: return self.inner_opacity
+        if index == 34: return 1.0 if self.inner_glow else 0.0
+        if index == 35: return self.inner_glow_size
+        if index == 36: return self.inner_glow_red
+        if index == 37: return self.inner_glow_green
+        if index == 38: return self.inner_glow_blue
+        if index == 39: return self.inner_glow_opacity
         return none
 
     ## Set setting `index` from a number, checked: switches take non-zero as
@@ -124,7 +137,7 @@ pub struct Style:
             error(invalid, "style settings must be finite")
         let kind = field_kind(index)
         if kind == 0:
-            error(invalid, "style fields are 0..33")
+            error(invalid, "style fields are 0..39")
         if kind == 2 and (value < 0.0 or value > 1.0):
             error(invalid, "style colors and opacities are 0..1")
         if kind == 3 and (value < 0.0 or value > 250.0):
@@ -167,27 +180,34 @@ pub struct Style:
         elif index == 30: self.inner_red = value
         elif index == 31: self.inner_green = value
         elif index == 32: self.inner_blue = value
-        else: self.inner_opacity = value
+        elif index == 33: self.inner_opacity = value
+        elif index == 34: self.inner_glow = on
+        elif index == 35: self.inner_glow_size = value
+        elif index == 36: self.inner_glow_red = value
+        elif index == 37: self.inner_glow_green = value
+        elif index == 38: self.inner_glow_blue = value
+        else: self.inner_glow_opacity = value
 
 ## How many numbered style settings there are.
-pub let style_field_count: i64 = 34
+pub let style_field_count: i64 = 40
 
 ## The settings' names, in field order, as documents keep them.
-pub func style_field_names() -> str[34]:
+pub func style_field_names() -> str[40]:
     return ["shadow", "shadow_dx", "shadow_dy", "shadow_blur", "shadow_red", "shadow_green", "shadow_blue", "shadow_opacity",
             "stroke", "stroke_size", "stroke_red", "stroke_green", "stroke_blue", "stroke_opacity",
             "glow", "glow_size", "glow_red", "glow_green", "glow_blue", "glow_opacity", "stroke_position",
             "overlay", "overlay_red", "overlay_green", "overlay_blue", "overlay_opacity",
-            "inner", "inner_dx", "inner_dy", "inner_blur", "inner_red", "inner_green", "inner_blue", "inner_opacity"]
+            "inner", "inner_dx", "inner_dy", "inner_blur", "inner_red", "inner_green", "inner_blue", "inner_opacity",
+            "inner_glow", "inner_glow_size", "inner_glow_red", "inner_glow_green", "inner_glow_blue", "inner_glow_opacity"]
 
 ## What a field holds: 1 a switch, 2 a color or opacity, 3 a size, 4 an
 ## offset, 5 the stroke's position; 0 no such field.
 func field_kind(index: i64) -> i64:
-    if index == 0 or index == 8 or index == 14 or index == 21 or index == 26:
+    if index == 0 or index == 8 or index == 14 or index == 21 or index == 26 or index == 34:
         return 1
     if index == 1 or index == 2 or index == 27 or index == 28:
         return 4
-    if index == 3 or index == 9 or index == 15 or index == 29:
+    if index == 3 or index == 9 or index == 15 or index == 29 or index == 35:
         return 3
     if index == 20:
         return 5

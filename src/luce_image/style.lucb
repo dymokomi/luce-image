@@ -86,14 +86,35 @@ pub struct Styler:
         defer inner.destroy()
         var eroded = try self.spread_alpha(device, flat, width, height, inside, eroded_mode)
         defer eroded.destroy()
+        var over = try Tiles.create(device, width, height)
+        errdefer over.destroy()
         var params: f32[22] = [0.0, 0.0, (f32)width, (f32)height, 1.0,
                                1.0 if style.inner else 0.0, (f32)style.inner_dx, (f32)style.inner_dy, (f32)style.inner_red, (f32)style.inner_green, (f32)style.inner_blue, (f32)style.inner_opacity,
                                1.0 if inside > 0.0 else 0.0, (f32)style.stroke_red, (f32)style.stroke_green, (f32)style.stroke_blue, (f32)style.stroke_opacity,
-                               1.0 if style.overlay else 0.0, (f32)style.overlay_red, (f32)style.overlay_green, (f32)style.overlay_blue, (f32)style.overlay_opacity]
-        var over = try Tiles.create(device, width, height)
-        errdefer over.destroy()
-        try self.draw(&over, params, [flat, inner, eroded, flat])
+                               1.0 if style.overlay and not style.inner_glow else 0.0, (f32)style.overlay_red, (f32)style.overlay_green, (f32)style.overlay_blue, (f32)style.overlay_opacity]
+        if style.inner_glow:
+            # An inner glow goes first, over the overlay and under the inner shadow
+            # and stroke (Photoshop's order); its result is the second pass's base.
+            var glowed = try self.inner_glow(device, flat, eroded, width, height, style)
+            defer glowed.destroy()
+            try self.draw(&over, params, [glowed, inner, eroded, flat])
+        else:
+            try self.draw(&over, params, [flat, inner, eroded, flat])
         return Rendered(under = under, over = over, has_over = true)
+
+    ## The layer with its overlay and inner glow on it, as one texture: the
+    ## inward pass with no offset and the glow's color.
+    func inner_glow(device: gpu.Device, flat: gpu.Texture, eroded: gpu.Texture, width: u32, height: u32, style: Style) -> gpu.Texture!:
+        var spread = try self.spread_alpha(device, flat, width, height, style.inner_glow_size * 0.5, blurred)
+        defer spread.destroy()
+        let params: f32[22] = [0.0, 0.0, (f32)width, (f32)height, 1.0,
+                               1.0, 0.0, 0.0, (f32)style.inner_glow_red, (f32)style.inner_glow_green, (f32)style.inner_glow_blue, (f32)style.inner_glow_opacity,
+                               0.0, 0.0, 0.0, 0.0, 0.0,
+                               1.0 if style.overlay else 0.0, (f32)style.overlay_red, (f32)style.overlay_green, (f32)style.overlay_blue, (f32)style.overlay_opacity]
+        var glowed = try Tiles.create(device, width, height)
+        defer glowed.destroy()
+        try self.draw(&glowed, params, [flat, spread, eroded, flat])
+        return try flatten(device, &glowed)
 
     ## Every cell of `tiles` drawn by `style.frag` with `params` (the cell's
     ## origin filled in) from `images`.
@@ -219,4 +240,14 @@ test "a drop shadow, glow and stroke appear around a layer's pixels":
     assert(pixels[(70 * 128 + 70) * 4 + 2] > 0.99 and pixels[(70 * 128 + 70) * 4 + 3] > 0.99)
     assert(pixels[(42 * 128 + 42) * 4 + 2] < 0.05 and pixels[(42 * 128 + 42) * 4 + 3] > 0.99)
     assert(pixels[(30 * 128 + 30) * 4 + 3] == 0.0)
+    effects.destroy()
+    # An inner glow lights the square's edge from inside, over the blue overlay; its middle stays blue.
+    layer.style.inner = false
+    layer.style.inner_glow = true
+    layer.style.inner_glow_size = 8.0
+    layer.style.inner_glow_opacity = 1.0
+    effects = try styler.render(layer)
+    try effects.over.read(pixels)
+    assert(pixels[(64 * 128 + 41) * 4] > 0.3 and pixels[(64 * 128 + 41) * 4 + 3] > 0.99)
+    assert(pixels[(64 * 128 + 64) * 4] < 0.05 and pixels[(64 * 128 + 64) * 4 + 2] > 0.99)
     effects.destroy()
