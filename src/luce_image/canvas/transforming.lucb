@@ -128,6 +128,9 @@ func end_session(canvas: Canvas*, keep: bool) -> !:
     try canvas.begin_edit(session.name)
     defer canvas.end_edit()
     try warp_session(canvas, document, transformer, session)
+    # Transformed text is pixels.
+    for at in 0..<session.count:
+        rasterize_type(canvas, session.entries[at].id)
     if session.floating:
         try canvas.live().warp(session.warp)
 

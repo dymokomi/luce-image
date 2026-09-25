@@ -1,0 +1,138 @@
+#==============================================================================================
+#
+#   canvas/type_layers - Text layers that stay text
+#
+#   DESCRIPTION:
+#       A text layer keeps its words and how they are set — family, style, size, color,
+#       where, the box it wraps in, alignment, tracking and leading — and its pixels are
+#       set again from them on every change, as Photoshop's live type. Moving the layer or
+#       resizing the canvas moves the text; painting, filtering or transforming its pixels
+#       turns it into an ordinary layer. Setting type is one undo step, and typing into a
+#       layer coalesces into one.
+#
+#==============================================================================================
+
+## What a text layer is set from.
+struct TypeSpec:
+    var text: str
+    var family: str
+    var style: str
+    var size: f64
+    var red: f64
+    var green: f64
+    var blue: f64
+    ## The first line's top-left, in document pixels.
+    var x: f64
+    var y: f64
+    ## The box it wraps in (0: point text), and fonts.Setting's alignment, tracking and leading.
+    var box_width: f64
+    var alignment: i64
+    var tracking: f64
+    var leading: f64
+
+## `Canvas.set_type`: layer `id` made (or kept) a text layer set as `spec` says.
+func set_layer_type(canvas: Canvas*, id: u64, spec: TypeSpec) -> !:
+    try canvas.require_open()
+    try canvas.require_idle()
+    let index = try canvas.index(id)
+    let record = canvas.records[index]
+    if record.group or record.adjustment >= 0:
+        error(invalid, "only a pixel layer can hold text")
+    if spec.text.length > 65536:
+        error(invalid, "a text layer holds at most 64 KiB of text")
+    for value in [spec.size, spec.red, spec.green, spec.blue, spec.x, spec.y, spec.box_width, spec.tracking, spec.leading]:
+        if not math.is_finite(value):
+            error(invalid, "type settings must be finite")
+    try gpu_check_color(gpu.Color(spec.red, spec.green, spec.blue, 1.0))
+    let document = canvas.document else error(invalid, "draw the document once before setting type")
+    # Set first, so a font that will not load changes nothing.
+    var tiles = try rendered_type(canvas, spec)
+    errdefer tiles.destroy()
+    try canvas.remember_state("Type", id)
+    var copied = spec
+    with memory.heap:
+        copied.text = try strings.copy(spec.text)
+        copied.family = try strings.copy(spec.family)
+        copied.style = try strings.copy(spec.style)
+    release_type(&canvas.records[index])
+    canvas.records[index].typed = true
+    canvas.records[index].typeset = copied
+    try document.set_tiles(id, tiles)
+
+## The layer's pixels for `spec`: the set text in its color, laid where it
+## goes (past the canvas too).
+func rendered_type(canvas: Canvas*, spec: TypeSpec) -> Tiles!:
+    let device = canvas.device else error(invalid, "draw the document once before setting type")
+    var face = try fonts.TypeFace(spec.family, spec.style, spec.size)
+    defer face.close()
+    var set = try fonts.set_text(&face, spec.text, fonts.Setting(width = spec.box_width, alignment = spec.alignment, tracking = spec.tracking, leading = spec.leading))
+    defer set.close()
+    let width = (usize)set.bitmap.width
+    let height = (usize)set.bitmap.height
+    let pixels = try alloc f32[width * height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    for at in 0..<(width * height):
+        pixels[at * 4] = (f32)spec.red
+        pixels[at * 4 + 1] = (f32)spec.green
+        pixels[at * 4 + 2] = (f32)spec.blue
+        pixels[at * 4 + 3] = (f32)set.bitmap.pixels[at] / 255.0
+    var whole = try Tiles.create(device, (u32)width, (u32)height)
+    defer whole.destroy()
+    try whole.write(pixels)
+    var tiles = try Tiles.create(device, canvas.extent_x, canvas.extent_y)
+    errdefer tiles.destroy()
+    try relocate(&whole, &tiles, 1.0, 1.0, spec.x - set.origin_x, spec.y - set.origin_y, false)
+    return tiles
+
+## Free a record's text and make it an ordinary layer.
+func release_type(record: Record*):
+    if not record.typed:
+        return
+    strings.release(record.typeset.text)
+    strings.release(record.typeset.family)
+    strings.release(record.typeset.style)
+    record.typed = false
+
+## A record's text copied, for a copy of the record that owns its own.
+func copy_type(record: Record*) -> !:
+    if not record.typed:
+        return
+    with memory.heap:
+        let text = try strings.copy(record.typeset.text)
+        errdefer strings.release(text)
+        let family = try strings.copy(record.typeset.family)
+        errdefer strings.release(family)
+        let style = try strings.copy(record.typeset.style)
+        record.typeset.text = text
+        record.typeset.family = family
+        record.typeset.style = style
+
+## Pixels of layer `id` about to change as pixels: it is no longer text.
+func rasterize_type(canvas: Canvas*, id: u64):
+    let index = canvas.index(id) catch _:
+        return
+    release_type(&canvas.records[index])
+
+## Every text layer's text moved by (`dx`, `dy`), with its pixels.
+func shift_type(canvas: Canvas*, dx: f64, dy: f64):
+    for index in 0..<canvas.count:
+        if canvas.records[index].typed:
+            canvas.records[index].typeset.x += dx
+            canvas.records[index].typeset.y += dy
+
+## The record of the text layer at stack `index`.
+func typed_record(canvas: const Canvas*, index: i64) -> Record!:
+    let record = try canvas.record(index)
+    if not record.typed:
+        error(invalid, "the layer holds no text")
+    return record
+
+## The installed families, listed once per canvas.
+func family_names(canvas: Canvas*) -> fonts.Names*!:
+    if let names = canvas.families:
+        return names
+    let listed = try fonts.families()
+    let boxed = try new fonts.Names in memory.heap
+    *boxed = listed
+    canvas.families = boxed
+    return boxed

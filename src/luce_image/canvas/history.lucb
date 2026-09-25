@@ -76,6 +76,11 @@ func copy_records(records: const Record[], count: usize) -> Record[]!:
                 error(failure.code, failure.message)
         copies[index] = records[index]
         copies[index].name = name
+        copy_type(&copies[index]) catch failure:
+            strings.release(name)
+            copies[index].typed = false
+            release_records(copies, index)
+            error(failure.code, failure.message)
         copies[index].picture = none
         copies[index].mask_picture = none
     return copies
@@ -84,4 +89,5 @@ func copy_records(records: const Record[], count: usize) -> Record[]!:
 func release_records(records: Record[], count: usize):
     for index in 0..<count:
         strings.release(records[index].name)
+        release_type(&records[index])
     free(records) in memory.heap

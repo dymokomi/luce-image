@@ -138,6 +138,8 @@ func save_canvas_package(canvas: Canvas*, path: str) -> !:
                 let number = try prism.Value.number(record.adjustment_values[parameter])
                 defer number.release()
                 try manifest.value().set(element, try format_file(key_buffer, "a", parameter, ""), number)
+        if record.typed:
+            try write_type(manifest.value(), element, record.typeset)
         if record.style.any():
             let names = style_field_names()
             for field in 0..<style_field_count:
@@ -174,6 +176,47 @@ func write_mask(canvas: Canvas*, layer: Layer*, layers_dir: str, index: usize) -
     let mask = layer.mask_tiles() else return none
     var file_buffer: u8[64]
     return try write_layer_picture(canvas, mask, layers_dir, try format_file(file_buffer, "layer", index, ".mask.png"), true)
+
+## A text layer's words and setting, in its manifest element.
+func write_type(manifest: prism.Document*, element: str, spec: TypeSpec) -> !:
+    for (key, value) in [("text", spec.text), ("family", spec.family), ("font_style", spec.style)]:
+        let text = try prism.Value.text(value)
+        defer text.release()
+        try manifest.set(element, key, text)
+    let names = type_value_names()
+    let values: f64[10] = [spec.size, spec.red, spec.green, spec.blue, spec.x, spec.y, spec.box_width, (f64)spec.alignment, spec.tracking, spec.leading]
+    for index in 0..<(usize)10:
+        let number = try prism.Value.number(values[index])
+        defer number.release()
+        try manifest.set(element, names[index], number)
+
+## The text a layer's element carries, if any: the layer is a text layer again
+## (its pixels, already read, are what it was set as).
+func read_type(doc: prism.Document*, element: str, canvas: Canvas*, id: i64) -> !:
+    let text_value = doc.get(element, "text") catch _:
+        return
+    defer text_value.release()
+    let family_value = try doc.get(element, "family")
+    defer family_value.release()
+    let style_value = try doc.get(element, "font_style")
+    defer style_value.release()
+    let names = type_value_names()
+    var values: f64[10]
+    for index in 0..<(usize)10:
+        values[index] = try get_number(doc, element, names[index])
+    let index = try canvas.index((u64)id)
+    var spec = TypeSpec(text = "", family = "", style = "", size = values[0], red = values[1], green = values[2], blue = values[3], x = values[4], y = values[5],
+                        box_width = values[6], alignment = (i64)values[7], tracking = values[8], leading = values[9])
+    with memory.heap:
+        spec.text = try strings.copy(try text_value.value().text_at())
+        spec.family = try strings.copy(try family_value.value().text_at())
+        spec.style = try strings.copy(try style_value.value().text_at())
+    release_type(&canvas.records[index])
+    canvas.records[index].typeset = spec
+    canvas.records[index].typed = true
+
+func type_value_names() -> str[10]:
+    return ["type_size", "type_red", "type_green", "type_blue", "type_x", "type_y", "box_width", "alignment", "tracking", "leading"]
 
 ## Where a mask's picture starts, when it reaches past the canvas.
 func note_mask(manifest: prism.Document*, element: str, origin: Bounds?) -> !:
@@ -265,6 +308,13 @@ func place_image_at(canvas: Canvas*, id: i64, picture: interop.Reference[Image],
 func open_canvas(path: str) -> interop.Reference[Canvas]!:
     if ends_with(path, ".l2d"):
         return try open_package(path)
+    # A package's manifest names the package: Windows' file dialog opens the
+    # .l2d folder rather than choosing it, so this is how it is picked there.
+    let manifest = "document.prisma"
+    if ends_with(path, manifest) and path.length > manifest.length + 5:
+        let folder = (str)path.bytes[..<(path.length - manifest.length - 1)]
+        if ends_with(folder, ".l2d"):
+            return try open_package(folder)
     if ends_with(path, ".psd") or ends_with(path, ".PSD"):
         return try open_psd(path)
     let picture = try Image.open(path)
@@ -418,6 +468,7 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
             let y = get_integer(doc, element, "y") catch _:
                 recover 0
             try native.place((u64)id, picture, x, y)
+            try read_type(doc, element, native, id)
         if (try get_integer(doc, element, "mask")) != 0:
             try native.set_mask(id, true)
             let mask = try Image.open(try paths.join(layers_dir, try format_file(file_buffer, "layer", index, ".mask.png")))

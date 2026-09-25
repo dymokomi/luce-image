@@ -288,8 +288,8 @@ test "previews show edits on the original pixels and end kept or dropped":
     # Renaming reaches the record and the bound layer.
     try canvas.rename_layer(layer, "Dot")
     assert((try canvas.layer_name(0)) == "Dot")
-    # Text lands on the layer and is undoable.
-    try canvas.draw_text(layer, 0.0, 0.0, "X", 24.0, 0.0, 1.0, 0.0)
+    # Text set on the layer is undoable.
+    try canvas.set_type(layer, "X", "Helvetica", "Regular", 24.0, 0.0, 1.0, 0.0, 0.0, 0.0)
     try canvas.undo()
     assert((try shown_centre(&canvas, &target, pixels)) == base)
     # A white glow lights the transparent surround of the dot; off again, it is dark.
@@ -1010,10 +1010,67 @@ test "guides are added, moved, removed and cleared undoably, and saved with the 
     try canvas.remove_guide(across)
     assert(canvas.guide_count() == 1 and (try canvas.guide_vertical(0)))
     try canvas.save_package("build/canvas-guides.l2d")
-    let reopened = try Canvas.open("build/canvas-guides.l2d")
+    let reopened = try Canvas.open("build/canvas-guides.l2d/document.prisma")
     defer reopened.release()
     assert(reopened.value().guide_count() == 1 and (try reopened.value().guide_position(0)) == 30.5)
     try canvas.clear_guides()
     assert(canvas.guide_count() == 0)
     try canvas.undo()
     assert(canvas.guide_count() == 1)
+
+test "text layers stay text: set, typed into, moved, saved and rasterised by painting":
+    var canvas = try Canvas(120, 60)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Words")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    assert(not (try canvas.layer_typed(0)) and (try canvas.font_family_count()) > 0)
+    try canvas.set_type(layer, "Hi", "Helvetica", "Bold", 30.0, 1.0, 0.0, 0.0, 10.0, 10.0)
+    assert((try canvas.layer_typed(0)) and (try canvas.layer_text(0)) == "Hi" and (try canvas.layer_font_style(0)) == "Bold")
+    assert((try canvas.measure_content(layer)) and canvas.content_left() >= 10 and canvas.content_left() < 16 and canvas.content_top() >= 10)
+    # Typing into it is one step with the setting before.
+    try canvas.set_type(layer, "Hi!", "Helvetica", "Bold", 30.0, 1.0, 0.0, 0.0, 10.0, 10.0)
+    try canvas.set_type(layer, "Hi!!", "Helvetica", "Bold", 30.0, 1.0, 0.0, 0.0, 10.0, 10.0)
+    assert(canvas.undo_name() == "Type")
+    # Moved, it stays text and its place follows.
+    try canvas.move_layer(layer, 20, 5)
+    assert((try canvas.layer_typed(0)) and (try canvas.layer_type_value(0, 4)) == 30.0 and (try canvas.layer_type_value(0, 5)) == 15.0)
+    # Saved and opened again, it is still text.
+    try canvas.save_package("build/canvas-type.l2d")
+    let reopened = try Canvas.open("build/canvas-type.l2d")
+    defer reopened.release()
+    assert((try reopened.value().layer_typed(0)) and (try reopened.value().layer_text(0)) == "Hi!!" and (try reopened.value().layer_type_value(0, 0)) == 30.0)
+    # Undo gives the text back; painting makes it pixels.
+    try canvas.undo()
+    assert((try canvas.layer_type_value(0, 4)) == 10.0)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, false)
+    try canvas.fill(layer, false)
+    assert(not (try canvas.layer_typed(0)))
+    try canvas.undo()
+    assert(try canvas.layer_typed(0))
+
+test "after an undo, a cancelled transform shows the pixels as they are, not a cached image":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Square")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(8, 8, 16, 16, 0)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    # Moved away and undone: the square is back at 8..24.
+    try canvas.transform_layer(layer, 1.0, 1.0, 0.0, 30.0, 0.0, 16.0, 16.0)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 0)
+    try canvas.undo()
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 255)
+    # A transform begun and cancelled leaves it there, as drawn.
+    try canvas.begin_transform(layer)
+    try canvas.end_transform(false)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 255 and (try shown_at(&canvas, &target, 44, 12))[0] == 0)
