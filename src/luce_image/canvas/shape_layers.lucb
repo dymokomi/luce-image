@@ -119,6 +119,8 @@ func transformed_shape(spec: ShapeSpec, forward: Warp) -> ShapeSpec?:
     moved.matrix = [a * old[0] + c * old[1], b * old[0] + d * old[1],
                     a * old[2] + c * old[3], b * old[2] + d * old[3],
                     a * old[4] + c * old[5] + e, b * old[4] + d * old[5] + f]
+    # The stroke grows with the shape, as Photoshop's: by the map's mean scale.
+    moved.stroke_width = spec.stroke_width * math.sqrt(math.abs(a * d - b * c))
     return moved
 
 ## The layer's pixels for `spec`: the shape as SVG, drawn by luce-svg over the canvas.

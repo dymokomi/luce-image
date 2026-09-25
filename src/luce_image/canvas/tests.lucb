@@ -1441,7 +1441,7 @@ test "shape layers stay shapes: drawn, moved, scaled crisp, saved, and pixels on
     try canvas.begin_transform(layer)
     try canvas.preview_transform(2.0, 2.0, 0.0, 0.0, 0.0, 28.0, 8.0)
     try canvas.end_transform(true)
-    assert((try canvas.layer_shaped(0)) and math.abs((try canvas.layer_shape_value(0, 16)) - 2.0) < 1e-9)
+    assert((try canvas.layer_shaped(0)) and math.abs((try canvas.layer_shape_value(0, 16)) - 2.0) < 1e-9 and math.abs((try canvas.layer_shape_value(0, 15)) - 4.0) < 1e-9)
     try ((document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")).read(pixels)
     assert(pixels[(30 * 64 + 45) * 4] > 0.99 and pixels[(30 * 64 + 45) * 4 + 3] > 0.99)
     # Restyled: no stroke now, the place kept.
@@ -1474,11 +1474,11 @@ test "the clone preview shows the source under the brush, cut to a circle":
     try canvas.fill(layer, false)
     try canvas.deselect()
     canvas.set_clone_source(20.0, 32.0)
-    let preview = try canvas.clone_preview(layer, 70.0, 32.0, 21.0)
+    let preview = try canvas.clone_preview(layer, 70.0, 32.0, 21.0, 0.5)
     assert(preview.length == 21 * 21 * 4)
     # The middle is the red source; a corner is outside the circle.
     let middle = (10 * 21 + 10) * 4
-    assert(preview[middle] == 255 and preview[middle + 1] == 0 and preview[middle + 3] == 255 and preview[3] == 0)
+    assert(preview[middle] == 255 and preview[middle + 1] == 0 and preview[middle + 3] == 128 and preview[3] == 0)
 
 test "dodge lightens and burn darkens where they are brushed, each one step":
     var canvas = try Canvas(64, 32)

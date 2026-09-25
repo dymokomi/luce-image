@@ -1540,10 +1540,10 @@ pub struct Canvas:
 
     ## What a Clone Stamp stroke on layer `id` at (`x`, `y`) would lay down:
     ## the source under a brush `diameter` pixels wide, cut to its circle, as
-    ## RGBA8 (sRGB, straight alpha), a square the diameter rounded up — for
-    ## the preview inside the brush.
-    pub mutating func clone_preview(id: i64, x: f64, y: f64, diameter: f64) -> const u8[]!:
-        return try clone_preview_pixels(&self, (u64)id, x, y, diameter)
+    ## RGBA8 (sRGB, straight alpha, faded by `opacity`), a square the
+    ## diameter rounded up — for the preview inside the brush.
+    pub mutating func clone_preview(id: i64, x: f64, y: f64, diameter: f64, opacity: f64 = 1.0) -> const u8[]!:
+        return try clone_preview_pixels(&self, (u64)id, x, y, diameter, opacity)
 
     ## Where a clone stroke through (`x`, `y`) takes its pixels from, for the source crosshair.
     pub func clone_sample_x(x: f64) -> f64:

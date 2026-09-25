@@ -257,7 +257,7 @@ func retouch_name(kind: i64) -> str:
 ## pixels, or with All Layers the picture — cut to the brush's circle, as
 ## RGBA8 (sRGB, straight alpha), `side` × `side` with `side` the diameter
 ## rounded up. Only the cells under it are read back.
-func clone_preview_pixels(canvas: Canvas*, id: u64, x: f64, y: f64, diameter: f64) -> const u8[]!:
+func clone_preview_pixels(canvas: Canvas*, id: u64, x: f64, y: f64, diameter: f64, opacity: f64) -> const u8[]!:
     let document = canvas.document else error(invalid, "draw the document once before previewing a clone")
     let side = (usize)math.max(1.0, math.min(1024.0, math.ceil(diameter)))
     if canvas.preview_bytes.length != side * side * 4:
@@ -291,14 +291,18 @@ func clone_preview_pixels(canvas: Canvas*, id: u64, x: f64, y: f64, diameter: f6
                 copy_cell(out, side, bytes, column * (i64)tile_size - left, row * (i64)tile_size - top)
             column += 1
         row += 1
-    # The brush's circle: nothing past it.
+    # The brush's circle: nothing past it; inside, faded by `opacity`.
     let radius = (f64)side * 0.5
+    let fade = math.clamp(opacity, 0.0, 1.0)
     for py in 0..<side:
         for px in 0..<side:
             let dx = (f64)px + 0.5 - radius
             let dy = (f64)py + 0.5 - radius
+            let at = (py * side + px) * 4 + 3
             if dx * dx + dy * dy > radius * radius:
-                out[(py * side + px) * 4 + 3] = 0
+                out[at] = 0
+            else:
+                out[at] = (u8)math.round((f64)out[at] * fade)
     return out
 
 ## A cell's half-float texels into the preview at (`at_x`, `at_y`), as sRGB bytes.
