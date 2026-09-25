@@ -562,6 +562,13 @@ pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brus
     var coverage = try gpu.Texture.create(painter.owner, 1, 1, gpu.Format.r8)
     defer coverage.destroy()
     try coverage.upload([(u8)255])
+    # A cell's result depends only on its source tile and selection tile: cells
+    # with the same pair (an empty layer under no selection, or under the one tile
+    # every fully selected cell shares) share one result, so filling a huge
+    # empty layer costs one tile, not thousands.
+    var made_keys: u64[16]
+    var made_cells: u32[32]
+    var made_count: usize = 0
     for row in 0..<tiles.rows():
         for column in 0..<tiles.columns():
             var clip = painter.white
@@ -571,6 +578,19 @@ pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brus
                 # A selection cell with no tile selects nothing there.
                 clip = selected.texture(column, row) else continue
                 params[7] = 1.0
+            let source_stamp = before.stamp(column, row)
+            var clip_stamp: u64 = 1
+            if let selected = selection:
+                clip_stamp = selected.stamp(column, row)
+            let key = (source_stamp *% 1099511628211) ^ clip_stamp
+            var shared = false
+            for at in 0..<made_count:
+                if made_keys[at] == key:
+                    try tiles.share(column, row, made_cells[at * 2], made_cells[at * 2 + 1])
+                    shared = true
+                    break
+            if shared:
+                continue
             var source = gpu.Texture()
             if let existing = before.texture(column, row):
                 source = existing
@@ -593,6 +613,11 @@ pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brus
                           [source, coverage, clip], gpu.Filter.nearest)
             discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
             try tiles.set(column, row, fresh)
+            if made_count < made_keys.length:
+                made_keys[made_count] = key
+                made_cells[made_count * 2] = column
+                made_cells[made_count * 2 + 1] = row
+                made_count += 1
     target.revision += 1
     return before
 
