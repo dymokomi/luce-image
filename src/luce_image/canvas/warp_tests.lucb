@@ -1,0 +1,116 @@
+## Smudge and push walked on a worker: the same pixels as walked in place,
+## history that waits for the worker, and a canvas that can close mid-stroke.
+
+## A 600 by 300 canvas, drawn once, with a red square and a blue bar on its
+## layer, whose strokes cross cell edges.
+func warp_canvas(target: gpu.Texture*, async: bool) -> Canvas!:
+    var canvas = try Canvas(600, 300)
+    errdefer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    discard(try shown_at(&canvas, target, 0, 0))
+    try canvas.set_async_warp(async)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(200, 80, 120, 120, 0)
+    try canvas.fill(layer, false)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.2, 1.0, false)
+    try canvas.select_rectangle(240, 150, 300, 30, 0)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    return canvas
+
+## A stroke of `kind` (4 smudge, 5 push) from the square out across the cell
+## edge at x 256, a soft 90-pixel tip.
+func warp_path(canvas: Canvas*, layer: i64, kind: i64) -> !:
+    try canvas.set_retouch(kind)
+    try canvas.set_brush(90.0, 0.3, 0.8, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.begin_stroke(layer, 230.0, 120.0)
+    for step in 1..<(i64)16:
+        try canvas.extend_stroke(230.0 + (f64)step * 17.0, 120.0 + (f64)step * 6.0)
+    try canvas.end_stroke()
+
+## Every straight-alpha sample of the canvas's first layer.
+func layer_samples(canvas: Canvas*) -> f32[]!:
+    let pixels = try alloc f32[600 * 300 * 4] in memory.heap
+    errdefer free(pixels) in memory.heap
+    try layer_tiles(canvas, try canvas.layer_id(0)).read(pixels)
+    return pixels
+
+test "a smudge or push walked on its worker gives the pixels walked in place give":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    for kind in [(i64)4, 5]:
+        var walked = try warp_canvas(&target, true)
+        defer walked.close()
+        var here = try warp_canvas(&target, false)
+        defer here.close()
+        try warp_path(&walked, try walked.layer_id(0), kind)
+        try warp_path(&here, try here.layer_id(0), kind)
+        # The worker's stroke is kept once waited for; the other already was.
+        assert(walked.busy() and not here.busy())
+        try walked.wait_idle()
+        assert(not walked.busy() and walked.undo_name() == here.undo_name())
+        let a = try layer_samples(&walked)
+        defer free(a) in memory.heap
+        let b = try layer_samples(&here)
+        defer free(b) in memory.heap
+        var moved = false
+        for index in 0..<a.length:
+            assert(a[index] == b[index])
+        # And it did something: red dragged past the square's right edge.
+        moved = a[(130 * 600 + 330) * 4] > 0.2
+        assert(moved)
+
+test "undo straight after a smudge ends waits for its worker and puts the layer back":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    var canvas = try warp_canvas(&target, true)
+    defer canvas.close()
+    let before = try layer_samples(&canvas)
+    defer free(before) in memory.heap
+    try warp_path(&canvas, try canvas.layer_id(0), 4)
+    assert(not canvas.painting() and canvas.busy())
+    # Points after the end are refused, not walked.
+    var refused = false
+    canvas.extend_stroke(10.0, 10.0) catch failure:
+        assert(failure.code == invalid)
+        refused = true
+    assert(refused)
+    try canvas.undo()
+    assert(not canvas.busy())
+    let after = try layer_samples(&canvas)
+    defer free(after) in memory.heap
+    for index in 0..<before.length:
+        assert(before[index] == after[index])
+    try canvas.redo()
+    let again = try layer_samples(&canvas)
+    defer free(again) in memory.heap
+    assert(again[(130 * 600 + 330) * 4] > 0.2)
+
+test "a canvas closes cleanly with a smudge walking or finishing on its worker":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    # Mid-stroke: points recorded, the stroke never ended.
+    var walking = try warp_canvas(&target, true)
+    try walking.set_retouch(4)
+    try walking.set_brush(250.0, 0.2, 0.9, 1.0, 1.0, 0.0, 0.0, false)
+    try walking.begin_stroke(try walking.layer_id(0), 150.0, 150.0)
+    for step in 1..<(i64)40:
+        try walking.extend_stroke(150.0 + (f64)step * 8.0, 150.0)
+    walking.close()
+    # Ended and still finishing.
+    var finishing = try warp_canvas(&target, true)
+    try warp_path(&finishing, try finishing.layer_id(0), 5)
+    finishing.close()
+    assert(not finishing.busy())
