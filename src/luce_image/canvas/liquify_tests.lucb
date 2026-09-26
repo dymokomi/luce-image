@@ -1,0 +1,108 @@
+#==============================================================================================
+#
+#   canvas/liquify_tests - Liquify's push: what it moves, its preview, and no seams
+#
+#==============================================================================================
+
+## Every straight-alpha sample of layer `layer`, `width` by `height`.
+func pushed_samples(canvas: Canvas*, layer: i64, width: usize, height: usize) -> f32[]!:
+    let pixels = try alloc f32[width * height * 4] in memory.heap
+    errdefer free(pixels) in memory.heap
+    try layer_tiles(canvas, layer).read(pixels)
+    return pixels
+
+## A push along row `y` from `from_x` to `to_x`, in 10-pixel moves, not ended.
+func push_along(canvas: Canvas*, layer: i64, y: f64, from_x: f64, to_x: f64, diameter: f64) -> !:
+    try canvas.set_retouch(5)
+    try canvas.set_brush(diameter, 0.5, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.begin_stroke(layer, from_x, y)
+    var x = from_x
+    while x < to_x:
+        x = math.min(to_x, x + 10.0)
+        try canvas.extend_stroke(x, y)
+
+test "a push drags what is under the tip along its path, shows it live, and undoes":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(600, 400)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 128, 128, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    let view = try alloc u8[128 * 128 * 4] in memory.heap
+    defer free(view) in memory.heap
+    let kept = try alloc u8[128 * 128 * 4] in memory.heap
+    defer free(kept) in memory.heap
+    try drawn(&canvas, &target, 1.0, 0.0, 0.0, view)
+    # A blue bar down the whole layer, across the cell edge at y 256.
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.1, 0.2, 1.0, false)
+    try canvas.select_rectangle(240, 0, 12, 400, 0)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    try push_along(&canvas, layer, 250.0, 200.0, 330.0, 120.0)
+    assert(canvas.painting())
+    # Shown while it goes, at 100% the same pixels keeping makes.
+    try drawn(&canvas, &target, 1.0, -230.0, -190.0, view)
+    try canvas.end_stroke()
+    assert(not canvas.painting() and canvas.undo_name() == "Liquify")
+    try drawn(&canvas, &target, 1.0, -230.0, -190.0, kept)
+    let off = apart(view, kept, 2)
+    assert(off.percent < 0.5)
+    let pixels = try pushed_samples(&canvas, layer, 600, 400)
+    defer free(pixels) in memory.heap
+    # Along the path the bar went with the tip; behind it, what came from
+    # behind (nothing); past the tip's reach it stayed.
+    var carried = false
+    for x in 300..<(usize)380:
+        carried = carried or pixels[(250 * 600 + x) * 4 + 3] > 0.5
+    assert(carried)
+    assert(pixels[(250 * 600 + 246) * 4 + 3] < 0.5)
+    assert(pixels[(20 * 600 + 246) * 4 + 3] > 0.99 and pixels[(390 * 600 + 246) * 4 + 3] > 0.99)
+    try canvas.undo()
+    let back = try pushed_samples(&canvas, layer, 600, 400)
+    defer free(back) in memory.heap
+    assert(back[(250 * 600 + 246) * 4 + 3] > 0.99 and back[(250 * 600 + 300) * 4 + 3] == 0.0)
+
+test "a push across cell edges leaves no seam, and its coarse preview looks like what it keeps":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(2048, 1536)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 512, 384, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    let view = try alloc u8[512 * 384 * 4] in memory.heap
+    defer free(view) in memory.heap
+    let kept = try alloc u8[512 * 384 * 4] in memory.heap
+    defer free(kept) in memory.heap
+    try drawn(&canvas, &target, 0.25, 0.0, 0.0, view)
+    # Black to white across the picture: smooth, so a seam would show.
+    try canvas.fill_gradient(layer, 0.0, 0.0, 2048.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    let before = try pushed_samples(&canvas, layer, 2048, 1536)
+    defer free(before) in memory.heap
+    # Along the cell row edge at y 768, over the column edge at x 1024.
+    try push_along(&canvas, layer, 768.0, 700.0, 1300.0, 400.0)
+    try drawn(&canvas, &target, 0.25, 0.0, 0.0, view)
+    try canvas.end_stroke()
+    try drawn(&canvas, &target, 0.25, 0.0, 0.0, kept)
+    let off = apart(view, kept, 12)
+    assert(off.percent < 3.0 and off.mean < 4.0)
+    let pixels = try pushed_samples(&canvas, layer, 2048, 1536)
+    defer free(pixels) in memory.heap
+    # The push moved the gradient: the red under the path is not where it was.
+    assert(math.abs((f64)pixels[(768 * 2048 + 1100) * 4] - (f64)before[(768 * 2048 + 1100) * 4]) > 0.02)
+    # Across each cell edge the pixels change no more than beside it.
+    for y in 600..<(usize)940:
+        let step = (f64)pixels[(y * 2048 + 1024) * 4] - (f64)pixels[(y * 2048 + 1023) * 4]
+        let left_step = (f64)pixels[(y * 2048 + 1023) * 4] - (f64)pixels[(y * 2048 + 1022) * 4]
+        let after = (f64)pixels[(y * 2048 + 1025) * 4] - (f64)pixels[(y * 2048 + 1024) * 4]
+        assert(math.abs(step) <= 3.0 * math.max(math.abs(left_step), math.abs(after)) + 0.004)
+    for x in 700..<(usize)1400:
+        let across = (f64)pixels[(768 * 2048 + x) * 4] - (f64)pixels[(767 * 2048 + x) * 4]
+        let above = (f64)pixels[(767 * 2048 + x) * 4] - (f64)pixels[(766 * 2048 + x) * 4]
+        let below = (f64)pixels[(769 * 2048 + x) * 4] - (f64)pixels[(768 * 2048 + x) * 4]
+        assert(math.abs(across) <= 3.0 * math.max(math.abs(above), math.abs(below)) + 0.004)

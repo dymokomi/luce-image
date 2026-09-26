@@ -1,4 +1,4 @@
-## Smudge and push walked on a worker: the same pixels as walked in place,
+## Smudge walked on a worker: the same pixels as walked in place,
 ## history that waits for the worker, and a canvas that can close mid-stroke.
 
 ## A 600 by 300 canvas, drawn once, with a red square and a blue bar on its
@@ -18,7 +18,7 @@ func warp_canvas(target: gpu.Texture*, async: bool) -> Canvas!:
     try canvas.deselect()
     return canvas
 
-## A stroke of `kind` (4 smudge, 5 push) from the square out across the cell
+## A stroke of `kind` (4 smudge) from the square out across the cell
 ## edge at x 256, a soft 90-pixel tip.
 func warp_path(canvas: Canvas*, layer: i64, kind: i64) -> !:
     try canvas.set_retouch(kind)
@@ -35,34 +35,33 @@ func layer_samples(canvas: Canvas*) -> f32[]!:
     try layer_tiles(canvas, try canvas.layer_id(0)).read(pixels)
     return pixels
 
-test "a smudge or push walked on its worker gives the pixels walked in place give":
+test "a smudge walked on its worker gives the pixels walked in place give":
     var device = gpu.Device.open() catch failure:
         assert(failure.code == gpu.unavailable)
         return
     defer device.destroy()
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    for kind in [(i64)4, 5]:
-        var walked = try warp_canvas(&target, true)
-        defer walked.close()
-        var here = try warp_canvas(&target, false)
-        defer here.close()
-        try warp_path(&walked, try walked.layer_id(0), kind)
-        try warp_path(&here, try here.layer_id(0), kind)
-        # The worker's stroke is kept once waited for; the other already was.
-        assert(walked.busy() and not here.busy())
-        try walked.wait_idle()
-        assert(not walked.busy() and walked.undo_name() == here.undo_name())
-        let a = try layer_samples(&walked)
-        defer free(a) in memory.heap
-        let b = try layer_samples(&here)
-        defer free(b) in memory.heap
-        var moved = false
-        for index in 0..<a.length:
-            assert(a[index] == b[index])
-        # And it did something: red dragged past the square's right edge.
-        moved = a[(130 * 600 + 330) * 4] > 0.2
-        assert(moved)
+    var walked = try warp_canvas(&target, true)
+    defer walked.close()
+    var here = try warp_canvas(&target, false)
+    defer here.close()
+    try warp_path(&walked, try walked.layer_id(0), 4)
+    try warp_path(&here, try here.layer_id(0), 4)
+    # The worker's stroke is kept once waited for; the other already was.
+    assert(walked.busy() and not here.busy())
+    try walked.wait_idle()
+    assert(not walked.busy() and walked.undo_name() == here.undo_name())
+    let a = try layer_samples(&walked)
+    defer free(a) in memory.heap
+    let b = try layer_samples(&here)
+    defer free(b) in memory.heap
+    var moved = false
+    for index in 0..<a.length:
+        assert(a[index] == b[index])
+    # And it did something: red dragged past the square's right edge.
+    moved = a[(130 * 600 + 330) * 4] > 0.2
+    assert(moved)
 
 test "undo straight after a smudge ends waits for its worker and puts the layer back":
     var device = gpu.Device.open() catch failure:
@@ -111,6 +110,6 @@ test "a canvas closes cleanly with a smudge walking or finishing on its worker":
     walking.close()
     # Ended and still finishing.
     var finishing = try warp_canvas(&target, true)
-    try warp_path(&finishing, try finishing.layer_id(0), 5)
+    try warp_path(&finishing, try finishing.layer_id(0), 4)
     finishing.close()
     assert(not finishing.busy())

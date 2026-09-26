@@ -201,6 +201,10 @@ pub struct Composer:
     pub mutating func drop_stand_ins():
         self.stand_in_count = 0
 
+    ## The layer levels it keeps: what a stand-in reads, for work made outside a draw.
+    pub mutating func levels() -> Pyramid*:
+        return &self.pyramid
+
     ## `layer`'s tile (or its mask's) at the level being made: its stand-in's
     ## while a preview shows one, else its own `tiles`'.
     mutating func layer_source(layer: const Layer*, tiles: const Tiles*, column: u32, row: u32, mask: bool = false) -> gpu.Texture?!:

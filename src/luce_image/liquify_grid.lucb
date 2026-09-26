@@ -1,0 +1,255 @@
+#==============================================================================================
+#
+#   liquify_grid - Liquify's push as a field of displacements on a coarse grid
+#
+#   DESCRIPTION:
+#       A push does not move pixels as it goes. It moves a grid of control points `step`
+#       document pixels apart (Krita's liquify keeps one too): pixel p of the pushed layer
+#       shows the layer as the stroke began at p + D(p), D bilinear between the points. A
+#       dab is then a few thousand points at any brush size rather than millions of pixels,
+#       and the pixels are made once, on the GPU, where a view or the kept stroke needs
+#       them (liquify.lucb). The grid is held in blocks of 32 by 32 points, each made the
+#       first time a dab moves one of its points, so its memory follows the area pushed.
+#       Positions are pixel indices: pixel i sits at i.
+#
+#==============================================================================================
+
+import math
+import memory
+from half import to_half
+from raster_errors import invalid
+
+## Points along a block's side.
+let block_side: i64 = 32
+
+## A displacement, document pixels.
+pub struct Shift:
+    pub var x: f64
+    pub var y: f64
+
+## One block's points, row by row: each point's (dx, dy) side by side.
+struct Block:
+    var values: f32[]
+
+## The document box the moved points lie in.
+pub struct Moved:
+    pub var any: bool = false
+    pub var left: f64 = 0.0
+    pub var top: f64 = 0.0
+    pub var right: f64 = 0.0
+    pub var bottom: f64 = 0.0
+
+## What `Grid.field` found over a cell: whether any sample moves, and the box
+## of document pixels the cell's pixels come from.
+pub struct Reach:
+    pub var moved: bool
+    pub var left: f64
+    pub var top: f64
+    pub var right: f64
+    pub var bottom: f64
+
+## A layer's push so far: where each of its pixels comes from.
+pub struct Grid:
+    ## Document pixels between points: a power of two.
+    pub var step: f64
+    ## Points across and down (the last ones past the layer's edge).
+    var points_x: i64
+    var points_y: i64
+    ## Blocks across and down, and each block (none: its points have not moved).
+    var blocks_x: i64
+    var blocks_y: i64
+    var blocks: Block*?[]
+    pub var moved: Moved
+
+    ## A grid over a `width` by `height` layer, its points `step` pixels apart.
+    pub static func create(width: u32, height: u32, step: f64) -> Grid!:
+        if not (step >= 1.0 and step <= 64.0):
+            error(invalid, "a liquify grid's step is 1..64 pixels")
+        let points_x = (i64)math.ceil((f64)width / step) + 2
+        let points_y = (i64)math.ceil((f64)height / step) + 2
+        let blocks_x = (points_x + block_side - 1) // block_side
+        let blocks_y = (points_y + block_side - 1) // block_side
+        let blocks = try alloc Block*?[(usize)(blocks_x * blocks_y)] in memory.heap
+        for index in 0..<blocks.length:
+            blocks[index] = none
+        return Grid(step = step, points_x = points_x, points_y = points_y, blocks_x = blocks_x, blocks_y = blocks_y, blocks = blocks, moved = Moved())
+
+    pub mutating func destroy():
+        for index in 0..<self.blocks.length:
+            if let block = self.blocks[index]:
+                free(block.values) in memory.heap
+                free(block) in memory.heap
+        free(self.blocks) in memory.heap
+
+    ## Point (`gx`, `y`)'s displacement; none past the grid or where it never moved.
+    func point(gx: i64, gy: i64) -> Shift:
+        if gx < 0 or gy < 0 or gx >= self.points_x or gy >= self.points_y:
+            return Shift(x = 0.0, y = 0.0)
+        let block = self.blocks[(usize)((gy // block_side) * self.blocks_x + gx // block_side)] else return Shift(x = 0.0, y = 0.0)
+        let at = (usize)((gy % block_side) * block_side + gx % block_side) * 2
+        return Shift(x = (f64)block.values[at], y = (f64)block.values[at + 1])
+
+    ## Set point (`gx`, `gy`), making its block the first time.
+    mutating func set(gx: i64, gy: i64, shift: Shift) -> !:
+        if gx < 0 or gy < 0 or gx >= self.points_x or gy >= self.points_y:
+            return
+        let index = (usize)((gy // block_side) * self.blocks_x + gx // block_side)
+        if self.blocks[index] == none:
+            let values = try alloc f32[(usize)(block_side * block_side * 2)] in memory.heap
+            errdefer free(values) in memory.heap
+            for at in 0..<values.length:
+                values[at] = 0.0
+            self.blocks[index] = try new Block(values = values) in memory.heap
+        let block = self.blocks[index] else trap("made")
+        let at = (usize)((gy % block_side) * block_side + gx % block_side) * 2
+        block.values[at] = (f32)shift.x
+        block.values[at + 1] = (f32)shift.y
+
+    ## The displacement at pixel position (`x`, `y`), bilinear between points.
+    pub func sample(x: f64, y: f64) -> Shift:
+        let u = x / self.step
+        let v = y / self.step
+        let gx = (i64)math.floor(u)
+        let gy = (i64)math.floor(v)
+        let fx = u - (f64)gx
+        let fy = v - (f64)gy
+        let a = self.point(gx, gy)
+        let b = self.point(gx + 1, gy)
+        let c = self.point(gx, gy + 1)
+        let d = self.point(gx + 1, gy + 1)
+        let top_x = a.x + (b.x - a.x) * fx
+        let top_y = a.y + (b.y - a.y) * fx
+        let bottom_x = c.x + (d.x - c.x) * fx
+        let bottom_y = c.y + (d.y - c.y) * fx
+        return Shift(x = top_x + (bottom_x - top_x) * fy, y = top_y + (bottom_y - top_y) * fy)
+
+    ## One push dab: under a tip of `radius` (smoothstep from `hardness` to the
+    ## rim) at (`x`, `y`), each pixel takes what lay `move` behind it by the
+    ## tip's weight there. On the field: D'(g) = D(g - m w(g)) - m w(g), read
+    ## from the field as it was before the dab.
+    pub mutating func push(x: f64, y: f64, move_x: f64, move_y: f64, radius: f64, hardness: f64) -> !:
+        let first_x = math.imax(0, (i64)math.ceil((x - radius) / self.step))
+        let first_y = math.imax(0, (i64)math.ceil((y - radius) / self.step))
+        let last_x = math.imin(self.points_x - 1, (i64)math.floor((x + radius) / self.step))
+        let last_y = math.imin(self.points_y - 1, (i64)math.floor((y + radius) / self.step))
+        if last_x < first_x or last_y < first_y:
+            return
+        let across = last_x - first_x + 1
+        let count = (usize)(across * (last_y - first_y + 1))
+        # The new values first, all read from the field before the dab.
+        let fresh = try alloc f32[count * 2] in memory.heap
+        defer free(fresh) in memory.heap
+        let weights = try alloc f32[count] in memory.heap
+        defer free(weights) in memory.heap
+        for gy in first_y..<last_y + 1:
+            for gx in first_x..<last_x + 1:
+                let at = (usize)((gy - first_y) * across + gx - first_x)
+                let px = (f64)gx * self.step
+                let py = (f64)gy * self.step
+                let w = tip_weight(math.hypot(px - x, py - y) / radius, hardness)
+                weights[at] = (f32)w
+                if w <= 0.0:
+                    continue
+                let behind = self.sample(px - move_x * w, py - move_y * w)
+                fresh[at * 2] = (f32)(behind.x - move_x * w)
+                fresh[at * 2 + 1] = (f32)(behind.y - move_y * w)
+        for gy in first_y..<last_y + 1:
+            for gx in first_x..<last_x + 1:
+                let at = (usize)((gy - first_y) * across + gx - first_x)
+                if weights[at] <= 0.0:
+                    continue
+                try self.set(gx, gy, Shift(x = (f64)fresh[at * 2], y = (f64)fresh[at * 2 + 1]))
+        # A pixel a step past the last moved point still leans on it.
+        let left = (f64)first_x * self.step - self.step
+        let top = (f64)first_y * self.step - self.step
+        let right = (f64)last_x * self.step + self.step
+        let bottom = (f64)last_y * self.step + self.step
+        if not self.moved.any:
+            self.moved = Moved(any = true, left = left, top = top, right = right, bottom = bottom)
+            return
+        self.moved.left = math.min(self.moved.left, left)
+        self.moved.top = math.min(self.moved.top, top)
+        self.moved.right = math.max(self.moved.right, right)
+        self.moved.bottom = math.max(self.moved.bottom, bottom)
+
+    ## Whether any moved point lies within the box of pixel positions
+    ## `left`..`right`, `top`..`bottom` or a step around it.
+    pub func touches(left: f64, top: f64, right: f64, bottom: f64) -> bool:
+        return self.moved.any and left < self.moved.right and right > self.moved.left and top < self.moved.bottom and bottom > self.moved.top
+
+    ## The field over a cell for liquify.frag: `n` by `n` samples `spacing`
+    ## pixels apart from pixel (`x0`, `y0`), each (dx, dy) as a coarse and a
+    ## fine half float (their sum the displacement; a half alone is too coarse
+    ## past a few hundred pixels), into `bytes` (rgba16_float, n by n). Also
+    ## the box the cell's pixels come from.
+    pub func field(x0: f64, y0: f64, spacing: f64, n: i64, bytes: u8[]) -> Reach:
+        var reach = Reach(moved = false, left = 1.0e18, top = 1.0e18, right = -1.0e18, bottom = -1.0e18)
+        for j in 0..<n:
+            for i in 0..<n:
+                let x = x0 + (f64)i * spacing
+                let y = y0 + (f64)j * spacing
+                let shift = self.sample(x, y)
+                if shift.x != 0.0 or shift.y != 0.0:
+                    reach.moved = true
+                reach.left = math.min(reach.left, x + shift.x)
+                reach.top = math.min(reach.top, y + shift.y)
+                reach.right = math.max(reach.right, x + shift.x)
+                reach.bottom = math.max(reach.bottom, y + shift.y)
+                let at = (usize)(j * n + i) * 8
+                put_split(bytes, at, shift.x)
+                put_split(bytes, at + 2, shift.y)
+        return reach
+
+## A tip's weight at `u` of its radius: whole within `hardness`, a smoothstep
+## down to nothing at the rim.
+func tip_weight(u: f64, hardness: f64) -> f64:
+    if u >= 1.0:
+        return 0.0
+    if u <= hardness:
+        return 1.0
+    let t = (1.0 - u) / (1.0 - hardness)
+    return t * t * (3.0 - 2.0 * t)
+
+## `value` as two half floats at `at` and `at + 4` in `bytes`: a multiple of
+## 64, exact in a half, and what is left, within 32 of nothing.
+func put_split(bytes: u8[], at: usize, value: f64):
+    let coarse = math.round(value / 64.0) * 64.0
+    put_half(bytes, at, coarse)
+    put_half(bytes, at + 4, value - coarse)
+
+func put_half(bytes: u8[], at: usize, value: f64):
+    let half = to_half((f32)value)
+    bytes[at] = (u8)(half & 0xff)
+    bytes[at + 1] = (u8)(half >> 8)
+
+## The grid step for a brush `diameter` pixels wide: a sixteenth of it, the
+## power of two at or below, 1..32 pixels. A small brush moves pixels one by
+## one; a huge one moves a few thousand points a dab.
+pub func step_for(diameter: f64) -> f64:
+    var step = 1.0
+    while step < 32.0 and step * 2.0 <= diameter / 16.0:
+        step *= 2.0
+    return step
+
+test "a push moves what is under the tip along the move, and nothing past the rim":
+    var grid = try Grid.create(1000, 800, 8.0)
+    defer grid.destroy()
+    try grid.push(400.0, 400.0, 10.0, 0.0, 100.0, 0.5)
+    # At the middle the pixel shows what lay 10 pixels behind it.
+    let middle = grid.sample(400.0, 400.0)
+    assert(math.abs(middle.x + 10.0) < 1e-4 and math.abs(middle.y) < 1e-4)
+    assert(grid.sample(600.0, 400.0).x == 0.0 and grid.sample(400.0, 520.0).x == 0.0)
+    # A second dab at the same place pushes again: 20 behind.
+    try grid.push(400.0, 400.0, 10.0, 0.0, 100.0, 0.5)
+    assert(math.abs(grid.sample(400.0, 400.0).x + 20.0) < 1e-3)
+    assert(grid.touches(350.0, 350.0, 360.0, 360.0) and not grid.touches(700.0, 700.0, 710.0, 710.0))
+
+test "a field's split halves sum back to the displacement":
+    var grid = try Grid.create(2000, 2000, 16.0)
+    defer grid.destroy()
+    try grid.push(1000.0, 1000.0, 700.25, -300.5, 500.0, 0.9)
+    let bytes = try alloc u8[3 * 3 * 8] in memory.heap
+    defer free(bytes) in memory.heap
+    let reach = grid.field(992.0, 992.0, 16.0, 3, bytes)
+    assert(reach.moved and reach.left < 300.0)
+    assert(step_for(12.0) == 1.0 and step_for(90.0) == 4.0 and step_for(2000.0) == 32.0)
