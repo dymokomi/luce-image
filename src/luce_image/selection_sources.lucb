@@ -2,14 +2,17 @@
 ## (or mask) loaded as the selection, and the magic wand. Nothing the size of
 ## the document is ever held. The pixels come through a `Reader` (a layer's
 ## tiles, the composited picture, or a test's buffer) as straight-alpha RGBA
-## half floats; a batch of cells is read on the calling thread (the GPU's) and
-## turned into coverage on every processor. Half floats have 65536 values, so
+## half floats. GPU sources are read 64 cells to a read batch on the calling
+## thread (the GPU's), two batches in turn: while every processor turns one
+## batch into coverage straight from the readback memory, the next is already
+## on the GPU. Half floats have 65536 values, so
 ## each conversion is a table lookup.
 ##
 ## The wand's matching pixels become a selection of their own (`near`), cells
 ## wholly matching or wholly not costing nothing; a contiguous wand then
 ## floods through it from the seed, a cell that matches wholly being taken at
 ## once and only mixed cells being walked pixel by pixel.
+import gpu
 import math
 import memory
 from tiles import tile_size
@@ -24,13 +27,51 @@ let cell_halves: usize = 524288
 ## Cells read before they are converted together.
 let batch_cells: usize = 32
 
-## Where pixels come from, a cell at a time: `read(context, column, row,
-## halves)` fills `halves` (rows of 256 pixels, 8 bytes each, as many rows as
-## the cell has) and is true, or is false for a cell wholly transparent and
-## leaves `halves` alone.
+## Where pixels come from, a cell at a time (`cpu_reader`, `gpu_reader`).
+## A CPU source's `read(context, column, row, halves)` fills `halves` (rows of
+## 256 pixels, 8 bytes each, as many rows as the cell has) and is true, or is
+## false for a cell wholly transparent and leaves `halves` alone. A GPU
+## source's `texture(context, column, row)` is the cell's tile (256 wide,
+## rgba16f) or none where it is transparent; its cells are read in batches.
 pub struct Reader:
     pub var context: void*?
     pub var read: func(void*?, u32, u32, u8[]) -> bool!
+    pub var texture: func(void*?, u32, u32) -> gpu.Texture?!
+    pub var device: gpu.Device
+    pub var batched: bool
+
+## A reader of pixels the CPU already has.
+pub func cpu_reader(context: void*?, read: func(void*?, u32, u32, u8[]) -> bool!) -> Reader:
+    return Reader(context = context, read = read, texture = no_texture, device = gpu.Device(), batched = false)
+
+## A reader of tiles on `device`, read back in batches.
+pub func gpu_reader(context: void*?, device: gpu.Device, texture: func(void*?, u32, u32) -> gpu.Texture?!) -> Reader:
+    return Reader(context = context, read = no_read, texture = texture, device = device, batched = true)
+
+func no_texture(context: void*?, column: u32, row: u32) -> gpu.Texture?!:
+    discard(context)
+    discard(column)
+    discard(row)
+    return none
+
+func no_read(context: void*?, column: u32, row: u32, halves: u8[]) -> bool!:
+    discard(context)
+    discard(column)
+    discard(row)
+    discard(halves)
+    return false
+
+## One cell through `reader` into `halves`: whether it is painted.
+func read_one(cells: const Cells*, reader: Reader, column: u32, row: u32, halves: u8[]) -> bool!:
+    if not reader.batched:
+        return try reader.read(reader.context, column, row, halves)
+    let texture = (try reader.texture(reader.context, column, row)) else return false
+    let rows = min_u32(tile_size, cells.extent_y - row * tile_size)
+    try texture.read(halves[..<(usize)rows * (usize)tile_size * 8], gpu.Region(0, 0, tile_size, rows))
+    return true
+
+func min_u32(a: u32, b: u32) -> u32:
+    return a if a < b else b
 
 # mark: Loading =================================================================================
 
@@ -125,7 +166,7 @@ func seed_color(cells: const Cells*, reader: Reader, x: i64, y: i64, reach: i64)
             let column = px // (i64)tile_size
             let row = py // (i64)tile_size
             if column != read_column or row != read_row:
-                painted = try reader.read(reader.context, (u32)column, (u32)row, halves)
+                painted = try read_one(cells, reader, (u32)column, (u32)row, halves)
                 read_column = column
                 read_row = row
             count += 1.0
@@ -174,7 +215,7 @@ struct CellJob:
     var limit: i64
     ## The batch: the cells, and their halves one after another.
     var indices: usize[]
-    var halves: u8[]
+    var halves: const u8[]
 
     ## Whether `color` is within the limit of the seed on every channel.
     func matches(color: u8[4]) -> bool:
@@ -188,6 +229,9 @@ struct CellJob:
 ## at a time on every processor; a transparent cell is `blank` throughout,
 ## combined by the job's mode here.
 func read_batches(cells: Cells*, reader: Reader, job: CellJob*, work: func(void*?, usize) -> unit, blank: u8) -> !:
+    if reader.batched:
+        try read_gpu_batches(cells, reader, job, work, blank)
+        return
     let indices = try alloc usize[batch_cells] in memory.heap
     defer free(indices) in memory.heap
     let halves = try alloc u8[batch_cells * cell_halves] in memory.heap
@@ -206,6 +250,66 @@ func read_batches(cells: Cells*, reader: Reader, job: CellJob*, work: func(void*
             job.halves = halves
             each(filled, (void*)job, work)
             filled = 0
+
+## One of the two read batches a GPU source's cells go through, and which
+## cells it holds (its halves one after another from offset 0).
+struct CellRead:
+    var batch: gpu.ReadBatch
+    var indices: usize[]
+    var filled: usize
+
+## `read_batches` for a GPU source: cells recorded into one read batch while
+## the other's are worked on, straight from the readback memory.
+func read_gpu_batches(cells: Cells*, reader: Reader, job: CellJob*, work: func(void*?, usize) -> unit, blank: u8) -> !:
+    var reads: CellRead[2] = [CellRead(batch = try gpu.ReadBatch.begin(reader.device)), CellRead(batch = gpu.ReadBatch())]
+    defer release_cell_read(&reads[0])
+    reads[1].batch = try gpu.ReadBatch.begin(reader.device)
+    defer release_cell_read(&reads[1])
+    let per_batch = reads[0].batch.capacity() // cell_halves
+    for index in 0..<(usize)2:
+        reads[index].indices = try alloc usize[per_batch] in memory.heap
+    var next: usize = 0
+    next = try fill_cell_read(cells, reader, &reads[0], next, blank, job.mode)
+    next = try fill_cell_read(cells, reader, &reads[1], next, blank, job.mode)
+    var turn: usize = 0
+    while reads[turn].filled > 0:
+        let current = &reads[turn]
+        try current.batch.wait()
+        job.indices = current.indices[..<current.filled]
+        job.halves = try current.batch.bytes(0, current.filled * cell_halves)
+        each(current.filled, (void*)job, work)
+        next = try fill_cell_read(cells, reader, current, next, blank, job.mode)
+        turn = 1 - turn
+
+## Record cells from `next` on into `target` until it is full and submit it;
+## transparent cells are combined as `blank` on the way. Where the list continues.
+func fill_cell_read(cells: Cells*, reader: Reader, target: CellRead*, next: usize, blank: u8, mode: Mode) -> usize!:
+    try target.batch.reset()
+    target.filled = 0
+    var index = next
+    while index < cells.count() and target.filled < target.indices.length:
+        let column = (u32)(index % (usize)cells.columns())
+        let row = (u32)(index // (usize)cells.columns())
+        if let texture = try reader.texture(reader.context, column, row):
+            # Cells of halves one after another: each offset is a whole cell on.
+            let offset = (try target.batch.reserve(cell_halves)) else break
+            let rows = min_u32(tile_size, cells.extent_y - row * tile_size)
+            try target.batch.copy(texture, gpu.Region(0, 0, tile_size, rows), offset)
+            target.indices[target.filled] = index
+            target.filled += 1
+        else:
+            combine_value(cells, index, blank, mode)
+        index += 1
+    if target.filled > 0:
+        try target.batch.submit()
+    return index
+
+func release_cell_read(target: CellRead*):
+    target.batch.finish()
+    if target.indices.length > 0:
+        free(target.indices) in memory.heap
+        var none_left: usize[]
+        target.indices = none_left
 
 # mark: The flood ===============================================================================
 

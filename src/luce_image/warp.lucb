@@ -19,7 +19,8 @@ import math
 import memory
 import os
 import thread
-from tiles import Tiles, tile_size
+from tiles import Tiles, Cell, tile_size
+from half import from_half
 from raster_errors import invalid
 from luce_image.warp_queue import WarpQueue
 from luce_image.warp_upload import PackCell, pack_cells
@@ -364,22 +365,22 @@ pub struct WarpStroke:
         let first_row = math.imax(0, top // (i64)tile_size)
         let last_column = math.imin((i64)self.columns - 1, right // (i64)tile_size)
         let last_row = math.imin(rows - 1, bottom // (i64)tile_size)
+        if last_column < first_column or last_row < first_row:
+            return
+        # The cells not yet read, read back together.
+        let wanted = try alloc Cell[(usize)((last_column - first_column + 1) * (last_row - first_row + 1))] in memory.heap
+        defer free(wanted) in memory.heap
+        var count: usize = 0
         var row = first_row
         while row <= last_row:
             var column = first_column
             while column <= last_column:
-                let index = (usize)row * self.columns + (usize)column
-                if self.cells[index] == none:
-                    let pixels = try alloc f32[(usize)tile_size * (usize)tile_size * 4] in memory.heap
-                    errdefer free(pixels) in memory.heap
-                    try self.source.read_cell((u32)column, (u32)row, pixels)
-                    for at in 0..<pixels.length // 4:
-                        let alpha = pixels[at * 4 + 3]
-                        for channel in 0..<(usize)3:
-                            pixels[at * 4 + channel] *= alpha
-                    self.cells[index] = try new WarpCell(pixels = pixels) in memory.heap
+                if self.cells[(usize)row * self.columns + (usize)column] == none:
+                    wanted[count] = Cell(column = (u32)column, row = (u32)row)
+                    count += 1
                 column += 1
             row += 1
+        try self.source.read_many(wanted[..<count], (void*)&self, load_cell)
 
     ## Mark the cells a dab over document pixels `left`..`right`, `top`..`bottom`
     ## reached: in the shared queue when a worker walks.
@@ -516,3 +517,21 @@ func upload_packed(tiles: Tiles*, packs: PackCell[], places: const u32[]) -> !:
         let rows = packs[index].height
         try texture.upload(packs[index].bytes[..<rows * (usize)tile_size * 8], gpu.Region(0, 0, tile_size, (u32)rows))
         try tiles.set(column, row, texture)
+
+## `WarpStroke.load`'s visitor: a cell read back, premultiplied, into the working copy.
+func load_cell(context: void*?, cell: Cell, bytes: const u8[]) -> !:
+    let stroke = (WarpStroke*)(context else trap("a warp load lost its stroke"))
+    let pixels = try alloc f32[(usize)tile_size * (usize)tile_size * 4] in memory.heap
+    errdefer free(pixels) in memory.heap
+    for index in 0..<pixels.length:
+        pixels[index] = 0.0
+    # Only the document's part of an edge cell; past it stays clear.
+    let columns = (usize)stroke.source.region(cell.column, cell.row).width
+    for y in 0..<bytes.length // ((usize)tile_size * 8):
+        for x in 0..<columns:
+            let at = y * (usize)tile_size + x
+            let alpha = from_half((u16)bytes[at * 8 + 6] | ((u16)bytes[at * 8 + 7] << 8))
+            for channel in 0..<(usize)3:
+                pixels[at * 4 + channel] = from_half((u16)bytes[at * 8 + channel * 2] | ((u16)bytes[at * 8 + channel * 2 + 1] << 8)) * alpha
+            pixels[at * 4 + 3] = alpha
+    stroke.cells[(usize)cell.row * stroke.columns + (usize)cell.column] = try new WarpCell(pixels = pixels) in memory.heap

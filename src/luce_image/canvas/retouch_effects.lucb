@@ -196,7 +196,7 @@ func finish_heal(canvas: Canvas*, stroke: Stroke*) -> !:
     let original = stroke.original()
     let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
     defer free(bytes) in memory.heap
-    let hole = (try spot_bounds(stroke, original, bytes)) else return
+    let hole = (try spot_bounds(device, stroke, original)) else return
     let window = heal_window(hole, (i64)canvas.extent_x, (i64)canvas.extent_y)
     let width = (usize)(window.right - window.left)
     let height = (usize)(window.bottom - window.top)
@@ -204,7 +204,7 @@ func finish_heal(canvas: Canvas*, stroke: Stroke*) -> !:
     defer free(pixels) in memory.heap
     let painted = try alloc u8[width * height] in memory.heap
     defer free(painted) in memory.heap
-    try gather_spot(stroke, original, window, pixels, painted, bytes)
+    try gather_spot(device, stroke, original, window, pixels, painted)
     if not (try heal(pixels, width, height, painted)):
         return
     # Back to straight alpha for the effect tiles.
@@ -215,42 +215,53 @@ func finish_heal(canvas: Canvas*, stroke: Stroke*) -> !:
     # The effect: in each cell the stroke reached, the layer as it was with the window's part healed.
     var healed = try Tiles.create(device, canvas.extent_x, canvas.extent_y)
     errdefer healed.destroy()
-    for row in 0..<original.rows():
-        for column in 0..<original.columns():
-            if stroke.coverage_at(column, row) == none:
-                continue
-            try read_cell(original, column, row, bytes)
-            spot_into_cell(pixels, window, column, row, bytes)
-            var texture = try gpu.Texture.create(device, tile_size, tile_size, gpu.Format.rgba16_float)
-            errdefer texture.destroy()
-            try texture.upload(bytes)
-            try healed.set(column, row, texture)
+    var read = HealRead(stroke = stroke, original = original, columns = original.columns(), window = window, pixels = pixels, bytes = bytes, healed = &healed, device = device)
+    try read_pieces(device, (usize)original.columns() * (usize)original.rows(), (void*)&read, healed_piece, healed_visit)
     try stroke.use_effect(&painter, document, healed, 2.0, canvas.heal_opacity)
 
 ## The box of the pixels the stroke painted (coverage past 1%); none when it painted nothing.
-func spot_bounds(stroke: Stroke*, original: const Tiles*, bytes: u8[]) -> Bounds?!:
-    var found = false
-    var bounds = Bounds(left = 0, top = 0, right = 0, bottom = 0)
-    for row in 0..<original.rows():
-        for column in 0..<original.columns():
-            let coverage = stroke.coverage_at(column, row) else continue
-            let area = original.region(column, row)
-            try coverage.read(bytes[..<((usize)area.height * (usize)tile_size * 8)], gpu.Region(0, 0, tile_size, area.height))
-            for y in 0..<(usize)area.height:
-                for x in 0..<(usize)area.width:
-                    if not painted_at(bytes, x, y):
-                        continue
-                    let px = (i64)(column * tile_size) + (i64)x
-                    let py = (i64)(row * tile_size) + (i64)y
-                    if not found:
-                        bounds = Bounds(left = px, top = py, right = px + 1, bottom = py + 1)
-                        found = true
-                        continue
-                    bounds.left = math.imin(bounds.left, px)
-                    bounds.top = math.imin(bounds.top, py)
-                    bounds.right = math.imax(bounds.right, px + 1)
-                    bounds.bottom = math.imax(bounds.bottom, py + 1)
-    return bounds if found else none
+func spot_bounds(device: gpu.Device, stroke: Stroke*, original: const Tiles*) -> Bounds?!:
+    var read = SpotRead(stroke = stroke, original = original, columns = original.columns())
+    try read_pieces(device, (usize)original.columns() * (usize)original.rows(), (void*)&read, coverage_piece, bounds_visit)
+    return read.bounds if read.found else none
+
+## What the reads of a spot share: the stroke, the layer as it was, the grid's
+## columns, and what is found.
+struct SpotRead:
+    var stroke: Stroke*
+    var original: const Tiles*
+    var columns: u32
+    var found: bool
+    var bounds: Bounds
+
+## The stroke's coverage in cell `index` of the grid, where it painted.
+func coverage_piece(context: void*?, index: usize) -> Piece!:
+    let read = (SpotRead*)(context else trap("a spot read lost its state"))
+    let column = (u32)(index % (usize)read.columns)
+    let row = (u32)(index // (usize)read.columns)
+    let coverage = read.stroke.coverage_at(column, row) else return no_piece()
+    return Piece(texture = coverage, region = gpu.Region(0, 0, tile_size, read.original.region(column, row).height), present = true)
+
+## Grow the box by the painted texels of a cell's coverage.
+func bounds_visit(context: void*?, index: usize, bytes: const u8[]) -> !:
+    let read = (SpotRead*)(context else trap("a spot read lost its state"))
+    let column = (u32)(index % (usize)read.columns)
+    let row = (u32)(index // (usize)read.columns)
+    let area = read.original.region(column, row)
+    for y in 0..<bytes.length // ((usize)tile_size * 8):
+        for x in 0..<(usize)area.width:
+            if not painted_at(bytes, x, y):
+                continue
+            let px = (i64)(column * tile_size) + (i64)x
+            let py = (i64)(row * tile_size) + (i64)y
+            if not read.found:
+                read.bounds = Bounds(left = px, top = py, right = px + 1, bottom = py + 1)
+                read.found = true
+                continue
+            read.bounds.left = math.imin(read.bounds.left, px)
+            read.bounds.top = math.imin(read.bounds.top, py)
+            read.bounds.right = math.imax(read.bounds.right, px + 1)
+            read.bounds.bottom = math.imax(read.bounds.bottom, py + 1)
 
 ## Whether the coverage texel at (`x`, `y`) of a read-back cell counts as painted.
 func painted_at(bytes: const u8[], x: usize, y: usize) -> bool:
@@ -271,44 +282,106 @@ func heal_window(hole: Bounds, extent_x: i64, extent_y: i64) -> Bounds:
                   right = math.imin(extent_x, hole.right + reach), bottom = math.imin(extent_y, hole.bottom + reach))
 
 ## The window's pixels (premultiplied) from the layer as it was, and where the stroke painted.
-func gather_spot(stroke: Stroke*, original: const Tiles*, window: Bounds, pixels: f32[], painted: u8[], bytes: u8[]) -> !:
+func gather_spot(device: gpu.Device, stroke: Stroke*, original: const Tiles*, window: Bounds, pixels: f32[], painted: u8[]) -> !:
     for index in 0..<pixels.length:
         pixels[index] = 0.0
     for index in 0..<painted.length:
         painted[index] = 0
-    let width = (usize)(window.right - window.left)
     let size = (i64)tile_size
-    for row in window.top // size..<(window.bottom - 1) // size + 1:
-        for column in window.left // size..<(window.right - 1) // size + 1:
-            let cell_x = column * size
-            let cell_y = row * size
-            let x0 = math.imax(window.left, cell_x)
-            let y0 = math.imax(window.top, cell_y)
-            let x1 = math.imin(window.right, cell_x + size)
-            let y1 = math.imin(window.bottom, cell_y + size)
-            if let texture = original.texture((u32)column, (u32)row):
-                try texture.read(bytes)
-                for y in y0..<y1:
-                    for x in x0..<x1:
-                        let source = (usize)((y - cell_y) * size + x - cell_x) * 8
-                        let target = ((usize)(y - window.top) * width + (usize)(x - window.left)) * 4
-                        let alpha = from_half((u16)bytes[source + 6] | ((u16)bytes[source + 7] << 8))
-                        for channel in 0..<(usize)3:
-                            pixels[target + channel] = from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8)) * alpha
-                        pixels[target + 3] = alpha
-            if let coverage = stroke.coverage_at((u32)column, (u32)row):
-                try coverage.read(bytes)
-                for y in y0..<y1:
-                    for x in x0..<x1:
-                        if painted_at(bytes, (usize)(x - cell_x), (usize)(y - cell_y)):
-                            painted[(usize)(y - window.top) * width + (usize)(x - window.left)] = 1
+    var read = WindowRead(stroke = stroke, original = original, window = window, pixels = pixels, painted = painted,
+                          first_column = window.left // size, first_row = window.top // size,
+                          columns = (window.right - 1) // size + 1 - window.left // size)
+    let rows = (window.bottom - 1) // size + 1 - window.top // size
+    # Two pieces a cell: the layer's tile, then the stroke's coverage.
+    try read_pieces(device, (usize)(read.columns * rows) * 2, (void*)&read, window_piece, window_visit)
 
-## A cell of `tiles` read back into `bytes` (zero where it has no tile).
-func read_cell(tiles: const Tiles*, column: u32, row: u32, bytes: u8[]) -> !:
-    if let texture = tiles.texture(column, row):
-        try texture.read(bytes)
+## A spot's window being gathered: its cells from (`first_column`, `first_row`), `columns` wide.
+struct WindowRead:
+    var stroke: Stroke*
+    var original: const Tiles*
+    var window: Bounds
+    var pixels: f32[]
+    var painted: u8[]
+    var first_column: i64
+    var first_row: i64
+    var columns: i64
+
+func window_cell(read: const WindowRead*, index: usize) -> (i64, i64):
+    let cell = (i64)(index // 2)
+    return (read.first_column + cell % read.columns, read.first_row + cell // read.columns)
+
+func window_piece(context: void*?, index: usize) -> Piece!:
+    let read = (WindowRead*)(context else trap("a window read lost its state"))
+    let (column, row) = window_cell(read, index)
+    let texture = (read.original.texture((u32)column, (u32)row) if index % 2 == 0 else read.stroke.coverage_at((u32)column, (u32)row)) else return no_piece()
+    return Piece(texture = texture, region = gpu.Region(0, 0, tile_size, tile_size), present = true)
+
+func window_visit(context: void*?, index: usize, bytes: const u8[]) -> !:
+    let read = (WindowRead*)(context else trap("a window read lost its state"))
+    if bytes.length == 0:
         return
-    memory.set(bytes, 0)
+    let (column, row) = window_cell(read, index)
+    let size = (i64)tile_size
+    let window = read.window
+    let width = (usize)(window.right - window.left)
+    let cell_x = column * size
+    let cell_y = row * size
+    let x0 = math.imax(window.left, cell_x)
+    let y0 = math.imax(window.top, cell_y)
+    let x1 = math.imin(window.right, cell_x + size)
+    let y1 = math.imin(window.bottom, cell_y + size)
+    if index % 2 == 0:
+        for y in y0..<y1:
+            for x in x0..<x1:
+                let source = (usize)((y - cell_y) * size + x - cell_x) * 8
+                let target = ((usize)(y - window.top) * width + (usize)(x - window.left)) * 4
+                let alpha = from_half((u16)bytes[source + 6] | ((u16)bytes[source + 7] << 8))
+                for channel in 0..<(usize)3:
+                    read.pixels[target + channel] = from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8)) * alpha
+                read.pixels[target + 3] = alpha
+        return
+    for y in y0..<y1:
+        for x in x0..<x1:
+            if painted_at(bytes, (usize)(x - cell_x), (usize)(y - cell_y)):
+                read.painted[(usize)(y - window.top) * width + (usize)(x - window.left)] = 1
+
+## The healed cells being made: each cell the stroke reached, the layer as it
+## was with the window's part healed, into `healed`.
+struct HealRead:
+    var stroke: Stroke*
+    var original: const Tiles*
+    var columns: u32
+    var window: Bounds
+    var pixels: const f32[]
+    var bytes: u8[]
+    var healed: Tiles*
+    var device: gpu.Device
+
+func healed_piece(context: void*?, index: usize) -> Piece!:
+    let read = (HealRead*)(context else trap("a heal lost its state"))
+    let column = (u32)(index % (usize)read.columns)
+    let row = (u32)(index // (usize)read.columns)
+    if read.stroke.coverage_at(column, row) == none:
+        return no_piece()
+    let texture = read.original.texture(column, row) else return no_piece()
+    return Piece(texture = texture, region = gpu.Region(0, 0, tile_size, tile_size), present = true)
+
+func healed_visit(context: void*?, index: usize, bytes: const u8[]) -> !:
+    let read = (HealRead*)(context else trap("a heal lost its state"))
+    let column = (u32)(index % (usize)read.columns)
+    let row = (u32)(index // (usize)read.columns)
+    if read.stroke.coverage_at(column, row) == none:
+        return
+    # The cell as it was (clear where it had no tile), then the healed part over it.
+    if bytes.length == 0:
+        memory.set(read.bytes, 0)
+    else:
+        memory.copy(read.bytes, bytes, bytes.length)
+    spot_into_cell(read.pixels, read.window, column, row, read.bytes)
+    var texture = try gpu.Texture.create(read.device, tile_size, tile_size, gpu.Format.rgba16_float)
+    errdefer texture.destroy()
+    try texture.upload(read.bytes)
+    try read.healed.set(column, row, texture)
 
 ## The healed window's straight-alpha pixels written over a read-back cell.
 func spot_into_cell(pixels: const f32[], window: Bounds, column: u32, row: u32, bytes: u8[]):

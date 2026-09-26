@@ -639,7 +639,7 @@ struct Buffer:
     var height: usize
 
     func reader() -> sources.Reader:
-        return sources.Reader(context = (void*)&self, read = read_buffer)
+        return sources.cpu_reader((void*)&self, read_buffer)
 
 func read_buffer(context: void*?, column: u32, row: u32, halves: u8[]) -> bool!:
     let buffer = (Buffer*)(context else return false)

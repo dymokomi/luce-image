@@ -157,27 +157,16 @@ func clone_preview_pixels(canvas: Canvas*, id: u64, x: f64, y: f64, diameter: f6
     let left = (i64)math.floor(canvas.clone_sample_x(x) - (f64)side * 0.5)
     let top = (i64)math.floor(canvas.clone_sample_y(y) - (f64)side * 0.5)
     let layer = document.find(id) else error(invalid, "no such layer")
-    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
-    defer free(bytes) in memory.heap
-    let first_column = math.max(0.0, math.floor((f64)left / (f64)tile_size))
-    let first_row = math.max(0.0, math.floor((f64)top / (f64)tile_size))
-    let columns = (i64)tile_columns(canvas.extent_x)
-    let rows = (i64)tile_columns(canvas.extent_y)
-    var row = (i64)first_row
-    while row < rows and row * (i64)tile_size < top + (i64)side:
-        var column = (i64)first_column
-        while column < columns and column * (i64)tile_size < left + (i64)side:
-            var texture: gpu.Texture? = none
-            if canvas.clone_all:
-                let composer = canvas.composer else error(invalid, "draw the document once before previewing a clone")
-                texture = try composer.tile(document, (u32)column, (u32)row, 0)
-            elif let tiles = layer.tiles():
-                texture = tiles.texture((u32)column, (u32)row)
-            if let cell = texture:
-                try cell.read(bytes)
-                copy_cell(out, side, bytes, column * (i64)tile_size - left, row * (i64)tile_size - top)
-            column += 1
-        row += 1
+    let first_column = (i64)math.max(0.0, math.floor((f64)left / (f64)tile_size))
+    let first_row = (i64)math.max(0.0, math.floor((f64)top / (f64)tile_size))
+    let last_column = math.imin((i64)tile_columns(canvas.extent_x), (left + (i64)side + (i64)tile_size - 1) // (i64)tile_size)
+    let last_row = math.imin((i64)tile_columns(canvas.extent_y), (top + (i64)side + (i64)tile_size - 1) // (i64)tile_size)
+    if last_column > first_column and last_row > first_row:
+        let device = canvas.device else error(invalid, "draw the document once before previewing a clone")
+        # The cells under the brush, read back together.
+        var read = CloneRead(canvas = canvas, layer = layer, out = out, side = side, left = left, top = top,
+                             first_column = first_column, first_row = first_row, columns = last_column - first_column)
+        try read_pieces(device, (usize)((last_column - first_column) * (last_row - first_row)), (void*)&read, clone_piece, clone_visit)
     # The brush's circle: nothing past it; inside, faded by `opacity`.
     let radius = (f64)side * 0.5
     let fade = math.clamp(opacity, 0.0, 1.0)
@@ -212,3 +201,38 @@ func copy_cell(out: u8[], side: usize, bytes: const u8[], at_x: i64, at_y: i64):
 func srgb_of(linear: f64) -> f64:
     let v = math.clamp(linear, 0.0, 1.0)
     return v * 12.92 if v <= 0.0031308 else 1.055 * math.pow(v, 1.0 / 2.4) - 0.055
+
+## A clone preview's cells being read: from (`first_column`, `first_row`),
+## `columns` wide, into `out` (`side` square at `left`, `top`).
+struct CloneRead:
+    var canvas: Canvas*
+    var layer: Layer*
+    var out: u8[]
+    var side: usize
+    var left: i64
+    var top: i64
+    var first_column: i64
+    var first_row: i64
+    var columns: i64
+
+func clone_piece(context: void*?, index: usize) -> Piece!:
+    let read = (CloneRead*)(context else trap("a clone preview lost its state"))
+    let column = (u32)(read.first_column + (i64)index % read.columns)
+    let row = (u32)(read.first_row + (i64)index // read.columns)
+    var texture: gpu.Texture? = none
+    if read.canvas.clone_all:
+        let composer = read.canvas.composer else error(invalid, "draw the document once before previewing a clone")
+        let document = read.canvas.document else error(invalid, "draw the document once before previewing a clone")
+        texture = try composer.tile(document, column, row, 0)
+    elif let tiles = read.layer.tiles():
+        texture = tiles.texture(column, row)
+    let cell = texture else return no_piece()
+    return Piece(texture = cell, region = gpu.Region(0, 0, tile_size, tile_size), present = true)
+
+func clone_visit(context: void*?, index: usize, bytes: const u8[]) -> !:
+    let read = (CloneRead*)(context else trap("a clone preview lost its state"))
+    if bytes.length == 0:
+        return
+    let column = read.first_column + (i64)index % read.columns
+    let row = read.first_row + (i64)index // read.columns
+    copy_cell(read.out, read.side, bytes, column * (i64)tile_size - read.left, row * (i64)tile_size - read.top)

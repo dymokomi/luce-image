@@ -44,21 +44,11 @@ func begin_range(canvas: Canvas*) -> !:
     let height = (usize)((canvas.extent_y + scale - 1) >> level)
     let pixels = try alloc f32[width * height * 4] in memory.heap
     errdefer free(pixels) in memory.heap
-    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
-    defer free(bytes) in memory.heap
-    let span = tile_size * scale
-    for row in 0..<(canvas.extent_y + span - 1) // span:
-        for column in 0..<(canvas.extent_x + span - 1) // span:
-            let texture = try composer.tile(document, column, row, level)
-            try texture.read(bytes)
-            let x0 = (usize)column * (usize)tile_size
-            let y0 = (usize)row * (usize)tile_size
-            for y in 0..<min_usize((usize)tile_size, height - y0):
-                for x in 0..<min_usize((usize)tile_size, width - x0):
-                    let source = (y * (usize)tile_size + x) * 8
-                    let destination = ((y0 + y) * width + x0 + x) * 4
-                    for channel in 0..<(usize)4:
-                        pixels[destination + channel] = from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8))
+    let device = canvas.device else error(invalid, "draw the document once before selecting a color range")
+    # The picture at the level, read back in batches (canvas/files.lucb's FlatRead).
+    var flat = FlatRead(composer = composer, document = document, pixels = pixels, extent_x = canvas.extent_x, extent_y = canvas.extent_y, level = level,
+                        columns = (u32)((width + (usize)tile_size - 1) // (usize)tile_size), width = width)
+    try read_pieces(device, (usize)flat.columns * ((height + (usize)tile_size - 1) // (usize)tile_size), (void*)&flat, flat_piece, flat_visit)
     let labs = try alloc f32[width * height * 3] in memory.heap
     errdefer free(labs) in memory.heap
     try range_labs(pixels, labs)

@@ -853,6 +853,31 @@ test "an export wider than one read-back strip keeps pixels either side of the j
     assert((try saved.value().getpixel(16379, 15)).a == 0.0 and (try saved.value().getpixel(16388, 15)).a == 0.0)
     assert((try saved.value().getpixel(16599, 39)).a == 0.0)
 
+test "an export wider than a read batch holds is read in parts, whole on both sides of the join":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(33000, 20)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.select_rectangle(32760, 4, 20, 8)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, false)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.save("build/canvas-parts.png")
+    let saved = try Image.open("build/canvas-parts.png")
+    defer saved.release()
+    for x in [(usize)32760, 32767, 32768, 32779]:
+        let pixel = try saved.value().getpixel(x, 6)
+        assert(pixel.b == 255.0 and pixel.r == 0.0 and pixel.a == 255.0)
+    assert((try saved.value().getpixel(32759, 6)).a == 0.0 and (try saved.value().getpixel(32780, 6)).a == 0.0)
+    assert((try saved.value().getpixel(32999, 19)).a == 0.0 and (try saved.value().getpixel(0, 0)).a == 0.0)
+
 test "a canvas binds headless, without a window, and edits with history":
     var canvas = try Canvas(40, 30)
     defer canvas.close()

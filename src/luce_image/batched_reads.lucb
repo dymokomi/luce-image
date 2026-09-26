@@ -1,0 +1,104 @@
+## Many texture regions read back through two read batches taking turns: while
+## the caller works through one batch's pieces the next is on the GPU, and a
+## batch is one submission and one wait however many pieces it holds. Every
+## loop that reads tiles one after another (the flattened picture, Color
+## Range's copy, a heal's window, a clone preview, bounds past the canvas)
+## goes through here instead of a read and a full stop per tile.
+import gpu
+import memory
+from raster_errors import invalid
+
+## Piece `index` of a read: a region of a texture, its texels coming back
+## tightly packed; `present` false for a piece with nothing to read.
+pub struct Piece:
+    pub var texture: gpu.Texture
+    pub var region: gpu.Region
+    pub var present: bool
+
+## A piece with nothing to read.
+pub func no_piece() -> Piece:
+    return Piece(texture = gpu.Texture(), region = gpu.Region(0, 0, 1, 1), present = false)
+
+## One batch's share: pieces `first..<last` and where each landed (`missing` for none).
+struct Share:
+    var batch: gpu.ReadBatch
+    var first: usize
+    var last: usize
+    var offsets: usize[]
+    var submitted: bool
+    var pending: bool
+
+let missing: usize = 0xffffffffffffffff
+
+## Read pieces `0..<count` on `device`: `piece(context, index)` names each and
+## `visit(context, index, bytes)` gets its texels, in order, while they are
+## valid (empty bytes for a piece with nothing to read). Main thread only.
+pub func read_pieces(device: gpu.Device, count: usize, context: void*?, piece: func(void*?, usize) -> Piece!, visit: func(void*?, usize, const u8[]) -> unit!) -> !:
+    if count == 0:
+        return
+    var shares: Share[2] = [Share(batch = try gpu.ReadBatch.begin(device)), Share(batch = gpu.ReadBatch())]
+    defer release_share(&shares[0])
+    shares[1].batch = try gpu.ReadBatch.begin(device)
+    defer release_share(&shares[1])
+    for index in 0..<(usize)2:
+        shares[index].offsets = try alloc usize[256] in memory.heap
+    var next: usize = 0
+    next = try fill_share(&shares[0], next, count, context, piece)
+    if next < count:
+        next = try fill_share(&shares[1], next, count, context, piece)
+    var turn: usize = 0
+    while shares[turn].pending:
+        let current = &shares[turn]
+        if current.submitted:
+            try current.batch.wait()
+        for index in current.first..<current.last:
+            let offset = current.offsets[index - current.first]
+            if offset == missing:
+                var nothing: u8[]
+                try visit(context, index, nothing)
+                continue
+            let next_offset = next_landing(current, index)
+            try visit(context, index, try current.batch.bytes(offset, next_offset - offset))
+        current.pending = false
+        if next < count:
+            next = try fill_share(current, next, count, context, piece)
+        turn = 1 - turn
+
+## Where the bytes of piece `index` end: its recorded size.
+func next_landing(share: const Share*, index: usize) -> usize:
+    return share.offsets[index - share.first + 128]
+
+## Record pieces from `next` on into `share` until it is full (or 128 pieces)
+## and submit them; where the pieces continue.
+func fill_share(share: Share*, next: usize, count: usize, context: void*?, piece: func(void*?, usize) -> Piece!) -> usize!:
+    try share.batch.reset()
+    share.first = next
+    share.submitted = false
+    var at = next
+    while at < count and at - next < 128:
+        let wanted = try piece(context, at)
+        if not wanted.present:
+            share.offsets[at - next] = missing
+            at += 1
+            continue
+        let bytes = (usize)wanted.region.width * (usize)wanted.region.height * gpu.texel_bytes(try wanted.texture.pixel_format())
+        let offset = (try share.batch.reserve(bytes)) else break
+        try share.batch.copy(wanted.texture, wanted.region, offset)
+        share.offsets[at - next] = offset
+        share.offsets[at - next + 128] = offset + bytes
+        at += 1
+    if at == next:
+        error(invalid, "a piece is larger than a read batch")
+    share.last = at
+    share.pending = true
+    if share.batch.copies() > 0:
+        try share.batch.submit()
+        share.submitted = true
+    return at
+
+func release_share(share: Share*):
+    share.batch.finish()
+    if share.offsets.length > 0:
+        free(share.offsets) in memory.heap
+        var none_left: usize[]
+        share.offsets = none_left

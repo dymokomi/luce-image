@@ -71,7 +71,8 @@ from luce_image.geometry import resize_canvas, resize_image
 from luce_image.selection import Selection
 from luce_image.selection_cells import Mode
 import luce_image.selection_sources as selection_sources
-from luce_image.shaders import ants_frag_words, ants_frag_msl
+from luce_image.batched_reads import Piece, read_pieces, no_piece
+from luce_image.shaders import ants_frag_words, ants_frag_msl, encode_frag_words, encode_frag_msl
 from half import from_half, to_half
 from binary import Buffer
 from raster_errors import invalid, limit
@@ -1055,7 +1056,8 @@ pub struct Canvas:
         let tiles = (layer.mask_tiles() else error(invalid, "the layer has no mask")) if mask else (layer.tiles() else error(invalid, "a group has no pixels to select"))
         # A mask cell never painted reveals everything.
         var source = TilesSource(tiles = tiles)
-        let reader = selection_sources.Reader(context = (void*)&source, read = read_tiles_cell)
+        let device = self.device else error(invalid, "draw the document once before selecting from a layer")
+        let reader = selection_sources.gpu_reader((void*)&source, device, tiles_cell_texture)
         try self.live().load(reader, 0 if mask else 3, 255 if mask else 0, try selection_mode(mode))
 
     ## Whether the layer at `index` is a group.
@@ -1221,14 +1223,15 @@ pub struct Canvas:
         try self.require_open()
         try self.remember_state("Magic Wand")
         let document = self.document else error(invalid, "draw the document once before using the wand")
+        let device = self.device else error(invalid, "draw the document once before using the wand")
         if all_layers:
             let composer = self.composer else error(invalid, "draw the document once before using the wand")
             var picture = PictureSource(composer = composer, document = document, extent_y = self.extent_y)
-            try wand_from(&self, selection_sources.Reader(context = (void*)&picture, read = read_picture_cell), x, y, sample, tolerance, contiguous, mode)
+            try wand_from(&self, selection_sources.gpu_reader((void*)&picture, device, picture_cell_texture), x, y, sample, tolerance, contiguous, mode)
             return
         let layer = document.find((u64)id) else error(invalid, "no such layer")
         var source = TilesSource(tiles = layer.tiles() else error(invalid, "a group has no pixels to sample"))
-        try wand_from(&self, selection_sources.Reader(context = (void*)&source, read = read_tiles_cell), x, y, sample, tolerance, contiguous, mode)
+        try wand_from(&self, selection_sources.gpu_reader((void*)&source, device, tiles_cell_texture), x, y, sample, tolerance, contiguous, mode)
 
     ## Forget Color Range's sampled colors.
     pub mutating func clear_range_samples():

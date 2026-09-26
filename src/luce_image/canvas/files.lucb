@@ -77,24 +77,54 @@ func flattened_pixels(canvas: Canvas*) -> f32[]!:
     try canvas.require_open()
     let document = canvas.document else error(invalid, "draw the document once before reading it flattened")
     let composer = canvas.composer else error(invalid, "draw the document once before reading it flattened")
+    let device = canvas.device else error(invalid, "draw the document once before reading it flattened")
     let count = (usize)canvas.extent_x * (usize)canvas.extent_y * 4
     let pixels = try alloc f32[count] in memory.heap
     errdefer free(pixels) in memory.heap
-    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
-    defer free(bytes) in memory.heap
-    for row in 0..<tile_columns(canvas.extent_y):
-        for column in 0..<tile_columns(canvas.extent_x):
-            let texture = try composer.tile(document, column, row, 0)
-            let width = min_u32(tile_size, canvas.extent_x - column * tile_size)
-            let height = min_u32(tile_size, canvas.extent_y - row * tile_size)
-            try texture.read(bytes[..<((usize)width * (usize)height * 8)], gpu.Region(0, 0, width, height))
-            for y in 0..<(usize)height:
-                for x in 0..<(usize)width:
-                    let source = (y * (usize)width + x) * 8
-                    let destination = (((usize)row * (usize)tile_size + y) * (usize)canvas.extent_x + (usize)column * (usize)tile_size + x) * 4
-                    for channel in 0..<(usize)4:
-                        pixels[destination + channel] = from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8))
+    var flat = FlatRead(composer = composer, document = document, pixels = pixels, extent_x = canvas.extent_x, extent_y = canvas.extent_y, level = 0,
+                        columns = tile_columns(canvas.extent_x), width = (usize)canvas.extent_x)
+    try read_pieces(device, (usize)flat.columns * (usize)tile_columns(canvas.extent_y), (void*)&flat, flat_piece, flat_visit)
     return pixels
+
+## A flattened read at pyramid level `level`: the composited tiles, `columns`
+## a row, into `pixels`, `width` pixels a row.
+struct FlatRead:
+    var composer: Composer*
+    var document: const Document*
+    var pixels: f32[]
+    var extent_x: u32
+    var extent_y: u32
+    var level: u32
+    var columns: u32
+    var width: usize
+
+## Composited cell `index` of the level, as much of it as the level covers.
+func flat_piece(context: void*?, index: usize) -> Piece!:
+    let flat = (FlatRead*)(context else trap("a flattened read lost its state"))
+    let column = (u32)(index % (usize)flat.columns)
+    let row = (u32)(index // (usize)flat.columns)
+    let texture = try flat.composer.tile(flat.document, column, row, flat.level)
+    let width = min_u32(tile_size, level_size(flat.extent_x, flat.level) - column * tile_size)
+    let height = min_u32(tile_size, level_size(flat.extent_y, flat.level) - row * tile_size)
+    return Piece(texture = texture, region = gpu.Region(0, 0, width, height), present = true)
+
+## A composited cell's half floats into place among the samples.
+func flat_visit(context: void*?, index: usize, bytes: const u8[]) -> !:
+    let flat = (FlatRead*)(context else trap("a flattened read lost its state"))
+    let column = (u32)(index % (usize)flat.columns)
+    let row = (u32)(index // (usize)flat.columns)
+    let width = (usize)min_u32(tile_size, level_size(flat.extent_x, flat.level) - column * tile_size)
+    let height = bytes.length // (width * 8)
+    for y in 0..<height:
+        for x in 0..<width:
+            let source = (y * width + x) * 8
+            let destination = (((usize)row * (usize)tile_size + y) * flat.width + (usize)column * (usize)tile_size + x) * 4
+            for channel in 0..<(usize)4:
+                flat.pixels[destination + channel] = from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8))
+
+## A side's length at pyramid level `level`.
+func level_size(extent: u32, level: u32) -> u32:
+    return (extent + (1u32 << level) - 1) >> level
 
 ## `Canvas.measure_trim`: the box of the flattened picture unlike what
 ## `based_on` names (0 transparent, 1 the top-left color, 2 the bottom-right),

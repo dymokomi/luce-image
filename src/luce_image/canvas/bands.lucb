@@ -4,76 +4,106 @@
 #
 #   DESCRIPTION:
 #       Streamed exports (JPEG, PNG) take the composited document a band of 256 pixel rows at
-#       a time. The main thread copies the band's composited tiles side by side into a strip
-#       texture (up to 64 tiles wide) and reads each strip back at once: one wait on the GPU
-#       per strip rather than per tile, which Vulkan makes costly. The band is then turned
-#       into sRGB bytes across the processors. Half floats have only 65536 values, so each channel is a table lookup
-#       indexed by its bits: no float maths at all for opaque pixels, the common case.
+#       a time. The GPU turns each band into its export bytes: encode.frag draws every
+#       composited tile into a strip texture (64 tiles wide) as 8-bit sRGB, over the matte or
+#       with its alpha, through the same 4097-step table the CPU used, so opaque pixels come
+#       out byte for byte as before. The strips are read back with one read batch, at the
+#       band's row pitch, straight into place: half the bytes of the half floats, and no
+#       per-pixel work on the CPU.
+#
+#       While the encoder works through one band the next is already composited and on its way
+#       back: two read batches take turns. A band wider than a batch holds (over 32768 pixels)
+#       is read in parts instead, one after another.
 #
 #==============================================================================================
 
-## How wide a strip of tiles read back at once may be: 64 tiles, within every
-## GPU's texture limit.
+## How wide a strip of tiles drawn at once may be: 64 tiles, within every GPU's
+## texture limit.
 let strip_width: u32 = 16384
-
-## The bits of a half float 1.0: an opaque pixel's alpha.
-let half_one: u16 = 0x3c00
 
 ## A row of cells of the flattened document as 8-bit sRGB RGBA, one at a time:
 ## over `matte` (linear light) when its red is not negative, else alpha kept.
 struct Bands:
     ## The band's pixels, `extent_x` wide, 8-bit sRGB RGBA.
     var band: u8[]
-    ## The band's composited tiles as read back: strip after strip, each packed
-    ## its own width wide, 8 bytes (four half floats) a pixel.
-    var staged: u8[]
-    ## Where a strip of tiles is gathered to be read back in one go.
-    var strip: gpu.Texture
-    ## Half-float bits to a linear value, an sRGB byte and an alpha byte.
-    var linear: f32[]
-    var color: u8[]
-    var coverage: u8[]
-    ## Linear light to 8-bit sRGB, 4096 steps across 0..1: for blended pixels.
-    var table: u8[]
+    ## One rgba8_linear strip per 16384 columns, 256 rows.
+    var strips: gpu.Texture[]
+    ## Linear light to 8-bit sRGB, 4097 steps across 0..1, as an r8 texture.
+    var table: gpu.Texture
+    var shader: gpu.Shader
+    var pipeline: gpu.Pipeline
+    ## Two read batches taking turns: band `row` in `reads[row % 2]`.
+    var reads: gpu.ReadBatch[2]
+    ## Strips per read batch, and parts per band (1: the next band is prefetched).
+    var strips_per_part: usize
+    var parts: usize
+    ## The band already on its way back, or -1.
+    var prepared: i64
     var matte: f64[3]
 
     static func begin(canvas: Canvas*, matte: f64[3]) -> Bands!:
         try canvas.require_open()
+        let device = canvas.device else error(invalid, "draw the document once before saving it")
         let band = try alloc u8[(usize)canvas.extent_x * (usize)tile_size * 4] in memory.heap
         errdefer free(band) in memory.heap
-        let staged = try alloc u8[(usize)canvas.extent_x * (usize)tile_size * 8] in memory.heap
-        errdefer free(staged) in memory.heap
-        let device = canvas.device else error(invalid, "draw the document once before saving it")
-        var strip = try gpu.Texture.create(device, min_u32(canvas.extent_x, strip_width), tile_size, gpu.Format.rgba16_float)
-        errdefer strip.destroy()
-        let linear = try alloc f32[65536] in memory.heap
-        errdefer free(linear) in memory.heap
-        let color = try alloc u8[65536] in memory.heap
-        errdefer free(color) in memory.heap
-        let coverage = try alloc u8[65536] in memory.heap
-        errdefer free(coverage) in memory.heap
-        let table = try alloc u8[4097] in memory.heap
-        errdefer free(table) in memory.heap
+        var bands = Bands(band = band, strips = try alloc gpu.Texture[(usize)((canvas.extent_x + strip_width - 1) // strip_width)] in memory.heap,
+                          table = gpu.Texture(), shader = gpu.Shader(), pipeline = gpu.Pipeline(), reads = [gpu.ReadBatch(), gpu.ReadBatch()],
+                          strips_per_part = 1, parts = 1, prepared = -1, matte = matte)
+        errdefer bands.close()
+        for index in 0..<bands.strips.length:
+            bands.strips[index] = gpu.Texture()
+        for index in 0..<bands.strips.length:
+            let left = (u32)index * strip_width
+            bands.strips[index] = try gpu.Texture.create(device, min_u32(strip_width, canvas.extent_x - left), tile_size, gpu.Format.rgba8_linear)
+        var steps: u8[4097] = ---
         for step in 0..<(usize)4097:
-            table[step] = srgb_byte((f64)step / 4096.0)
-        for bits in 0..<(usize)65536:
-            let value = from_half((u16)bits)
-            # NaN compares false both ways: it lands on zero, as a negative does.
-            let clamped = (f64)value if value > 0.0 else 0.0
-            linear[bits] = value
-            color[bits] = table[(usize)(math.clamp(clamped, 0.0, 1.0) * 4096.0 + 0.5)]
-            coverage[bits] = (u8)(math.clamp(clamped, 0.0, 1.0) * 255.0 + 0.5)
-        return Bands(band = band, staged = staged, strip = strip, linear = linear, color = color, coverage = coverage, table = table, matte = matte)
+            steps[step] = srgb_byte((f64)step / 4096.0)
+        bands.table = try gpu.Texture.create(device, 4097, 1, gpu.Format.r8)
+        try bands.table.upload(steps)
+        bands.shader = try gpu.Shader.create(device, encode_frag_words, encode_frag_msl)
+        bands.pipeline = try gpu.Pipeline.create(device, bands.shader, gpu.Blend.replace, gpu.Format.rgba8_linear)
+        bands.reads[0] = try gpu.ReadBatch.begin(device)
+        bands.reads[1] = try gpu.ReadBatch.begin(device)
+        let strip_bytes = (usize)strip_width * (usize)tile_size * 4
+        bands.strips_per_part = max_usize(1, bands.reads[0].capacity() // strip_bytes)
+        bands.parts = (bands.strips.length + bands.strips_per_part - 1) // bands.strips_per_part
+        return bands
 
     ## Row `row` of cells into `band`; how many pixel rows it holds.
     mutating func fill(canvas: Canvas*, row: u32) -> usize!:
+        let rows = min_u32(tile_size, canvas.extent_y - row * tile_size)
+        if self.parts > 1:
+            for part in 0..<self.parts:
+                try self.prepare(canvas, row, part, 0)
+                try self.take(canvas, row, part, 0)
+            return (usize)rows
+        let turn = (usize)(row % 2)
+        if self.prepared != (i64)row:
+            try self.prepare(canvas, row, 0, turn)
+        # The next band goes to the GPU before this one is waited for.
+        if row + 1 < tile_columns(canvas.extent_y):
+            try self.prepare(canvas, row + 1, 0, 1 - turn)
+        try self.take(canvas, row, 0, turn)
+        return (usize)rows
+
+    ## Draw part `part` of band `row` as export bytes into its strips, and send
+    ## their read back in batch `turn` (a batch per band at the band's width, or
+    ## one per part at the part's).
+    mutating func prepare(canvas: Canvas*, row: u32, part: usize, turn: usize) -> !:
         let document = canvas.document else error(invalid, "draw the document once before saving it")
         let composer = canvas.composer else error(invalid, "draw the document once before saving it")
         let rows = min_u32(tile_size, canvas.extent_y - row * tile_size)
-        var left: u32 = 0
-        while left < canvas.extent_x:
+        let first = part * self.strips_per_part
+        let last = min_usize(self.strips.length, first + self.strips_per_part)
+        let part_left = (u32)first * strip_width
+        let part_width = min_u32(canvas.extent_x - part_left, (u32)(last - first) * strip_width)
+        let batch = &self.reads[turn]
+        let base = (try batch.reserve((usize)part_width * (usize)rows * 4)) else error(invalid, "a band's part must fit a read batch")
+        let over: f32 = 1.0 if self.matte[0] >= 0.0 else 0.0
+        for index in first..<last:
+            let left = (u32)index * strip_width
             let width = min_u32(strip_width, canvas.extent_x - left)
-            let frame = try self.strip.frame()
+            let frame = try self.strips[index].frame()
             defer frame.release()
             let target = try frame.value().target()
             defer target.release()
@@ -81,87 +111,51 @@ struct Bands:
             while x < width:
                 let texture = try composer.tile(document, (left + x) // tile_size, row, 0)
                 let columns = min_u32(tile_size, width - x)
-                try gpu.copy_image(target.value(), texture, gpu.Rect((f64)x, 0.0, (f64)columns, (f64)rows), gpu.Region(0, 0, columns, rows))
+                var params: f32[8] = [(f32)x, 0.0, over, 0.0, (f32)self.matte[0], (f32)self.matte[1], (f32)self.matte[2], 0.0]
+                try gpu.shade(target.value(), self.pipeline, gpu.Rect((f64)x, 0.0, (f64)columns, (f64)rows), u8[]((u8*)&params[0], 32), [texture, self.table], gpu.Filter.nearest)
                 x += columns
             discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
-            let start = (usize)left * (usize)rows * 8
-            try self.strip.read(self.staged[start..<start + (usize)width * (usize)rows * 8], gpu.Region(0, 0, width, rows))
-            left += width
-        var job = BandJob(bands = &self, width = (usize)canvas.extent_x, rows = (usize)rows, first = 0, last = (usize)rows)
-        try convert_band(&job)
-        return (usize)rows
+            try batch.copy(self.strips[index], gpu.Region(0, 0, width, rows), base + (usize)(left - part_left) * 4, row_texels = part_width)
+        try batch.submit()
+        self.prepared = (i64)row
+
+    ## Wait for part `part` of band `row` in batch `turn` and copy its rows into
+    ## place in `band`.
+    mutating func take(canvas: Canvas*, row: u32, part: usize, turn: usize) -> !:
+        let rows = (usize)min_u32(tile_size, canvas.extent_y - row * tile_size)
+        let width = (usize)canvas.extent_x
+        let part_left = part * self.strips_per_part * (usize)strip_width
+        let part_width = min_usize(width - part_left, self.strips_per_part * (usize)strip_width)
+        let batch = &self.reads[turn]
+        try batch.wait()
+        let bytes = try batch.bytes(0, part_width * rows * 4)
+        if part_width == width:
+            memory.copy(self.band[..<bytes.length], bytes, bytes.length)
+        else:
+            for y in 0..<rows:
+                let destination = (y * width + part_left) * 4
+                memory.copy(self.band[destination..<destination + part_width * 4], bytes[y * part_width * 4..<(y + 1) * part_width * 4], part_width * 4)
+        try batch.reset()
 
     mutating func close():
-        free(self.band) in memory.heap
-        free(self.staged) in memory.heap
-        self.strip.destroy()
-        free(self.linear) in memory.heap
-        free(self.color) in memory.heap
-        free(self.coverage) in memory.heap
-        free(self.table) in memory.heap
+        self.reads[0].finish()
+        self.reads[1].finish()
+        self.pipeline.destroy()
+        self.shader.destroy()
+        self.table.destroy()
+        for index in 0..<self.strips.length:
+            self.strips[index].destroy()
+        if self.strips.length > 0:
+            free(self.strips) in memory.heap
+            var none_left: gpu.Texture[]
+            self.strips = none_left
+        if self.band.length > 0:
+            free(self.band) in memory.heap
+            var no_band: u8[]
+            self.band = no_band
 
-## One worker's share of a band: pixel rows `first..<last`.
-struct BandJob:
-    var bands: const Bands*
-    var width: usize
-    var rows: usize
-    var first: usize
-    var last: usize
-
-func band_entry(context: void*?):
-    band_rows((BandJob*)(context else return))
-
-func band_rows(job: BandJob*):
-    let bands = job.bands
-    let over = bands.matte[0] >= 0.0
-    let staged = bands.staged
-    let band = bands.band
-    for y in job.first..<job.last:
-        var x: usize = 0
-        while x < job.width:
-            let columns = min_usize((usize)strip_width, job.width - x)
-            let base = x * job.rows * 8 + y * columns * 8
-            let destination = (y * job.width + x) * 4
-            for index in 0..<columns:
-                let source = base + index * 8
-                let out = destination + index * 4
-                let alpha = (u16)staged[source + 6] | ((u16)staged[source + 7] << 8)
-                if not over or alpha == half_one:
-                    for channel in 0..<(usize)3:
-                        band[out + channel] = bands.color[(usize)((u16)staged[source + channel * 2] | ((u16)staged[source + channel * 2 + 1] << 8))]
-                    band[out + 3] = 255 if over else bands.coverage[(usize)alpha]
-                    continue
-                let a = math.clamp((f64)bands.linear[(usize)alpha], 0.0, 1.0)
-                for channel in 0..<(usize)3:
-                    let value = (f64)bands.linear[(usize)((u16)staged[source + channel * 2] | ((u16)staged[source + channel * 2 + 1] << 8))]
-                    let blended = value * a + bands.matte[channel] * (1.0 - a)
-                    band[out + channel] = bands.table[(usize)(math.clamp(blended, 0.0, 1.0) * 4096.0 + 0.5)]
-                band[out + 3] = 255
-            x += columns
-
-## `job`'s rows split across the processors.
-func convert_band(job: BandJob*) -> !:
-    let workers = (usize)math.imin(16, math.imax(1, (i64)os.cpus()))
-    if workers <= 1 or job.rows < 16:
-        band_rows(job)
-        return
-    var shares: BandJob[16] = ---
-    var handles: thread.Handle[16]
-    var started: usize = 0
-    let per = (job.rows + workers - 1) // workers
-    for share in 0..<workers:
-        shares[share] = *job
-        shares[share].first = min_usize(job.rows, share * per)
-        shares[share].last = min_usize(job.rows, share * per + per)
-    for share in 1..<workers:
-        handles[started] = thread.spawn(band_entry, (void*)&shares[share], name = "export-band") catch failure:
-            for other in share..<workers:
-                band_rows(&shares[other])
-            break
-        started += 1
-    band_rows(&shares[0])
-    for index in 0..<started:
-        try handles[index].join()
+func max_usize(a: usize, b: usize) -> usize:
+    return a if a > b else b
 
 ## A linear component as an 8-bit sRGB value.
 func srgb_byte(linear: f64) -> u8:
