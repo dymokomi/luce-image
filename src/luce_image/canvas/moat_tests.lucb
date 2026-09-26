@@ -271,3 +271,128 @@ test "a gradient's one-color cells share a tile at each end; the ramp between is
     assert(samples[0] == 1.0)
     let middle = ((0 * 256) + (700 - 512)) * 4
     assert(math.abs((f64)samples[middle] - 0.5) < 0.02 and math.abs((f64)samples[middle + 2] - 0.5) < 0.02)
+
+## Rows gathered from `linear_rgba_bands` into one buffer, checking the order.
+struct StreamedRows:
+    var pixels: f32[]
+    var next: usize
+    var width: usize
+    var calls: usize
+
+func keep_streamed(context: void*?, first: usize, count: usize, pixels: f32[]) -> !:
+    let into = (StreamedRows*)(context else return)
+    if first != into.next or count > 256 or pixels.length != into.width * count * 4:
+        error(invalid, "bands out of order")
+    for index in 0..<pixels.length:
+        into.pixels[first * into.width * 4 + index] = pixels[index]
+    into.next = first + count
+    into.calls += 1
+
+## `path` streamed a band at a time equals it decoded whole, and streaming
+## never decoded it whole.
+func streams_as_whole(path: str, width: usize, height: usize) -> !:
+    let streamed = try Image.open(path)
+    defer streamed.release()
+    var rows = StreamedRows(pixels = try alloc f32[width * height * 4] in memory.heap, next = 0, width = width, calls = 0)
+    defer free(rows.pixels) in memory.heap
+    try streamed.value().linear_rgba_bands(256, keep_streamed, (void*)&rows)
+    assert(rows.next == height and rows.calls == (height + 255) // 256)
+    assert(not streamed.value().is_loaded())
+    let whole = try Image.open(path)
+    defer whole.release()
+    let expected = try alloc f32[width * height * 4] in memory.heap
+    defer free(expected) in memory.heap
+    try whole.value().linear_rgba(expected)
+    for index in 0..<expected.length:
+        assert(expected[index] == rows.pixels[index])
+
+test "PNG, JPEG and TIFF pictures stream a band at a time exactly as they decode whole":
+    let width: usize = 700
+    let height: usize = 600
+    let bytes = try alloc u8[width * height * 4] in memory.heap
+    defer free(bytes) in memory.heap
+    for y in 0..<height:
+        for x in 0..<width:
+            let at = (y * width + x) * 4
+            bytes[at] = (u8)((x * 7 + y) % 256)
+            bytes[at + 1] = (u8)((y * 3) % 256)
+            bytes[at + 2] = (u8)((x * y) % 251)
+            bytes[at + 3] = (u8)(255 - (x + y) % 128)
+    let picture = try Image.from_rgba8(width, height, bytes)
+    defer picture.release()
+    try picture.value().save("build/stream.png")
+    try picture.value().save("build/stream-strips.tif")
+    try picture.value().save("build/stream-tiles.tif", tile = 256)
+    let opaque = try picture.value().convert("RGB")
+    defer opaque.release()
+    try opaque.value().save("build/stream.jpg", quality = 85)
+    try streams_as_whole("build/stream.png", width, height)
+    try streams_as_whole("build/stream-strips.tif", width, height)
+    try streams_as_whole("build/stream-tiles.tif", width, height)
+    try streams_as_whole("build/stream.jpg", width, height)
+
+test "a picture opened as a document becomes tiles a band at a time, exactly":
+    let width: usize = 600
+    let height: usize = 530
+    let bytes = try alloc u8[width * height * 4] in memory.heap
+    defer free(bytes) in memory.heap
+    for index in 0..<bytes.length:
+        bytes[index] = (u8)((index * 13) % 256) if index % 4 != 3 else 255
+    let source = try Image.from_rgba8(width, height, bytes)
+    defer source.release()
+    try source.value().save("build/stream-open.png")
+    let opened = try Canvas.open("build/stream-open.png")
+    defer opened.release()
+    var canvas = opened.value()
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    let record = canvas.records[0]
+    let document = canvas.document else trap("bound")
+    let layer = document.find(record.id) else trap("a layer")
+    let tiles = layer.tiles() else trap("pixels")
+    let samples = try alloc f32[256 * 256 * 4] in memory.heap
+    defer free(samples) in memory.heap
+    let expected = try alloc f32[width * height * 4] in memory.heap
+    defer free(expected) in memory.heap
+    let whole = try Image.open("build/stream-open.png")
+    defer whole.release()
+    try whole.value().linear_rgba(expected)
+    for row in 0..<tiles.rows():
+        for column in 0..<tiles.columns():
+            try tiles.read_cell(column, row, samples)
+            let area = tiles.region(column, row)
+            for y in 0..<(usize)area.height:
+                for x in 0..<(usize)area.width:
+                    let at = (((usize)row * 256 + y) * width + (usize)column * 256 + x) * 4
+                    for channel in 0..<(usize)4:
+                        assert(math.abs((f64)samples[(y * 256 + x) * 4 + channel] - (f64)expected[at + channel]) < 0.002)
+
+test "a picture that opens but cannot be decoded fails the bind that loads it, as an error":
+    let width: usize = 400
+    let height: usize = 300
+    let bytes = try alloc u8[width * height * 4] in memory.heap
+    defer free(bytes) in memory.heap
+    for index in 0..<bytes.length:
+        bytes[index] = (u8)((index * 31) % 256)
+    let source = try Image.from_rgba8(width, height, bytes)
+    defer source.release()
+    let opaque = try source.value().convert("RGB")
+    defer opaque.release()
+    try opaque.value().save("build/stream-broken.jpg")
+    # Its headers stay, so opening it (which reads just those) succeeds; its
+    # compressed pixels end halfway.
+    let data = try files.read((c_api.str)"build/stream-broken.jpg")
+    defer free(data)
+    try files.write_atomic((c_api.str)"build/stream-broken.jpg", data[..<data.length // 2])
+    let opened = try Canvas.open("build/stream-broken.jpg")
+    defer opened.release()
+    var canvas = opened.value()
+    var failed = false
+    canvas.bind_headless() catch failure:
+        if failure.code == gpu.unavailable:
+            return
+        failed = true
+    # The first draw's bind reports it (the window reports a draw's failure);
+    # the document stays bound, its layer empty, and closes cleanly.
+    assert(failed and canvas.is_bound() and canvas.layer_count() == 1)

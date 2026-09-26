@@ -324,9 +324,26 @@ func read_shape(doc: prism.Document*, element: str, canvas: Canvas*, id: i64) ->
 func type_value_names() -> str[10]:
     return ["type_size", "type_red", "type_green", "type_blue", "type_x", "type_y", "box_width", "alignment", "tracking", "leading"]
 
+## Pictures a document opens or places may be this large: they go to tiles a
+## band at a time (`linear_rgba_bands`), so only the file itself is held.
+let picture_pixels: usize = (usize)1 << 32
+let picture_bytes: usize = (usize)1 << 40
+
+## Tiles being made from a picture, a band of 256 rows at a time.
+struct PictureBands:
+    var canvas: Canvas*
+    var tiles: Tiles*
+
+## `linear_rgba_bands`' sink: a band of rows becomes a row of cells.
+func picture_band(context: void*?, first: usize, count: usize, pixels: f32[]) -> !:
+    let banding = (PictureBands*)(context else return)
+    discard(count)
+    try banding.tiles.write_band((u32)(first // (usize)tile_size), pixels)
+    try settle_job(banding.canvas)
+
 ## `Canvas.place_layer`: the picture at `path` on layer `id`, centred on a document point.
 func place_picture(canvas: Canvas*, id: i64, path: str, center_x: i64, center_y: i64) -> !:
-    let picture = try Image.open(path)
+    let picture = try Image.open(path, max_bytes = picture_bytes, max_pixels = picture_pixels)
     defer picture.release()
     try place_image_at(canvas, id, picture, center_x, center_y)
 
@@ -349,7 +366,7 @@ func open_canvas(path: str) -> interop.Reference[Canvas]!:
         return try open_package(path)
     if ends_with(path, ".psd") or ends_with(path, ".PSD") or ends_with(path, ".psb") or ends_with(path, ".PSB"):
         return try open_psd(path)
-    let picture = try Image.open(path)
+    let picture = try Image.open(path, max_bytes = picture_bytes, max_pixels = picture_pixels)
     errdefer picture.release()
     let width = try picture.value().width()
     let height = try picture.value().height()

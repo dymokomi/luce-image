@@ -550,6 +550,11 @@ pub struct Canvas:
 
     ## Bind to `acquired`, which the canvas owns from here (on failure too).
     mutating func bind_device(acquired: gpu.Device) -> !:
+        try self.attach_device(acquired)
+        try self.load_pictures()
+
+    ## The GPU document on `acquired`, its layers as the records say, empty.
+    mutating func attach_device(acquired: gpu.Device) -> !:
         var binding = Binding(device = acquired)
         errdefer unwind(&binding)
         let device = binding.device else trap("bound")
@@ -604,18 +609,40 @@ pub struct Canvas:
         self.document = binding.document
         self.composer = binding.composer
         binding = Binding()
+
+    ## The pictures waiting in the records become their layers' tiles (or
+    ## masks), decoded a band at a time. The document stays bound whatever
+    ## happens: a picture that cannot be read leaves its layer empty, every
+    ## other still loads, and the first failure is returned, for the window to
+    ## report (a draw's bind is where a picture opened as a document loads).
+    mutating func load_pictures() -> !:
+        var failed: ErrorCode? = none
+        var message: str = ""
         for index in 0..<self.count:
             if let picture = self.records[index].picture:
                 self.records[index].picture = none
-                defer picture.release()
-                let tiles = try self.tiles_of(picture, self.records[index].picture_x, self.records[index].picture_y)
-                try (self.document else trap("bound")).set_tiles(self.records[index].id, tiles)
+                self.load_picture(index, picture, self.records[index].picture_x, self.records[index].picture_y, false) catch failure:
+                    if failed == none:
+                        failed = failure.code
+                        message = failure.message
             if let picture = self.records[index].mask_picture:
                 self.records[index].mask_picture = none
-                defer picture.release()
-                let tiles = try self.tiles_of(picture, self.records[index].mask_x, self.records[index].mask_y, true)
-                var old = try (self.document else trap("bound")).take_mask(self.records[index].id, tiles)
-                old.destroy()
+                self.load_picture(index, picture, self.records[index].mask_x, self.records[index].mask_y, true) catch failure:
+                    if failed == none:
+                        failed = failure.code
+                        message = failure.message
+        if let code = failed:
+            error(code, message)
+
+    mutating func load_picture(index: usize, picture: interop.Reference[Image], x: i64, y: i64, mask: bool) -> !:
+        defer picture.release()
+        let tiles = try self.tiles_of(picture, x, y, mask)
+        let document = self.document else trap("bound")
+        if not mask:
+            try document.set_tiles(self.records[index].id, tiles)
+            return
+        var old = try document.take_mask(self.records[index].id, tiles)
+        old.destroy()
 
     func require_open() -> !:
         if self.closed:
@@ -910,17 +937,12 @@ pub struct Canvas:
             # A raw develops a tile at a time straight into the grid.
             whole = try raw_tiles(device, picture)
         else:
-            # A band of 256 rows at a time: never the picture whole in floats.
+            # A band of 256 rows at a time, decoded as it goes where the format
+            # allows: never the picture whole in floats.
             whole = try Tiles.create(device, (u32)width, (u32)height)
             errdefer whole.destroy()
-            let band = try alloc f32[width * (usize)tile_size * 4] in memory.heap
-            defer free(band) in memory.heap
-            for row in 0..<whole.rows():
-                let top = (usize)row * (usize)tile_size
-                let rows = min_usize((usize)tile_size, height - top)
-                try picture.value().linear_rgba_rows(top, rows, band[..<width * rows * 4])
-                try whole.write_band(row, band[..<width * rows * 4])
-                try settle_job(&self)
+            var banding = PictureBands(canvas = &self, tiles = &whole)
+            try picture.value().linear_rgba_bands((usize)tile_size, picture_band, (void*)&banding)
         errdefer whole.destroy()
         if x == 0 and y == 0 and width == (usize)self.extent_x and height == (usize)self.extent_y:
             return whole

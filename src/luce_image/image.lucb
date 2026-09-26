@@ -16,8 +16,9 @@ import raw
 import heic
 import luce_image.parallel as parallel
 from luce_image.svg_import import is_svg, render_svg
+from luce_image.streaming import LinearSink, stream_linear, decode_srgb
 from binary import Buffer
-from raster_errors import invalid, unsupported
+from raster_errors import invalid, unsupported, limit
 
 pub type SampleType = model.SampleType
 
@@ -498,6 +499,28 @@ pub struct Image:
         job.table = table
         try linear_bands(&job)
 
+    ## The picture as linear-light straight RGBA f32, `rows` rows at a time,
+    ## to `sink` in order from the top (luce_image/streaming). A PNG, JPEG or
+    ## TIFF not yet decoded goes a band at a time and is never whole; any other
+    ## picture, or one already decoded, from its whole raster, which may take
+    ## at most `whole_picture_bytes`.
+    pub mutating func linear_rgba_bands(rows: usize, sink: LinearSink, context: void*?) -> !:
+        try self.ensure_open()
+        if not self.is_loaded() and (try stream_linear(&self.raster, rows, sink, context)):
+            return
+        if not self.is_loaded() and self.raster.width * self.raster.height * self.raster.channels.length > whole_picture_bytes // 8:
+            error(limit, "a picture this large opens only from PNG, JPEG or TIFF")
+        let width = self.raster.width
+        let height = self.raster.height
+        let band = try alloc f32[width * rows * 4] in memory.heap
+        defer free(band) in memory.heap
+        var top: usize = 0
+        while top < height:
+            let count = min_rows(rows, height - top)
+            try self.linear_rgba_rows(top, count, band[..<width * count * 4])
+            try sink(context, top, count, band[..<width * count * 4])
+            top += count
+
     ## An 8-bit RGBA image from straight-alpha linear-light RGBA f32 samples,
     ## sRGB-encoded and clamped. Base only.
     pub static func from_linear_rgba(width: usize, height: usize, pixels: const f32[]) -> interop.Reference[Image]!:
@@ -651,9 +674,8 @@ pub struct Image:
 pub let image_type: interop.Type[Image] = interop.Type[Image]("Image", Image.close, closeable = true)
 
 ## The linear value of an sRGB-encoded component in 0..1.
-func decode_srgb(value: f64) -> f64:
-    let clamped = math.clamp(value, 0.0, 1.0)
-    return clamped / 12.92 if clamped <= 0.04045 else math.pow((clamped + 0.055) / 1.055, 2.4)
+## The most a picture decoded whole may take as f64 samples.
+pub let whole_picture_bytes: usize = 4294967296
 
 ## Rows `first..<last` of an image for `linear_rgba`.
 struct LinearJob:
