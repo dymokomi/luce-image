@@ -18,6 +18,9 @@
 #       and each row of the layer's cells lands (`land_rows`) once the picture rows under
 #       it are in; the picture's cells no row needs any more are let go as it goes.
 #
+#       A progressive JPEG shows itself before any row: its first scans give the picture at
+#       1/8 size, which stands in for the layer's cells not yet in (canvas/opening_coarse).
+#
 #       Edits and saves are refused until it is done (`require_loaded`); `opening_percent`
 #       is the progress for the window to show.
 #
@@ -40,6 +43,7 @@ struct Opening:
     ## The picture, released on the main thread once the worker has stopped.
     var picture: interop.Reference[Image]
     var image: Image*
+    var canvas: Canvas*
     var layer: u64
     ## The picture's size, which its bands are packed for.
     var extent_x: u32
@@ -74,6 +78,8 @@ struct Opening:
     var failure_length: usize
     var handle: thread.Handle
     var started: bool
+    ## A first sight of the picture while its rows come (canvas/opening_coarse).
+    var coarse: CoarseSight
 
 ## Whether `picture`, the document's own picture, loads in the background:
 ## frames draw progressively (the window's setting) and it decodes on the CPU
@@ -92,7 +98,7 @@ func places_in_background(picture: interop.Reference[Image]) -> bool:
 func begin_opening(canvas: Canvas*, layer: u64, picture: interop.Reference[Image], x: i64 = 0, y: i64 = 0) -> !:
     let device = canvas.device else trap("bound")
     let document = canvas.document else trap("bound")
-    let opening = new Opening(picture = picture, image = picture.value(), layer = layer, offset_x = x, offset_y = y,
+    let opening = new Opening(picture = picture, image = picture.value(), canvas = canvas, layer = layer, offset_x = x, offset_y = y,
                               uploaded = 0, failed = false, failure_code = invalid, failure_length = 0, started = false) in memory.heap catch failure:
         picture.release()
         error(failure.code, failure.message)
@@ -142,7 +148,7 @@ func opening_worker(context: void*?):
 
 ## Encoded samples where the format gives them, else linear floats.
 func opening_decode(opening: Opening*) -> !:
-    if not (try opening.image.encoded_rgba_bands((usize)tile_size, opening_coded_band, (void*)opening)):
+    if not (try opening.image.encoded_rgba_bands((usize)tile_size, opening_coded_band, (void*)opening, opening_coarse)):
         try opening.image.linear_rgba_bands((usize)tile_size, opening_band, (void*)opening)
 
 ## `linear_rgba_bands`' sink on the worker: pack the band into a free slot.
@@ -191,6 +197,8 @@ func collect_opening(canvas: Canvas*) -> !:
     let layer = document.find(opening.layer) else trap("the opening layer is gone")
     let tiles = layer.tiles() else trap("the opening layer has no tiles")
     let started = time.now()
+    try show_coarse(opening, composer)
+    let before = opening.uploaded
     while opening.uploaded < opening.packed.load(.acquire):
         let slot = &opening.slots[opening.uploaded % opening_slots]
         if opening.placed:
@@ -208,9 +216,12 @@ func collect_opening(canvas: Canvas*) -> !:
             # The rest go in the next frame, which nothing else may ask for.
             wake_frames()
             break
+    if opening.uploaded != before:
+        try refresh_coarse(opening, composer)
     if opening.finished.load(.acquire) == 0 or opening.uploaded < opening.packed.load(.acquire):
         return
     canvas.opening = none
+    hide_coarse(opening, composer)
     let failed = opening.failed
     let code = opening.failure_code
     # The message outlives the opening: the canvas keeps it.
@@ -281,6 +292,7 @@ func free_opening(opening: Opening*):
         opening.handle.join() catch _:
             recover ()
     opening.picture.release()
+    release_coarse(opening)
     if opening.placed:
         opening.source.destroy()
     if opening.color.length > 0:

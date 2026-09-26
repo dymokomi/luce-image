@@ -16,7 +16,7 @@ import raw
 import heic
 import luce_image.parallel as parallel
 from luce_image.svg_import import is_svg, render_svg
-from luce_image.streaming import LinearSink, EncodedSink, stream_linear, stream_encoded, decode_srgb
+from luce_image.streaming import LinearSink, EncodedSink, CoarseSink, stream_linear, stream_encoded, decode_srgb
 from luce_image.file_source import FileSource, read_head
 from binary import Buffer
 from raster_errors import invalid, unsupported, limit
@@ -573,16 +573,17 @@ pub struct Image:
 
     ## A PNG or JPEG not yet decoded as its encoded 8 or 16-bit RGBA samples,
     ## `rows` rows at a time, to `sink` (luce_image/streaming); false for any
-    ## other picture, which `linear_rgba_bands` gives instead.
-    pub mutating func encoded_rgba_bands(rows: usize, sink: EncodedSink, context: void*?) -> bool!:
+    ## other picture, which `linear_rgba_bands` gives instead. A progressive
+    ## JPEG's first sight goes to `coarse` first, with the same `context`.
+    pub mutating func encoded_rgba_bands(rows: usize, sink: EncodedSink, context: void*?, coarse: CoarseSink? = none) -> bool!:
         try self.ensure_open()
         if self.is_loaded():
             return false
         if not self.head_only:
-            return try stream_encoded(&self.raster, none, rows, sink, context)
+            return try stream_encoded(&self.raster, none, rows, sink, context, coarse)
         var source = try FileSource.open(self.raster.path, self.file_size)
         defer source.close()
-        return try stream_encoded(&self.raster, &source, rows, sink, context)
+        return try stream_encoded(&self.raster, &source, rows, sink, context, coarse)
 
     ## `stream_linear` from the file when only its start is held.
     mutating func stream_linear_from(rows: usize, sink: LinearSink, context: void*?) -> bool!:

@@ -350,3 +350,53 @@ test "a large PNG or JPEG opens from its file's start; a whole decode reads the 
             refused = failure.code == invalid
             recover false)
         assert(refused)
+
+test "a progressive JPEG shows a coarse picture before its rows, and then the tiles of one opened at once":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    # 480 by 360, progressive 4:2:0 (cjpeg's scans: the DC first).
+    let path = "tests/fixtures/progressive-480x360.jpg"
+    let cells = (usize)tile_columns(480) * (usize)tile_columns(360) * (usize)tile_size * (usize)tile_size * 4
+    let at_once = try alloc f32[cells] in memory.heap
+    defer free(at_once) in memory.heap
+    let in_background = try alloc f32[cells] in memory.heap
+    defer free(in_background) in memory.heap
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    let whole = try Canvas.open(path)
+    defer whole.release()
+    try draw_opening_frame(whole.value(), &target, 0.05)
+    try first_layer_texels(whole.value(), at_once)
+    let later = try Canvas.open(path)
+    defer later.release()
+    var loading = later.value()
+    Canvas.set_progressive_loading(true)
+    defer Canvas.set_progressive_loading(false)
+    # A frame binds it and starts the worker; its first sight comes before any row is in.
+    try draw_opening_frame(loading, &target, 0.05)
+    if let opening = loading.opening:
+        while opening.coarse.ready.load(.acquire) == 0 and opening.finished.load(.acquire) == 0:
+            thread.sleep(1)
+        let composer = loading.composer else trap("bound")
+        try show_coarse(opening, composer)
+        assert(opening.coarse.shown and opening.coarse.width == 60 and opening.coarse.height == 45)
+        if opening.uploaded == 0:
+            # Cell (0, 0) at full size is the coarse picture scaled up: near the real one.
+            let made = try coarse_cell((void*)opening, composer.levels(), opening.layer, false, 0, 0, 0)
+            var texture = made.texture else trap("a coarse cell")
+            defer texture.destroy()
+            let texels = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+            defer free(texels) in memory.heap
+            try texture.read(texels)
+            var difference = 0.0
+            for index in 0..<(usize)tile_size * (usize)tile_size * 4:
+                let near = (f64)from_half((u16)texels[index * 2] | ((u16)texels[index * 2 + 1] << 8))
+                difference += math.abs(near - (f64)at_once[index])
+            assert(difference / (f64)((usize)tile_size * (usize)tile_size * 4) < 0.08)
+    while loading.is_opening():
+        try draw_opening_frame(loading, &target, 0.05)
+    try first_layer_texels(loading, in_background)
+    for index in 0..<cells:
+        assert(at_once[index] == in_background[index])

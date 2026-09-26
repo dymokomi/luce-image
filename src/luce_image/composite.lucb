@@ -89,6 +89,11 @@ pub struct Composer:
     ## Layers shown through a preview's stand-in rather than their tiles.
     var stand_ins: StandIn[8]
     var stand_in_count: usize
+    ## What was cached while stand-ins showed: keyed by their generations, it
+    ## is stale once they change, and is let go then rather than filling the
+    ## cache until pushed out.
+    var stand_in_keys: u64[]
+    var stand_in_key_count: usize
 
     ## A compositor keeping at most `budget` composited tiles (512 KiB each),
     ## and as many bytes again of layer levels.
@@ -162,6 +167,7 @@ pub struct Composer:
         # A zoomed-out composite is made from every layer's levels below it:
         # precious, so the view at fit keeps it while finer tiles come and go.
         try self.cache.put(digest | 1, texture, tile_bytes, precious = precious_level(document.width(), document.height(), level))
+        try self.note_stand_in_key(digest | 1)
         return texture
 
     ## Forget the composites and `tiles`' level tiles over row `row` of cells,
@@ -277,6 +283,8 @@ pub struct Composer:
     pub mutating func stand_in(stand_in: StandIn) -> !:
         for index in 0..<self.stand_in_count:
             if self.stand_ins[index].layer == stand_in.layer and self.stand_ins[index].mask == stand_in.mask:
+                if self.stand_ins[index].generation != stand_in.generation:
+                    self.forget_stand_in_keys()
                 self.stand_ins[index] = stand_in
                 return
         if self.stand_in_count == stand_in_limit:
@@ -287,6 +295,27 @@ pub struct Composer:
     ## Show every layer through its own tiles again.
     pub mutating func drop_stand_ins():
         self.stand_in_count = 0
+        self.forget_stand_in_keys()
+
+    ## Remember `key`, cached while stand-ins show, to let it go with them.
+    mutating func note_stand_in_key(key: u64) -> !:
+        if self.stand_in_count == 0:
+            return
+        if self.stand_in_key_count == self.stand_in_keys.length:
+            let grown = try alloc u64[self.stand_in_keys.length * 2 + 64] in memory.heap
+            for index in 0..<self.stand_in_key_count:
+                grown[index] = self.stand_in_keys[index]
+            if self.stand_in_keys.length > 0:
+                free(self.stand_in_keys) in memory.heap
+            self.stand_in_keys = grown
+        self.stand_in_keys[self.stand_in_key_count] = key
+        self.stand_in_key_count += 1
+
+    ## Let go of what was cached for the stand-ins as they were.
+    mutating func forget_stand_in_keys():
+        for index in 0..<self.stand_in_key_count:
+            self.cache.forget(self.stand_in_keys[index])
+        self.stand_in_key_count = 0
 
     ## The layer levels it keeps: what a stand-in reads, for work made outside a draw.
     pub mutating func levels() -> Pyramid*:
@@ -316,6 +345,7 @@ pub struct Composer:
                 return try self.source(tiles, column, row, mask)
             let texture = result.texture else return none
             try self.cache.put(key, texture, tile_bytes)
+            try self.note_stand_in_key(key)
             return texture
         return try self.source(tiles, column, row, mask)
 
@@ -608,6 +638,11 @@ pub struct Composer:
                 self.effects[index].live = false
 
     pub mutating func destroy():
+        if self.stand_in_keys.length > 0:
+            free(self.stand_in_keys) in memory.heap
+        var no_keys: u64[]
+        self.stand_in_keys = no_keys
+        self.stand_in_key_count = 0
         self.clear()
         self.cache.destroy()
         self.pyramid.destroy()

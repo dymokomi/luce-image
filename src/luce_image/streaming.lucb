@@ -37,6 +37,11 @@ pub type LinearSink = func(void*?, usize, usize, f32[]) -> unit!
 ## last argument says so. The samples are valid only during the call.
 pub type EncodedSink = func(void*?, usize, usize, const u8[], bool) -> unit!
 
+## Receives a picture's first sight while its rows are still to come: the
+## picture at a fraction of its size, `width` by `height` 8-bit RGBA pixels
+## (a progressive JPEG's first scans). Valid only during the call.
+pub type CoarseSink = func(void*?, usize, usize, const u8[]) -> unit!
+
 ## The sRGB decoding of an encoded component in 0..1.
 pub func decode_srgb(value: f64) -> f64:
     let clamped = math.clamp(value, 0.0, 1.0)
@@ -88,7 +93,7 @@ pub func stream_linear(raster: model.Raster*, file: FileSource*?, rows: usize, s
 ## the encoded samples its decoder makes, when it is a PNG or a JPEG; false
 ## for any other, which goes through `stream_linear`. One held only as its
 ## file's start is read from `file`.
-pub func stream_encoded(raster: model.Raster*, file: FileSource*?, rows: usize, sink: EncodedSink, context: void*?) -> bool!:
+pub func stream_encoded(raster: model.Raster*, file: FileSource*?, rows: usize, sink: EncodedSink, context: void*?, coarse: CoarseSink? = none) -> bool!:
     let named = raster.file_format
     if named != "PNG" and named != "JPEG":
         return false
@@ -102,7 +107,7 @@ pub func stream_encoded(raster: model.Raster*, file: FileSource*?, rows: usize, 
     if named == "PNG":
         try png_rows(raster, file, encoded_rows, (void*)&banding, deep)
     else:
-        try jpeg_rows(raster, file, encoded_rows, (void*)&banding)
+        try jpeg_rows(raster, file, encoded_rows, (void*)&banding, coarse, context)
     if banding.top + banding.filled != banding.height:
         error(invalid, "the picture ended before its last row")
     return true
@@ -116,9 +121,10 @@ func png_rows(raster: const model.Raster*, file: FileSource*?, sink: png.RowSink
         return
     try png.decode_rows(raster.encoded, sink, context, deep, options)
 
-## A JPEG's rows to `sink` as RGBA, from its bytes held or from `file`.
-func jpeg_rows(raster: const model.Raster*, file: FileSource*?, sink: jpeg.RowSink, context: void*?) -> !:
-    let options = jpeg.Options(max_bytes = raster.max_bytes)
+## A JPEG's rows to `sink` as RGBA, from its bytes held or from `file`; a
+## progressive one's first sight to `coarse` with `coarse_context`.
+func jpeg_rows(raster: const model.Raster*, file: FileSource*?, sink: jpeg.RowSink, context: void*?, coarse: CoarseSink? = none, coarse_context: void*? = none) -> !:
+    let options = jpeg.Options(max_bytes = raster.max_bytes, coarse = coarse, coarse_context = coarse_context)
     if let source = file:
         let size = source.size()
         try jpeg.decode_rows_at(read_source, (void*)source, size, sink, context, .rgba, options)

@@ -1,0 +1,177 @@
+#==============================================================================================
+#
+#   canvas/opening_coarse - A picture's first sight while its rows come
+#
+#   DESCRIPTION:
+#       A progressive JPEG's rows come only after its last scan, but its first scans give
+#       the whole picture at 1/8 size (jpeg `Options.coarse`). The worker packs that
+#       picture into half-float tiles' bytes as it packs bands; a frame uploads it into a
+#       small grid of its own and shows it through a stand-in for the layer (stand_in.lucb):
+#       a cell whose rows are not all in is the coarse picture scaled up, and a cell that is
+#       all in is the layer's own. So the view shows a blurry whole picture at once and
+#       sharpens from the top. Rows that complete a row of the cells drawn make a new
+#       generation, so those cells are made again; each generation's cells and composites
+#       are let go with it (composite.lucb), so the caches do not fill with them.
+#
+#==============================================================================================
+
+## The coarse picture of an opening, from the worker to the frames.
+struct CoarseSight:
+    ## Its size, and its bands packed on the worker: a row of cells each.
+    var width: u32
+    var height: u32
+    var bands: u8[]
+    var painted: bool[]
+    ## Set by the worker once `bands` is complete.
+    var ready: @u32
+    ## Once a frame has it: its tiles, shown through a stand-in.
+    var shown: bool
+    var tiles: Tiles
+    var generation: u64
+    ## The pyramid levels drawn through the stand-in, a bit each, and the
+    ## loaded rows when its generation began.
+    var levels: u32
+    var loaded: i64
+
+## `Options.coarse` on the worker: the 1/8-size picture packed a row of cells
+## at a time, for a frame to upload.
+func opening_coarse(context: void*?, width: usize, height: usize, pixels: const u8[]) -> !:
+    let opening = (Opening*)(context else return)
+    let coarse = &opening.coarse
+    if coarse.ready.load(.acquire) != 0 or width == 0 or height == 0:
+        return
+    let rows = (usize)tile_columns((u32)height)
+    let columns = (usize)tile_columns((u32)width)
+    let band_bytes = packed_band_bytes((u32)width)
+    let color = try alloc u16[256] in memory.heap
+    defer free(color) in memory.heap
+    let alpha = try alloc u16[256] in memory.heap
+    defer free(alpha) in memory.heap
+    try encoded_tables(false, color, alpha)
+    coarse.bands = try alloc u8[rows * band_bytes] in memory.heap
+    coarse.painted = try alloc bool[rows * columns] in memory.heap
+    coarse.width = (u32)width
+    coarse.height = (u32)height
+    let line = width * 4
+    for row in 0..<rows:
+        let first = row * (usize)tile_size
+        let last = first + (usize)tile_size if first + (usize)tile_size < height else height
+        try pack_band_coded((u32)width, (u32)height, (u32)row, pixels[first * line..<last * line], false, color, alpha,
+                            coarse.bands[row * band_bytes..<(row + 1) * band_bytes], coarse.painted[row * columns..<(row + 1) * columns])
+    coarse.ready.store(1, .release)
+    wake_frames()
+
+## On a frame: the coarse picture, once the worker has it, uploaded and shown.
+func show_coarse(opening: Opening*, composer: Composer*) -> !:
+    let coarse = &opening.coarse
+    if coarse.shown or coarse.ready.load(.acquire) == 0:
+        return
+    let device = opening.canvas.device else trap("bound")
+    coarse.tiles = try Tiles.create(device, coarse.width, coarse.height)
+    coarse.shown = true
+    let band_bytes = packed_band_bytes(coarse.width)
+    let columns = (usize)tile_columns(coarse.width)
+    for row in 0..<coarse.tiles.rows():
+        let at = (usize)row
+        try coarse.tiles.write_packed(row, coarse.bands[at * band_bytes..<(at + 1) * band_bytes], coarse.painted[at * columns..<(at + 1) * columns])
+    free(coarse.bands) in memory.heap
+    free(coarse.painted) in memory.heap
+    var no_bands: u8[]
+    coarse.bands = no_bands
+    var no_painted: bool[]
+    coarse.painted = no_painted
+    try refresh_coarse(opening, composer)
+
+## Rows came in: when they complete a row of the cells drawn (at a level the
+## view has drawn), a new generation, so those cells are made again.
+func refresh_coarse(opening: Opening*, composer: Composer*) -> !:
+    let coarse = &opening.coarse
+    if not coarse.shown:
+        return
+    let loaded = opening.offset_y + loaded_rows(opening)
+    if coarse.generation != 0 and not completes_cells(opening, coarse.loaded, loaded):
+        return
+    coarse.loaded = loaded
+    coarse.generation = next_generation()
+    try composer.stand_in(StandIn(layer = opening.layer, mask = false, generation = opening.coarse.generation, context = (void*)opening, make = coarse_cell))
+
+## The picture is in: the layer shows its own tiles again.
+func hide_coarse(opening: Opening*, composer: Composer*):
+    if opening.coarse.shown:
+        composer.drop_stand_ins()
+
+## What the coarse picture holds, let go with the opening.
+func release_coarse(opening: Opening*):
+    let coarse = &opening.coarse
+    if coarse.bands.length > 0:
+        free(coarse.bands) in memory.heap
+    if coarse.painted.length > 0:
+        free(coarse.painted) in memory.heap
+    if coarse.shown:
+        coarse.tiles.destroy()
+        coarse.shown = false
+
+## Whether the rows loaded from `before` to `after` complete a row of cells at
+## a level drawn through the stand-in.
+func completes_cells(opening: const Opening*, before: i64, after: i64) -> bool:
+    let bottom = opening.offset_y + (i64)opening.extent_y
+    for level in 0..<(u32)17:
+        if (opening.coarse.levels & (1u32 << level)) == 0:
+            continue
+        let side = (i64)tile_size << level
+        if (after >= bottom) != (before >= bottom) or floor_rows(after, side) != floor_rows(before, side):
+            return true
+    return false
+
+## The cell row holding document row `at`, below zero too.
+func floor_rows(at: i64, side: i64) -> i64:
+    return at // side if at >= 0 else -((-at + side - 1) // side)
+
+## The document rows from the top whose layer cells are all in.
+func loaded_rows(opening: const Opening*) -> i64:
+    if opening.placed:
+        return opening.landed * (i64)tile_size
+    let rows = (i64)opening.uploaded * (i64)tile_size
+    return rows if rows < (i64)opening.extent_y else (i64)opening.extent_y
+
+## The stand-in's cell (`column`, `row`) of `level`: the layer's own once the
+## picture rows under it are all in, else the coarse picture scaled up.
+func coarse_cell(context: void*?, layer_levels: Pyramid*, layer: u64, mask: bool, column: u32, row: u32, level: u32) -> Made!:
+    let opening = (Opening*)(context else return made_original())
+    if mask or not opening.coarse.shown:
+        return made_original()
+    opening.coarse.levels = opening.coarse.levels | (1u32 << level)
+    let side = (i64)tile_size << level
+    let cell_x = (i64)column * side
+    let cell_y = (i64)row * side
+    let left = opening.offset_x
+    let top = opening.offset_y
+    let right = left + (i64)opening.extent_x
+    let bottom = top + (i64)opening.extent_y
+    let loaded = top + loaded_rows(opening)
+    let covered_bottom = cell_y + side if cell_y + side < bottom else bottom
+    if cell_x >= right or cell_x + side <= left or cell_y >= bottom or cell_y + side <= top or covered_bottom <= loaded:
+        return made_original()
+    let coarse = &opening.coarse.tiles
+    var texture = try coarse.blank()
+    errdefer texture.destroy()
+    let frame = try texture.frame()
+    defer frame.release()
+    let target = try frame.value().target()
+    defer target.release()
+    # Coarse texel (x, y) is picture pixels 8x..8x+7: its tiles that reach the cell.
+    let scale = 8.0 / (f64)((u64)1 << level)
+    let span = (i64)tile_size * 8
+    for coarse_row in 0..<coarse.rows():
+        let y = (f64)(top + (i64)coarse_row * span - cell_y) / (f64)((u64)1 << level)
+        if y >= (f64)tile_size or y + (f64)tile_size * scale <= 0.0:
+            continue
+        for coarse_column in 0..<coarse.columns():
+            let x = (f64)(left + (i64)coarse_column * span - cell_x) / (f64)((u64)1 << level)
+            if x >= (f64)tile_size or x + (f64)tile_size * scale <= 0.0:
+                continue
+            let piece = (try coarse.texture(coarse_column, coarse_row)) else continue
+            let area = coarse.region(coarse_column, coarse_row)
+            try gpu.copy_image(target.value(), piece, gpu.Rect(x, y, (f64)area.width * scale, (f64)area.height * scale), area, gpu.Filter.linear)
+    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+    return made_texture(texture)
