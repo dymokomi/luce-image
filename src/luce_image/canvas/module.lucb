@@ -2687,6 +2687,22 @@ pub struct Canvas:
     pub func redo_name() -> str:
         return self.future[self.future_count - 1].name if self.future_count > 0 else ""
 
+    ## The steps Undo takes back one at a time, as a History panel lists them:
+    ## how many, and each one's name, 0 the oldest (what `undo_name` says when
+    ## it is the last). Snapshots taken together count once.
+    pub func history_steps() -> i64:
+        return (i64)step_starts(self.history, self.history_count, false, none)
+
+    pub func history_step_name(index: i64) -> str:
+        return step_name(self.history, self.history_count, false, index)
+
+    ## The steps Redo brings back, 0 the next one.
+    pub func future_steps() -> i64:
+        return (i64)step_starts(self.future, self.future_count, true, none)
+
+    pub func future_step_name(index: i64) -> str:
+        return step_name(self.future, self.future_count, true, index)
+
     # mark: Files and drawing =====================================================================
 
     ## Write the document with all its layers to `path`, an `.l2d` directory

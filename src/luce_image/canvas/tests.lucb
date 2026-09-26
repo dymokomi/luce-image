@@ -704,6 +704,34 @@ test "retouching: clone stamp copies from its source, blur softens, healing fill
     let healed = (try shown_at(&canvas, &target, 41, 41))[0]
     assert(healed > 120 and healed < 135)
 
+test "the history lists its steps by name, undo side oldest first and redo side next first":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    let base = try canvas.add_layer("Base")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    let first = canvas.history_steps()
+    try canvas.select_rectangle(4, 4, 8, 8, 0)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.fill(base, false)
+    let extra = try canvas.add_layer("Extra")
+    discard(extra)
+    let steps = canvas.history_steps()
+    assert(steps == first + 3)
+    assert(canvas.history_step_name(steps - 3) == "Select" and canvas.history_step_name(steps - 2) == "Fill")
+    assert(canvas.history_step_name(steps - 1) == canvas.undo_name() and canvas.history_step_name(steps) == "")
+    try canvas.undo()
+    try canvas.undo()
+    assert(canvas.history_steps() == steps - 2 and canvas.future_steps() == 2)
+    assert(canvas.future_step_name(0) == "Fill" and canvas.future_step_name(1) == "New Layer" and canvas.future_step_name(2) == "")
+    try canvas.redo()
+    assert(canvas.undo_name() == "Fill" and canvas.future_steps() == 1)
+
 test "everything undoes: layers, properties, styles, masks, selections and the canvas size, each a named step":
     var device = gpu.Device.open() catch failure:
         assert(failure.code == gpu.unavailable)
