@@ -156,6 +156,16 @@ func unfilter_tile(filtered: const u8[], rows: usize, texels: u8[]):
             sample = sample +% 1
         row = row +% 1
 
+## A whole tile's rgba16f `texels` as a stored record in `into` (the tile
+## codec's bound): filtered, then deflated at the document's level; its
+## length. What the memory governor's compressed tier packs with, on workers.
+func encode_tile_record(context: void*?, texels: const u8[], into: u8[]) -> usize!:
+    discard(context)
+    let filtered = try alloc u8[texels.length] in memory.heap
+    defer free(filtered) in memory.heap
+    filter_tile(texels, (usize)tile_size, filtered)
+    return try flate.deflate_raw(filtered, tile_deflate_level, into, true)
+
 # -- Work spread over the processors.
 
 ## Tasks `0..<count` of `task(context, index)`, taken in turn by up to one

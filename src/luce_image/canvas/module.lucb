@@ -45,7 +45,7 @@ import os
 import time
 import thread
 from luce_image.image import Image, Pixel
-from tiles import Cell, CellRange, read_cells, transient_mark, release_transients, Tiles, Bounds, tile_size, tile_columns, min_u32, max_u32, flatten, tiles_alive, tile_texture, residency_configure, residency_budgets, residency_advance, residency_frame, residency_over_budget, residency_begin_marking, residency_mark_live, residency_settle, residency_report, set_scratch_directory, release_scratch, TileSource, open_tile_source, release_tile_source, back_cell, detach_tile_source, tile_source_is
+from tiles import Cell, CellRange, read_cells, transient_mark, release_transients, Tiles, Bounds, tile_size, tile_columns, min_u32, max_u32, flatten, tiles_alive, tile_texture, residency_configure, residency_budgets, residency_advance, residency_frame, residency_over_budget, residency_begin_marking, residency_mark_live, residency_settle, residency_report, set_scratch_directory, residency_codec, clear_residency_codec, release_scratch, TileSource, open_tile_source, release_tile_source, back_cell, detach_tile_source, tile_source_is
 from pyramid import covered_at
 from luce_image.heal import heal
 from luce_image.color_range import RangeSample, range_sample, range_coverage, range_labs
@@ -416,6 +416,12 @@ pub struct Canvas:
     pub static func set_scratch_folder(directory: str) -> !:
         try set_scratch_directory(directory)
 
+    ## Compress tiles past the RAM budget in RAM before they go to the scratch
+    ## file (off by default; see canvas/memory): for a slow or small scratch disk.
+    pub static func set_compressed_tier(on: bool):
+        compressed_tier = on
+        apply_compressed_tier()
+
     ## On quitting, once every document is closed: the scratch file closes and
     ## its folder goes (on Windows the folder would otherwise stay behind).
     pub static func release_scratch_file():
@@ -473,6 +479,13 @@ pub struct Canvas:
 
     pub func memory_spills() -> i64:
         return (i64)residency_report().spills
+
+    ## Bytes of tiles held compressed in RAM, and tiles compressed so far.
+    pub func memory_packed_bytes() -> i64:
+        return (i64)residency_report().packed_tiles
+
+    pub func memory_packs() -> i64:
+        return (i64)residency_report().packs
 
     pub func memory_loads() -> i64:
         return (i64)residency_report().loads

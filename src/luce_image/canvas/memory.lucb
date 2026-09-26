@@ -26,8 +26,24 @@ var forced: bool = false
 ## budgets set in bytes.
 func configure_memory(device: gpu.Device) -> !:
     try residency_configure(device, memory_usage)
+    apply_compressed_tier()
     if forced:
         residency_budgets(forced_gpu, forced_ram)
+
+## Whether tiles past the RAM budget are compressed before they go to disk
+## (`Canvas.set_compressed_tier`). Off: with the .l2d codec, compressing makes
+## the scratch file about 4.5 times smaller but, on a fast SSD, a document
+## built past its budget takes 2.7 times as long (deflate costs more than the
+## write it saves) and a cold pan 1.5 times as long. It pays on a slow or
+## nearly full scratch disk.
+var compressed_tier: bool = false
+
+## Register the .l2d document's tile codec with the governor, or none.
+func apply_compressed_tier():
+    if compressed_tier:
+        residency_codec(none, encode_tile_record, decode_record, flate.deflate_bound((usize)tile_size * tile_row_bytes))
+    else:
+        clear_residency_codec()
 
 ## `Canvas.set_memory_budgets`: bytes, kept across binds.
 func force_memory_budgets(gpu_bytes: usize, ram_bytes: usize):
