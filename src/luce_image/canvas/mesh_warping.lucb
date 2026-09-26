@@ -1,0 +1,172 @@
+#==============================================================================================
+#
+#   canvas/mesh_warping - Warp and Puppet Warp on a canvas: shown live, kept once
+#
+#   DESCRIPTION:
+#       Edit › Transform › Warp and Edit › Puppet Warp bend one layer through a mesh over its
+#       painted box: a Bézier patch's sixteen points (warp_patch.lucb) or pins
+#       (puppet.lucb). While the points or pins move nothing is made at full size: once a
+#       frame, when they moved, the mesh is laid again and the layer is shown through a new
+#       generation of a stand-in that makes the cells the view draws, at its level
+#       (mesh_render.lucb). Keeping the warp makes the cells the mesh came from or lands on
+#       once at full size as one undo step, within the selection; cancelling leaves the
+#       layer as it was, for it never changed.
+#
+#==============================================================================================
+
+## A warp under way on layer `layer`: its pixels as it began, what bends them,
+## and the mesh laid for the last frame.
+struct MeshWarping:
+    var layer: u64
+    var original: Tiles
+    var mesher: Mesher
+    ## The box the mesh covers: the layer's painted box.
+    var box: Footprint
+    ## Warp's patch, or Puppet Warp's pins.
+    var points: f64[32]
+    var puppet: Puppet*?
+    var mesh: MeshMap?
+    var generation: u64
+    ## The points or pins moved since the last frame showed them.
+    var changed: bool
+    var name: str
+
+## `Canvas.begin_warp` and `Canvas.begin_puppet`: a warp of layer `id`'s pixels.
+func begin_mesh_warp(canvas: Canvas*, id: u64, puppet: bool, density: i64) -> !:
+    try canvas.require_idle()
+    let document = canvas.document else error(invalid, "draw the document once before warping")
+    let device = canvas.device else error(invalid, "draw the document once before warping")
+    let layer = document.find(id) else error(invalid, "no such layer")
+    let tiles = layer.tiles() else error(invalid, "a group has no pixels to warp")
+    let found = try tiles.content_bounds() else error(invalid, "the layer has no pixels to warp")
+    # A pixel wider all round, so the painted pixels are inside the mesh's soft rim.
+    let box = Footprint(left = (f64)found.left - 1.0, top = (f64)found.top - 1.0, right = (f64)found.right + 1.0, bottom = (f64)found.bottom + 1.0)
+    if canvas.mesher == none:
+        canvas.mesher = try Mesher.create(device)
+    let mesher = canvas.mesher else trap("made")
+    var original = try tiles.clone()
+    errdefer original.destroy()
+    var points: f64[32] = ---
+    try identity_patch(box, points[0..])
+    var shaped: Puppet*? = none
+    if puppet:
+        shaped = try Puppet.create_boxed(box, density)
+    canvas.mesh_warp = try new MeshWarping(layer = id, original = original, mesher = mesher, box = box, points = points, puppet = shaped,
+                                           mesh = none, generation = 0, changed = true, name = "Puppet Warp" if puppet else "Warp") in memory.heap
+
+## The warp under way; an error when there is none.
+func mesh_session(canvas: Canvas*) -> MeshWarping*!:
+    return canvas.mesh_warp else error(invalid, "no warp is in progress")
+
+## The puppet warp under way; an error when there is none.
+func puppet_session(canvas: Canvas*) -> Puppet*!:
+    let shown = try mesh_session(canvas)
+    if shown.puppet == none:
+        error(invalid, "no puppet warp is in progress")
+    return shown.puppet else trap("checked")
+
+## A Warp control point's index, checked.
+func warp_index(index: i64) -> i64!:
+    if index < 0 or index >= (i64)patch_points:
+        error(invalid, "a warp has sixteen control points, 0..15")
+    return index
+
+## Once a frame: when the points or pins moved, lay the mesh again and show
+## the layer through a new generation of the stand-in.
+func settle_mesh_warp(canvas: Canvas*, shown: MeshWarping*) -> !:
+    if not shown.changed:
+        return
+    shown.changed = false
+    try lay_mesh(shown)
+    let composer = canvas.composer else return
+    shown.generation = next_generation()
+    try composer.stand_in(StandIn(layer = shown.layer, mask = false, generation = shown.generation, context = (void*)shown, make = mesh_warp_cell))
+
+## The mesh as the points or pins have it now.
+func lay_mesh(shown: MeshWarping*) -> !:
+    var fresh: MeshMap = ---
+    if let puppet = shown.puppet:
+        fresh = try puppet.mesh()
+    else:
+        fresh = try patch_mesh(shown.box, shown.points[0..])
+    if let old = shown.mesh:
+        var owned = old
+        owned.destroy()
+    shown.mesh = fresh
+
+## A stand-in's cell (`column`, `row`) of `level`: the warped layer there.
+func mesh_warp_cell(context: void*?, layer_levels: Pyramid*, layer: u64, mask: bool, column: u32, row: u32, level: u32) -> Made!:
+    let shown = (MeshWarping*)(context else return made_original())
+    let mesh = shown.mesh else return made_original()
+    let made = try shown.mesher.cell(&mesh, &shown.original, layer_levels, column, row, level)
+    let texture = made else return made_nothing()
+    return made_texture(texture)
+
+## End the warp: kept, the cells the mesh came from or lands on made at full
+## size as one undo step within the selection; else nothing changes.
+func end_mesh_warp(canvas: Canvas*, keep: bool) -> !:
+    let shown = try mesh_session(canvas)
+    canvas.mesh_warp = none
+    defer drop_mesh_warping(shown)
+    if let composer = canvas.composer:
+        composer.drop_stand_ins()
+    if not keep:
+        return
+    try lay_mesh(shown)
+    let mesh = shown.mesh else return
+    let document = canvas.document else trap("warp without a document")
+    let composer = canvas.composer else trap("warp without a compositor")
+    let layer = document.find(shown.layer) else error(invalid, "the warped layer is gone")
+    let tiles = layer.tiles() else error(invalid, "the warped layer has no pixels")
+    try canvas.remember(shown.layer, try tiles.clone(), name = shown.name)
+    # Every cell the pixels leave or land on, within the canvas.
+    let span = (f64)tile_size
+    let left = math.min(mesh.source.left, mesh.landed.left)
+    let top = math.min(mesh.source.top, mesh.landed.top)
+    let right = math.max(mesh.source.right, mesh.landed.right)
+    let bottom = math.max(mesh.source.bottom, mesh.landed.bottom)
+    let first_column = (u32)math.max(0.0, math.floor((left - 1.0) / span))
+    let first_row = (u32)math.max(0.0, math.floor((top - 1.0) / span))
+    let last_column = (u32)math.min((f64)tiles.columns() - 1.0, math.floor((right + 1.0) / span))
+    let last_row = (u32)math.min((f64)tiles.rows() - 1.0, math.floor((bottom + 1.0) / span))
+    if right >= 0.0 and bottom >= 0.0:
+        var into = Landing(tiles = tiles, made = 0)
+        for row in first_row..<last_row + 1:
+            try shown.mesher.row_of_cells(&mesh, &shown.original, composer.levels(), row, first_column, last_column, mesh_threads, (void*)&into, land)
+        canvas.mesh_cells_made = into.made
+    layer.revision += 1
+    try canvas.restrict_to_selection(shown.layer, &canvas.history[canvas.history_count - 1].tiles)
+
+## Threads making a kept warp's cells' fields at once.
+let mesh_threads: usize = 8
+
+## Where a kept warp's cells go: the layer's tiles.
+struct Landing:
+    var tiles: Tiles*
+    var made: usize
+
+func land(context: void*, column: u32, row: u32, made: gpu.Texture?) -> !:
+    let into = (Landing*)context
+    into.made += 1
+    if let texture = made:
+        try into.tiles.set(column, row, texture)
+    else:
+        try into.tiles.clear(column, row)
+
+## Let a warp go without keeping it (the canvas closing mid-warp).
+func drop_mesh_warp(canvas: Canvas*):
+    let shown = canvas.mesh_warp else return
+    canvas.mesh_warp = none
+    if let composer = canvas.composer:
+        composer.drop_stand_ins()
+    drop_mesh_warping(shown)
+
+func drop_mesh_warping(shown: MeshWarping*):
+    if let mesh = shown.mesh:
+        var owned = mesh
+        owned.destroy()
+    if let puppet = shown.puppet:
+        puppet.destroy()
+        free(puppet) in memory.heap
+    shown.original.destroy()
+    free(shown) in memory.heap

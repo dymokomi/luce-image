@@ -88,6 +88,17 @@ pub func level_for(box: Footprint) -> u32:
 pub func gather(device: gpu.Device, tiles: const Tiles*, parts: const Pieces*, pyramid: Pyramid*, box: Footprint, level: u32, mask: bool, empty: gpu.Color) -> Window!:
     if level == 0:
         return try gather_pieces(device, parts, box, empty)
+    return try gather_level(device, tiles, pyramid, box, level, mask, empty)
+
+## As `gather`, reading full-size pixels from `tiles` themselves (on the
+## canvas) rather than a list of pieces made earlier.
+pub func gather_tiles(device: gpu.Device, tiles: const Tiles*, pyramid: Pyramid*, box: Footprint, level: u32, mask: bool, empty: gpu.Color) -> Window!:
+    if level == 0:
+        return try gather_cells(device, tiles, box, empty)
+    return try gather_level(device, tiles, pyramid, box, level, mask, empty)
+
+## `box` of `tiles` at pyramid `level` (above 0) into a window texture.
+func gather_level(device: gpu.Device, tiles: const Tiles*, pyramid: Pyramid*, box: Footprint, level: u32, mask: bool, empty: gpu.Color) -> Window!:
     let scale = (f64)(1u32 << level)
     let left = (i64)math.floor(box.left / scale)
     let top = (i64)math.floor(box.top / scale)
@@ -112,6 +123,32 @@ pub func gather(device: gpu.Device, tiles: const Tiles*, parts: const Pieces*, p
             try gpu.copy_image(whole.value(), cell, gpu.Rect((f64)(column * span - left), (f64)(row * span - top), (f64)width, (f64)height), gpu.Region(0, 0, width, height))
     discard(try frame.value().present(empty))
     return Window(texture = texture, left = left, top = top, level = level)
+
+## `box` of `tiles` on the canvas gathered at full size into a window texture,
+## `empty` where the layer has nothing. Each cell's texture is asked for as it
+## is copied, so a tile the memory tiers moved off the GPU comes back for it;
+## a list of pieces made earlier may name textures since let go.
+pub func gather_cells(device: gpu.Device, tiles: const Tiles*, box: Footprint, empty: gpu.Color) -> Window!:
+    let left = (i64)math.floor(box.left)
+    let top = (i64)math.floor(box.top)
+    let right = (i64)math.ceil(box.right)
+    let bottom = (i64)math.ceil(box.bottom)
+    if right - left > 16384 or bottom - top > 16384:
+        error(invalid, "a transform window cannot exceed 16384 texels")
+    var texture = try gpu.Texture.create(device, (u32)(right - left), (u32)(bottom - top), gpu.Format.rgba16_float)
+    errdefer texture.destroy()
+    let frame = try texture.frame()
+    defer frame.release()
+    let whole = try frame.value().target()
+    defer whole.release()
+    let span = (i64)tile_size
+    for row in max_i64(0, top // span)..<min_i64((i64)tiles.rows(), (bottom + span - 1) // span):
+        for column in max_i64(0, left // span)..<min_i64((i64)tiles.columns(), (right + span - 1) // span):
+            let cell = (try tiles.texture((u32)column, (u32)row)) else continue
+            let area = tiles.region((u32)column, (u32)row)
+            try gpu.copy_image(whole.value(), cell, gpu.Rect((f64)(column * span - left), (f64)(row * span - top), (f64)area.width, (f64)area.height), area)
+    discard(try frame.value().present(empty))
+    return Window(texture = texture, left = left, top = top, level = 0)
 
 ## `box` of a layer's `parts` (past the canvas too) gathered at full size into
 ## a window texture, `empty` where the layer has nothing.
