@@ -313,10 +313,15 @@ pub struct TreeState:
     var extent_x: u32
     var extent_y: u32
     var selection: Selection
+    ## Quick Mask's layer, when it was on: undo and redo take the mode with them.
+    var quick: Layer*? = none
 
     pub mutating func destroy():
         layer_destroy(self.root)
         self.selection.destroy()
+        if let quick = self.quick:
+            layer_destroy(quick)
+            self.quick = none
 
 ## Free a `Document.snapshot`.
 pub func release_snapshot(layer: Layer*):
@@ -726,7 +731,12 @@ pub struct Document:
     pub func capture() -> TreeState!:
         let root = try clone_layer(self.root)
         errdefer layer_destroy(root)
-        return TreeState(root = root, next_id = self.next_id, extent_x = self.extent_x, extent_y = self.extent_y, selection = try self.selection.copy())
+        var selection = try self.selection.copy()
+        errdefer selection.destroy()
+        var quick: Layer*? = none
+        if let layer = self.quick:
+            quick = try clone_layer(layer)
+        return TreeState(root = root, next_id = self.next_id, extent_x = self.extent_x, extent_y = self.extent_y, selection = selection, quick = quick)
 
     ## The document as it is now, on the heap, sharing its tiles: what a
     ## stroke reads while it paints (a Clone Stamp sampling every layer).
@@ -757,6 +767,11 @@ pub struct Document:
         let selection = self.selection
         self.selection = state.selection
         state.selection = selection
+        # Quick Mask comes and goes with the steps that turned it on and off.
+        let quick = self.quick
+        self.quick = state.quick
+        state.quick = quick
+        self.selection_suspended = self.quick != none
         # History keeps the cells alone, not their GPU tiles.
         state.selection.drop_gpu_tiles()
         self.revision += 1

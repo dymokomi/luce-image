@@ -10,13 +10,14 @@ import math
 import memory
 from tiles import Tiles, tile_size
 from luce_image.projective import Warp, affine_warp
-from luce_image.selection_cells import Cells, Mode, block_bytes, each
+from luce_image.selection_cells import Cells, Covered, Mode, block_bytes, each
 from luce_image.selection_mirror import Mirror
 import luce_image.selection_shapes as shapes
 import luce_image.selection_modify as modifying
 import luce_image.selection_sources as sources
-import luce_image.selection_refine as refining
-from luce_image.selection_refine import Refinement, CellBox
+import luce_image.selection_warp as warping
+import luce_image.selection_level as levels
+from luce_image.selection_refine import CellBox
 from raster_errors import invalid
 from half import to_half
 
@@ -91,16 +92,33 @@ pub struct Selection:
         self.finish()
 
     ## Take the selection through `warp` (a backwards map, as free transform
-    ## and distort use), bilinear; what leaves the document is dropped.
-    pub mutating func warp(warp: Warp) -> !:
+    ## and distort use), bilinear; what leaves the document is dropped
+    ## (selection_warp.lucb). Only the cells `limit` holds are worked out; a
+    ## preview's others are left clear.
+    pub mutating func warp(warp: Warp, limit: CellBox = CellBox()) -> !:
         if self.empty:
             return
-        var moved = try Cells.create(self.extent_x, self.extent_y)
-        var job = WarpJob(selection = &self, target = &moved, warp = warp)
-        each(moved.count(), (void*)&job, warp_item)
+        let covered = Covered(found = true, left = self.left, top = self.top, right = self.right, bottom = self.bottom)
+        var moved = try warping.warp_cells(&self.cells, covered, warp, limit)
         self.cells.destroy()
         self.cells = moved
         self.finish()
+
+    ## The selection taken down `level` pyramid levels, each pixel the mean
+    ## of the square it covers (selection_level.lucb): what a preview works on.
+    pub func reduced(level: u32) -> Selection!:
+        return Selection.adopt(try levels.reduce(&self.cells, level))
+
+    ## A selection holding `cells` (settled here), handed over.
+    pub static func adopt(cells: Cells) -> Selection:
+        var selection = Selection(extent_x = cells.extent_x, extent_y = cells.extent_y, cells = cells, mirror = Mirror.create(), empty = true,
+                                  left = 0, top = 0, right = 0, bottom = 0)
+        selection.finish()
+        return selection
+
+    ## The coverage cells, borrowed: for work that reads them elsewhere.
+    pub func coverage() -> const Cells*:
+        return &self.cells
 
     ## A rectangle, combined by `mode`.
     pub mutating func rectangle(x: i64, y: i64, width: i64, height: i64, mode: Mode):
@@ -207,33 +225,6 @@ pub struct Selection:
         try sources.grow(&found, &self.cells, reader, tolerance, contiguous)
         var nothing_bytes: u8[]
         shapes.from_source(&self.cells, shapes.Source(other = &found, bytes = nothing_bytes), Mode.add)
-        self.finish()
-
-    ## Select and Mask: the edge refined as `refinement` says, its edge
-    ## detection guided by the pixels `reader` gives (none skips it), only in
-    ## the cells `limit` holds (selection_refine.lucb).
-    pub mutating func refine(reader: sources.Reader?, refinement: Refinement, limit: CellBox = CellBox()) -> !:
-        if refinement.radius < 0 or refinement.radius > 250 or refinement.smooth < 0 or refinement.smooth > 100 or refinement.feather < 0 or refinement.feather > 250:
-            error(invalid, "Select and Mask takes a radius and feather of 0..250 and smoothing of 0..100")
-        if not math.is_finite(refinement.contrast) or refinement.contrast < 0.0 or refinement.contrast > 100.0 or not math.is_finite(refinement.shift) or refinement.shift < -100.0 or refinement.shift > 100.0:
-            error(invalid, "Select and Mask takes a contrast of 0..100 and a shift of -100..100")
-        if self.empty or not refinement.changes():
-            return
-        var luma = try Cells.create(self.extent_x, self.extent_y)
-        defer luma.destroy()
-        var guided = false
-        if let pixels = reader:
-            if refinement.radius > 0:
-                # The lightness of the cells within reach of those worked out, no more.
-                let values = try alloc i64[self.cells.count()] in memory.heap
-                defer free(values) in memory.heap
-                discard(refining.pending_cells(&self.cells, refinement, limit, values))
-                var needed = try Cells.create(self.extent_x, self.extent_y)
-                defer needed.destroy()
-                refining.needed_cells(&self.cells, values, refinement.apron(), &needed)
-                try sources.luma(&luma, pixels, &needed)
-                guided = true
-        try refining.refine(&self.cells, &luma if guided else none, refinement, limit)
         self.finish()
 
     ## Grow (positive) or shrink (negative) the selection by `pixels` with a
@@ -438,87 +429,6 @@ func move_item(context: void*?, index: usize):
             if sx >= 0 and sy >= 0 and sx < (i64)source.extent_x and sy < (i64)source.extent_y:
                 coverage = source.at(sx, sy)
             bytes[(usize)row * (usize)tile_size + (usize)column] = coverage
-
-struct WarpJob:
-    var selection: const Selection*
-    var target: Cells*
-    var warp: Warp
-
-## One cell of a warped selection, each pixel sampled bilinearly back through
-## the warp: a cell whose corners map where the selection is one value (or
-## wholly past its box) takes that value without sampling, so the work
-## follows the selection's edge.
-func warp_item(context: void*?, index: usize):
-    let job = (WarpJob*)(context else return)
-    let settled = settled_warp(job, index)
-    if settled >= 0:
-        job.target.fill(index, (u8)settled)
-        return
-    let shape = alloc u8[block_bytes] in memory.heap catch failure:
-        trap("out of memory warping the selection")
-    defer free(shape) in memory.heap
-    memory.set(shape, 0)
-    let origin_x = job.target.origin_x(index)
-    let origin_y = job.target.origin_y(index)
-    for row in 0..<job.target.cell_height(index):
-        for column in 0..<job.target.cell_width(index):
-            var x = 0.0
-            var y = 0.0
-            var value = 0.0
-            if job.warp.map((f64)(origin_x + column) + 0.5, (f64)(origin_y + row) + 0.5, &x, &y):
-                let sx = x - 0.5
-                let sy = y - 0.5
-                let x0 = (i64)math.floor(sx)
-                let y0 = (i64)math.floor(sy)
-                let fx = sx - (f64)x0
-                let fy = sy - (f64)y0
-                let upper = (f64)job.selection.sample(x0, y0) * (1.0 - fx) + (f64)job.selection.sample(x0 + 1, y0) * fx
-                let lower = (f64)job.selection.sample(x0, y0 + 1) * (1.0 - fx) + (f64)job.selection.sample(x0 + 1, y0 + 1) * fx
-                value = upper * (1.0 - fy) + lower * fy
-            shape[(usize)row * (usize)tile_size + (usize)column] = (u8)math.clamp(math.round(value), 0.0, 255.0)
-    shapes.combine_cell(job.target, index, shape, Mode.add)
-
-## The one value cell `index` of a warped selection takes when its corners,
-## mapped back through the warp, land where the selection is that value
-## throughout (a pixel of slack for the bilinear taps); -1 to sample it.
-func settled_warp(job: const WarpJob*, index: usize) -> i64:
-    let selection = job.selection
-    let x0 = (f64)job.target.origin_x(index)
-    let y0 = (f64)job.target.origin_y(index)
-    let x1 = x0 + (f64)job.target.cell_width(index)
-    let y1 = y0 + (f64)job.target.cell_height(index)
-    var low_x = 1e300
-    var low_y = 1e300
-    var high_x = -1e300
-    var high_y = -1e300
-    for corner in 0..<(usize)4:
-        var x = 0.0
-        var y = 0.0
-        if not job.warp.map(x1 if corner % 2 == 1 else x0, y1 if corner >= 2 else y0, &x, &y):
-            return -1
-        low_x = math.min(low_x, x)
-        low_y = math.min(low_y, y)
-        high_x = math.max(high_x, x)
-        high_y = math.max(high_y, y)
-    let left = (i64)math.floor(low_x) - 1
-    let top = (i64)math.floor(low_y) - 1
-    let right = (i64)math.ceil(high_x) + 1
-    let bottom = (i64)math.ceil(high_y) + 1
-    # Wholly past the selected pixels' box: nothing.
-    if right <= selection.left or bottom <= selection.top or left >= selection.right or top >= selection.bottom:
-        return 0
-    # Past the document is clear, so a cell reaching out is only settled when clear.
-    if left < 0 or top < 0 or right > (i64)selection.extent_x or bottom > (i64)selection.extent_y:
-        return -1
-    let span = (i64)tile_size
-    var value: i64 = -2
-    for row in (top // span)..<((bottom - 1) // span + 1):
-        for column in (left // span)..<((right - 1) // span + 1):
-            let found = selection.cells.uniform((usize)row * (usize)selection.cells.columns() + (usize)column)
-            if found < 0 or (value != -2 and found != value):
-                return -1
-            value = found
-    return value
 
 test "selection shapes combine, invert, grow and feather":
     var selection = try Selection.create(64, 48)
@@ -824,7 +734,6 @@ test "a warped selection samples only the cells its edge crosses, and agrees wit
     try small.warp(warp)
     var every = try Cells.create(600, 520)
     defer every.destroy()
-    var job = WarpJob(selection = &sampled, target = &every, warp = warp)
     for index in 0..<every.count():
         let shape = try alloc u8[block_bytes] in memory.heap
         defer free(shape) in memory.heap

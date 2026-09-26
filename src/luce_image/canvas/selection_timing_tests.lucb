@@ -1,0 +1,70 @@
+#==============================================================================================
+#
+#   canvas/selection_timing_tests - Select and Mask and Transform Selection at 15000 by 24000
+#
+#==============================================================================================
+
+## Milliseconds since `started`.
+func since(started: u64) -> u64:
+    return (time.now() - started) // 1000000
+
+## Soft blobs everywhere, as Color Range picks from a photograph: an edge in
+## every cell of the document, the worst a selection's previews meet.
+func select_blobs(canvas: Canvas*) -> !:
+    let width: usize = 15000
+    let height: usize = 24000
+    let coverage = try alloc u8[width * height] in memory.heap
+    defer free(coverage) in memory.heap
+    for y in 0..<height:
+        let wave_y = (i64)(y % 1800) - 900
+        let ty = wave_y if wave_y >= 0 else -wave_y
+        for x in 0..<width:
+            let wave_x = (i64)(x % 1400) - 700
+            let tx = wave_x if wave_x >= 0 else -wave_x
+            let value = (tx + ty - 700) * 255 // 300 + 128
+            coverage[y * width + x] = (u8)math.imin(255, math.imax(0, value))
+    try canvas.live().from_coverage(coverage, Mode.replace)
+
+test "select and mask and transform selection keep up with a 15000 by 24000 selection edged everywhere":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    var canvas = try Canvas(15000, 24000)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.fill_gradient(layer, 0.0, 0.0, 15000.0, 24000.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    try select_blobs(&canvas)
+    # The whole document fitted (level 5), and 1:1 on 2000 by 1500 pixels.
+    let fit = Scope(level = 5, box = CellBox(everything = false, left = 0, top = 0, right = 512, bottom = 768))
+    let near = Scope(level = 0, box = CellBox(everything = false, left = 6912, top = 11008, right = 8960, bottom = 12544))
+    try canvas.begin_refine()
+    let session = canvas.select_mask else trap("Select and Mask is open")
+    for scope in [fit, near]:
+        for radius in [(i64)0, 50]:
+            for feather in [(i64)10, 250]:
+                let started = time.now()
+                try canvas.preview_refine(radius, 5, feather, 30.0, 20.0)
+                try prepare_refine_preview(&canvas, scope)
+                # The frame asking never waits for the work.
+                assert(since(started) < 250)
+                try collect_refine(session, true)
+                assert(since(started) < 3000 and session.shown.level == scope.level)
+    var started = time.now()
+    try canvas.end_refine(true, 50, 5, 20, 30.0, 20.0)
+    # Every cell worked out at full size (it was 13.6 s before windows were shared).
+    assert(since(started) < 20000 and canvas.undo_name() == "Select and Mask")
+    try canvas.begin_selection_transform()
+    let warping = canvas.selection_warping else trap("a transform is under way")
+    for step in 1..<(i64)4:
+        started = time.now()
+        try canvas.preview_selection_transform(1.0 + 0.02 * (f64)step, 1.0, 3.0 * (f64)step, 10.0 * (f64)step, 0.0, 7500.0, 12000.0)
+        try prepare_selection_warp(warping, fit)
+        try prepare_selection_warp(warping, near)
+        assert(since(started) < 500)
+    started = time.now()
+    try canvas.end_selection_transform(true)
+    assert(since(started) < 5000 and canvas.undo_name() == "Transform Selection")

@@ -1,0 +1,215 @@
+## A selection's cells taken down pyramid levels: each byte of level `level`
+## the mean coverage of the 2^level by 2^level square of document pixels it
+## covers (those inside the document), as the view's pyramid reduces a
+## layer. Previews work here — Select and Mask's and Transform Selection's —
+## so a slider or a drag costs the pixels the screen shows, not the
+## document's.
+##
+## A level cell whose square of document cells is one value throughout takes
+## that value without looking at a byte; only the squares an edge crosses are
+## read, a run of document pixels at a time, so the work follows the edge.
+import math
+import memory
+from tiles import tile_size
+from luce_image.selection_cells import Cells, each
+
+## How many pixels a side of `extent` document pixels has at `level`.
+pub func level_extent(extent: u32, level: u32) -> u32:
+    let span = (u64)1 << (u64)level
+    return (u32)(((u64)extent + span - 1) >> (u64)level)
+
+## `source` taken down `level` levels (0: a copy sharing its cells).
+pub func reduce(source: const Cells*, level: u32) -> Cells!:
+    if level == 0:
+        return try source.copy()
+    var target = try Cells.create(level_extent(source.extent_x, level), level_extent(source.extent_y, level))
+    errdefer target.destroy()
+    let count = target.count()
+    let values = try alloc i64[count] in memory.heap
+    defer free(values) in memory.heap
+    var pending: usize = 0
+    for index in 0..<count:
+        values[index] = settled_square(source, &target, index, level)
+        if values[index] >= 0:
+            target.fill(index, (u8)values[index])
+        else:
+            pending += 1
+    let items = try alloc usize[pending] in memory.heap
+    defer free(items) in memory.heap
+    var at: usize = 0
+    for index in 0..<count:
+        if values[index] < 0:
+            items[at] = index
+            at += 1
+            # Made here, on this thread: the workers only fill the bytes.
+            discard(target.fresh(index))
+    var job = ReduceJob(source = source, target = &target, items = items, level = level, failed = false)
+    each(pending, (void*)&job, reduce_item)
+    if job.failed:
+        error(memory.exhausted, "out of memory taking the selection down a level")
+    discard(try target.settle())
+    return target
+
+## The document cells level cell `index` covers: first column and row, and
+## one past the last.
+struct Square:
+    var left: i64
+    var top: i64
+    var right: i64
+    var bottom: i64
+
+func square_of(source: const Cells*, target: const Cells*, index: usize, level: u32) -> Square:
+    let per = (i64)1 << (i64)level
+    let column = (i64)(index % (usize)target.columns())
+    let row = (i64)(index // (usize)target.columns())
+    return Square(left = column * per, top = row * per, right = math.imin((i64)source.columns(), (column + 1) * per),
+                  bottom = math.imin((i64)source.rows(), (row + 1) * per))
+
+## The one value level cell `index` takes when every document cell it covers
+## is that value; -1 when its bytes must be worked out.
+func settled_square(source: const Cells*, target: const Cells*, index: usize, level: u32) -> i64:
+    let square = square_of(source, target, index, level)
+    let columns = (i64)source.columns()
+    var value: i64 = -2
+    for row in square.top..<square.bottom:
+        for column in square.left..<square.right:
+            let found = source.uniform((usize)(row * columns + column))
+            if found < 0 or (value != -2 and found != value):
+                return -1
+            value = found
+    return value
+
+struct ReduceJob:
+    var source: const Cells*
+    var target: const Cells*
+    var items: const usize[]
+    var level: u32
+    var failed: bool
+
+## One level cell: the sums of the document pixels over each of its bytes,
+## a run at a time along each row of each document cell it covers, then the
+## means.
+func reduce_item(context: void*?, item: usize):
+    let job = (ReduceJob*)(context else return)
+    let source = job.source
+    let index = job.items[item]
+    let level = (i64)job.level
+    let bytes = (job.target.block(index) else return).bytes
+    let sums = alloc u32[(usize)tile_size * (usize)tile_size] in memory.heap catch failure:
+        job.failed = true
+        return
+    defer free(sums) in memory.heap
+    memory.set(u8[]((u8*)sums.data, sums.length * 4), 0)
+    let square = square_of(source, job.target, index, job.level)
+    let columns = (i64)source.columns()
+    # The level cell's first document pixel.
+    let base_x = square.left * (i64)tile_size
+    let base_y = square.top * (i64)tile_size
+    for row in square.top..<square.bottom:
+        for column in square.left..<square.right:
+            let cell = (usize)(row * columns + column)
+            let value = source.uniform(cell)
+            if value == 0:
+                continue
+            let origin_x = column * (i64)tile_size
+            let origin_y = row * (i64)tile_size
+            let width = source.cell_width(cell)
+            let block = source.block(cell)
+            for y in 0..<source.cell_height(cell):
+                let line = (usize)(((origin_y + y - base_y) >> level) * (i64)tile_size)
+                var x: i64 = 0
+                while x < width:
+                    # The run of pixels that fall in one level byte.
+                    let at = (origin_x + x - base_x) >> level
+                    let end = math.imin(width, ((at + 1) << level) - (origin_x - base_x))
+                    var total: u32 = 0
+                    if let found = block:
+                        let row_at = y * (i64)tile_size
+                        for sample in x..<end:
+                            total += (u32)found.bytes[(usize)(row_at + sample)]
+                    else:
+                        total = (u32)value * (u32)(end - x)
+                    sums[line + (usize)at] += total
+                    x = end
+    # Each byte's mean over the document pixels it covers.
+    let width = job.target.cell_width(index)
+    let height = job.target.cell_height(index)
+    let limit_x = (i64)source.extent_x - base_x
+    let limit_y = (i64)source.extent_y - base_y
+    for y in 0..<height:
+        let across_y = math.imin((y + 1) << level, limit_y) - (y << level)
+        for x in 0..<width:
+            let across_x = math.imin((x + 1) << level, limit_x) - (x << level)
+            let count = (u32)(across_x * across_y)
+            let at = (usize)(y * (i64)tile_size + x)
+            bytes[at] = (u8)((sums[at] + count // 2) // count)
+
+# mark: Tests ===================================================================================
+
+## Tests' oracle: the mean of the document pixels a level byte covers.
+func dense_mean(cells: const Cells*, level: u32, x: i64, y: i64) -> u8:
+    let per = (i64)1 << (i64)level
+    var total: i64 = 0
+    var count: i64 = 0
+    for sy in y * per..<math.imin((y + 1) * per, (i64)cells.extent_y):
+        for sx in x * per..<math.imin((x + 1) * per, (i64)cells.extent_x):
+            total += (i64)cells.at(sx, sy)
+            count += 1
+    return (u8)((total + count // 2) // count)
+
+## Cells `width` by `height`, a soft disc, a hard notch and a cut corner:
+## edges in some cells, others one value either way.
+func disc(width: u32, height: u32) -> Cells!:
+    var cells = try Cells.create(width, height)
+    for index in 0..<cells.count():
+        let bytes = cells.writable(index)
+        for y in 0..<cells.cell_height(index):
+            for x in 0..<cells.cell_width(index):
+                let px = cells.origin_x(index) + x
+                let py = cells.origin_y(index) + y
+                let dx = px - 700
+                let dy = py - 500
+                let distance = math.sqrt((f64)(dx * dx + dy * dy))
+                var value = math.clamp((420.0 - distance) * 8.0, 0.0, 255.0)
+                if px > 1100 and py < 90:
+                    value = 255.0
+                bytes[(usize)(y * (i64)tile_size + x)] = (u8)value
+    discard(try cells.settle())
+    return cells
+
+test "a selection taken down a level holds each square's mean, reading only the edge":
+    var cells = try disc(1500, 1100)
+    defer cells.destroy()
+    for level in [(u32)1, 2, 3, 5, 9]:
+        var reduced = try reduce(&cells, level)
+        defer reduced.destroy()
+        assert(reduced.extent_x == level_extent(1500, level) and reduced.extent_y == level_extent(1100, level))
+        for y in 0..<(i64)reduced.extent_y:
+            for x in 0..<(i64)reduced.extent_x:
+                if reduced.at(x, y) != dense_mean(&cells, level, x, y):
+                    trap(f"level {level} differs at {x}, {y}: {reduced.at(x, y)} vs {dense_mean(&cells, level, x, y)}")
+
+test "a 15000 by 24000 selection taken down levels keeps whole squares one value":
+    var cells = try Cells.create(15000, 24000)
+    defer cells.destroy()
+    for index in 0..<cells.count():
+        let x = cells.origin_x(index)
+        let y = cells.origin_y(index)
+        if x >= 1024 and x < 12032 and y >= 2048 and y < 20224:
+            cells.fill(index, 255)
+    # A soft edge down one column of cells.
+    for row in 8..<(usize)79:
+        let bytes = cells.writable(row * (usize)cells.columns() + 47)
+        for y in 0..<(usize)256:
+            for x in 0..<(usize)256:
+                bytes[y * 256 + x] = (u8)x
+    discard(try cells.settle())
+    var reduced = try reduce(&cells, 5)
+    defer reduced.destroy()
+    assert(reduced.extent_x == 469 and reduced.extent_y == 750)
+    assert(reduced.at(200, 300) == 255 and reduced.at(10, 10) == 0 and reduced.at(380, 300) > 100 and reduced.at(380, 300) < 200)
+    # At level 2 a cell covers four by four document cells: inside the
+    # rectangle it holds no bytes.
+    var quarter = try reduce(&cells, 2)
+    defer quarter.destroy()
+    assert(quarter.uniform(3 * (usize)quarter.columns() + 1) == 255 and quarter.uniform(0) == 0)

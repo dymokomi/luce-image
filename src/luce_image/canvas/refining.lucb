@@ -3,59 +3,106 @@
 #   canvas/refining - Select › Transform Selection: the outline reshaped, the pixels left
 #
 #   DESCRIPTION:
-#       The selection as it began is kept aside; each preview takes a copy of it through the
-#       warp the box describes (Selection.warp, which samples only the cells the edge
-#       crosses), so a drag costs the selection's edge whatever the document's size.
-#       Keeping it records the selection it began from as one undo step.
+#       The selection stays as it began while the box is dragged. A move of the box only
+#       records the warp (`show_selection_warp`); each frame (`draw_selection`) takes the
+#       selection it began from, at the level the view draws (selection_preview.lucb),
+#       through that warp scaled to the level, over the cells the view shows, and draws that:
+#       the work of a frame follows the screen, and a drag's moves between two frames cost
+#       one. Keeping it warps the selection at full size once (Selection.warp, which samples
+#       only the cells the moved edge crosses) and records the one it began from as one
+#       undo step.
 #
 #==============================================================================================
+
+## Transform Selection while the box is up.
+struct SelectionWarping:
+    ## The selection it began from, as the live one stays meanwhile.
+    var origin: Selection
+    ## The warp last asked for (none: the box as found).
+    var warp: Warp?
+    ## The origin at the preview's level.
+    var levels: LevelOrigin
+    ## The last preview drawn, the box of its level it covers, and whether
+    ## it shows the warp last asked for.
+    var shown: Shown
+    var shown_box: CellBox
+    var shown_current: bool
 
 ## `Canvas.begin_selection_transform`.
 func begin_selection_transform(canvas: Canvas*) -> !:
     try canvas.require_open()
-    if canvas.selection_origin != none:
+    if canvas.selection_warping != none:
         error(invalid, "the selection is already being transformed")
     if not canvas.has_selection():
         error(invalid, "nothing is selected to transform")
-    let copy = try canvas.live().copy()
-    let kept = try new Selection in memory.heap
-    *kept = copy
-    canvas.selection_origin = kept
+    let origin = try canvas.live().copy()
+    canvas.selection_warping = try new SelectionWarping(origin = origin, warp = none, levels = LevelOrigin(selection = none, level = 0),
+                                                        shown = Shown(selection = none, level = 0), shown_box = CellBox(), shown_current = false) in memory.heap
 
-## Show the selection it began from through `warp`.
+## Show the selection it began from through `warp`, from the next frame.
 func show_selection_warp(canvas: Canvas*, warp: Warp) -> !:
-    let origin = canvas.selection_origin else error(invalid, "no selection transform is under way")
-    var shown = try origin.copy()
-    errdefer shown.destroy()
-    try shown.warp(warp)
-    var live = canvas.live()
-    live.destroy()
-    *live = shown
+    let session = canvas.selection_warping else error(invalid, "no selection transform is under way")
+    session.warp = warp
+    session.shown_current = false
 
-## `Canvas.end_selection_transform`: keep the shown selection as one step,
-## recorded against the one it began from, or put that one back.
-func end_selection_transform(canvas: Canvas*, keep: bool) -> !:
-    let origin = canvas.selection_origin else return
-    canvas.selection_origin = none
-    defer free(origin) in memory.heap
-    var live = canvas.live()
-    if not keep:
-        live.destroy()
-        *live = *origin
+## The preview for a view of `scope`: the origin at the scope's level taken
+## through the warp there, over the scope's box, made when anything changed.
+func prepare_selection_warp(session: SelectionWarping*, scope: Scope) -> !:
+    let warp = session.warp else return
+    if session.shown_current and session.shown.selection != none and session.shown.level == scope.level and session.shown_box.covers(scope.box):
         return
-    # History records the state before the change: the original, briefly back.
-    var shown = *live
-    *live = *origin
-    canvas.remember_state("Transform Selection") catch failure:
-        live.destroy()
-        *live = shown
-        error(failure.code, failure.message)
-    live.destroy()
-    *live = shown
+    let origin = try session.levels.at(&session.origin, scope.level)
+    var moved = try origin.copy()
+    errdefer moved.destroy()
+    try moved.warp(level_warp(warp, scope.level), scope.box)
+    try session.shown.show(moved, scope.level)
+    session.shown_box = scope.box
+    session.shown_current = true
 
-## Drop a selection transform left under way (the canvas closing).
+## `warp` (a backwards map in document pixels) in the pixels of `level`:
+## scaled up to the document, mapped, scaled back down.
+func level_warp(warp: Warp, level: u32) -> Warp:
+    if level == 0:
+        return warp
+    let scale = (f64)(1u64 << level)
+    let up = Warp(m = [scale, 0.0, 0.0, 0.0, scale, 0.0, 0.0, 0.0, 1.0])
+    let down = Warp(m = [1.0 / scale, 0.0, 0.0, 0.0, 1.0 / scale, 0.0, 0.0, 0.0, 1.0])
+    return multiply(down, multiply(warp, up))
+
+## `Canvas.end_selection_transform`: keep the selection warped at full size
+## as one step, recorded against the one it began from, or leave that one.
+func end_selection_transform(canvas: Canvas*, keep: bool) -> !:
+    let session = canvas.selection_warping else return
+    if keep:
+        if let warp = session.warp:
+            var moved = try session.origin.copy()
+            errdefer moved.destroy()
+            try moved.warp(warp)
+            # History records the state before the change: the live one, still the origin.
+            try canvas.remember_state("Transform Selection")
+            var live = canvas.live()
+            live.destroy()
+            *live = moved
+    drop_selection_transform(canvas)
+
+## Let a selection transform go with all it holds (ended, or the canvas closing).
 func drop_selection_transform(canvas: Canvas*):
-    let origin = canvas.selection_origin else return
-    canvas.selection_origin = none
-    origin.destroy()
-    free(origin) in memory.heap
+    let session = canvas.selection_warping else return
+    canvas.selection_warping = none
+    session.shown.destroy()
+    session.levels.destroy()
+    session.origin.destroy()
+    free(session) in memory.heap
+
+## Transform Selection's outline over the document as `draw` drew it: the
+## preview's ants (or, before the box moves, the selection's own). False when
+## no selection transform is under way.
+func draw_selection_warp(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, phase: f64) -> bool!:
+    let session = canvas.selection_warping else return false
+    if session.warp == none:
+        try draw_canvas_selection(canvas, target, rectangle, zoom, offset_x, offset_y, phase)
+        return true
+    try prepare_selection_warp(session, view_scope(canvas, rectangle, zoom, offset_x, offset_y))
+    if let shown = session.shown.selection:
+        try draw_shown(canvas, shown, session.shown.level, refine_ants, target, rectangle, zoom, offset_x, offset_y, phase)
+    return true

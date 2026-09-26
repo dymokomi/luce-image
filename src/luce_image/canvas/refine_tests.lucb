@@ -61,10 +61,16 @@ test "transform selection reshapes the outline, not the pixels, and undoes as on
     let steps = canvas.history_steps()
     try canvas.begin_selection_transform()
     assert(canvas.transforming_selection())
-    # Twice the size about the middle: the previews start from the original each time.
+    # Twice the size about the middle: the previews start from the original
+    # each time, and only record the warp; the selection stays till kept.
     try canvas.preview_selection_transform(1.5, 1.5, 0.0, 0.0, 0.0, 150.0, 150.0)
     try canvas.preview_selection_transform(2.0, 2.0, 0.0, 0.0, 0.0, 150.0, 150.0)
-    assert(canvas.selected_at(60, 60) == 255 and canvas.selected_at(40, 40) == 0)
+    assert(canvas.selected_at(60, 60) == 0 and canvas.selection_left() == 100)
+    # A frame at half size shows it a level down, over the cells in view.
+    let session = canvas.selection_warping else trap("a transform is under way")
+    try prepare_selection_warp(session, Scope(level = 1, box = CellBox(everything = false, left = 0, top = 0, right = 256, bottom = 256)))
+    let shown = session.shown.selection else trap("a preview shows")
+    assert(session.shown.level == 1 and shown.width() == 200 and shown.at(30, 30) == 255 and shown.at(20, 20) == 0)
     try canvas.end_selection_transform(true)
     assert(not canvas.transforming_selection() and canvas.history_steps() == steps + 1 and canvas.undo_name() == "Transform Selection")
     # Bilinear edges may cover a pixel more, partly.
@@ -80,7 +86,9 @@ test "transform selection reshapes the outline, not the pixels, and undoes as on
     # Cancelled, it is as it was, and no step is added.
     try canvas.begin_selection_transform()
     try canvas.preview_selection_distort(100.0, 100.0, 100.0, 100.0, 80.0, 90.0, 220.0, 100.0, 200.0, 200.0, 100.0, 200.0)
-    assert(canvas.selected_at(85, 95) == 255)
+    let distorting = canvas.selection_warping else trap("a transform is under way")
+    try prepare_selection_warp(distorting, Scope())
+    assert((distorting.shown.selection else trap("a preview shows")).at(85, 95) == 255)
     try canvas.end_selection_transform(false)
     assert(canvas.selection_left() == 100 and canvas.history_steps() == steps)
 
@@ -119,13 +127,24 @@ test "quick mask paints the selection with the painting tools and turns back int
     let painted = canvas.history_steps()
     try canvas.exit_quick_mask()
     assert(not canvas.quick_mask() and canvas.undo_name() == "Exit Quick Mask")
-    # The strokes on the mask went with it: one step in their place.
-    assert(canvas.history_steps() == painted - 2 + 1)
+    # Photoshop's order: Quick Mask, the edits on the mask, Exit Quick Mask.
+    assert(canvas.history_steps() == painted + 1 and canvas.history_step_name(steps) == "Quick Mask" and canvas.history_step_name(painted - 1) == "Brush Stroke")
     assert(canvas.selected_at(5, 50) == 0 and canvas.selected_at(150, 150) == 255 and canvas.selected_at(20, 200) == 0 and canvas.selected_at(150, 250) == 255)
+    # Undoing Exit Quick Mask brings the mode back with its mask as painted,
+    # and the stroke before it then undoes on the mask.
     try canvas.undo()
-    assert(not canvas.quick_mask() and canvas.selected_at(5, 50) == 255 and canvas.selected_at(150, 250) == 0)
-    # Undoing the step that turned it on takes Quick Mask down.
-    try canvas.enter_quick_mask()
+    assert(canvas.quick_mask() and canvas.selected_at(5, 50) == 255 and canvas.selected_at(150, 250) == 0)
+    try canvas.undo()
+    assert(canvas.quick_mask() and canvas.undo_name() == "Gradient")
+    try canvas.exit_quick_mask()
+    assert(canvas.selected_at(20, 200) == 255 and canvas.selected_at(5, 50) == 0)
+    # Undoing back past Quick Mask takes the mode down; redoing brings it back.
+    try canvas.undo()
+    try canvas.undo()
+    try canvas.undo()
+    assert(not canvas.quick_mask() and canvas.selected_at(20, 50) == 255 and canvas.redo_name() == "Quick Mask")
+    try canvas.redo()
+    assert(canvas.quick_mask())
     try canvas.undo()
     assert(not canvas.quick_mask() and canvas.selected_at(20, 50) == 255)
     # Nothing selected stays nothing selected through an unpainted Quick Mask.
@@ -230,20 +249,66 @@ test "select and mask previews in the view's box, keeps one step, and cancels ba
     assert(canvas.refining())
     try canvas.set_refine_view(2)
     assert(canvas.refine_view_mode() == 2)
-    # Only the box's cells: the edge in the first row of cells moves, below it not yet.
-    try canvas.preview_refine(12, 0, 0, 0.0, 0.0, 0, 0, 620, 200)
-    assert(canvas.selected_at(303, 100) == 0 and canvas.selected_at(303, 300) == 255 and canvas.history_steps() == steps)
+    # A setting is only recorded: the selection stays as it began till kept.
+    try canvas.preview_refine(12, 0, 0, 0.0, 0.0)
+    assert(canvas.selected_at(303, 100) == 255 and canvas.history_steps() == steps)
+    # A frame showing the top at full size works that out on a thread of its own.
+    let session = canvas.select_mask else trap("Select and Mask is open")
+    try prepare_refine_preview(&canvas, Scope(level = 0, box = CellBox(everything = false, left = 0, top = 0, right = 620, bottom = 200)))
+    assert(canvas.busy())
+    try collect_refine(session, true)
+    assert(not canvas.busy())
+    let shown = session.shown.selection else trap("a preview shows")
+    # Only the box's cells: the edge in the first row of cells moves; below,
+    # off the view, edge cells are left clear so its GPU tiles cost the view.
+    assert(shown.at(303, 100) == 0 and shown.at(309, 100) == 255 and shown.at(303, 300) == 0 and shown.at(600, 300) == 255)
+    let previewed = shown.cell_bytes(1, 0) else trap("the edge cell holds bytes")
     try canvas.end_refine(true, 12)
     assert(not canvas.refining() and canvas.refine_view_mode() == 0 and canvas.undo_name() == "Select and Mask")
-    assert(canvas.selected_at(303, 300) == 0 and canvas.selected_at(309, 300) == 255)
+    assert(canvas.selected_at(303, 300) == 0 and canvas.selected_at(309, 300) == 255 and canvas.selected_at(303, 100) == 0)
+    # OK took the cell the full-size preview had worked out rather than working it again.
+    assert((canvas.current().cell_bytes(1, 0) else trap("the edge cell holds bytes")).data == previewed.data)
     try canvas.undo()
     assert(canvas.selected_at(303, 300) == 255)
-    # Cancel puts it back.
+    # Cancel leaves it as it was.
     try canvas.begin_refine()
     try canvas.preview_refine(0, 0, 20, 0.0, 0.0)
-    assert(canvas.selected_at(295, 100) > 0)
     try canvas.end_refine(false)
-    assert(canvas.selected_at(295, 100) == 0 and canvas.selected_at(303, 100) == 255)
+    assert(canvas.selected_at(295, 100) == 0 and canvas.selected_at(303, 100) == 255 and canvas.history_steps() == steps)
+
+test "select and mask previews a level down, and a newer setting cancels an older one":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    var canvas = try half_white(1200, 800, 606, &target)
+    defer canvas.close()
+    try canvas.select_rectangle(600, 0, 600, 800, 0)
+    try canvas.begin_refine()
+    let session = canvas.select_mask else trap("Select and Mask is open")
+    let fit = Scope(level = 2, box = CellBox(everything = false, left = 0, top = 0, right = 512, bottom = 512))
+    # A slider dragged: each setting replaces the last, the running one is
+    # cancelled, and once it stops the latest starts.
+    try canvas.preview_refine(0, 0, 40, 0.0, 0.0)
+    try prepare_refine_preview(&canvas, fit)
+    try canvas.preview_refine(0, 0, 80, 0.0, 0.0)
+    try prepare_refine_preview(&canvas, fit)
+    try collect_refine(session, true)
+    try prepare_refine_preview(&canvas, fit)
+    try collect_refine(session, true)
+    let shown = session.shown.selection else trap("a preview shows")
+    assert(session.shown.level == 2 and session.shown_setting.feather == 20 and shown.width() == 300 and shown.height() == 200)
+    # The preview a quarter size is the full refinement a quarter size, near enough.
+    let probes: i64[5] = [120, 140, 150, 160, 180]
+    var quarter: i64[5]
+    for index in 0..<(usize)5:
+        quarter[index] = (i64)shown.at(probes[index], 100)
+    try canvas.end_refine(true, 0, 0, 80, 0.0, 0.0)
+    for index in 0..<(usize)5:
+        let whole = (i64)canvas.selected_at(probes[index] * 4 + 2, 400)
+        assert(math.iabs(whole - quarter[index]) <= 12)
 
 test "grow takes its colors from the selection's solid pixels, not its anti-aliased rim":
     var device = gpu.Device.open() catch failure:

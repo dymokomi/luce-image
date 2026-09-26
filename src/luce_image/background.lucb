@@ -1,0 +1,38 @@
+## One piece of work on a thread of its own, looked in on by the main thread
+## each frame: a preview worked out while frames go on (Select and Mask's).
+## The main thread starts it, asks `background_done` without waiting, and
+## joins it (`join_background`) once it is done, or to wait for it after
+## cancelling it through its own context.
+import memory
+import thread
+
+pub struct Background:
+    var context: void*?
+    var work: func(void*?) -> unit
+    var handle: thread.Handle
+    var over: @bool
+
+## Run `work(context)` on a new thread; `context` must stay where it is
+## until `join_background`.
+pub func start_background(work: func(void*?) -> unit, context: void*?, name: str) -> Background*!:
+    let task = try new Background(context = context, work = work) in memory.heap
+    task.over.store(false, .relaxed)
+    task.handle = thread.spawn(background_entry, (void*)task, name = name) catch failure:
+        free(task) in memory.heap
+        error(failure.code, failure.message)
+    return task
+
+func background_entry(raw: void*?):
+    let task = (Background*)(raw else return)
+    task.work(task.context)
+    task.over.store(true, .release)
+
+## Whether the work is done (`join_background` then returns at once).
+pub func background_done(task: const Background*) -> bool:
+    return task.over.load(.acquire)
+
+## Wait for the work to be done and let the thread go.
+pub func join_background(task: Background*):
+    task.handle.join() catch failure:
+        trap("a background thread failed to join")
+    free(task) in memory.heap

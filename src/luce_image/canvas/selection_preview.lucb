@@ -1,0 +1,93 @@
+#==============================================================================================
+#
+#   canvas/selection_preview - A selection previewed at the level the view draws
+#
+#   DESCRIPTION:
+#       Select and Mask (masking.lucb) and Transform Selection (refining.lucb) show the
+#       selection as it would be without making it at full size for every slider step or
+#       pointer move. Each works on the selection it began from taken down to the pyramid
+#       level the view draws (selection_level.lucb, kept while the level holds), only over
+#       the cells the view shows with some slack, and draws the result in the live
+#       selection's place, scaled back up. The live selection stays as it began until the
+#       change is kept, which then works at full size once.
+#
+#==============================================================================================
+
+## What a preview covers: the level the view draws at and, in that level's
+## pixels, the box of it on screen, widened by a quarter of the view each way
+## and out to whole cells, so a small pan needs nothing new.
+struct Scope:
+    var level: u32 = 0
+    var box: CellBox = CellBox()
+
+## The scope of a view drawing the document into `rectangle` at `zoom`, its
+## corner at (`offset_x`, `offset_y`) from the rectangle's.
+func view_scope(canvas: const Canvas*, rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64) -> Scope:
+    let level = view_level(zoom)
+    let span = (f64)(1u64 << level)
+    let slack_x = rectangle.width * 0.25
+    let slack_y = rectangle.height * 0.25
+    let left = (-offset_x - slack_x) / zoom / span
+    let top = (-offset_y - slack_y) / zoom / span
+    let right = (rectangle.width - offset_x + slack_x) / zoom / span
+    let bottom = (rectangle.height - offset_y + slack_y) / zoom / span
+    let cell = (f64)tile_size
+    return Scope(level = level, box = CellBox(everything = false, left = (i64)(math.floor(left / cell) * cell), top = (i64)(math.floor(top / cell) * cell),
+                                              right = (i64)(math.ceil(right / cell) * cell), bottom = (i64)(math.ceil(bottom / cell) * cell)))
+
+## The selection a preview began from, taken down to one level at a time.
+struct LevelOrigin:
+    var selection: Selection*?
+    var level: u32
+
+    ## `origin` at `level`, made when the level changes.
+    mutating func at(origin: const Selection*, level: u32) -> const Selection*!:
+        if let kept = self.selection:
+            if self.level == level:
+                return kept
+        self.destroy()
+        let made = try new Selection in memory.heap
+        *made = try origin.reduced(level)
+        self.selection = made
+        self.level = level
+        return made
+
+    mutating func destroy():
+        let kept = self.selection else return
+        self.selection = none
+        kept.destroy()
+        free(kept) in memory.heap
+
+## A preview's result: a selection at `level`, drawn in the live one's place.
+struct Shown:
+    var selection: Selection*?
+    var level: u32
+
+    ## Show `made` (a selection at `level`), handed over.
+    mutating func show(made: Selection, level: u32) -> !:
+        let kept = try new Selection in memory.heap
+        *kept = made
+        self.destroy()
+        self.selection = kept
+        self.level = level
+
+    mutating func destroy():
+        let kept = self.selection else return
+        self.selection = none
+        kept.destroy()
+        free(kept) in memory.heap
+
+## Draw `shown` over the document as `draw` drew it: marching ants (`view` 0,
+## as Select and Mask's views number them; Transform Selection's always) or
+## Select and Mask's matte views.
+func draw_shown(canvas: Canvas*, shown: Selection*, level: u32, view: i64, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64,
+                offset_x: f64, offset_y: f64, phase: f64) -> !:
+    let device = canvas.device else return
+    let tiles = (try shown.gpu_tiles(device)) else return
+    if view == refine_overlay:
+        try draw_matte(canvas, target, rectangle, zoom, offset_x, offset_y, tiles, level, false, [quick_red, 0.0, 0.0], quick_opacity)
+    elif view == refine_on_black or view == refine_on_white:
+        let shade: f32 = 0.0 if view == refine_on_black else 1.0
+        try draw_matte(canvas, target, rectangle, zoom, offset_x, offset_y, tiles, level, false, [shade, shade, shade], 1.0)
+    else:
+        try draw_ants(canvas, target, rectangle, zoom, offset_x, offset_y, phase, tiles, level)

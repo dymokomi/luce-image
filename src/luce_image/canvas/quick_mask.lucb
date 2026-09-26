@@ -9,8 +9,10 @@
 #       paint any layer's mask: white selects, black masks, gray is partial. The selection
 #       stops clipping meanwhile, and the view tints what is masked (`draw_quick_overlay`).
 #       Leaving reads the mask back as the selection, a cell at a time, and takes the layer
-#       down; the strokes made on it go from the history with it, the change they made
-#       being the step leaving records. Each way is one undo step.
+#       down. Each way is one undo step, in Photoshop's order: Quick Mask, the strokes on
+#       the mask, Exit Quick Mask. The document's states carry the layer (TreeState), so
+#       undoing Exit Quick Mask brings the mode back with its mask as painted, and the
+#       strokes before it undo on that mask; undoing Quick Mask takes the mode down.
 #
 #==============================================================================================
 
@@ -92,24 +94,18 @@ func exit_quick_mask(canvas: Canvas*) -> !:
     var source = TilesSource(tiles = mask)
     # Where the mask has no tile it reveals: selected.
     try found.load(selection_sources.gpu_reader((void*)&source, device, tiles_cell_texture), 0, 255, Mode.replace)
-    let id = quick.id
     try canvas.remember_state("Exit Quick Mask")
     document.end_quick()
-    purge_layer_steps(canvas, id)
     # Nothing masked from nothing selected stays nothing selected.
     if was_empty and full(&found):
         found.clear()
     document.selection.destroy()
     document.selection = found
 
-## Take Quick Mask down without keeping it (the step that entered it undone,
-## or the canvas closing).
+## Take Quick Mask down without keeping it (the canvas closing).
 func drop_quick_mask(canvas: Canvas*):
     let document = canvas.document else return
-    let quick = document.quick_layer() else return
-    let id = quick.id
     document.end_quick()
-    purge_layer_steps(canvas, id)
 
 ## Whether every pixel is selected.
 func full(selection: const Selection*) -> bool:
@@ -121,35 +117,20 @@ func full(selection: const Selection*) -> bool:
                 return false
     return true
 
-## Drop the history's and the future's pixel steps on layer `id` (gone).
-func purge_layer_steps(canvas: Canvas*, id: u64):
-    purge_steps(&canvas.history, &canvas.history_count, id)
-    purge_steps(&canvas.future, &canvas.future_count, id)
-
-func purge_steps(entries: Snapshot[]*, count: usize*, id: u64):
-    var kept: usize = 0
-    for index in 0..<*count:
-        var entry = (*entries)[index]
-        if entry.state == none and entry.layer == id:
-            drop_snapshot(&entry)
-            continue
-        (*entries)[kept] = entry
-        kept += 1
-    *count = kept
-
 ## Tint what Quick Mask masks over the document as `draw` drew it.
 func draw_quick_overlay(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64) -> !:
     let document = canvas.document else return
     let quick = document.quick_layer() else return
     let mask = quick.mask_tiles() else return
-    try draw_matte(canvas, target, rectangle, zoom, offset_x, offset_y, mask, true, [quick_red, 0.0, 0.0], quick_opacity)
+    try draw_matte(canvas, target, rectangle, zoom, offset_x, offset_y, mask, 0, true, [quick_red, 0.0, 0.0], quick_opacity)
 
 ## Cover what `coverage` leaves out (its red channel, a mask's or the
-## selection's) with `color` at `opacity`, over the document as `draw` drew
-## it, at the view's level, only the cells on screen. A cell without a tile
-## is wholly covered in a mask (`mask`), wholly left out in a selection.
+## selection's, its tiles `coverage_level` pyramid levels down: a preview's)
+## with `color` at `opacity`, over the document as `draw` drew it, at the
+## view's level, only the cells on screen. A cell without a tile is wholly
+## covered in a mask (`mask`), wholly left out in a selection.
 func draw_matte(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64,
-                coverage: const Tiles*, mask: bool, color: f32[3], opacity: f32) -> !:
+                coverage: const Tiles*, coverage_level: u32, mask: bool, color: f32[3], opacity: f32) -> !:
     let checked = try target.get()
     let pipeline = try canvas.quick_pipeline()
     let clipped = try checked.clipped(rectangle)
@@ -160,7 +141,8 @@ func draw_matte(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectang
     let placement = try checked.placement()
     let composer = canvas.composer else return
     composer.hold()
-    let level = view_level(zoom)
+    let level = max_u32(view_level(zoom), coverage_level)
+    let within = level - coverage_level
     let span = (f64)((u64)tile_size << level)
     let step = (f64)(1u64 << level)
     for row in 0..<level_cells(canvas.extent_y, level):
@@ -173,7 +155,7 @@ func draw_matte(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectang
             let height = (f64)covered_y * step * zoom
             if left >= rectangle.x + rectangle.width or top >= rectangle.y + rectangle.height or left + width <= rectangle.x or top + height <= rectangle.y:
                 continue
-            let found = try composer.level_texture(coverage, column, row, level, mask)
+            let found = try composer.level_texture(coverage, column, row, within, mask)
             if found == none and mask:
                 # A mask reveals where it has no tile: nothing to cover.
                 continue

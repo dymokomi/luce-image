@@ -15,7 +15,8 @@ import time
 import memory
 from tiles import tile_size
 from luce_image.selection_cells import Cells, each
-from luce_image.selection_modify import Window, settled_value, keep_middle, gather, ramp, extreme_rows, extreme_columns, box_rows, box_columns
+from raster_errors import invalid
+from luce_image.selection_modify import Window, settled_value, gather, ramp, extreme_rows, extreme_columns, box_rows, box_columns
 
 ## The refinement, in Photoshop's units.
 pub struct Refinement:
@@ -42,6 +43,29 @@ pub struct Refinement:
     ## Whether it changes anything at all.
     pub func changes() -> bool:
         return self.radius > 0 or self.smooth > 0 or self.feather > 0 or self.contrast > 0.0 or self.shift != 0.0
+
+    ## The same refinement for a selection `level` pyramid levels down (a
+    ## preview's): each distance in that level's pixels, rounded, and one at
+    ## least where it is set, so a small setting still shows.
+    pub func at_level(level: u32) -> Refinement:
+        return Refinement(radius = scaled(self.radius, level), smooth = scaled(self.smooth, level), feather = scaled(self.feather, level),
+                          contrast = self.contrast, shift = self.shift)
+
+    ## Whether each setting is in Photoshop's range.
+    pub func check() -> !:
+        if self.radius < 0 or self.radius > 250 or self.smooth < 0 or self.smooth > 100 or self.feather < 0 or self.feather > 250:
+            error(invalid, "Select and Mask takes a radius and feather of 0..250 and smoothing of 0..100")
+        if not math.is_finite(self.contrast) or self.contrast < 0.0 or self.contrast > 100.0 or not math.is_finite(self.shift) or self.shift < -100.0 or self.shift > 100.0:
+            error(invalid, "Select and Mask takes a contrast of 0..100 and a shift of -100..100")
+
+    pub func equals(other: Refinement) -> bool:
+        return self.radius == other.radius and self.smooth == other.smooth and self.feather == other.feather and self.contrast == other.contrast and self.shift == other.shift
+
+## `distance` document pixels in pixels of `level`.
+func scaled(distance: i64, level: u32) -> i64:
+    if distance <= 0 or level == 0:
+        return distance
+    return math.imax(1, (distance + ((i64)1 << (i64)(level - 1))) >> (i64)level)
 
 ## The cells `refine` works out (the rest keep one value): -1 at those, the
 ## value to keep elsewhere, into `values`; how many there are.
@@ -82,7 +106,20 @@ pub struct CellBox:
     pub var right: i64 = 0
     pub var bottom: i64 = 0
 
-    func holds(cells: const Cells*, index: usize) -> bool:
+    pub func equals(other: CellBox) -> bool:
+        if self.everything or other.everything:
+            return self.everything == other.everything
+        return self.left == other.left and self.top == other.top and self.right == other.right and self.bottom == other.bottom
+
+    ## Whether every cell `other` holds, this holds too.
+    pub func covers(other: CellBox) -> bool:
+        if self.everything:
+            return true
+        if other.everything:
+            return false
+        return other.left >= self.left and other.top >= self.top and other.right <= self.right and other.bottom <= self.bottom
+
+    pub func holds(cells: const Cells*, index: usize) -> bool:
         if self.everything:
             return true
         let x = cells.origin_x(index)
@@ -95,28 +132,125 @@ pub struct CellBox:
 pub func refine(cells: Cells*, luma: const Cells*?, refinement: Refinement, limit: CellBox) -> !:
     if not refinement.changes():
         return
-    let count = cells.count()
-    let values = try alloc i64[count] in memory.heap
-    defer free(values) in memory.heap
-    let pending = pending_cells(cells, refinement, limit, values)
-    let items = try alloc usize[pending] in memory.heap
-    defer free(items) in memory.heap
-    var before = try cells.copy()
-    defer before.destroy()
-    var at: usize = 0
-    for index in 0..<count:
-        if values[index] == -1:
-            items[at] = index
-            at += 1
-            discard(cells.fresh(index))
-        elif values[index] >= 0 and cells.uniform(index) != values[index]:
-            cells.fill(index, (u8)values[index])
-    var curve: u8[256]
-    tone_curve(refinement, &curve)
-    var job = RefineJob(source = &before, target = cells, luma = luma, items = items, refinement = refinement, curve = curve, failed = false)
-    each(pending, (void*)&job, refine_item)
-    if job.failed:
+    let work = try RefineWork.prepare(cells, luma, refinement, limit, none, CellBox())
+    defer RefineWork.destroy(work)
+    if not work.run():
         error(memory.exhausted, "out of memory refining the selection")
+    let result = try work.take()
+    cells.destroy()
+    *cells = result
+
+## A refinement laid out on the main thread (`prepare`), worked out on any
+## thread (`run`, which a `cancel` from elsewhere cuts short), and taken back
+## on the main thread (`take`). It holds its own copies of the source and the
+## lightness, sharing their cells: block reference counts only ever change on
+## the main thread, so the thread working reads bytes nothing else writes.
+pub struct RefineWork:
+    ## The cells refined into: one value, a block shared from the source or
+    ## from earlier work, or a fresh block `run` fills.
+    var target: Cells
+    var source: Cells
+    var luma: Cells
+    var guided: bool
+    ## The cells `run` works out (1 there), in `units`.
+    var marks: u8[]
+    var units: Unit[]
+    var count: usize
+    var refinement: Refinement
+    var curve: u8[256]
+    var cancelled: @bool
+    var failed: @bool
+
+    ## `source` refined as `refinement` says in the cells `limit` holds, the
+    ## edge detection guided by `luma` (none skips it); the edge cells outside
+    ## it are kept as they are, or with `clear_outside` (a preview's, whose
+    ## GPU tiles should cost only what it shows) left clear. Cells `reused`
+    ## holds are shared from `reuse` rather than worked out again: the same
+    ## refinement of the same source, done before.
+    pub static func prepare(source: const Cells*, luma: const Cells*?, refinement: Refinement, limit: CellBox, reuse: const Cells*?, reused: CellBox,
+                            clear_outside: bool = false) -> RefineWork*!:
+        let count = source.count()
+        let values = try alloc i64[count] in memory.heap
+        defer free(values) in memory.heap
+        var pending = pending_cells(source, refinement, limit, values)
+        if reuse != none:
+            for index in 0..<count:
+                if values[index] == -1 and not reused.everything and reused.holds(source, index):
+                    values[index] = -3
+                    pending -= 1
+        var target = try Cells.create(source.extent_x, source.extent_y)
+        errdefer target.destroy()
+        let marks = try alloc u8[count] in memory.heap
+        errdefer free(marks) in memory.heap
+        memory.set(marks, 0)
+        for index in 0..<count:
+            let value = values[index]
+            if value == -1:
+                marks[index] = 1
+                discard(target.fresh(index))
+            elif value == -2:
+                if not clear_outside:
+                    target.share(index, source, index)
+            elif value == -3:
+                target.share(index, reuse else trap("reused cells come from earlier work"), index)
+            else:
+                target.fill(index, (u8)value)
+        var no_luma = try Cells.create(1, 1)
+        errdefer no_luma.destroy()
+        var guided = false
+        if let guide = luma:
+            if refinement.radius > 0:
+                no_luma.destroy()
+                no_luma = try guide.copy()
+                guided = true
+        var copy = try source.copy()
+        errdefer copy.destroy()
+        var curve: u8[256]
+        tone_curve(refinement, &curve)
+        let units = try group_units(source, marks, pending, refinement.apron())
+        errdefer free(units) in memory.heap
+        let work = try new RefineWork(target = target, source = copy, luma = no_luma, guided = guided, marks = marks, units = units, count = pending,
+                                      refinement = refinement, curve = curve) in memory.heap
+        work.cancelled.store(false, .relaxed)
+        work.failed.store(false, .relaxed)
+        return work
+
+    ## How many cells `run` works out.
+    pub func pending() -> usize:
+        return self.count
+
+    ## Work out every pending cell on every processor: false when cut short
+    ## by `cancel` or out of memory (`out_of_memory` tells which).
+    pub mutating func run() -> bool:
+        each(self.units.length, (void*)&self, refine_item)
+        return not self.cancelled.load(.acquire) and not self.failed.load(.acquire)
+
+    ## Stop `run` at the next cell (or pass) it reaches, from any thread.
+    pub mutating func cancel():
+        self.cancelled.store(true, .release)
+
+    pub func out_of_memory() -> bool:
+        return self.failed.load(.acquire)
+
+    pub func was_cancelled() -> bool:
+        return self.cancelled.load(.acquire)
+
+    ## The refined cells, settled, handed over (after a `run` that finished).
+    pub mutating func take() -> Cells!:
+        discard(try self.target.settle())
+        let taken = self.target
+        self.target = try Cells.create(1, 1)
+        return taken
+
+    ## Let the work go, on the main thread.
+    pub static func destroy(work: RefineWork*):
+        work.target.destroy()
+        work.source.destroy()
+        work.luma.destroy()
+        free(work.marks) in memory.heap
+        if work.units.length > 0:
+            free(work.units) in memory.heap
+        free(work) in memory.heap
 
 ## Contrast then Shift Edge as one table: contrast steepens the soft edge
 ## about half coverage (all the way at 100), shift bends it out or in.
@@ -128,60 +262,138 @@ func tone_curve(refinement: Refinement, curve: u8[256]*):
         level = math.pow(level, power)
         (*curve)[value] = (u8)math.imin(255, (i64)(level * 255.0 + 0.5))
 
-struct RefineJob:
-    var source: const Cells*
-    var target: const Cells*
-    var luma: const Cells*?
-    var items: const usize[]
-    var refinement: Refinement
-    var curve: u8[256]
-    var failed: bool
+## Cells worked out through one window: a square of whole cells, `columns`
+## by `rows` from (`column`, `row`), some of them pending.
+struct Unit:
+    var column: i64
+    var row: i64
+    var columns: i64
+    var rows: i64
 
-## Work out one cell: its window, edge detection, the separable passes, the curve.
+## Most bytes a window over several cells may take (the cells' own and the
+## apron round them); one cell's window may take more.
+let group_window: i64 = 4194304
+
+## Fewer pending cells than this keep a window each, to be shared out over
+## every processor.
+let group_least: usize = 64
+
+## The windows `run` works through. A window's apron costs as much as the
+## cells in it when the apron is wide, so where several pending cells sit
+## together a square of them shares one window, as large as keeps within
+## `group_window`, when that is less work than a window each; alone, each
+## has its own.
+func group_units(cells: const Cells*, marks: const u8[], pending: usize, apron: i64) -> Unit[]!:
+    let cell = (i64)tile_size
+    let single = (cell + 2 * apron) * (cell + 2 * apron)
+    var group: i64 = 1
+    while pending >= group_least and group < 8 and (2 * group * cell + 2 * apron) * (2 * group * cell + 2 * apron) <= math.imax(single, group_window):
+        group *= 2
+    let columns = (i64)cells.columns()
+    let rows = (i64)cells.rows()
+    let found = try alloc Unit[pending] in memory.heap
+    defer free(found) in memory.heap
+    var count: usize = 0
+    var row: i64 = 0
+    while row < rows:
+        var column: i64 = 0
+        while column < columns:
+            let across = math.imin(group, columns - column)
+            let down = math.imin(group, rows - row)
+            var inside: i64 = 0
+            for y in row..<row + down:
+                for x in column..<column + across:
+                    inside += (i64)marks[(usize)(y * columns + x)]
+            let width = math.imin((column + across) * cell, (i64)cells.extent_x) - column * cell + 2 * apron
+            let height = math.imin((row + down) * cell, (i64)cells.extent_y) - row * cell + 2 * apron
+            if inside > 1 and width * height < inside * single:
+                found[count] = Unit(column = column, row = row, columns = across, rows = down)
+                count += 1
+            else:
+                for y in row..<row + down:
+                    for x in column..<column + across:
+                        if marks[(usize)(y * columns + x)] == 1:
+                            found[count] = Unit(column = x, row = y, columns = 1, rows = 1)
+                            count += 1
+            column += group
+        row += group
+    let units = try alloc Unit[count] in memory.heap
+    for index in 0..<count:
+        units[index] = found[index]
+    return units
+
+## Work out one unit's cells: their window, edge detection, the separable
+## passes, the curve. A cancel is looked for between the passes, so a stale
+## preview stops soon.
 func refine_item(context: void*?, item: usize):
-    let job = (RefineJob*)(context else return)
-    let cells = job.source
-    let index = job.items[item]
-    let refinement = job.refinement
+    let work = (RefineWork*)(context else return)
+    if work.cancelled.load(.relaxed) or work.failed.load(.relaxed):
+        return
+    let cells = &work.source
+    let part = work.units[item]
+    let refinement = work.refinement
     let apron = refinement.apron()
-    let width = cells.cell_width(index)
-    let height = cells.cell_height(index)
-    var window = Window(left = cells.origin_x(index) - apron, top = cells.origin_y(index) - apron,
-                        width = width + 2 * apron, height = height + 2 * apron, extent_x = (i64)cells.extent_x, extent_y = (i64)cells.extent_y)
+    let cell = (i64)tile_size
+    let left = part.column * cell
+    let top = part.row * cell
+    let width = math.imin((part.column + part.columns) * cell, (i64)cells.extent_x) - left
+    let height = math.imin((part.row + part.rows) * cell, (i64)cells.extent_y) - top
+    var window = Window(left = left - apron, top = top - apron, width = width + 2 * apron, height = height + 2 * apron,
+                        extent_x = (i64)cells.extent_x, extent_y = (i64)cells.extent_y)
     let size = (usize)(window.width * window.height)
     let a = alloc u8[size] in memory.heap catch failure:
-        job.failed = true
+        work.failed.store(true, .release)
         return
     defer free(a) in memory.heap
     let b = alloc u8[size] in memory.heap catch failure:
-        job.failed = true
+        work.failed.store(true, .release)
         return
     defer free(b) in memory.heap
     let scratch = alloc u8[(usize)math.imax(window.width, window.height) * 2] in memory.heap catch failure:
-        job.failed = true
+        work.failed.store(true, .release)
         return
     defer free(scratch) in memory.heap
     gather(cells, &window, a)
     var margin: i64 = 0
-    if refinement.radius > 0:
-        if let guide = job.luma:
-            if not detect_edges(a, b, guide, &window, refinement, scratch):
-                job.failed = true
-                return
-            margin = refinement.radius + refinement.reach()
+    if refinement.radius > 0 and work.guided:
+        if not detect_edges(a, b, &work.luma, &window, refinement, scratch):
+            work.failed.store(true, .release)
+            return
+        margin = refinement.radius + refinement.reach()
+        if work.cancelled.load(.relaxed):
+            return
     if refinement.smooth > 0:
         box_rows(a, b, &window, refinement.smooth, margin)
         window.clear_outside(b)
         box_columns(b, a, &window, refinement.smooth, margin + refinement.smooth)
         ramp(a)
         margin += refinement.smooth
+        if work.cancelled.load(.relaxed):
+            return
     if refinement.feather > 0:
         box_rows(a, b, &window, refinement.feather, margin)
         window.clear_outside(b)
         box_columns(b, a, &window, refinement.feather, margin + refinement.feather)
-    for at in 0..<size:
-        a[at] = job.curve[(usize)a[at]]
-    keep_middle(job.target, index, a, &window, apron, width, height)
+    let columns = (i64)cells.columns()
+    for row in part.row..<part.row + part.rows:
+        for column in part.column..<part.column + part.columns:
+            let index = (usize)(row * columns + column)
+            if work.marks[index] == 1:
+                keep_cell(work, index, a, &window)
+
+## Cell `index`'s part of the window, through the curve, into its block.
+func keep_cell(work: RefineWork*, index: usize, current: const u8[], window: const Window*):
+    let result = (work.target.block(index) else return).bytes
+    memory.set(result, 0)
+    let cells = &work.source
+    let x = cells.origin_x(index) - window.left
+    let y = cells.origin_y(index) - window.top
+    let width = (usize)cells.cell_width(index)
+    for row in 0..<cells.cell_height(index):
+        let start = (usize)((y + row) * window.width + x)
+        let line = (usize)row * (usize)tile_size
+        for at in 0..<width:
+            result[line + at] = work.curve[(usize)current[start + at]]
 
 ## Edge detection in the window: within `radius` of the edge (the selection
 ## grown less the selection shrunk, the unknown band), each pixel's coverage
@@ -263,17 +475,31 @@ func box_float(source: const f32[], target: f32[], window: const Window*, radius
                 total -= (f64)source[row + (usize)(x - radius - 1)]
             let count = math.imin(width - 1, x + radius) - math.imax(0, x - radius) + 1
             line[row + (usize)x] = (f32)(total / (f64)count)
+    # Down the columns a whole row at a time, so the memory is walked in order.
+    let totals = alloc f64[(usize)width] in memory.heap catch failure:
+        trap("out of memory in Select and Mask's edge detection")
+    defer free(totals) in memory.heap
     for x in 0..<width:
-        var total: f64 = 0.0
-        for y in 0..<math.imin(radius, height):
-            total += (f64)line[(usize)(y * width + x)]
-        for y in 0..<height:
-            if y + radius < height:
-                total += (f64)line[(usize)((y + radius) * width + x)]
-            if y - radius - 1 >= 0:
-                total -= (f64)line[(usize)((y - radius - 1) * width + x)]
-            let count = math.imin(height - 1, y + radius) - math.imax(0, y - radius) + 1
-            target[(usize)(y * width + x)] = (f32)(total / (f64)count)
+        totals[(usize)x] = 0.0
+    for y in 0..<math.imin(radius, height):
+        let row = (usize)(y * width)
+        for x in 0..<(usize)width:
+            totals[x] += (f64)line[row + x]
+    for y in 0..<height:
+        let adding = y + radius < height
+        let leaving = y - radius - 1 >= 0
+        let added = (usize)((y + radius) * width)
+        let left = (usize)((y - radius - 1) * width)
+        let inverse = 1.0 / (f64)(math.imin(height - 1, y + radius) - math.imax(0, y - radius) + 1)
+        let row = (usize)(y * width)
+        for x in 0..<(usize)width:
+            var total = totals[x]
+            if adding:
+                total += (f64)line[added + x]
+            if leaving:
+                total -= (f64)line[left + x]
+            totals[x] = total
+            target[row + x] = (f32)(total * inverse)
 
 # mark: Tests ===================================================================================
 
@@ -421,3 +647,26 @@ test "refining a 15000 by 24000 selection works out only the cells along its edg
     try refine(&cells, &luma, refinement, CellBox())
     assert(time.now() - started < 30000000000)
     assert(cells.at(5000, 10000) == 255 and cells.at(100, 100) == 0 and cells.at(1024, 10000) > 0 and cells.at(1024, 10000) < 255)
+
+## A checkerboard of odd-sized squares: an edge in every cell.
+func checkers(x: i64, y: i64) -> u8:
+    return 255 if (x // 97 + y // 131) % 2 == 0 else 0
+
+test "pending cells side by side share a window and refine as they would alone":
+    var luma = try painted(2600, 2300, lit)
+    defer luma.destroy()
+    let dense = try alloc u8[2600 * 2300] in memory.heap
+    defer free(dense) in memory.heap
+    for refinement in [Refinement(feather = 9), Refinement(radius = 14, smooth = 3, feather = 4, contrast = 20.0)]:
+        var cells = try painted(2600, 2300, checkers)
+        defer cells.destroy()
+        let work = try RefineWork.prepare(&cells, &luma, refinement, CellBox(), none, CellBox())
+        defer RefineWork.destroy(work)
+        # Every cell pending, in fewer windows than cells.
+        assert(work.pending() == cells.count() and work.units.length < cells.count() // 3)
+        dense_refine(&cells, &luma, refinement, dense)
+        try refine(&cells, &luma, refinement, CellBox())
+        for y in 0..<(i64)2300:
+            for x in 0..<(i64)2600:
+                if cells.at(x, y) != dense[(usize)(y * 2600 + x)]:
+                    trap(f"refine differs at {x}, {y}: {cells.at(x, y)} vs {dense[(usize)(y * 2600 + x)]}")

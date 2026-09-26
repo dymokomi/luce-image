@@ -1,0 +1,233 @@
+## A selection's cells taken through a warp (a backwards map, as Free
+## Transform and Distort use), bilinear: Select › Transform Selection.
+##
+## Only the cells the moved edge crosses cost anything. A cell whose corners
+## map back where the selection is one value throughout (or wholly outside
+## its box) takes that value without sampling. Every other cell gathers the
+## source pixels its footprint covers into a window once, whole rows of each
+## source cell at a time, then walks its pixels stepping the map along each
+## row: no division or cell lookup per tap, so a transform of a
+## 360-megapixel selection costs its edge.
+import math
+import memory
+from tiles import tile_size
+from luce_image.projective import Warp, quad_warp, affine_warp
+from luce_image.selection_cells import Cells, Covered, each
+from luce_image.selection_modify import Window, gather
+from luce_image.selection_refine import CellBox
+
+## Past this many bytes a cell's footprint (a warp shrinking the selection
+## hard) is sampled tap by tap instead of gathered.
+let window_limit: i64 = 4194304
+
+## `source` (whose selected pixels lie within `covered`) taken through
+## `warp`, only in the cells `limit` holds; the rest are left clear (a
+## preview's cells off screen). What leaves the document is dropped.
+pub func warp_cells(source: const Cells*, covered: Covered, warp: Warp, limit: CellBox) -> Cells!:
+    var target = try Cells.create(source.extent_x, source.extent_y)
+    errdefer target.destroy()
+    var job = WarpJob(source = source, covered = covered, target = &target, warp = warp, limit = limit, failed = false)
+    each(target.count(), (void*)&job, warp_item)
+    if job.failed:
+        error(memory.exhausted, "out of memory transforming the selection")
+    return target
+
+struct WarpJob:
+    var source: const Cells*
+    var covered: Covered
+    var target: Cells*
+    var warp: Warp
+    var limit: CellBox
+    var failed: bool
+
+## One cell of the warped selection.
+func warp_item(context: void*?, index: usize):
+    let job = (WarpJob*)(context else return)
+    if not job.limit.holds(job.target, index):
+        return
+    let settled = settled_warp(job, index)
+    if settled >= 0:
+        job.target.fill(index, (u8)settled)
+        return
+    let origin_x = job.target.origin_x(index)
+    let origin_y = job.target.origin_y(index)
+    let width = job.target.cell_width(index)
+    let height = job.target.cell_height(index)
+    var reach = Reach()
+    if not footprint(job.warp, origin_x, origin_y, width, height, &reach) or (reach.right - reach.left) * (reach.bottom - reach.top) > window_limit:
+        tap_cell(job, index)
+        return
+    var window = Window(left = reach.left, top = reach.top, width = reach.right - reach.left, height = reach.bottom - reach.top,
+                        extent_x = (i64)job.source.extent_x, extent_y = (i64)job.source.extent_y)
+    let pixels = alloc u8[(usize)(window.width * window.height)] in memory.heap catch failure:
+        job.failed = true
+        return
+    defer free(pixels) in memory.heap
+    gather(job.source, &window, pixels)
+    let bytes = job.target.fresh(index)
+    let m = job.warp.m
+    for row in 0..<height:
+        # The map's numerators and denominator at the row's first pixel
+        # centre, stepped a pixel along: one division a pixel, none when affine.
+        let py = (f64)(origin_y + row) + 0.5
+        let px = (f64)origin_x + 0.5
+        var nx = m[0] * px + m[1] * py + m[2]
+        var ny = m[3] * px + m[4] * py + m[5]
+        var nw = m[6] * px + m[7] * py + m[8]
+        let line = (usize)row * (usize)tile_size
+        for column in 0..<width:
+            var value: u8 = 0
+            if nw > 1e-9:
+                let sx = nx / nw - 0.5 - (f64)window.left
+                let sy = ny / nw - 0.5 - (f64)window.top
+                value = bilinear(pixels, &window, sx, sy)
+            bytes[line + (usize)column] = value
+            nx += m[0]
+            ny += m[3]
+            nw += m[6]
+
+## Coverage at window point (`sx`, `sy`) (pixel centres at whole numbers),
+## bilinear; clear past the window, which the footprint's slack keeps away.
+func bilinear(pixels: const u8[], window: const Window*, sx: f64, sy: f64) -> u8:
+    let x0 = (i64)math.floor(sx)
+    let y0 = (i64)math.floor(sy)
+    if x0 < 0 or y0 < 0 or x0 + 1 >= window.width or y0 + 1 >= window.height:
+        return 0
+    let fx = sx - (f64)x0
+    let fy = sy - (f64)y0
+    let at = (usize)(y0 * window.width + x0)
+    let below = at + (usize)window.width
+    let upper = (f64)pixels[at] * (1.0 - fx) + (f64)pixels[at + 1] * fx
+    let lower = (f64)pixels[below] * (1.0 - fx) + (f64)pixels[below + 1] * fx
+    return (u8)math.clamp(math.round(upper * (1.0 - fy) + lower * fy), 0.0, 255.0)
+
+## A box of source pixels, one past the last.
+struct Reach:
+    var left: i64 = 0
+    var top: i64 = 0
+    var right: i64 = 0
+    var bottom: i64 = 0
+
+## The source pixels the cell at (`x`, `y`), `width` by `height`, samples:
+## its corners mapped back (a projective map takes a box to a quad within
+## theirs), with slack for the bilinear taps. False where a corner lies past
+## the map's horizon.
+func footprint(warp: Warp, x: i64, y: i64, width: i64, height: i64, reach: Reach*) -> bool:
+    var low_x = 1e300
+    var low_y = 1e300
+    var high_x = -1e300
+    var high_y = -1e300
+    for corner in 0..<(usize)4:
+        var mapped_x = 0.0
+        var mapped_y = 0.0
+        let corner_x = (f64)(x + (width if corner % 2 == 1 else 0))
+        let corner_y = (f64)(y + (height if corner >= 2 else 0))
+        if not warp.map(corner_x, corner_y, &mapped_x, &mapped_y):
+            return false
+        low_x = math.min(low_x, mapped_x)
+        low_y = math.min(low_y, mapped_y)
+        high_x = math.max(high_x, mapped_x)
+        high_y = math.max(high_y, mapped_y)
+    *reach = Reach(left = (i64)math.floor(low_x) - 2, top = (i64)math.floor(low_y) - 2, right = (i64)math.ceil(high_x) + 3, bottom = (i64)math.ceil(high_y) + 3)
+    return true
+
+## One cell sampled tap by tap: a footprint too big to gather, or one
+## reaching past the map's horizon.
+func tap_cell(job: WarpJob*, index: usize):
+    let origin_x = job.target.origin_x(index)
+    let origin_y = job.target.origin_y(index)
+    let bytes = job.target.fresh(index)
+    for row in 0..<job.target.cell_height(index):
+        for column in 0..<job.target.cell_width(index):
+            var x = 0.0
+            var y = 0.0
+            var value = 0.0
+            if job.warp.map((f64)(origin_x + column) + 0.5, (f64)(origin_y + row) + 0.5, &x, &y):
+                let sx = x - 0.5
+                let sy = y - 0.5
+                let x0 = (i64)math.floor(sx)
+                let y0 = (i64)math.floor(sy)
+                let fx = sx - (f64)x0
+                let fy = sy - (f64)y0
+                let upper = (f64)sample(job.source, x0, y0) * (1.0 - fx) + (f64)sample(job.source, x0 + 1, y0) * fx
+                let lower = (f64)sample(job.source, x0, y0 + 1) * (1.0 - fx) + (f64)sample(job.source, x0 + 1, y0 + 1) * fx
+                value = upper * (1.0 - fy) + lower * fy
+            bytes[(usize)row * (usize)tile_size + (usize)column] = (u8)math.clamp(math.round(value), 0.0, 255.0)
+
+## Coverage at a pixel, nothing past the document.
+func sample(cells: const Cells*, x: i64, y: i64) -> u8:
+    if x < 0 or y < 0 or x >= (i64)cells.extent_x or y >= (i64)cells.extent_y:
+        return 0
+    return cells.at(x, y)
+
+## The one value cell `index` of the warped selection takes when its corners,
+## mapped back through the warp, land where the selection is that value
+## throughout (a pixel of slack for the bilinear taps); -1 to sample it.
+func settled_warp(job: const WarpJob*, index: usize) -> i64:
+    let source = job.source
+    var reach = Reach()
+    if not footprint(job.warp, job.target.origin_x(index), job.target.origin_y(index), job.target.cell_width(index), job.target.cell_height(index), &reach):
+        return -1
+    # Wholly past the selected pixels' box: nothing.
+    let covered = job.covered
+    if not covered.found or reach.right <= covered.left or reach.bottom <= covered.top or reach.left >= covered.right or reach.top >= covered.bottom:
+        return 0
+    # Past the document is clear, so a cell reaching out is only settled when clear.
+    if reach.left < 0 or reach.top < 0 or reach.right > (i64)source.extent_x or reach.bottom > (i64)source.extent_y:
+        return -1
+    let span = (i64)tile_size
+    var value: i64 = -2
+    for row in (reach.top // span)..<((reach.bottom - 1) // span + 1):
+        for column in (reach.left // span)..<((reach.right - 1) // span + 1):
+            let found = source.uniform((usize)row * (usize)source.columns() + (usize)column)
+            if found < 0 or (value != -2 and found != value):
+                return -1
+            value = found
+    return value
+
+# mark: Tests ===================================================================================
+
+## Cells `width` by `height`: a hard square, a soft ramp across cells and a
+## corner at the document's edge.
+func shapes_cells(width: u32, height: u32) -> Cells!:
+    var cells = try Cells.create(width, height)
+    for index in 0..<cells.count():
+        let bytes = cells.writable(index)
+        for y in 0..<cells.cell_height(index):
+            for x in 0..<cells.cell_width(index):
+                let px = cells.origin_x(index) + x
+                let py = cells.origin_y(index) + y
+                var value: i64 = 0
+                if px >= 100 and px < 380 and py >= 90 and py < 330:
+                    value = 255
+                elif py >= 380 and py < 470:
+                    value = math.imin(255, math.imax(0, (px - 150) * 2))
+                elif px >= 560 and py < 40:
+                    value = 255
+                bytes[(usize)(y * (i64)tile_size + x)] = (u8)value
+    discard(try cells.settle())
+    return cells
+
+test "a gathered, stepped warp matches sampling tap by tap, and a limit leaves the rest clear":
+    var cells = try shapes_cells(600, 520)
+    defer cells.destroy()
+    let covered = try cells.settle()
+    let corners: f64[8] = [60.0, 40.0, 560.0, 90.0, 520.0, 500.0, 30.0, 430.0]
+    let warps: Warp[2] = [try quad_warp(0.0, 0.0, 600.0, 520.0, corners), try affine_warp(0.5, 0.5, 0.2, 40.0, 0.0, 300.0, 260.0)]
+    for warp in warps:
+        var moved = try warp_cells(&cells, covered, warp, CellBox())
+        defer moved.destroy()
+        var tapped = try Cells.create(600, 520)
+        defer tapped.destroy()
+        var job = WarpJob(source = &cells, covered = covered, target = &tapped, warp = warp, limit = CellBox(), failed = false)
+        for index in 0..<tapped.count():
+            tap_cell(&job, index)
+        for y in 0..<(i64)520:
+            for x in 0..<(i64)600:
+                if moved.at(x, y) != tapped.at(x, y):
+                    trap(f"warp differs at {x}, {y}: {moved.at(x, y)} vs {tapped.at(x, y)}")
+    var limited = try warp_cells(&cells, covered, warps[0], CellBox(everything = false, left = 0, top = 0, right = 200, bottom = 200))
+    defer limited.destroy()
+    var whole = try warp_cells(&cells, covered, warps[0], CellBox())
+    defer whole.destroy()
+    assert(limited.at(150, 150) == whole.at(150, 150) and whole.at(300, 300) == 255 and limited.at(300, 300) == 0)

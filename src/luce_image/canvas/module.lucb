@@ -64,9 +64,10 @@ from luce_image.filter import Filters
 import luce_image.filter as filtering
 import luce_image.light_filters as light_filters
 from luce_image.transform import translate, Transformer, Landed, landing, sampling_nearest, sampling_smooth, sampling_high
-from luce_image.projective import Warp, affine_warp, quad_warp
+from luce_image.projective import Warp, affine_warp, quad_warp, multiply
 import luce_image.live_wire as live_wire
-from luce_image.selection_refine import Refinement, CellBox
+from luce_image.selection_refine import Refinement, CellBox, RefineWork, pending_cells, needed_cells
+from luce_image.background import Background, start_background, background_done, join_background
 from luce_image.extent import full_bounds, pieces, relocate, Pieces
 from luce_image.transform_window import Footprint
 from luce_image.transform_preview import warp_preview_cell, lifted_preview_cell
@@ -78,7 +79,7 @@ import psd
 import fonts
 from luce_image.geometry import resize_canvas, resize_image
 from luce_image.selection import Selection
-from luce_image.selection_cells import Mode, block_bytes
+from luce_image.selection_cells import Mode, Cells, block_bytes
 import luce_image.selection_sources as selection_sources
 from luce_image.batched_reads import Piece, read_pieces, no_piece
 from luce_image.shaders import ants_frag_words, ants_frag_msl, quickmask_frag_words, quickmask_frag_msl, encode_frag_words, encode_frag_msl, channels_frag_words, channels_frag_msl
@@ -258,14 +259,12 @@ pub struct Canvas:
     var families: fonts.Names*?
     ## The free transform under way, if any.
     var transform_session: TransformSession*?
-    ## Select › Transform Selection under way: the selection as it began.
-    var selection_origin: Selection*?
+    ## Select › Transform Selection under way (refining.lucb).
+    var selection_warping: SelectionWarping*?
     ## The Magnetic Lasso under way (magnetic.lucb).
     var magnetic: Magnetic*?
-    ## Select and Mask while open: the selection it began from, and how the
-    ## view shows the refined one (masking.lucb).
-    var refine_origin: Selection*?
-    var refine_view: i64
+    ## Select and Mask while open (masking.lucb).
+    var select_mask: SelectMask*?
     ## A filter dialog's preview, shown through the compositor until kept or dropped.
     var filter_stand_in: FilterPreview*?
     ## A gradient being dragged, shown through the compositor until kept or dropped.
@@ -359,10 +358,9 @@ pub struct Canvas:
         self.mesh_cells_made = 0
         self.smudge_spacing = default_smudge_spacing
         self.transform_session = none
-        self.selection_origin = none
+        self.selection_warping = none
         self.magnetic = none
-        self.refine_origin = none
-        self.refine_view = 0
+        self.select_mask = none
         self.filter_stand_in = none
         self.gradient_stand_in = none
         self.coarse_shown = false
@@ -1588,29 +1586,48 @@ pub struct Canvas:
         try begin_refine(&self)
 
     pub func refining() -> bool:
-        return self.refine_origin != none
+        return self.select_mask != none
 
-    ## The selection as it began refined: edge detection `radius` (0..250),
-    ## `smooth` (0..100), `feather` (0..250), `contrast` (0..100%) and
-    ## `shift` edge (-100..100%), worked out only in the box of document
-    ## pixels at (`left`, `top`), `width` by `height` (the view; 0 wide is all).
-    pub mutating func preview_refine(radius: i64, smooth: i64, feather: i64, contrast: f64, shift: f64, left: i64 = 0, top: i64 = 0, width: i64 = 0, height: i64 = 0) -> !:
-        let within = CellBox() if width <= 0 or height <= 0 else CellBox(everything = false, left = left, top = top, right = left + width, bottom = top + height)
-        try show_refined(&self, Refinement(radius = radius, smooth = smooth, feather = feather, contrast = contrast, shift = shift), within)
+    ## Show the selection as it began refined: edge detection `radius`
+    ## (0..250), `smooth` (0..100), `feather` (0..250), `contrast` (0..100%)
+    ## and `shift` edge (-100..100%). Only recorded here: the frames that
+    ## follow work it out at the view's level, over what it shows, on a
+    ## thread of their own (masking.lucb), the latest setting winning.
+    pub mutating func preview_refine(radius: i64, smooth: i64, feather: i64, contrast: f64, shift: f64) -> !:
+        try ask_refine(&self, Refinement(radius = radius, smooth = smooth, feather = feather, contrast = contrast, shift = shift))
 
-    ## OK (`keep`): the whole selection refined so, one step; Cancel: as it was.
+    ## OK (`keep`): the whole selection refined so at full size, one step;
+    ## Cancel: as it was.
     pub mutating func end_refine(keep: bool, radius: i64 = 0, smooth: i64 = 0, feather: i64 = 0, contrast: f64 = 0.0, shift: f64 = 0.0) -> !:
-        try end_refine(&self, keep, Refinement(radius = radius, smooth = smooth, feather = feather, contrast = contrast, shift = shift))
+        if keep and self.select_mask != none:
+            try ask_refine(&self, Refinement(radius = radius, smooth = smooth, feather = feather, contrast = contrast, shift = shift))
+        try end_refine(&self, keep)
 
     ## How the view shows the selection while refining: 0 marching ants,
     ## 1 a red overlay, 2 on black, 3 on white.
     pub mutating func set_refine_view(mode: i64) -> !:
         if mode < 0 or mode > 3:
             error(invalid, "the view is 0 ants, 1 overlay, 2 on black or 3 on white")
-        self.refine_view = mode
+        let session = self.select_mask else error(invalid, "Select and Mask is not open")
+        session.view = mode
 
     pub func refine_view_mode() -> i64:
-        return self.refine_view
+        let session = self.select_mask else return refine_ants
+        return session.view
+
+    ## The pyramid level the last finished preview shows, -1 when none does
+    ## (none asked for yet, or no frame drawn since).
+    pub func refine_preview_level() -> i64:
+        let session = self.select_mask else return -1
+        if session.shown.selection == none:
+            return -1
+        return (i64)session.shown.level
+
+    ## Wait for a preview working on its own thread and take it in: for
+    ## tests and scripts that look at it before the next frame.
+    pub mutating func wait_previews() -> !:
+        let session = self.select_mask else return
+        try collect_refine(session, true)
 
     # mark: Magnetic Lasso ======================================================================
 
@@ -1727,7 +1744,7 @@ pub struct Canvas:
         try begin_selection_transform(&self)
 
     pub func transforming_selection() -> bool:
-        return self.selection_origin != none
+        return self.selection_warping != none
 
     ## The selection as it began, scaled, turned by `angle` degrees about the
     ## pivot and moved, as Free Transform's box has it.
@@ -1768,7 +1785,9 @@ pub struct Canvas:
     ## with the same rectangle, zoom and offset; `phase` animates the dashes.
     ## While Quick Mask is on, the masked part is tinted instead.
     pub mutating func draw_selection(target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, phase: f64) -> !:
-        if try draw_refine_view(&self, target, rectangle, zoom, offset_x, offset_y):
+        if try draw_refine_view(&self, target, rectangle, zoom, offset_x, offset_y, phase):
+            return
+        if try draw_selection_warp(&self, target, rectangle, zoom, offset_x, offset_y, phase):
             return
         if self.quick_mask():
             try self.require_open()
@@ -2090,7 +2109,7 @@ pub struct Canvas:
     ## tiles coming back in the background while coarser ones stand in): the
     ## view keeps drawing until it is done.
     pub func busy() -> bool:
-        return self.warp != none or self.coarse_shown or prefetch_pending()
+        return self.warp != none or self.coarse_shown or prefetch_pending() or refine_busy(&self)
 
     ## Wait for a smudge still finishing and keep it. Everything that
     ## changes or reads the whole document calls this first.
@@ -3230,9 +3249,6 @@ pub struct Canvas:
         if self.history_count == 0:
             error(invalid, "nothing to undo")
         let document = self.document else trap("history without a document")
-        # Taking back the step that turned Quick Mask on takes it down first.
-        if self.quick_mask() and self.history[self.history_count - 1].name == "Quick Mask" and self.history[self.history_count - 1].state != none:
-            drop_quick_mask(&self)
         # An edit may have remembered several snapshots; they go back together.
         while self.history_count > 0:
             let entry = self.history[self.history_count - 1]

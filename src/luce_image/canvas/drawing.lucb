@@ -179,9 +179,16 @@ func draw_canvas_selection(canvas: Canvas*, target: interop.View[gpu.RenderTarge
         return
     if not math.is_finite(zoom) or zoom <= 0.0 or not math.is_finite(phase):
         error(invalid, "zoom must be positive and the phase finite")
-    let checked = try target.get()
     let document = canvas.document else return
     let tiles = (try document.selection_tiles()) else return
+    try draw_ants(canvas, target, rectangle, zoom, offset_x, offset_y, phase, tiles, 0)
+
+## Marching ants along the edge of the selection `coverage` holds (its tiles
+## `coverage_level` pyramid levels down: a preview's), over the document as
+## `draw` drew it.
+func draw_ants(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, phase: f64,
+               coverage: const Tiles*, coverage_level: u32) -> !:
+    let checked = try target.get()
     let pipeline = try canvas.ants_pipeline()
     let clipped = try checked.clipped(rectangle)
     defer clipped.release()
@@ -191,10 +198,12 @@ func draw_canvas_selection(canvas: Canvas*, target: interop.View[gpu.RenderTarge
     # gl_FragCoord counts from the frame's corner, not this target's.
     let placement = try checked.placement()
     # At the view's level: the ants follow the edge a texel a point, and the
-    # cells drawn are the screen's, whatever the document's size.
+    # cells drawn are the screen's, whatever the document's size. A preview
+    # coarser than the view is drawn at its own level, scaled up.
     let composer = canvas.composer else return
     composer.hold()
-    let level = view_level(zoom)
+    let level = max_u32(view_level(zoom), coverage_level)
+    let within = level - coverage_level
     let span = (f64)((u64)tile_size << level)
     let step = (f64)(1u64 << level)
     for row in 0..<level_cells(canvas.extent_y, level):
@@ -208,9 +217,9 @@ func draw_canvas_selection(canvas: Canvas*, target: interop.View[gpu.RenderTarge
             if left >= rectangle.x + rectangle.width or top >= rectangle.y + rectangle.height or left + width <= rectangle.x or top + height <= rectangle.y:
                 continue
             # A cell with nothing selected still draws the edge with the cell after it.
-            let own = try composer.level_texture(tiles, column, row, level)
-            let right = try composer.level_texture(tiles, column + 1, row, level)
-            let below = try composer.level_texture(tiles, column, row + 1, level)
+            let own = try composer.level_texture(coverage, column, row, within)
+            let right = try composer.level_texture(coverage, column + 1, row, within)
+            let below = try composer.level_texture(coverage, column, row + 1, within)
             if own == none and right == none and below == none:
                 continue
             let texture = own else composer_blank(canvas)

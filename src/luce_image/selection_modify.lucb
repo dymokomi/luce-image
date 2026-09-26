@@ -262,11 +262,64 @@ pub func extreme_rows(source: const u8[], target: u8[], window: const Window*, r
         let line = (usize)(y * width)
         extreme_line(source, target, line, 1, width, radius, grow, scratch)
 
-## As `extreme_rows`, down every good column.
+## As `extreme_rows`, down every good column: the same running extremes,
+## a whole row of columns at a time so the memory is walked in order.
 pub func extreme_columns(source: const u8[], target: u8[], window: const Window*, radius: i64, grow: bool, margin: i64, scratch: u8[]):
-    let width = window.width
-    for x in margin..<width - margin:
-        extreme_line(source, target, (usize)x, (usize)width, window.height, radius, grow, scratch)
+    discard(scratch)
+    let width = (usize)window.width
+    let height = window.height
+    let first = (usize)margin
+    let last = (usize)math.imax(margin, window.width - margin)
+    if last <= first or height <= 0:
+        return
+    let run = 2 * radius + 1
+    let forward = alloc u8[source.length] in memory.heap catch failure:
+        # No room for the rows at once: a column at a time.
+        let line = alloc u8[(usize)height * 2] in memory.heap catch again:
+            trap("out of memory in a selection pass")
+        defer free(line) in memory.heap
+        for x in first..<last:
+            extreme_line(source, target, x, width, height, radius, grow, line)
+        return
+    defer free(forward) in memory.heap
+    let backward = alloc u8[source.length] in memory.heap catch failure:
+        trap("out of memory in a selection pass")
+    defer free(backward) in memory.heap
+    # Extremes from each block of rows' start downwards, and from its end upwards.
+    var at: i64 = 0
+    while at < height:
+        let end = math.imin(at + run, height)
+        for y in at..<end:
+            let row = (usize)y * width
+            if y == at:
+                memory.copy(forward[row + first..<row + last], source[row + first..<row + last], last - first)
+                continue
+            let above = row - width
+            for x in first..<last:
+                let sample = source[row + x]
+                let value = forward[above + x]
+                forward[row + x] = (sample if sample > value else value) if grow else (sample if sample < value else value)
+        var y = end - 1
+        while y >= at:
+            let row = (usize)y * width
+            if y == end - 1:
+                memory.copy(backward[row + first..<row + last], source[row + first..<row + last], last - first)
+            else:
+                let below = row + width
+                for x in first..<last:
+                    let sample = source[row + x]
+                    let value = backward[below + x]
+                    backward[row + x] = (sample if sample > value else value) if grow else (sample if sample < value else value)
+            y -= 1
+        at = end
+    for place in radius..<height - radius:
+        let low_row = (usize)(place - radius) * width
+        let high_row = (usize)(place + radius) * width
+        let row = (usize)place * width
+        for x in first..<last:
+            let low = backward[low_row + x]
+            let high = forward[high_row + x]
+            target[row + x] = (low if low > high else high) if grow else (low if low < high else high)
 
 ## One line of `length` values from `start`, `stride` apart: each place from
 ## `radius` to `length - radius` takes the extreme over its run.
@@ -302,10 +355,35 @@ pub func box_rows(source: const u8[], target: u8[], window: const Window*, radiu
     for y in margin..<window.height - margin:
         box_line(source, target, (usize)(y * window.width), 1, window.width, radius)
 
-## As `box_rows`, down every good column.
+## As `box_rows`, down every good column: a running sum for each column,
+## a whole row of them at a time so the memory is walked in order.
 pub func box_columns(source: const u8[], target: u8[], window: const Window*, radius: i64, margin: i64):
-    for x in margin..<window.width - margin:
-        box_line(source, target, (usize)x, (usize)window.width, window.height, radius)
+    let width = (usize)window.width
+    let height = window.height
+    let first = (usize)margin
+    let last = (usize)math.imax(margin, window.width - margin)
+    if height <= 2 * radius or last <= first:
+        return
+    let run = 2 * radius + 1
+    let totals = alloc i64[width] in memory.heap catch failure:
+        for x in first..<last:
+            box_line(source, target, x, width, height, radius)
+        return
+    defer free(totals) in memory.heap
+    for x in first..<last:
+        totals[x] = 0
+    for y in 0..<run - 1:
+        let row = (usize)y * width
+        for x in first..<last:
+            totals[x] += (i64)source[row + x]
+    for place in radius..<height - radius:
+        let adding = (usize)(place + radius) * width
+        let row = (usize)place * width
+        let leaving = (usize)(place - radius) * width
+        for x in first..<last:
+            let total = totals[x] + (i64)source[adding + x]
+            target[row + x] = (u8)(total // run)
+            totals[x] = total - (i64)source[leaving + x]
 
 ## One line: each place from `radius` to `length - radius` takes the mean of
 ## its run, by a running sum.

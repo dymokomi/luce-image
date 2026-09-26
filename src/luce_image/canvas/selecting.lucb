@@ -17,16 +17,18 @@ func tiles_cell_texture(context: void*?, column: u32, row: u32) -> gpu.Texture?!
     let source = (TilesSource*)(context else return none)
     return (try source.tiles.texture(column, row))
 
-## The composited picture (every visible layer) as a selection's pixels.
+## The composited picture (every visible layer) as a selection's pixels, at
+## pyramid `level` (a preview's).
 struct PictureSource:
     var composer: Composer*
     var document: const Document*
     var extent_y: u32
+    var level: u32 = 0
 
 ## Cell (`column`, `row`) of the composited picture: always painted.
 func picture_cell_texture(context: void*?, column: u32, row: u32) -> gpu.Texture?!:
     let source = (PictureSource*)(context else return none)
-    return try source.composer.tile(source.document, column, row, 0)
+    return try source.composer.tile(source.document, column, row, source.level)
 
 ## `Canvas.select_wand` once its pixels have a reader: the wand into the
 ## selection, or through a shape when the selection is being shaped.

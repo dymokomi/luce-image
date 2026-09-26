@@ -24,6 +24,7 @@ shape_render.lucb
 path_layers.lucb
 ranging.lucb
 selecting.lucb
+selection_preview.lucb
 refining.lucb
 magnetic.lucb
 masking.lucb
@@ -46,3 +47,4 @@ moat_tests.lucb
 refine_tests.lucb
 channel_tests.lucb
 mesh_warp_tests.lucb
+selection_timing_tests.lucb
