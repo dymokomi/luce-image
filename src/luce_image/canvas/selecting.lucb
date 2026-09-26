@@ -15,7 +15,7 @@ struct TilesSource:
 ## Cell (`column`, `row`)'s tile; none where none is painted.
 func tiles_cell_texture(context: void*?, column: u32, row: u32) -> gpu.Texture?!:
     let source = (TilesSource*)(context else return none)
-    return source.tiles.texture(column, row)
+    return (try source.tiles.texture(column, row))
 
 ## The composited picture (every visible layer) as a selection's pixels.
 struct PictureSource:

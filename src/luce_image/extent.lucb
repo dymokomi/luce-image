@@ -46,12 +46,12 @@ pub func pieces(tiles: const Tiles*) -> Pieces!:
     var list = Pieces(all = try alloc Piece[room + 1] in memory.heap, count = 0)
     for row in 0..<tiles.rows():
         for column in 0..<tiles.columns():
-            let texture = tiles.texture(column, row) else continue
+            let texture = (try tiles.texture(column, row)) else continue
             list.add(texture, tiles.region(column, row), (i64)(column * tile_size), (i64)(row * tile_size))
     let range = outside else return list
     for row in range.top..<range.bottom:
         for column in range.left..<range.right:
-            let texture = tiles.outside_texture(column, row) else continue
+            let texture = (try tiles.outside_texture(column, row)) else continue
             let x = column * (i64)tile_size
             let y = row * (i64)tile_size
             if not tiles.on_canvas(column, row):
@@ -195,7 +195,7 @@ pub func full_bounds(tiles: const Tiles*) -> Bounds?!:
     defer free(bytes) in memory.heap
     for row in range.top..<range.bottom:
         for column in range.left..<range.right:
-            let texture = tiles.outside_texture(column, row) else continue
+            let texture = (try tiles.outside_texture(column, row)) else continue
             let canvas = canvas_part(tiles, column, row)
             try texture.read(bytes)
             for y in 0..<(usize)tile_size:

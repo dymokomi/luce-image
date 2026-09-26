@@ -15,7 +15,7 @@
 import gpu
 import math
 import memory
-from tiles import Tiles, tile_size
+from tiles import Tiles, tile_size, tile_texture
 from pyramid import Pyramid
 from luce_image.extent import Pieces
 from luce_image.transform_window import Footprint, gather, gather_pieces, level_for, Window
@@ -48,7 +48,7 @@ pub struct Liquifier:
 
     ## liquify.frag with `params` over `window` and `field`, into a tile of its own.
     func shade(params: f32[12]*, window: gpu.Texture, field: gpu.Texture) -> gpu.Texture!:
-        var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        var fresh = try tile_texture(self.owner)
         errdefer fresh.destroy()
         let frame = try fresh.frame()
         defer frame.release()

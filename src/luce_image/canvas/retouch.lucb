@@ -227,7 +227,7 @@ func clone_piece(context: void*?, index: usize) -> Piece!:
         let document = read.canvas.document else error(invalid, "draw the document once before previewing a clone")
         texture = try composer.tile(document, column, row, 0)
     elif let tiles = read.layer.tiles():
-        texture = tiles.texture(column, row)
+        texture = (try tiles.texture(column, row))
     let cell = texture else return no_piece()
     return Piece(texture = cell, region = gpu.Region(0, 0, tile_size, tile_size), present = true)
 

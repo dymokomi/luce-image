@@ -34,7 +34,7 @@ struct CloneSource:
     func tiles_under(left: i64, top: i64, right: i64, bottom: i64) -> bool:
         for row in top..<bottom + 1:
             for column in left..<right + 1:
-                if self.tiles.texture((u32)column, (u32)row) != none:
+                if self.tiles.painted((u32)column, (u32)row):
                     return true
         return false
 
@@ -44,7 +44,7 @@ struct CloneSource:
         if let document = self.frozen:
             let composer = self.composer else trap("a frozen clone without a compositor")
             return try composer.tile(document, column, row, 0)
-        return self.tiles.texture(column, row)
+        return (try self.tiles.texture(column, row))
 
 func clone_source(canvas: Canvas*, tiles: const Tiles*, dx: i64, dy: i64) -> EffectSource!:
     let device = canvas.device else trap("cloning without a device")
@@ -82,7 +82,7 @@ func clone_cell(context: void*?, column: u32, row: u32) -> gpu.Texture?!:
     let size = (i64)tile_size
     if source.frozen == none and not source.tiles_under(x0 // size, y0 // size, (x1 - 1) // size, (y1 - 1) // size):
         return none
-    var cell = try gpu.Texture.create(source.device, tile_size, tile_size, gpu.Format.rgba16_float)
+    var cell = try tile_texture(source.device)
     errdefer cell.destroy()
     let frame = try cell.frame()
     defer frame.release()
@@ -176,7 +176,7 @@ func tone_source(canvas: Canvas*, tiles: const Tiles*, dodge: bool) -> EffectSou
 
 func tone_cell(context: void*?, column: u32, row: u32) -> gpu.Texture?!:
     let source = (ToneSource*)(context else trap("a tone without its source"))
-    let texture = source.tiles.texture(column, row) else return none
+    let texture = (try source.tiles.texture(column, row)) else return none
     return try source.adjuster.adjusted(texture, levels, source.values[..<20])
 
 func release_tone(context: void*?):
@@ -313,7 +313,7 @@ func window_cell(read: const WindowRead*, index: usize) -> (i64, i64):
 func window_piece(context: void*?, index: usize) -> Piece!:
     let read = (WindowRead*)(context else trap("a window read lost its state"))
     let (column, row) = window_cell(read, index)
-    let texture = (read.original.texture((u32)column, (u32)row) if index % 2 == 0 else read.stroke.coverage_at((u32)column, (u32)row)) else return no_piece()
+    let texture = ((try read.original.texture((u32)column, (u32)row)) if index % 2 == 0 else read.stroke.coverage_at((u32)column, (u32)row)) else return no_piece()
     return Piece(texture = texture, region = gpu.Region(0, 0, tile_size, tile_size), present = true)
 
 func window_visit(context: void*?, index: usize, bytes: const u8[]) -> !:
@@ -363,7 +363,7 @@ func healed_piece(context: void*?, index: usize) -> Piece!:
     let row = (u32)(index // (usize)read.columns)
     if read.stroke.coverage_at(column, row) == none:
         return no_piece()
-    let texture = read.original.texture(column, row) else return no_piece()
+    let texture = (try read.original.texture(column, row)) else return no_piece()
     return Piece(texture = texture, region = gpu.Region(0, 0, tile_size, tile_size), present = true)
 
 func healed_visit(context: void*?, index: usize, bytes: const u8[]) -> !:
@@ -378,7 +378,7 @@ func healed_visit(context: void*?, index: usize, bytes: const u8[]) -> !:
     else:
         memory.copy(read.bytes, bytes, bytes.length)
     spot_into_cell(read.pixels, read.window, column, row, read.bytes)
-    var texture = try gpu.Texture.create(read.device, tile_size, tile_size, gpu.Format.rgba16_float)
+    var texture = try tile_texture(read.device)
     errdefer texture.destroy()
     try texture.upload(read.bytes)
     try read.healed.set(column, row, texture)

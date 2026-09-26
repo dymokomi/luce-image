@@ -13,7 +13,7 @@
 ## document has one every key covers those neighbours.
 import gpu
 import memory
-from tiles import Tiles, Tile, tile_size, min_u32
+from tiles import Tiles, Tile, tile_size, min_u32, tile_texture, transient_mark, release_transients
 from pyramid import Pyramid, covered_at, tile_bytes
 from tile_cache import TileCache
 from luce_image.document import Document, Layer, fnv_start, fnv_mix
@@ -97,7 +97,7 @@ pub struct Composer:
         errdefer shader.destroy()
         var pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.replace, gpu.Format.rgba16_float)
         errdefer pipeline.destroy()
-        var blank = try gpu.Texture.create(device, tile_size, tile_size, gpu.Format.rgba16_float)
+        var blank = try tile_texture(device)
         errdefer blank.destroy()
         let zeros = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
         defer free(zeros) in memory.heap
@@ -164,6 +164,8 @@ pub struct Composer:
             digest = fnv_mix(digest, self.stand_ins[index].generation)
         if let found = self.cache.find(digest | 1):
             return found
+        let mark = transient_mark()
+        defer release_transients(mark)
         let texture = try self.flatten(document, column, row)
         self.renders += 1
         try self.cache.put(digest | 1, texture, tile_bytes)
@@ -180,9 +182,12 @@ pub struct Composer:
         self.cache.hold()
         self.pyramid.hold()
 
-    ## A layer's (or mask's) tile at the level being made; none where it is empty.
+    ## A layer's (or mask's) tile at the level being made; none where it is
+    ## empty. A level-0 tile kept in RAM comes up for this composite alone
+    ## (released when `tile` has made it), so compositing a document mostly in
+    ## RAM costs uploads rather than GPU memory.
     mutating func source(tiles: const Tiles*, column: u32, row: u32, mask: bool = false) -> gpu.Texture?!:
-        return try self.pyramid.texture(tiles, column, row, self.level, mask)
+        return try self.pyramid.pass_texture(tiles, column, row, self.level, mask)
 
     ## Show layer `stand_in.layer` (or its mask) through `stand_in` until
     ## `drop_stand_ins`, replacing one it has already; a new generation
@@ -245,7 +250,7 @@ pub struct Composer:
         try self.flatten_layers(document.layers(), 1.0, column, row, &backdrop, &owned)
         if not owned:
             # Nothing contributed: a transparent tile of its own, so the cache can destroy it.
-            backdrop = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+            backdrop = try tile_texture(self.owner)
             let frame = try backdrop.frame()
             defer frame.release()
             discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
@@ -332,7 +337,7 @@ pub struct Composer:
     ## One layer (or effects) tile composited over the backdrop so far.
     mutating func pass(backdrop: gpu.Texture*, owned: bool*, texture: gpu.Texture, mask: gpu.Texture, clip: gpu.Texture, area: gpu.Region, opacity: f64, blend: u32) -> !:
         var params: f32[6] = [0.0, 0.0, (f32)area.width, (f32)area.height, (f32)opacity, (f32)blend]
-        var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        var fresh = try tile_texture(self.owner)
         errdefer fresh.destroy()
         let frame = try fresh.frame()
         defer frame.release()
@@ -361,7 +366,7 @@ pub struct Composer:
             adjusted = try self.adjuster.adjusted(*backdrop, (u32)layer.adjustment, layer.adjustment_values[..<23], table, place)
         defer adjusted.destroy()
         var params: f32[1] = [(f32)opacity]
-        var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        var fresh = try tile_texture(self.owner)
         errdefer fresh.destroy()
         let frame = try fresh.frame()
         defer frame.release()
@@ -401,7 +406,7 @@ pub struct Composer:
         try self.filters.blur_tiles(&block, clamp_radius(layer.adjustment_values[0] / (f64)(1u64 << self.level)))
         var result = try block.blank()
         errdefer result.destroy()
-        if let blurred = block.texture(1, 1):
+        if let blurred = (try block.texture(1, 1)):
             try copy_tile(&result, blurred)
         return result
 
@@ -423,7 +428,7 @@ pub struct Composer:
         self.stopped = outer_stopped
         if owned:
             return backdrop
-        var clear = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        var clear = try tile_texture(self.owner)
         errdefer clear.destroy()
         let frame = try clear.frame()
         defer frame.release()
@@ -490,16 +495,16 @@ pub struct Composer:
         let tiles = lower.tiles() else error(invalid, "no pixels to merge into")
         for row in 0..<tiles.rows():
             for column in 0..<tiles.columns():
-                let texture = source.texture(column, row) else continue
+                let texture = (try source.texture(column, row)) else continue
                 let area = tiles.region(column, row)
-                let backdrop = tiles.texture(column, row) else self.blank
+                let backdrop = (try tiles.texture(column, row)) else self.blank
                 var mask = self.white
                 if let mask_tiles = top.active_mask():
-                    if let mask_texture = mask_tiles.texture(column, row):
+                    if let mask_texture = (try mask_tiles.texture(column, row)):
                         mask = mask_texture
-                let clip = (tiles.texture(column, row) else self.blank) if top.clipped else self.white
+                let clip = ((try tiles.texture(column, row)) else self.blank) if top.clipped else self.white
                 var params: f32[6] = [0.0, 0.0, (f32)area.width, (f32)area.height, (f32)top.opacity, (f32)top.blend]
-                var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+                var fresh = try tile_texture(self.owner)
                 errdefer fresh.destroy()
                 let frame = try fresh.frame()
                 defer frame.release()

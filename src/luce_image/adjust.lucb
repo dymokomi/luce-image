@@ -4,7 +4,7 @@
 import gpu
 import memory
 import math
-from tiles import Tiles, tile_size
+from tiles import Tiles, tile_size, tile_texture
 from luce_image.document import Document
 from luce_image.shaders import adjust_frag_words, adjust_frag_msl
 from raster_errors import invalid
@@ -77,7 +77,7 @@ pub struct Adjuster:
         let tiles = try target.edited_tiles(on_mask)
         for row in 0..<tiles.rows():
             for column in 0..<tiles.columns():
-                let source = tiles.texture(column, row) else continue
+                let source = (try tiles.texture(column, row)) else continue
                 let place = Place(x = column * tile_size, y = row * tile_size, width = tiles.width(), height = tiles.height())
                 var fresh = try self.adjusted(source, kind, values, table, place)
                 errdefer fresh.destroy()
@@ -101,7 +101,7 @@ pub struct Adjuster:
         params[27] = (f32)place.height
         # Binding 2 is read only by curves; the others get the tile again.
         let images: gpu.Texture[2] = [source, table else source]
-        var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        var fresh = try tile_texture(self.owner)
         errdefer fresh.destroy()
         let frame = try fresh.frame()
         defer frame.release()
@@ -144,7 +144,7 @@ test "adjustments rewrite a layer's tiles":
     try current.read(pixels)
     # Inverted red is cyan; the empty right tile stays empty; alpha is kept.
     assert(pixels[(20 * 300 + 100) * 4] < 0.01 and pixels[(20 * 300 + 100) * 4 + 1] > 0.99 and pixels[(20 * 300 + 100) * 4 + 3] == 1.0)
-    assert(current.texture(1, 0) == none)
+    assert(not current.painted(1, 0))
     try adjuster.apply(&document, layer, desaturate, no_values)
     try current.read(pixels)
     let grey = pixels[(20 * 300 + 100) * 4]

@@ -6,7 +6,7 @@ import gpu
 import interop
 import math
 import memory
-from tiles import Tiles, tile_size
+from tiles import Tiles, tile_size, tile_texture
 from luce_image.extent import relocate, pieces, landing_cells, canvas_part, reaches_past_part
 from luce_image.transform_window import Footprint, Window, footprint, level_for, gather, window_map
 from pyramid import Pyramid, tile_bytes
@@ -61,7 +61,7 @@ pub struct Transformer:
         errdefer float_shader.destroy()
         var floating = try gpu.Pipeline.create(device, float_shader, gpu.Blend.replace, gpu.Format.rgba16_float)
         errdefer floating.destroy()
-        var clear = try gpu.Texture.create(device, tile_size, tile_size, gpu.Format.rgba16_float)
+        var clear = try tile_texture(device)
         errdefer clear.destroy()
         let frame = try clear.frame()
         discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
@@ -201,7 +201,7 @@ pub struct Transformer:
     pub func shade_tile(params: f32[16]*, origin_x: f64, origin_y: f64, source: gpu.Texture, selection: gpu.Texture) -> gpu.Texture!:
         (*params)[6] = (f32)origin_x
         (*params)[7] = (f32)origin_y
-        var texture = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        var texture = try tile_texture(self.owner)
         errdefer texture.destroy()
         let frame = try texture.frame()
         defer frame.release()
@@ -219,7 +219,7 @@ pub struct Transformer:
         let p = *params
         # float.frag's push constants: the map, the origin, the size, the perspective row, the sampling.
         var packed: f32[14] = [p[0], p[1], p[2], p[3], p[4], p[5], (f32)origin_x, (f32)origin_y, p[8], p[9], p[11], p[12], p[13], p[15]]
-        var texture = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        var texture = try tile_texture(self.owner)
         errdefer texture.destroy()
         let frame = try texture.frame()
         defer frame.release()
@@ -365,7 +365,7 @@ test "translating a layer moves its pixels across tiles, and what leaves the can
     assert(pixels[(15 * 300 + 270) * 4 + 1] > 0.99 and pixels[(10 * 300 + 250) * 4 + 3] == 0.0)
     let soft = (15 * 300 + 40) * 4
     assert(pixels[soft] > 0.99 and pixels[soft + 1] > 0.99 and pixels[soft + 2] > 0.99 and pixels[soft + 3] > 0.49 and pixels[soft + 3] < 0.51)
-    assert(current.texture(1, 0) != none)
+    assert(current.painted(1, 0))
     var again = try translate(&document, layer, 100, 0)
     again.destroy()
     try current.read(pixels)
@@ -378,7 +378,7 @@ test "translating a layer moves its pixels across tiles, and what leaves the can
     var away = try translate(&document, layer, -600, -300)
     away.destroy()
     try current.read(pixels)
-    assert(pixels[(15 * 300 + 270) * 4 + 3] == 0.0 and current.has_outside() and current.texture(0, 0) == none and current.texture(1, 0) == none)
+    assert(pixels[(15 * 300 + 270) * 4 + 3] == 0.0 and current.has_outside() and not current.painted(0, 0) and not current.painted(1, 0))
     var home = try translate(&document, layer, 600, 300)
     home.destroy()
     try current.read(pixels)

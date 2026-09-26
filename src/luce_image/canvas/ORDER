@@ -16,9 +16,11 @@ ranging.lucb
 selecting.lucb
 raw_tiles.lucb
 history.lucb
+memory.lucb
 support.lucb
 tests.lucb
 preview_tests.lucb
 warp_tests.lucb
 liquify_tests.lucb
 path_tests.lucb
+memory_tests.lucb

@@ -17,6 +17,8 @@ func draw_canvas(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectan
     # A standalone frame has no device; it records nothing.
     let document = canvas.document else return
     let composer = canvas.composer else return
+    # A new frame: what the last one pinned may move, within the memory budget.
+    try settle_memory(canvas)
     let clipped = try checked.clipped(rectangle)
     defer clipped.release()
     let area = clipped.value()

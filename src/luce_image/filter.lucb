@@ -8,7 +8,7 @@
 import gpu
 import memory
 import math
-from tiles import Tiles, tile_size, box, unbox, flatten
+from tiles import Tiles, tile_size, box, unbox, flatten, tile_texture
 from luce_image.document import Document
 from luce_image.extent import pieces
 from luce_image.transform_window import Footprint, gather
@@ -33,7 +33,7 @@ pub struct Filters:
         errdefer resample_shader.destroy()
         var resample = try gpu.Pipeline.create(device, resample_shader, gpu.Blend.replace, gpu.Format.rgba16_float)
         errdefer resample.destroy()
-        var blank = try gpu.Texture.create(device, tile_size, tile_size, gpu.Format.rgba16_float)
+        var blank = try tile_texture(device)
         errdefer blank.destroy()
         let zeros = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
         defer free(zeros) in memory.heap
@@ -111,7 +111,7 @@ pub struct Filters:
     ## resample.frag with `params` over `window`, into a tile of its own (a
     ## preview's cell, handed to the compositor).
     pub func resample_tile(params: f32[12]*, window: gpu.Texture) -> gpu.Texture!:
-        var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        var fresh = try tile_texture(self.owner)
         errdefer fresh.destroy()
         let frame = try fresh.frame()
         defer frame.release()
@@ -148,9 +148,9 @@ pub struct Filters:
             if at < 0 or at >= (i64)tiles.rows():
                 continue
             let line = (u32)at
-            let before = tiles.texture(column - 1, line) if column > 0 else none
-            let after = tiles.texture(column + 1, line) if column + 1 < tiles.columns() else none
-            let middle = tiles.texture(column, line)
+            let before = (try tiles.texture(column - 1, line)) if column > 0 else none
+            let after = (try tiles.texture(column + 1, line)) if column + 1 < tiles.columns() else none
+            let middle = (try tiles.texture(column, line))
             if middle == none and before == none and after == none:
                 continue
             across[index] = try self.blur_one(tiles.region(column, line).width, taps, radius, true, before, middle, after)
@@ -165,7 +165,7 @@ pub struct Filters:
     ## One pass of the blur over three tiles in a line, into a new tile.
     pub func blur_one(extent: u32, taps: f64, sigma: f64, horizontal: bool, before: gpu.Texture?, middle: gpu.Texture?, after: gpu.Texture?) -> gpu.Texture!:
         var params: f32[4] = [(f32)taps, (f32)sigma, 1.0 if horizontal else 0.0, (f32)extent]
-        var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        var fresh = try tile_texture(self.owner)
         errdefer fresh.destroy()
         let frame = try fresh.frame()
         defer frame.release()
@@ -183,19 +183,19 @@ pub struct Filters:
         defer source.destroy()
         for row in 0..<tiles.rows():
             for column in 0..<tiles.columns():
-                let middle = source.texture(column, row)
+                let middle = (try source.texture(column, row))
                 var before: gpu.Texture? = none
                 var after: gpu.Texture? = none
                 if horizontal:
                     if column > 0:
-                        before = source.texture(column - 1, row)
+                        before = (try source.texture(column - 1, row))
                     if column + 1 < tiles.columns():
-                        after = source.texture(column + 1, row)
+                        after = (try source.texture(column + 1, row))
                 else:
                     if row > 0:
-                        before = source.texture(column, row - 1)
+                        before = (try source.texture(column, row - 1))
                     if row + 1 < tiles.rows():
-                        after = source.texture(column, row + 1)
+                        after = (try source.texture(column, row + 1))
                 if middle == none and before == none and after == none:
                     continue
                 let area = tiles.region(column, row)

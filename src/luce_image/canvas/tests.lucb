@@ -1659,7 +1659,7 @@ func layer_texel(canvas: Canvas*, id: i64, x: u32, y: u32) -> f32[4]!:
     let layer = document.find((u64)id) else trap("no layer")
     let tiles = layer.tiles() else trap("no tiles")
     var texel: f32[4] = [0.0, 0.0, 0.0, 0.0]
-    let texture = tiles.texture(x // tile_size, y // tile_size) else return texel
+    let texture = (try tiles.texture(x // tile_size, y // tile_size)) else return texel
     var bytes: u8[8]
     try texture.read(bytes, gpu.Region(x % tile_size, y % tile_size, 1, 1))
     for channel in 0..<(usize)4:

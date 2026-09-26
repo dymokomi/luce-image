@@ -1,0 +1,51 @@
+#==============================================================================================
+#
+#   canvas/memory - Keeping the documents' tiles within the machine's memory
+#
+#   DESCRIPTION:
+#       luce-canvas's governor keeps every tile on the GPU, in RAM, or both, within budgets
+#       (a share of the GPU's and the machine's memory; Settings › Memory usage). The
+#       canvas budgets it when it binds its device, and settles it as each frame begins:
+#       what the frame before drew stays recent, what no document shows (history's tiles)
+#       leaves the GPU first, then what no recent frame drew. Nothing is ever dropped:
+#       a tile moved to RAM comes back when drawn with, undone to, or read.
+#
+#==============================================================================================
+
+## The share of the GPU's and the machine's memory tiles may use: Settings ›
+## Memory usage, one setting for every open document.
+var memory_usage: f64 = 0.6
+
+## Budget the governor for `device` at the current memory usage.
+func configure_memory(device: gpu.Device) -> !:
+    try residency_configure(device, memory_usage)
+
+## `Canvas.set_memory_usage`: a new share, applied at once when bound.
+func set_memory_usage(canvas: Canvas*, fraction: f64) -> !:
+    if not (fraction >= 0.1 and fraction <= 0.95):
+        error(invalid, "memory usage must be 0.1..0.95 of what the machine has")
+    memory_usage = fraction
+    if let device = canvas.device:
+        try configure_memory(device)
+
+## Begin a frame's epoch and, when the tiers hold too much, mark what every
+## layer and mask of the document shows and move the least wanted tiles to
+## RAM. Cheap when within budget: one comparison.
+func settle_memory(canvas: Canvas*) -> !:
+    residency_advance()
+    if not residency_over_budget():
+        return
+    let device = canvas.device else return
+    let document = canvas.document else return
+    residency_begin_marking()
+    for layer in document.layers():
+        mark_layer(layer)
+    try residency_settle(device)
+
+func mark_layer(layer: Layer*):
+    if let tiles = layer.tiles():
+        residency_mark_live(tiles)
+    if let mask = layer.mask_tiles():
+        residency_mark_live(mask)
+    for child in layer.layers():
+        mark_layer(child)

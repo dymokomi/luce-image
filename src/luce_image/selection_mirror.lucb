@@ -5,7 +5,7 @@
 ## every wholly selected cell shares one tile.
 import gpu
 import memory
-from tiles import Tiles, tile_size, box, unbox
+from tiles import Tiles, tile_size, box, unbox, tile_texture
 from half import to_half
 from luce_image.selection_cells import Cells, each
 
@@ -90,7 +90,7 @@ func upload(tiles: Tiles*, cells: const Cells*, items: const usize[]) -> !:
     each(items.length, (void*)&job, convert_item)
     for item in 0..<items.length:
         let index = items[item]
-        var texture = try gpu.Texture.create(tiles.device(), tile_size, tile_size, gpu.Format.rgba16_float)
+        var texture = try tile_texture(tiles.device())
         errdefer texture.destroy()
         try texture.upload(staging[item * tile_bytes..<(item + 1) * tile_bytes])
         try tiles.set((u32)(index % (usize)cells.columns()), (u32)(index // (usize)cells.columns()), texture)

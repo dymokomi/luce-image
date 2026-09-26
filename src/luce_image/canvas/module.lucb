@@ -43,7 +43,7 @@ import svg
 import os
 import thread
 from luce_image.image import Image, Pixel
-from tiles import Tiles, Bounds, tile_size, tile_columns, min_u32, max_u32, flatten, tiles_alive
+from tiles import Tiles, Bounds, tile_size, tile_columns, min_u32, max_u32, flatten, tiles_alive, tile_texture, residency_configure, residency_budgets, residency_advance, residency_over_budget, residency_begin_marking, residency_mark_live, residency_settle, residency_report
 from pyramid import covered_at
 from luce_image.heal import heal
 from luce_image.color_range import RangeSample, range_sample, range_coverage, range_labs
@@ -381,6 +381,43 @@ pub struct Canvas:
             error(failure.code, failure.message)
         try self.bind_device(acquired)
 
+    # mark: Memory =================================================================================
+
+    ## Let the documents' tiles use `fraction` (0.1..0.95) of the GPU's and the
+    ## machine's memory, as Photoshop's Memory Usage: past it, the least wanted
+    ## tiles move from the GPU to RAM. One setting for every document.
+    pub mutating func set_memory_usage(fraction: f64) -> !:
+        try set_memory_usage(&self, fraction)
+
+    ## Set the GPU and RAM budgets in bytes directly (0 for none): tests, and
+    ## seeing the governor work on a small machine.
+    pub mutating func set_memory_budgets(gpu_bytes: i64, ram_bytes: i64) -> !:
+        if gpu_bytes < 0 or ram_bytes < 0:
+            error(invalid, "memory budgets are bytes, 0 for none")
+        residency_budgets((usize)gpu_bytes, (usize)ram_bytes)
+
+    ## Begin a new epoch and keep the tiers within their budgets now, as a
+    ## frame does: for headless work between steps.
+    pub mutating func settle_memory() -> !:
+        try settle_memory(&self)
+
+    ## Bytes of layer tiles on the GPU, their copies in RAM, derived tiles
+    ## (pyramids and composites) on the GPU, and the two budgets.
+    pub func memory_gpu_bytes() -> i64:
+        return (i64)residency_report().gpu_tiles
+
+    pub func memory_ram_bytes() -> i64:
+        return (i64)residency_report().ram_tiles
+
+    pub func memory_derived_bytes() -> i64:
+        return (i64)residency_report().derived
+
+    pub func memory_gpu_budget() -> i64:
+        return (i64)residency_report().gpu_budget
+
+    pub func memory_ram_budget() -> i64:
+        return (i64)residency_report().ram_budget
+
     ## Whether the canvas is on a GPU device yet (drawn once, or bound headless):
     ## what reads pixels back needs it.
     pub func is_bound() -> bool:
@@ -414,6 +451,7 @@ pub struct Canvas:
         let device = binding.device else trap("bound")
         var document = try Document.create(device, self.extent_x, self.extent_y)
         errdefer document.destroy()
+        try configure_memory(device)
         # Everything at the top level first, so the ids come out as the records'...
         for index in 0..<self.count:
             let record = self.records[index]
@@ -932,7 +970,7 @@ pub struct Canvas:
             if record.visible:
                 if let layer = document.find(record.id):
                     if let tiles = layer.tiles():
-                        if let texture = tiles.texture(column, row):
+                        if let texture = (try tiles.texture(column, row)):
                             try texture.read(texel, gpu.Region((u32)x - column * tile_size, (u32)y - row * tile_size, 1, 1))
                             if from_half((u16)texel[6] | ((u16)texel[7] << 8)) > 0.05:
                                 return index

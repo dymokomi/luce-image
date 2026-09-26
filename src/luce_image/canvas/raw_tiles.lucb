@@ -60,7 +60,7 @@ func raw_tiles(device: gpu.Device, picture: interop.Reference[Image]) -> Tiles!:
             let cell = (usize)row * columns + (usize)column
             if not painted[cell]:
                 continue
-            var texture = try gpu.Texture.create(device, tile_size, tile_size, gpu.Format.rgba16_float)
+            var texture = try tile_texture(device)
             errdefer texture.destroy()
             try texture.upload(slots[cell * per_tile..<(cell + 1) * per_tile])
             try tiles.set(column, row, texture)

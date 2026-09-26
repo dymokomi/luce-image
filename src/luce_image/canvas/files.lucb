@@ -405,7 +405,7 @@ func write_layer_picture(canvas: Canvas*, tiles: const Tiles*, directory: str, n
         # A cell never painted reveals everything: white.
         for row in 0..<whole.rows():
             for column in 0..<whole.columns():
-                if whole.texture(column, row) != none:
+                if whole.painted(column, row):
                     continue
                 let area = whole.region(column, row)
                 for y in 0..<(usize)area.height:

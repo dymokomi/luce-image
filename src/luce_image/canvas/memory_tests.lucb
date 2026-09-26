@@ -1,0 +1,76 @@
+#==============================================================================================
+#
+#   canvas/memory_tests - The document under a memory budget
+#
+#==============================================================================================
+
+## The document drawn at `zoom` into `target` (a frame's settling included),
+## and every texel of it read back.
+func frame_pixels(canvas: Canvas*, target: gpu.Texture*, zoom: f64, x: f64, y: f64, into: u8[]) -> !:
+    try canvas.wait_idle()
+    let frame = try target.frame()
+    defer frame.release()
+    let root = try frame.value().target()
+    defer root.release()
+    try canvas.draw(root, gpu.Rect(width = 256.0, height = 192.0), zoom, x, y)
+    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    try target.read(into)
+
+func same_bytes(a: const u8[], b: const u8[]) -> bool:
+    for index in 0..<a.length:
+        if a[index] != b[index]:
+            return false
+    return true
+
+test "under a tiny memory budget the document draws, strokes, undoes and exports exactly as without one":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(1500, 1100)
+    defer canvas.close()
+    defer residency_budgets(0, 0)
+    let first = try canvas.add_layer("First")
+    let second = try canvas.add_layer("Second")
+    var target = try gpu.Texture.create(device, 256, 192, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    let fit = 256.0 / 1500.0
+    var reference_fit: u8[196608]
+    var reference_near: u8[196608]
+    var seen: u8[196608]
+    try frame_pixels(&canvas, &target, fit, 0.0, 0.0, reference_fit)
+    try canvas.fill_gradient(first, 0.0, 0.0, 1500.0, 1100.0, 1.0, 0.2, 0.1, 1.0, 0.1, 0.3, 0.9, 1.0)
+    try canvas.fill_gradient(second, 750.0, 550.0, 1300.0, 900.0, 0.9, 0.9, 0.2, 0.8, 0.2, 0.9, 0.4, 0.3, radial = true)
+    try frame_pixels(&canvas, &target, fit, 0.0, 0.0, reference_fit)
+    try frame_pixels(&canvas, &target, 1.0, -600.0, -500.0, reference_near)
+    try canvas.save("build/memory-reference.png")
+    # Two tiles' worth of GPU: everything else lives in RAM between frames.
+    try canvas.set_memory_budgets(1048576, 0)
+    for round in 0..<(usize)3:
+        try frame_pixels(&canvas, &target, fit, 0.0, 0.0, seen)
+        assert(same_bytes(seen, reference_fit))
+        try frame_pixels(&canvas, &target, 1.0, -600.0 + (f64)round * 10.0 - 10.0 * (f64)round, -500.0, seen)
+        assert(same_bytes(seen, reference_near))
+    try canvas.settle_memory()
+    assert(canvas.memory_gpu_bytes() <= 4194304 and canvas.memory_ram_bytes() > 0)
+    # A stroke, undone, leaves the picture as it was; redone, as it was drawn.
+    try canvas.set_brush(80.0, 0.8, 1.0, 1.0, 0.0, 0.0, 0.0, false)
+    try canvas.begin_stroke(first, 700.0, 600.0)
+    try canvas.extend_stroke(900.0, 700.0)
+    try canvas.end_stroke()
+    try frame_pixels(&canvas, &target, 1.0, -600.0, -500.0, seen)
+    assert(not same_bytes(seen, reference_near))
+    try canvas.undo()
+    try frame_pixels(&canvas, &target, 1.0, -600.0, -500.0, seen)
+    assert(same_bytes(seen, reference_near))
+    # The export reads the tiles wherever they are: the same file's pixels.
+    try canvas.save("build/memory-budgeted.png")
+    let expected = try Image.open("build/memory-reference.png")
+    defer expected.release()
+    let exported = try Image.open("build/memory-budgeted.png")
+    defer exported.release()
+    for probe in [(usize)0, 377, 749, 1100, 1499]:
+        let y = probe * 1099 // 1499
+        let a = try expected.value().getpixel(probe, y)
+        let b = try exported.value().getpixel(probe, y)
+        assert(a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a)

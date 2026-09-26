@@ -4,7 +4,7 @@
 ## covers it. Built once per device, like the other engine passes.
 import gpu
 import math
-from tiles import Tiles, tile_size
+from tiles import Tiles, tile_size, tile_texture
 from luce_image.document import Document
 from luce_image.extent import pieces
 from luce_image.transform_window import Footprint, gather
@@ -101,8 +101,8 @@ pub struct SelectionPasses:
         var no_uniforms: u8[]
         for row in 0..<tiles.rows():
             for column in 0..<tiles.columns():
-                let edited = tiles.texture(column, row)
-                let original = before.texture(column, row)
+                let edited = (try tiles.texture(column, row))
+                let original = (try before.texture(column, row))
                 if edited == none and original == none:
                     continue
                 var fresh = try tiles.blank()
@@ -111,7 +111,7 @@ pub struct SelectionPasses:
                 defer frame.release()
                 let area = try frame.value().target()
                 defer area.release()
-                try gpu.shade(area.value(), self.mix, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), no_uniforms, [original else blank, edited else blank, selection.texture(column, row) else blank], gpu.Filter.nearest)
+                try gpu.shade(area.value(), self.mix, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), no_uniforms, [original else blank, edited else blank, (try selection.texture(column, row)) else blank], gpu.Filter.nearest)
                 discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
                 try tiles.set(column, row, fresh)
         target.revision += 1
@@ -120,7 +120,7 @@ pub struct SelectionPasses:
     ## it, over `original`: one tile of `restrict`, at any level, into a tile
     ## of its own (a preview's cell).
     pub func mix_tile(original: gpu.Texture, edited: gpu.Texture, coverage: gpu.Texture) -> gpu.Texture!:
-        var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        var fresh = try tile_texture(self.owner)
         errdefer fresh.destroy()
         let frame = try fresh.frame()
         defer frame.release()
