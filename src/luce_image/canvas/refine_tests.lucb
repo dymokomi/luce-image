@@ -124,6 +124,13 @@ test "quick mask paints the selection with the painting tools and turns back int
     defer free(pixels) in memory.heap
     try layer_tiles(&canvas, layer).read(pixels)
     assert(pixels[(200 * 300 + 20) * 4] == 1.0 and pixels[(200 * 300 + 20) * 4 + 3] == 1.0)
+    # A retouch tool is refused, as on any mask, rather than reaching the layer.
+    try canvas.set_retouch(3)
+    var refused = false
+    canvas.begin_stroke(layer, 150.0, 150.0) catch failure:
+        refused = true
+    assert(refused)
+    try canvas.set_retouch(0)
     let painted = canvas.history_steps()
     try canvas.exit_quick_mask()
     assert(not canvas.quick_mask() and canvas.undo_name() == "Exit Quick Mask")

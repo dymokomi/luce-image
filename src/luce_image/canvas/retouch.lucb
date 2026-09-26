@@ -29,7 +29,8 @@ func begin_retouch(canvas: Canvas*, id: u64, x: f64, y: f64, pressure: f64) -> !
     let document = canvas.document else error(invalid, "draw the document once before retouching")
     var painter = canvas.painter else error(invalid, "draw the document once before retouching")
     let index = try canvas.index(id)
-    if canvas.mask_editing and canvas.records[index].masked:
+    # Quick Mask is a mask too: a retouch there would reach the layer under it.
+    if (canvas.mask_editing and canvas.records[index].masked) or canvas.quick_mask():
         error(invalid, "retouching works on a layer's pixels, not its mask")
     let layer = document.find(id) else error(invalid, "no such layer")
     let tiles = layer.tiles() else error(invalid, "this layer has no pixels to retouch")
