@@ -6,19 +6,21 @@
 #       Two kinds of snapshot, one stack. A pixel snapshot holds one layer's pixels (or its
 #       mask's) from before an edit: strokes, fills, filters. A state snapshot holds the whole
 #       document from before a change to what it is made of: the layer tree (sharing tiles),
-#       the layers' records, the extent and the selection. Undo and redo swap a snapshot with
+#       the layers' records, the extent, the selection, the guides and the alpha channels
+#       (sharing cells). Undo and redo swap a snapshot with
 #       the document, so neither copies anything. Every snapshot names its step.
 #
 #==============================================================================================
 
 ## The document as a state snapshot keeps it: the tree, extent and selection,
-## and the layers' records beside them.
+## and the layers' records, the guides and the alpha channels beside them.
 struct DocumentState:
     var tree: TreeState
     var records: Record[]
     var count: usize
     var next_id: u64
     var guides: Guides
+    var channels: Channels
 
 ## A layer's pixels (or its mask's) at one moment, shared with whatever else
 ## holds them, or the whole document (`state`). A joined snapshot belongs to
@@ -39,6 +41,7 @@ struct Snapshot:
 func drop_snapshot(entry: Snapshot*):
     if let state = entry.state:
         state.tree.destroy()
+        state.channels.destroy()
         release_records(state.records, state.count)
         free(state) in memory.heap
         entry.state = none

@@ -91,7 +91,7 @@ func parse_index(index: const u8[], body: u64) -> PackageSource!:
     for blob in 0..<blob_count:
         let at = 4 + blob * package_blob_bytes
         let found = PackageBlob(offset = get_u64(index, at), length = get_u32(index, at + 8), rows = get_u16(index, at + 12), filter = index[at + 14])
-        if found.rows == 0 or (u32)found.rows > tile_size or found.filter != tile_filter_sub or (u64)found.length > most or found.offset > body or (u64)found.length > body - found.offset:
+        if found.rows == 0 or (u32)found.rows > tile_size or (found.filter != tile_filter_sub and found.filter != coverage_filter) or (u64)found.length > most or found.offset > body or (u64)found.length > body - found.offset:
             source.destroy()
             error(invalid, "the .l2d document's tile table is damaged")
         source.blobs[blob] = found
@@ -99,7 +99,8 @@ func parse_index(index: const u8[], body: u64) -> PackageSource!:
         let at = at_cells + 4 + cell * package_cell_bytes
         let found = PackageCell(layer = get_u32(index, at), plane = get_u32(index, at + 4), column = (i32)get_u32(index, at + 8),
                                 row = (i32)get_u32(index, at + 12), blob = get_u32(index, at + 16))
-        if found.plane > plane_mask_beyond or (usize)found.blob >= blob_count:
+        # A channel's cell selected throughout has no record.
+        if found.plane > plane_channel_full or (found.plane != plane_channel_full and (usize)found.blob >= blob_count):
             source.destroy()
             error(invalid, "the .l2d document's cell table is damaged")
         source.cells[cell] = found
@@ -179,6 +180,7 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
     for index in 0..<doc.child_count("/guides"):
         let element = doc.child_at("/guides", index) else break
         discard(try native.add_guide((try get_integer(doc, element, "vertical")) != 0, try get_number(doc, element, "position")))
+    try read_channels(native, &source, doc)
     # Groups come after their layers in the file, so layers go into them once all are read.
     for index in 0..<total:
         let element = doc.child_at("/layers", index) else error(invalid, "a layer element is missing")

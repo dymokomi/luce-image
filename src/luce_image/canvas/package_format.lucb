@@ -9,7 +9,8 @@
 #           tiles     one record per stored tile, back to back (see below)
 #           preview   a small flattened PNG of the document, for quick looks
 #           manifest  the document as Prism text: size, resolution, profile, every
-#                     layer's settings, text, shape and path, styles, guides
+#                     layer's settings, text, shape and path, styles, guides, and the
+#                     alpha channels' names
 #           index     where every tile is and which cells use it
 #           trailer   64 bytes: "L2DINDEX", then the offset and length (u64 each) of
 #                     the manifest, the preview and the index, then 8 reserved bytes
@@ -22,7 +23,8 @@
 #       `layer` is the layer's place in the manifest; `plane` is 0 for its pixels on the
 #       canvas grid, 1 for its pixels past the canvas, 2 and 3 likewise for its mask. A cell
 #       with nothing painted has no entry (a mask's unpainted cells are white), and one
-#       tile shared by several cells is stored once. A tile record is the cell's rgba16f
+#       tile shared by several cells is stored once. Planes 4 and 5 are an alpha channel's
+#       cells, `layer` its place among the channels (package_channels.lucb). A tile record is the cell's rgba16f
 #       texels, 256 to a row and `rows` rows, each 16-bit sample replaced by its difference
 #       from the same channel of the texel to its left, split into a plane of low bytes then
 #       one of high bytes, and deflated (raw DEFLATE). Nothing is ever the size of the
@@ -56,7 +58,7 @@ struct PackageCell:
 
 let package_magic: str = "LUCED2D1"
 let package_trailer_magic: str = "L2DINDEX"
-let package_version: u32 = 1
+let package_version: u32 = 2
 let package_header_bytes: usize = 16
 let package_trailer_bytes: usize = 64
 let package_blob_bytes: usize = 16

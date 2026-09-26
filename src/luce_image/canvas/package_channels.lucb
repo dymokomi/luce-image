@@ -1,0 +1,142 @@
+#==============================================================================================
+#
+#   canvas/package_channels - The alpha channels in an .l2d file (package_format.lucb)
+#
+#   DESCRIPTION:
+#       The manifest lists the channels under /channels, each with its name and whether the
+#       view shows it. Their cells go into the index as the layers' do, `layer` being the
+#       channel's place in that list: a cell selected throughout is a `plane_channel_full`
+#       entry with no record, a cell with an edge a `plane_channel` entry whose record is
+#       its coverage bytes (256 to a row, as many rows as the cell has) deflated raw,
+#       marked `coverage_filter`. A cell selecting nothing has no entry, and a block of
+#       coverage shared by several cells (or channels) is stored once. Selections need no
+#       GPU, so channels come back when the file opens, before the document is bound.
+#
+#==============================================================================================
+
+## A channel's cells stored as a record of coverage bytes, and selected throughout.
+let plane_channel: u32 = 4
+let plane_channel_full: u32 = 5
+## A record of coverage bytes, deflated with no filter.
+let coverage_filter: u8 = 2
+## Keeps coverage blocks apart from tile stamps in the writer's table of what
+## is written: a block's name with the top bit set.
+let coverage_stamp_bit: u64 = 0x8000000000000000
+
+## The channels' cells after the layers' tiles: each edge cell's coverage
+## deflated and written, one at a time (they are a selection's edge, few).
+func write_channels(canvas: Canvas*, writer: PackageWriter*) -> !:
+    if canvas.channels.count == 0:
+        return
+    let packed = try alloc u8[flate.deflate_bound(block_bytes)] in memory.heap
+    defer free(packed) in memory.heap
+    for index in 0..<canvas.channels.count:
+        let selection = &canvas.channels.items[index].selection
+        if selection.is_empty():
+            continue
+        for row in 0..<tile_columns(canvas.extent_y):
+            for column in 0..<tile_columns(canvas.extent_x):
+                let value = selection.cell_value(column, row)
+                if value == 0:
+                    continue
+                if value == 255:
+                    try writer.add_cell((u32)index, plane_channel_full, (i64)column, (i64)row, 0)
+                    continue
+                let stamp = selection.cell_stamp(column, row) | coverage_stamp_bit
+                if let known = writer.stamped(stamp):
+                    try writer.add_cell((u32)index, plane_channel, (i64)column, (i64)row, known)
+                    continue
+                let rows = (usize)min_u32(tile_size, canvas.extent_y - row * tile_size)
+                let coverage = selection.cell_bytes(column, row) else trap("a cell with an edge holds its bytes")
+                let length = try flate.deflate_raw(coverage[..<rows * (usize)tile_size], tile_deflate_level, packed, true)
+                let blob = try writer.new_blob(rows)
+                writer.blobs[(usize)blob].filter = coverage_filter
+                writer.blobs[(usize)blob].offset = writer.offset
+                writer.blobs[(usize)blob].length = (u32)length
+                try writer.write(packed[..<length])
+                try writer.remember(stamp, blob)
+                try writer.add_cell((u32)index, plane_channel, (i64)column, (i64)row, blob)
+
+## The manifest's /channels: each channel's name and whether it shows.
+func write_channel_manifest(canvas: Canvas*, manifest: prism.Document*) -> !:
+    try manifest.add("/channels", "channels")
+    for index in 0..<canvas.channels.count:
+        var buffer: u8[64]
+        let element = try format_path(buffer, "/channels/channel", index)
+        try manifest.add(element, "channel")
+        let name = try prism.Value.text(canvas.channels.items[index].name)
+        defer name.release()
+        try manifest.set(element, "name", name)
+        try set_integer(manifest, element, "shown", 1 if canvas.channels.items[index].shown else 0)
+
+## The file's channels onto `canvas` as it opens: each one's cells from the
+## records `source` lists, read from the file at `source.path`.
+func read_channels(canvas: Canvas*, source: const PackageSource*, doc: prism.Document*) -> !:
+    let total = doc.child_count("/channels")
+    if total == 0:
+        return
+    let native = try strings.copy(source.path)
+    defer strings.release(native)
+    var file = try files.File.open((c_api.str)native)
+    defer file.destroy()
+    let packed = try alloc u8[flate.deflate_bound(block_bytes)] in memory.heap
+    defer free(packed) in memory.heap
+    let first = try alloc i64[source.blobs.length if source.blobs.length > 0 else 1] in memory.heap
+    defer free(first) in memory.heap
+    for at in 0..<first.length:
+        first[at] = -1
+    for index in 0..<total:
+        let element = doc.child_at("/channels", index) else error(invalid, "a channel element is missing")
+        let shown = (try get_integer(doc, element, "shown")) != 0
+        let name_value = try doc.get(element, "name")
+        defer name_value.release()
+        var name: str = ""
+        with memory.heap:
+            name = try strings.copy(try name_value.value().text_at())
+        var selection = read_channel(canvas, source, &file, (u32)index, packed, first) catch failure:
+            strings.release(name)
+            error(failure.code, failure.message)
+        canvas.channels.insert(canvas.channels.count, Channel(name = name, selection = selection, shown = shown)) catch failure:
+            strings.release(name)
+            selection.destroy()
+            error(failure.code, failure.message)
+
+## Channel `index`'s selection from the file (the channels before it read
+## already): `packed` holds a record while it is inflated, `first` which
+## channel's cell each record went to first, for cells sharing it.
+func read_channel(canvas: Canvas*, source: const PackageSource*, file: files.File*, index: u32, packed: u8[], first: i64[]) -> Selection!:
+    var selection = try Selection.create(canvas.extent_x, canvas.extent_y)
+    errdefer selection.destroy()
+    for cell in source.cells:
+        if cell.layer != index or (cell.plane != plane_channel and cell.plane != plane_channel_full):
+            continue
+        if cell.column < 0 or cell.row < 0 or (u32)cell.column >= tile_columns(canvas.extent_x) or (u32)cell.row >= tile_columns(canvas.extent_y):
+            error(invalid, "a stored cell lies off the canvas grid")
+        let column = (u32)cell.column
+        let row = (u32)cell.row
+        if cell.plane == plane_channel_full:
+            selection.fill_cell(column, row, 255)
+            continue
+        let blob = source.blobs[(usize)cell.blob]
+        let rows = (usize)min_u32(tile_size, canvas.extent_y - row * tile_size)
+        if blob.filter != coverage_filter or (usize)blob.rows != rows or (usize)blob.length > packed.length:
+            error(invalid, "the .l2d document's channel table is damaged")
+        let seen = first[(usize)cell.blob]
+        if seen >= 0:
+            # A block stored once for several cells (or channels) is shared, as it was saved.
+            let owner = (usize)(seen >> 32)
+            let from_column = (u32)(seen & 0xffff)
+            let from_row = (u32)((seen >> 16) & 0xffff)
+            if owner == (usize)index:
+                selection.share_cell(column, row, &selection, from_column, from_row)
+            else:
+                selection.share_cell(column, row, &canvas.channels.items[canvas.channels.count - (usize)index + owner].selection, from_column, from_row)
+            continue
+        try read_at(file, blob.offset, packed[..<(usize)blob.length])
+        let block = selection.cell_block(column, row)
+        let used = try flate.inflate_raw(packed[..<(usize)blob.length], block[..<rows * (usize)tile_size])
+        if used != (usize)blob.length:
+            error(invalid, "a stored channel cell of the .l2d document is damaged")
+        first[(usize)cell.blob] = ((i64)index << 32) | ((i64)row << 16) | (i64)column
+    selection.settle()
+    return selection

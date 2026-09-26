@@ -235,6 +235,7 @@ func write_package(canvas: Canvas*, document: Document*, manifest: interop.Refer
         if let mask = layer.mask_tiles():
             try write_tiles(canvas, &writer, (u32)index, mask, plane_mask)
     try writer.flush()
+    try write_channels(canvas, &writer)
     # The preview, the manifest and the index, then the trailer that finds them.
     var trailer = PackageTrailer(manifest_offset = 0, manifest_length = 0, preview_offset = 0, preview_length = 0, index_offset = 0, index_length = 0)
     var preview = Buffer(maximum = (usize)1 << 30)
@@ -420,7 +421,8 @@ func package_preview(canvas: Canvas*, out: Buffer*) -> !:
     try encoder.finish()
 
 ## The document's manifest: its size, resolution and profile, every layer's
-## settings (with the text, shape or path it keeps), and the guides.
+## settings (with the text, shape or path it keeps), the guides and the
+## alpha channels.
 func package_manifest(canvas: Canvas*) -> interop.Reference[prism.Document]!:
     let native = try new prism.Document() in memory.heap
     let manifest = try interop.Reference[prism.Document].adopt(native, prism.document_type, memory.heap)
@@ -489,4 +491,5 @@ func package_manifest(canvas: Canvas*) -> interop.Reference[prism.Document]!:
         let place = try prism.Value.number(canvas.guides.positions[index])
         defer place.release()
         try manifest.value().set(element, "position", place)
+    try write_channel_manifest(canvas, manifest.value())
     return manifest

@@ -78,10 +78,10 @@ import psd
 import fonts
 from luce_image.geometry import resize_canvas, resize_image
 from luce_image.selection import Selection
-from luce_image.selection_cells import Mode
+from luce_image.selection_cells import Mode, block_bytes
 import luce_image.selection_sources as selection_sources
 from luce_image.batched_reads import Piece, read_pieces, no_piece
-from luce_image.shaders import ants_frag_words, ants_frag_msl, quickmask_frag_words, quickmask_frag_msl, encode_frag_words, encode_frag_msl
+from luce_image.shaders import ants_frag_words, ants_frag_msl, quickmask_frag_words, quickmask_frag_msl, encode_frag_words, encode_frag_msl, channels_frag_words, channels_frag_msl
 from half import from_half, to_half
 from binary import Buffer
 from raster_errors import invalid, limit
@@ -171,6 +171,12 @@ pub struct Canvas:
     ## Quick Mask's overlay, made when first drawn.
     var quick_shader: gpu.Shader?
     var quick_overlay: gpu.Pipeline?
+    ## channels.frag, for the Channels panel's view (channels.lucb).
+    var channels_shader: gpu.Shader?
+    var channels_view: gpu.Pipeline?
+    ## What the view's own pipelines (Quick Mask's tint, the channel view)
+    ## draw into: none for a window's surface; tests draw into textures.
+    var view_format: gpu.Format?
     ## Liquify's push pipeline, made for the first push.
     var liquifier: Liquifier?
     ## Warp and Puppet Warp's pipeline, made for the first warp.
@@ -244,6 +250,10 @@ pub struct Canvas:
     var shape_hard: bool
     ## The guides, dragged out of the rulers.
     var guides: Guides
+    ## The alpha channels (channels.lucb), and which of red, green and blue
+    ## the view shows: the Channels panel's eyes, never saved.
+    var channels: Channels
+    var view_channels: bool[3]
     ## The installed font families, listed when first asked for.
     var families: fonts.Names*?
     ## The free transform under way, if any.
@@ -310,6 +320,9 @@ pub struct Canvas:
         self.ants = none
         self.quick_shader = none
         self.quick_overlay = none
+        self.channels_shader = none
+        self.channels_view = none
+        self.view_format = none
         var no_history: Snapshot[]
         self.history = no_history
         self.history_count = 0
@@ -359,6 +372,8 @@ pub struct Canvas:
         self.shape_feather = 0
         self.shape_hard = false
         self.guides = Guides()
+        self.channels = Channels(count = 0)
+        self.view_channels = [true, true, true]
         self.families = none
         self.preview_name = "Adjustment"
         self.serial = 0
@@ -726,6 +741,15 @@ pub struct Canvas:
             var owned = shader
             owned.destroy()
             self.quick_shader = none
+        if let pipeline = self.channels_view:
+            var owned = pipeline
+            owned.destroy()
+            self.channels_view = none
+        if let shader = self.channels_shader:
+            var owned = shader
+            owned.destroy()
+            self.channels_shader = none
+        self.channels.destroy()
         if let liquifier = self.liquifier:
             var owned = liquifier
             owned.destroy()
@@ -1767,6 +1791,68 @@ pub struct Canvas:
         let document = self.document else return false
         return document.quick_layer() != none
 
+    # mark: Channels ==============================================================================
+
+    ## The alpha channels, saved selections by name, top first (channels.lucb).
+    pub func channel_count() -> i64:
+        return (i64)self.channels.count
+
+    pub func channel_name(index: i64) -> str!:
+        return (try channel_of(&self, index)).name
+
+    ## Select › Save Selection: the selection as a new alpha channel at the
+    ## end, named `name`; its index. Undoable.
+    pub mutating func save_selection_channel(name: str) -> i64!:
+        return try add_channel(&self, name, false, self.channels.count, "Save Selection")
+
+    ## The panel's New Channel: an alpha channel selecting nothing, at the end.
+    pub mutating func new_channel(name: str) -> i64!:
+        return try add_channel(&self, name, true, self.channels.count, "New Channel")
+
+    ## A copy of channel `index` named `name`, just after it; its index.
+    pub mutating func duplicate_channel(index: i64, name: str) -> i64!:
+        return try duplicate_channel(&self, index, name)
+
+    pub mutating func rename_channel(index: i64, name: str) -> !:
+        try rename_channel(&self, index, name)
+
+    pub mutating func delete_channel(index: i64) -> !:
+        try delete_channel(&self, index)
+
+    ## Select › Load Selection: channel `index` combined into the selection by
+    ## `mode` (0 replace, 1 add, 2 subtract, 3 intersect). Undoable.
+    pub mutating func load_channel(index: i64, mode: i64 = 0) -> !:
+        try load_channel(&self, index, mode)
+
+    ## Coverage 0..255 of alpha channel `index` at a document pixel.
+    pub func channel_at_pixel(index: i64, x: i64, y: i64) -> i64!:
+        let channel = try channel_of(&self, index)
+        return 0 if channel.selection.is_empty() else (i64)channel.selection.at(x, y)
+
+    ## Whether the view shows alpha channel `index` (red over the picture, or
+    ## alone as grayscale when no composite channel shows). Not a step.
+    pub func channel_shown(index: i64) -> bool!:
+        return (try channel_of(&self, index)).shown
+
+    pub mutating func set_channel_shown(index: i64, shown: bool) -> !:
+        let channel = try channel_at(&self, index)
+        channel.shown = shown
+        if not shown:
+            channel.selection.drop_gpu_tiles()
+
+    ## Which of the composite's red (0), green (1) and blue (2) the view
+    ## shows: all three the picture, one alone as grayscale. Not a step.
+    pub func composite_shown(channel: i64) -> bool:
+        return channel >= 0 and channel < 3 and self.view_channels[(usize)channel]
+
+    pub mutating func set_composite_view(red: bool, green: bool, blue: bool):
+        self.view_channels = [red, green, blue]
+
+    ## A Channels panel thumbnail scaled into `rectangle`: the composite (0),
+    ## its red, green or blue (1..3), or alpha channel `channel - 4`.
+    pub mutating func draw_channel(target: interop.View[gpu.RenderTarget], channel: i64, rectangle: gpu.Rect) -> !:
+        try draw_channel_thumbnail(&self, target, channel, rectangle)
+
     ## Where an edit to layer `id` goes: Quick Mask's layer while it is on.
     func paint_target(id: i64) -> i64:
         let document = self.document else return id
@@ -1785,9 +1871,20 @@ pub struct Canvas:
         let device = self.device else error(invalid, "draw the document once first")
         var shader = try gpu.Shader.create(device, quickmask_frag_words, quickmask_frag_msl)
         errdefer shader.destroy()
-        let pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.over)
+        let pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.over, self.view_format)
         self.quick_shader = shader
         self.quick_overlay = pipeline
+        return pipeline
+
+    mutating func channels_pipeline() -> gpu.Pipeline!:
+        if let existing = self.channels_view:
+            return existing
+        let device = self.device else error(invalid, "draw the document once first")
+        var shader = try gpu.Shader.create(device, channels_frag_words, channels_frag_msl)
+        errdefer shader.destroy()
+        let pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.over, self.view_format)
+        self.channels_shader = shader
+        self.channels_view = pipeline
         return pipeline
 
     mutating func ants_pipeline() -> gpu.Pipeline!:
@@ -2860,6 +2957,8 @@ pub struct Canvas:
         session.shown = true
         session.name = "Flip Canvas"
         try end_session(&self, true)
+        # The step just taken holds the channels as they were.
+        try warp_channels(&self, warp)
 
     ## Find layer `id`'s painted box, exactly, for `content_left` and the rest
     ## (past the canvas too); false when it has nothing painted. It reads the
@@ -2981,6 +3080,7 @@ pub struct Canvas:
             error(invalid, "canvas dimensions must be in 1..65536")
         let document = self.document else error(invalid, "draw the document once before resizing")
         try resize_canvas(document, (u32)width, (u32)height, offset_x, offset_y)
+        try refit_channels(&self, (u32)width, (u32)height, 1.0, 1.0, (f64)offset_x, (f64)offset_y, false)
         shift_type(&self, (f64)offset_x, (f64)offset_y)
         shift_shapes(&self, (f64)offset_x, (f64)offset_y)
         try self.adopt_extent((u32)width, (u32)height)
@@ -3024,10 +3124,11 @@ pub struct Canvas:
         if width < 1 or height < 1 or width > 65536 or height > 65536:
             error(invalid, "image dimensions must be in 1..65536")
         let document = self.document else error(invalid, "draw the document once before resizing")
-        try resize_image(document, (u32)width, (u32)height, smooth)
         # Resampled text is pixels; shapes scale and are drawn again, crisp.
         let scale_x = (f64)width / (f64)self.extent_x
         let scale_y = (f64)height / (f64)self.extent_y
+        try resize_image(document, (u32)width, (u32)height, smooth)
+        try refit_channels(&self, (u32)width, (u32)height, scale_x, scale_y, 0.0, 0.0, smooth)
         for index in 0..<self.count:
             release_type(&self.records[index])
         try self.adopt_extent((u32)width, (u32)height)
@@ -3203,7 +3304,9 @@ pub struct Canvas:
         errdefer tree.destroy()
         let records = try copy_records(self.records, self.count)
         errdefer release_records(records, self.count)
-        let state = try new DocumentState(tree = tree, records = records, count = self.count, next_id = self.next_id, guides = self.guides) in memory.heap
+        var channels = try self.channels.copy()
+        errdefer channels.destroy()
+        let state = try new DocumentState(tree = tree, records = records, count = self.count, next_id = self.next_id, guides = self.guides, channels = channels) in memory.heap
         errdefer free(state) in memory.heap
         self.make_room()
         let join = self.joining and self.history_count > 0
@@ -3236,6 +3339,11 @@ pub struct Canvas:
             let guides = self.guides
             self.guides = state.guides
             state.guides = guides
+            let channels = self.channels
+            self.channels = state.channels
+            state.channels = channels
+            # History keeps the cells alone, not their GPU tiles.
+            state.channels.drop_gpu_tiles()
             self.extent_x = document.width()
             self.extent_y = document.height()
             return entry

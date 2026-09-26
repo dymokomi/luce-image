@@ -59,7 +59,7 @@ preserve other pages/parts from the source container.
 reads it back. It keeps everything the editor does: every layer's pixels and
 mask as the canvas holds them (16-bit half floats, so nothing is lost to 8-bit),
 cells past the canvas, groups, adjustment layers, text, shapes and paths, styles,
-guides, resolution and profile. Nothing the size of the document is made in either
+guides, alpha channels, resolution and profile. Nothing the size of the document is made in either
 direction: tiles are read back, compressed and written a batch at a time, and
 come back the same way, within the memory budget.
 
@@ -67,20 +67,22 @@ Layout, all numbers little-endian:
 
 | Part | Content |
 |---|---|
-| header | 16 bytes: `LUCED2D1`, the format version (u32, now 1), reserved (u32) |
+| header | 16 bytes: `LUCED2D1`, the format version (u32, now 2), reserved (u32) |
 | tiles | one record per stored tile, back to back |
 | preview | a PNG of the flattened document, at most 256 pixels a side |
-| manifest | the document as Prism text: size, resolution, profile, layers (name, visibility, opacity, blend, clipping, mask flags, group and parent, adjustment and its parameters or curves, text, shape and path values, style fields), guides |
+| manifest | the document as Prism text: size, resolution, profile, layers (name, visibility, opacity, blend, clipping, mask flags, group and parent, adjustment and its parameters or curves, text, shape and path values, style fields), guides, alpha channels (name, shown) |
 | index | the blob table, then the cell table |
 | trailer | 64 bytes: `L2DINDEX`, then offset and length (u64 each) of the manifest, the preview and the index, then 8 reserved bytes |
 
 The index:
 
 - `u32` blob count, then per blob: `u64` offset, `u32` length, `u16` rows,
-  `u8` filter (1), `u8` 0.
+  `u8` filter (1 a tile record, 2 a channel's coverage record), `u8` 0.
 - `u32` cell count, then per cell: `u32` layer (its place in the manifest), `u32`
   plane (0 pixels on the canvas grid, 1 pixels past the canvas, 2 and 3 the
-  mask's), `i32` column, `i32` row, `u32` blob.
+  mask's; 4 an alpha channel's cell with an edge, 5 one selected throughout,
+  its blob unused, `layer` then the channel's place in the manifest), `i32`
+  column, `i32` row, `u32` blob.
 
 A tile record is a 256-texel-wide cell of rgba16f texels, `rows` rows (the
 canvas's last row of cells may be shorter). Each 16-bit sample is replaced by its
@@ -89,6 +91,12 @@ a plane of low bytes then one of high bytes, then deflated as raw DEFLATE at lev
 1. Unpainted cells have no entry (a mask's are white). A tile shared by several
 cells, or layers, is stored once: cells refer to its blob, and a layer's cells that
 share a blob come back sharing one tile.
+
+An alpha channel is a saved selection, a coverage byte per pixel. A cell of one
+with an edge is a coverage record: its bytes, 256 to a row and `rows` rows,
+deflated as raw DEFLATE with no filter. A cell selecting nothing has no entry,
+and a block of coverage several cells or channels share is stored once and comes
+back shared. Channels need no GPU, so they are read when the file opens.
 
 Saving writes `<name>.l2d.saving` beside the target and renames it over the target
 only when complete, so a failed save leaves the previous file as it was. Opening

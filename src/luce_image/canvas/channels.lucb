@@ -1,0 +1,382 @@
+#==============================================================================================
+#
+#   canvas/channels - Alpha channels and the Channels panel's view
+#
+#   DESCRIPTION:
+#       An alpha channel is a saved selection with a name: a Selection copy, sharing the
+#       cells of the selection it was saved from, as every history step then shares its
+#       cells in turn, so one costs its edges whatever the canvas's size. The list lives
+#       on the Canvas beside the guides and goes into every state snapshot, so saving,
+#       deleting, renaming and duplicating one are undo steps like any other; loading one
+#       combines it into the selection as a marquee would. The .l2d file keeps them
+#       (package_channels.lucb).
+#
+#       What the view shows is the panel's alone, never saved or undone: the composite's
+#       red, green and blue each shown or hidden (one alone drawn as grayscale), and each
+#       alpha channel shown as Quick Mask's red over the picture, or, with no composite
+#       channel shown, alone as grayscale (white selected). Drawing goes through
+#       channels.frag cell by cell at the view's level, as `draw` does; thumbnails read the
+#       pyramid's coarse levels, or sample an alpha channel's cells, never every pixel.
+#
+#==============================================================================================
+
+## Photoshop's most channels a document holds, less the composite's three.
+let channel_limit: usize = 53
+
+## One alpha channel: its name, the selection it keeps, and whether the view shows it.
+struct Channel:
+    var name: str
+    var selection: Selection
+    var shown: bool
+
+## The alpha channels in the panel's order, top first.
+struct Channels:
+    var items: Channel[]
+    var count: usize
+
+    ## A second list sharing every channel's cells: what a state snapshot keeps.
+    func copy() -> Channels!:
+        var copied = Channels(count = 0)
+        if self.count == 0:
+            return copied
+        copied.items = try alloc Channel[self.count] in memory.heap
+        errdefer copied.destroy()
+        for index in 0..<self.count:
+            var name: str = ""
+            with memory.heap:
+                name = try strings.copy(self.items[index].name)
+            var selection = self.items[index].selection.copy() catch failure:
+                strings.release(name)
+                error(failure.code, failure.message)
+            copied.items[index] = Channel(name = name, selection = selection, shown = self.items[index].shown)
+            copied.count += 1
+        return copied
+
+    ## Take `channel` in at `at`, those from there on moving down one.
+    mutating func insert(at: usize, channel: Channel) -> !:
+        if self.count == self.items.length:
+            let grown = try alloc Channel[8 if self.items.length == 0 else self.items.length * 2] in memory.heap
+            if self.count > 0:
+                memory.copy(grown, self.items, self.count)
+            if self.items.length > 0:
+                free(self.items) in memory.heap
+            self.items = grown
+        var index = self.count
+        while index > at:
+            self.items[index] = self.items[index - 1]
+            index -= 1
+        self.items[at] = channel
+        self.count += 1
+
+    ## Take channel `at` out and free it.
+    mutating func remove(at: usize):
+        strings.release(self.items[at].name)
+        self.items[at].selection.destroy()
+        for index in at + 1..<self.count:
+            self.items[index - 1] = self.items[index]
+        self.count -= 1
+
+    ## Let every channel's GPU tiles go (a list put away in history).
+    mutating func drop_gpu_tiles():
+        for index in 0..<self.count:
+            self.items[index].selection.drop_gpu_tiles()
+
+    mutating func destroy():
+        for index in 0..<self.count:
+            strings.release(self.items[index].name)
+            self.items[index].selection.destroy()
+        if self.items.length > 0:
+            free(self.items) in memory.heap
+        var no_items: Channel[]
+        self.items = no_items
+        self.count = 0
+
+## Channel `index` of the canvas, checked.
+func channel_at(canvas: Canvas*, index: i64) -> Channel*!:
+    if index < 0 or index >= (i64)canvas.channels.count:
+        error(invalid, "no such channel")
+    return &canvas.channels.items[(usize)index]
+
+## The same, to read.
+func channel_of(canvas: const Canvas*, index: i64) -> const Channel*!:
+    if index < 0 or index >= (i64)canvas.channels.count:
+        error(invalid, "no such channel")
+    return &canvas.channels.items[(usize)index]
+
+func check_channel_name(name: str) -> !:
+    if name.length == 0 or name.length > 256:
+        error(invalid, "a channel name is 1..256 bytes")
+
+# mark: Editing =================================================================================
+
+## `Canvas.save_selection_channel` and `new_channel`: a channel of the
+## selection (or of nothing, `empty`) at `at`, as step `step`; its index.
+func add_channel(canvas: Canvas*, name: str, empty: bool, at: usize, step: str) -> i64!:
+    try canvas.require_open()
+    try check_channel_name(name)
+    if canvas.channels.count >= channel_limit:
+        error(limit, "a document holds at most 53 alpha channels")
+    try canvas.remember_state(step)
+    var selection = try channel_selection(canvas, empty)
+    errdefer selection.destroy()
+    var copied: str = ""
+    with memory.heap:
+        copied = try strings.copy(name)
+    errdefer strings.release(copied)
+    try canvas.channels.insert(at, Channel(name = copied, selection = selection, shown = false))
+    return (i64)at
+
+## A new channel's selection: nothing, or a copy of the selection, which
+## shares its cells, so nothing is copied however large it is.
+func channel_selection(canvas: Canvas*, empty: bool) -> Selection!:
+    if empty:
+        return try Selection.create(canvas.extent_x, canvas.extent_y)
+    return try canvas.current().copy()
+
+## `Canvas.duplicate_channel`: a copy of channel `index` named `name` just
+## after it, sharing its cells; its index.
+func duplicate_channel(canvas: Canvas*, index: i64, name: str) -> i64!:
+    try canvas.require_open()
+    try check_channel_name(name)
+    let source = try channel_at(canvas, index)
+    if canvas.channels.count >= channel_limit:
+        error(limit, "a document holds at most 53 alpha channels")
+    try canvas.remember_state("Duplicate Channel")
+    var selection = try source.selection.copy()
+    errdefer selection.destroy()
+    var copied: str = ""
+    with memory.heap:
+        copied = try strings.copy(name)
+    errdefer strings.release(copied)
+    try canvas.channels.insert((usize)index + 1, Channel(name = copied, selection = selection, shown = false))
+    return index + 1
+
+## `Canvas.rename_channel`.
+func rename_channel(canvas: Canvas*, index: i64, name: str) -> !:
+    try canvas.require_open()
+    try check_channel_name(name)
+    discard(try channel_at(canvas, index))
+    try canvas.remember_state("Rename Channel")
+    var copied: str = ""
+    with memory.heap:
+        copied = try strings.copy(name)
+    let channel = try channel_at(canvas, index)
+    strings.release(channel.name)
+    channel.name = copied
+
+## `Canvas.delete_channel`.
+func delete_channel(canvas: Canvas*, index: i64) -> !:
+    try canvas.require_open()
+    discard(try channel_at(canvas, index))
+    try canvas.remember_state("Delete Channel")
+    canvas.channels.remove((usize)index)
+
+## `Canvas.load_channel`: channel `index` combined into the selection by `mode`.
+func load_channel(canvas: Canvas*, index: i64, mode: i64) -> !:
+    try canvas.require_open()
+    let how = try selection_mode(mode)
+    discard(try channel_at(canvas, index))
+    try canvas.remember_state("Load Selection")
+    let channel = try channel_at(canvas, index)
+    try canvas.live().merge(&channel.selection, how)
+
+# mark: Following the canvas ====================================================================
+
+## The channels rebuilt for a `width` by `height` canvas, scaled by
+## (`scale_x`, `scale_y`) with their origin at (`offset_x`, `offset_y`), as
+## the layers' masks are (geometry.lucb): through each one's GPU tiles, read
+## back a cell at a time. The step that changed the size keeps the old ones.
+func refit_channels(canvas: Canvas*, width: u32, height: u32, scale_x: f64, scale_y: f64, offset_x: f64, offset_y: f64, smooth: bool) -> !:
+    if canvas.channels.count == 0:
+        return
+    let device = canvas.device else error(invalid, "draw the document once before resizing")
+    for index in 0..<canvas.channels.count:
+        let channel = &canvas.channels.items[index]
+        var fitted = try Selection.create(width, height)
+        errdefer fitted.destroy()
+        if let tiles = try channel.selection.gpu_tiles(device):
+            var moved = try Tiles.create(device, width, height)
+            defer moved.destroy()
+            try relocate(tiles, &moved, scale_x, scale_y, offset_x, offset_y, smooth, gpu.Color(0.0, 0.0, 0.0, 0.0))
+            var source = TilesSource(tiles = &moved)
+            try fitted.load(selection_sources.gpu_reader((void*)&source, device, tiles_cell_texture), 0, 0, Mode.replace)
+        channel.selection.destroy()
+        channel.selection = fitted
+
+## The channels through `warp` (a whole-canvas flip), cell by cell.
+func warp_channels(canvas: Canvas*, warp: Warp) -> !:
+    for index in 0..<canvas.channels.count:
+        try canvas.channels.items[index].selection.warp(warp)
+
+# mark: The view ================================================================================
+
+## How channels.frag draws a tile: the pipeline (none: drawn as is), where
+## the target lies in its frame and its pixels per point (gl_FragCoord counts
+## frame pixels), which of red, green and blue it keeps, and whether as
+## grayscale (1) or opaque grayscale (2, an alpha channel alone).
+struct Shading:
+    var pipeline: gpu.Pipeline? = none
+    var x: f64
+    var y: f64
+    var scale: f64
+    var keep: f32[4]
+    var gray: f32
+
+## The shading for `target`, keeping `keep` as `gray` says.
+func shading_for(canvas: Canvas*, target: const gpu.RenderTarget*, keep: f32[4], gray: f32) -> Shading!:
+    let size = try target.size()
+    let placement = try target.placement()
+    return Shading(pipeline = try canvas.channels_pipeline(), x = placement.x, y = placement.y,
+                   scale = size.pixel_width / size.width if size.width > 0.0 else 1.0, keep = keep, gray = gray)
+
+## Texels `region` of `texture` into `destination` through channels.frag.
+func shade_tile(area: const gpu.RenderTarget*, shading: const Shading*, texture: gpu.Texture, destination: gpu.Rect, region: gpu.Region, filter: gpu.Filter) -> !:
+    if destination.width <= 0.0 or destination.height <= 0.0:
+        return
+    let pipeline = shading.pipeline else trap("a plain shading draws as is")
+    var params: f32[16] = [(f32)((shading.x + destination.x) * shading.scale), (f32)((shading.y + destination.y) * shading.scale),
+                           (f32)((f64)region.width / (destination.width * shading.scale)), (f32)((f64)region.height / (destination.height * shading.scale)),
+                           (f32)region.x, (f32)region.y, (f32)region.width, (f32)region.height,
+                           shading.keep[0], shading.keep[1], shading.keep[2], shading.keep[3], shading.gray, 0.0, 0.0, 0.0]
+    try gpu.shade(area, pipeline, destination, u8[]((u8*)&params[0], 64), [texture], filter)
+
+## What the composite's eyes keep, 1 or 0 each, and how many are on.
+func composite_keep(canvas: const Canvas*) -> f32[4]:
+    var keep: f32[4] = [0.0, 0.0, 0.0, 0.0]
+    for channel in 0..<(usize)3:
+        if canvas.view_channels[channel]:
+            keep[channel] = 1.0
+    return keep
+
+func composite_shown_count(canvas: const Canvas*) -> usize:
+    var shown: usize = 0
+    for channel in 0..<(usize)3:
+        if canvas.view_channels[channel]:
+            shown += 1
+    return shown
+
+## How `draw` shows the composite now: as is when every channel shows, else
+## through channels.frag keeping those shown, one alone as grayscale.
+func composite_shading(canvas: Canvas*, target: const gpu.RenderTarget*) -> Shading!:
+    let shown = composite_shown_count(canvas)
+    if shown == 3:
+        return Shading(x = 0.0, y = 0.0, scale = 1.0, keep = [1.0, 1.0, 1.0, 0.0], gray = 0.0)
+    return try shading_for(canvas, target, composite_keep(canvas), 1.0 if shown == 1 else 0.0)
+
+## A composite tile into `destination` as `shading` shows it.
+func draw_view_tile(area: const gpu.RenderTarget*, shading: const Shading*, texture: gpu.Texture, destination: gpu.Rect, region: gpu.Region, filter: gpu.Filter) -> !:
+    if shading.pipeline == none:
+        try gpu.draw_image(area, texture, destination, region, 1.0, filter)
+        return
+    try shade_tile(area, shading, texture, destination, region, filter)
+
+## After the composite: every shown alpha channel as Quick Mask's red over it
+## or, with no composite channel shown, the first alone as grayscale, the
+## rest red over that.
+func draw_channel_view(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64) -> !:
+    let device = canvas.device else return
+    var alone = composite_shown_count(canvas) == 0
+    for index in 0..<canvas.channels.count:
+        let channel = &canvas.channels.items[index]
+        if not channel.shown:
+            continue
+        let tiles = try channel.selection.gpu_tiles(device)
+        if alone:
+            try draw_channel_cells(canvas, target, rectangle, zoom, offset_x, offset_y, tiles, [1.0, 0.0, 0.0, 0.0], 2.0)
+            alone = false
+            continue
+        try draw_channel_cells(canvas, target, rectangle, zoom, offset_x, offset_y, tiles, [quick_red, 0.0, 0.0, quick_opacity], 3.0)
+
+## An alpha channel's `tiles` (none: nothing selected) through channels.frag
+## as `keep` and `gray` say — alone as opaque grayscale (white selected), or
+## as Quick Mask's red where it selects nothing — at the view's level, only
+## the cells on screen.
+func draw_channel_cells(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64,
+                        tiles: const Tiles*?, keep: f32[4], gray: f32) -> !:
+    let checked = try target.get()
+    let clipped = try checked.clipped(rectangle)
+    defer clipped.release()
+    let area = clipped.value()
+    let shading = try shading_for(canvas, checked, keep, gray)
+    let composer = canvas.composer else return
+    composer.hold()
+    let level = view_level(zoom)
+    let span = (f64)((u64)tile_size << level)
+    let step = (f64)(1u64 << level)
+    for row in 0..<level_cells(canvas.extent_y, level):
+        for column in 0..<level_cells(canvas.extent_x, level):
+            let covered_x = covered_at(canvas.extent_x, column, level)
+            let covered_y = covered_at(canvas.extent_y, row, level)
+            let destination = gpu.Rect(rectangle.x + offset_x + (f64)column * span * zoom, rectangle.y + offset_y + (f64)row * span * zoom,
+                                       (f64)covered_x * step * zoom, (f64)covered_y * step * zoom)
+            if not overlaps(destination, rectangle.x, rectangle.y, rectangle.x + rectangle.width, rectangle.y + rectangle.height):
+                continue
+            var found: gpu.Texture? = none
+            if let coverage = tiles:
+                found = try composer.level_texture(coverage, column, row, level)
+            # A cell without a tile selects nothing.
+            let texture = found else composer_blank(canvas)
+            try shade_tile(area, &shading, texture, destination, gpu.Region(0, 0, covered_x, covered_y), gpu.Filter.nearest if zoom * step >= 1.0 else gpu.Filter.linear)
+
+# mark: Thumbnails ==============================================================================
+
+## `Canvas.draw_channel`: the composite (0), its red, green or blue (1..3),
+## or alpha channel `channel - 4`, scaled into `rectangle`: the composite at
+## the pyramid level about a texel a point, an alpha channel sampled from its
+## cells (4 by 4 a thumbnail pixel), so a thumbnail never reads the canvas.
+func draw_channel_thumbnail(canvas: Canvas*, target: interop.View[gpu.RenderTarget], channel: i64, rectangle: gpu.Rect) -> !:
+    try canvas.require_open()
+    if channel < 0 or channel >= 4 + (i64)canvas.channels.count:
+        error(invalid, "no such channel")
+    if rectangle.width <= 0.0 or rectangle.height <= 0.0:
+        return
+    let checked = try target.get()
+    if channel >= 4:
+        try draw_alpha_thumbnail(canvas, checked, &canvas.channels.items[(usize)(channel - 4)].selection, rectangle)
+        return
+    let document = canvas.document else return
+    let composer = canvas.composer else return
+    var shading = Shading(x = 0.0, y = 0.0, scale = 1.0, keep = [1.0, 1.0, 1.0, 0.0], gray = 0.0)
+    if channel > 0:
+        var keep: f32[4] = [0.0, 0.0, 0.0, 0.0]
+        keep[(usize)channel - 1] = 1.0
+        shading = try shading_for(canvas, checked, keep, 1.0)
+    let scale_x = rectangle.width / (f64)canvas.extent_x
+    let scale_y = rectangle.height / (f64)canvas.extent_y
+    let level = view_level(math.min(scale_x, scale_y))
+    let span = (f64)((u64)tile_size << level)
+    let step = (f64)(1u64 << level)
+    for row in 0..<level_cells(canvas.extent_y, level):
+        for column in 0..<level_cells(canvas.extent_x, level):
+            let covered_x = covered_at(canvas.extent_x, column, level)
+            let covered_y = covered_at(canvas.extent_y, row, level)
+            let texture = try composer.tile(document, column, row, level)
+            let destination = gpu.Rect(rectangle.x + (f64)column * span * scale_x, rectangle.y + (f64)row * span * scale_y,
+                                       (f64)covered_x * step * scale_x, (f64)covered_y * step * scale_y)
+            try draw_view_tile(checked, &shading, texture, destination, gpu.Region(0, 0, covered_x, covered_y), gpu.Filter.linear)
+
+## An alpha channel's thumbnail: black, then white as far as each thumbnail
+## pixel's 16 samples of the cells are selected.
+func draw_alpha_thumbnail(canvas: Canvas*, target: const gpu.RenderTarget*, selection: const Selection*, rectangle: gpu.Rect) -> !:
+    let size = try target.size()
+    let scale = size.pixel_width / size.width if size.width > 0.0 else 1.0
+    let width = (u32)math.clamp(math.ceil(rectangle.width * scale), 1.0, 512.0)
+    let height = (u32)math.clamp(math.ceil(rectangle.height * scale), 1.0, 512.0)
+    let pixels = try alloc u8[(usize)width * (usize)height] in memory.heap
+    defer free(pixels) in memory.heap
+    memory.set(pixels, 255)
+    try target.mask(pixels, width, height, rectangle, gpu.Color(0.0, 0.0, 0.0, 1.0))
+    if selection.is_empty():
+        return
+    let step_x = (f64)canvas.extent_x / (f64)width / 4.0
+    let step_y = (f64)canvas.extent_y / (f64)height / 4.0
+    for y in 0..<height:
+        for x in 0..<width:
+            var sum: u32 = 0
+            for sy in 0..<4:
+                for sx in 0..<4:
+                    let px = (i64)(((f64)x * 4.0 + (f64)sx + 0.5) * step_x)
+                    let py = (i64)(((f64)y * 4.0 + (f64)sy + 0.5) * step_y)
+                    sum += (u32)selection.at(px, py)
+            pixels[(usize)y * (usize)width + (usize)x] = (u8)((sum + 8) // 16)
+    try target.mask(pixels, width, height, rectangle, gpu.Color(1.0, 1.0, 1.0, 1.0))

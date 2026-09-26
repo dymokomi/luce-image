@@ -332,6 +332,31 @@ pub struct Selection:
         let block = self.cells.block((usize)row * (usize)self.cells.columns() + (usize)column) else return none
         return block.bytes
 
+    ## A name for cell (`column`, `row`)'s content, the same for every cell
+    ## (in any copy) sharing its block: what a saved file stores once.
+    pub func cell_stamp(column: u32, row: u32) -> u64:
+        return self.cells.shows((usize)row * (usize)self.cells.columns() + (usize)column)
+
+    ## Cell (`column`, `row`) `value` throughout: a selection built a cell at a
+    ## time (an alpha channel read from a file); `settle` once all are in.
+    pub mutating func fill_cell(column: u32, row: u32, value: u8):
+        self.cells.fill((usize)row * (usize)self.cells.columns() + (usize)column, value)
+
+    ## Cell (`column`, `row`)'s coverage bytes to write, rows of 256, a block
+    ## of its own whatever it held; `settle` once all are in.
+    pub mutating func cell_block(column: u32, row: u32) -> u8[]:
+        return self.cells.fresh((usize)row * (usize)self.cells.columns() + (usize)column)
+
+    ## Put cell (`column`, `row`) of `other` (a selection of the same size)
+    ## here, shared: a block read from a file once, shown by many cells.
+    pub mutating func share_cell(column: u32, row: u32, other: const Selection*, from_column: u32, from_row: u32):
+        let columns = (usize)self.cells.columns()
+        self.cells.share((usize)row * columns + (usize)column, &other.cells, (usize)from_row * columns + (usize)from_column)
+
+    ## After cells were written directly: settle them and take the bounds.
+    pub mutating func settle():
+        self.finish()
+
     ## Let the GPU tiles go (a selection put away in history); they are made
     ## again when wanted.
     pub mutating func drop_gpu_tiles():

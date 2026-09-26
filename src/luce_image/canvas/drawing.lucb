@@ -4,7 +4,8 @@
 #
 #==============================================================================================
 
-## `Canvas.draw`: the flattened document's tiles at the pyramid level for `zoom`.
+## `Canvas.draw`: the flattened document's tiles at the pyramid level for
+## `zoom`, as the Channels panel shows them (channels.lucb).
 func draw_canvas(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64) -> !:
     try canvas.require_open()
     try canvas.settle_stroke()
@@ -21,6 +22,13 @@ func draw_canvas(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectan
     # once this draw is done with it. Later draws into the same frame keep what
     # this one pins.
     let settles = begin_frame(checked.frame_serial())
+    if composite_shown_count(canvas) == 0:
+        # No composite channel shown: an alpha channel alone, or nothing.
+        try draw_channel_view(canvas, target, rectangle, zoom, offset_x, offset_y)
+        if settles:
+            try settle_tiers(canvas)
+        return
+    let shading = try composite_shading(canvas, checked)
     let clipped = try checked.clipped(rectangle)
     defer clipped.release()
     let area = clipped.value()
@@ -64,15 +72,17 @@ func draw_canvas(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectan
             if not waits and not composer.kept(document, column, row, level) and (try composer.lacking(document, column, row, level, &lacking)) > 0:
                 # Its tiles come back in the background: a coarser level kept stands in.
                 if let coarse = composer.coarser(document, column, row, level, covered_x, covered_y):
-                    try gpu.draw_image(area, coarse.texture, destination, coarse.region, 1.0, gpu.Filter.linear)
+                    try draw_view_tile(area, &shading, coarse.texture, destination, coarse.region, gpu.Filter.linear)
                     canvas.coarse_shown = true
                     continue
                 # Nothing coarser is kept (the first frame): this cell waits.
                 try composer.gather(document, column, row, column + 1, row + 1, level)
             let texture = try composer.tile(document, column, row, level)
-            try gpu.draw_image(area, texture, destination, gpu.Region(0, 0, covered_x, covered_y), 1.0,
+            try draw_view_tile(area, &shading, texture, destination, gpu.Region(0, 0, covered_x, covered_y),
                                gpu.Filter.nearest if zoom >= 1.0 else gpu.Filter.linear)
     try lacking.finish()
+    # The alpha channels shown, red over the picture.
+    try draw_channel_view(canvas, target, rectangle, zoom, offset_x, offset_y)
     if settles:
         try settle_tiers(canvas)
 

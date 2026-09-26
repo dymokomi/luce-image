@@ -1,0 +1,192 @@
+#==============================================================================================
+#
+#   canvas/channel_tests - Alpha channels: saved, loaded, undone, filed and shown
+#
+#==============================================================================================
+
+test "alpha channels save the selection, load it in every mode, and every change undoes":
+    var canvas = try Canvas(600, 400)
+    defer canvas.close()
+    discard(try canvas.add_layer("Paint"))
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try canvas.bind_headless()
+    try canvas.select_rectangle(10, 10, 300, 200, 0)
+    assert((try canvas.save_selection_channel("Alpha 1")) == 0)
+    assert(canvas.channel_count() == 1 and (try canvas.channel_name(0)) == "Alpha 1" and canvas.undo_name() == "Save Selection")
+    assert((try canvas.channel_at_pixel(0, 50, 50)) == 255 and (try canvas.channel_at_pixel(0, 400, 300)) == 0)
+    # Replace, add, subtract and intersect, as a marquee combines.
+    try canvas.deselect()
+    try canvas.load_channel(0, 0)
+    assert(canvas.undo_name() == "Load Selection" and canvas.selected_at(50, 50) == 255 and canvas.selected_at(400, 300) == 0)
+    try canvas.select_rectangle(250, 150, 300, 200, 0)
+    try canvas.load_channel(0, 1)
+    assert(canvas.selected_at(50, 50) == 255 and canvas.selected_at(500, 300) == 255 and canvas.selected_at(500, 50) == 0)
+    try canvas.load_channel(0, 2)
+    assert(canvas.selected_at(50, 50) == 0 and canvas.selected_at(500, 300) == 255 and canvas.selected_at(280, 180) == 0)
+    try canvas.select_rectangle(250, 150, 300, 200, 0)
+    try canvas.load_channel(0, 3)
+    assert(canvas.selected_at(280, 180) == 255 and canvas.selected_at(500, 300) == 0 and canvas.selected_at(50, 50) == 0)
+    # A new channel selects nothing: loading it deselects.
+    assert((try canvas.new_channel("Alpha 2")) == 1 and (try canvas.channel_at_pixel(1, 50, 50)) == 0)
+    try canvas.load_channel(1, 0)
+    assert(not canvas.has_selection())
+    # Duplicate, rename, delete; each one step, undone in turn.
+    assert((try canvas.duplicate_channel(0, "Alpha 1 copy")) == 1)
+    assert(canvas.channel_count() == 3 and (try canvas.channel_name(1)) == "Alpha 1 copy" and (try canvas.channel_at_pixel(1, 50, 50)) == 255)
+    try canvas.rename_channel(1, "Kept")
+    try canvas.delete_channel(2)
+    assert(canvas.channel_count() == 2 and (try canvas.channel_name(1)) == "Kept" and canvas.undo_name() == "Delete Channel")
+    try canvas.undo()
+    assert(canvas.channel_count() == 3 and (try canvas.channel_name(2)) == "Alpha 2")
+    try canvas.undo()
+    assert((try canvas.channel_name(1)) == "Alpha 1 copy")
+    try canvas.undo()
+    assert(canvas.channel_count() == 2 and (try canvas.channel_name(1)) == "Alpha 2")
+    try canvas.redo()
+    assert(canvas.channel_count() == 3 and (try canvas.channel_at_pixel(1, 50, 50)) == 255)
+    # The eye is the view's: shown or not, no step.
+    let steps = canvas.history_steps()
+    try canvas.set_channel_shown(0, true)
+    assert((try canvas.channel_shown(0)) and canvas.history_steps() == steps)
+    # A wider canvas keeps the channels where their pixels are; undo puts them back.
+    try canvas.resize_canvas(700, 400, 100, 0)
+    assert((try canvas.channel_at_pixel(0, 60, 50)) == 0 and (try canvas.channel_at_pixel(0, 150, 50)) == 255 and (try canvas.channel_at_pixel(0, 405, 50)) == 255)
+    try canvas.undo()
+    assert(canvas.width() == 600 and (try canvas.channel_at_pixel(0, 50, 50)) == 255 and (try canvas.channel_at_pixel(0, 350, 50)) == 0)
+    # Image Size scales them; a flipped canvas mirrors them.
+    try canvas.resize_image(300, 200)
+    assert((try canvas.channel_at_pixel(0, 100, 50)) == 255 and (try canvas.channel_at_pixel(0, 200, 50)) == 0)
+    try canvas.undo()
+    try canvas.flip_canvas(true)
+    assert((try canvas.channel_at_pixel(0, 50, 50)) == 0 and (try canvas.channel_at_pixel(0, 550, 50)) == 255)
+    try canvas.undo()
+    assert((try canvas.channel_at_pixel(0, 50, 50)) == 255 and (try canvas.channel_at_pixel(0, 550, 50)) == 0)
+
+test "a channel of a 360-megapixel selection shares its cells: saving, duplicating and loading copy nothing":
+    var canvas = try Canvas(15000, 24000)
+    defer canvas.close()
+    try canvas.select_ellipse(1000, 1000, 13000, 22000, 0)
+    let before = selection_blocks(&canvas.selection)
+    discard(try canvas.save_selection_channel("Alpha 1"))
+    discard(try canvas.duplicate_channel(0, "Alpha 1 copy"))
+    try canvas.deselect()
+    try canvas.load_channel(1, 0)
+    # The edge cells are the ellipse's alone, however many hold them.
+    assert(selection_blocks(&canvas.channels.items[0].selection) == before and selection_blocks(&canvas.selection) == before)
+    assert(canvas.selected_at(7500, 12000) == 255 and canvas.selected_at(10, 10) == 0 and (try canvas.channel_at_pixel(1, 7500, 12000)) == 255)
+
+## How many cells of `selection` hold bytes (the rest are one value).
+func selection_blocks(selection: const Selection*) -> usize:
+    var blocks: usize = 0
+    for row in 0..<tile_columns(selection.height()):
+        for column in 0..<tile_columns(selection.width()):
+            if selection.cell_value(column, row) < 0:
+                blocks += 1
+    return blocks
+
+test "an .l2d keeps the alpha channels: names, eyes, soft edges, whole cells and shared blocks":
+    var canvas = try Canvas(700, 520)
+    defer canvas.close()
+    discard(try canvas.add_layer("Paint"))
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try canvas.bind_headless()
+    # A feathered ellipse: soft edge cells, whole cells inside, partial cells at the canvas's edge.
+    try canvas.set_selection_shape(12, true)
+    try canvas.select_ellipse(20, 30, 660, 480, 0)
+    discard(try canvas.save_selection_channel("Soft"))
+    discard(try canvas.duplicate_channel(0, "Soft copy"))
+    discard(try canvas.new_channel("Nothing"))
+    try canvas.set_channel_shown(1, true)
+    try canvas.save_package("build/canvas-channels.l2d")
+    let reopened = try Canvas.open("build/canvas-channels.l2d")
+    defer reopened.release()
+    let opened = reopened.value()
+    assert(opened.channel_count() == 3 and (try opened.channel_name(0)) == "Soft" and (try opened.channel_name(1)) == "Soft copy" and (try opened.channel_name(2)) == "Nothing")
+    assert(not (try opened.channel_shown(0)) and (try opened.channel_shown(1)))
+    var y: i64 = 0
+    while y < 520:
+        var x: i64 = 0
+        while x < 700:
+            let saved = try canvas.channel_at_pixel(0, x, y)
+            assert((try opened.channel_at_pixel(0, x, y)) == saved and (try opened.channel_at_pixel(1, x, y)) == saved)
+            assert((try opened.channel_at_pixel(2, x, y)) == 0)
+            x += 7
+        y += 5
+    # The copy's blocks are the original's, stored once and shared again.
+    let first = &opened.channels.items[0].selection
+    let copy = &opened.channels.items[1].selection
+    assert(selection_blocks(first) > 0)
+    for row in 0..<tile_columns(520):
+        for column in 0..<tile_columns(700):
+            assert(first.cell_stamp(column, row) == copy.cell_stamp(column, row))
+
+## What `draw` shows at (`x`, `y`) of a 64 by 64 target, at 100%.
+func view_at(canvas: Canvas*, target: gpu.Texture*, x: u32, y: u32) -> u8[4]!:
+    return try shown_at(canvas, target, x, y)
+
+## A thumbnail of `channel` drawn over the whole 64 by 64 target, read at (`x`, `y`).
+func thumbnail_at(canvas: Canvas*, target: gpu.Texture*, channel: i64, x: u32, y: u32) -> u8[4]!:
+    let frame = try target.frame()
+    defer frame.release()
+    let root = try frame.value().target()
+    defer root.release()
+    try canvas.draw_channel(root, channel, gpu.Rect(width = 64.0, height = 64.0))
+    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    var pixel: u8[4]
+    try target.read(pixel, gpu.Region(x, y, 1, 1))
+    return pixel
+
+test "the channel view shows channels alone as grayscale, hides them, and tints alpha channels":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    # The view's pipelines draw into the test's texture, not a window.
+    canvas.view_format = gpu.Format.rgba8_linear
+    discard(try view_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.5, false)
+    try canvas.fill(layer, false)
+    let whole = try view_at(&canvas, &target, 10, 10)
+    assert(whole[0] == 255 and whole[1] == 0 and whole[2] >= 127 and whole[2] <= 128)
+    # Red alone: its values as gray; blue alone likewise; green and blue, red hidden.
+    canvas.set_composite_view(true, false, false)
+    let red = try view_at(&canvas, &target, 10, 10)
+    assert(red[0] == 255 and red[1] == 255 and red[2] == 255)
+    canvas.set_composite_view(false, false, true)
+    let blue = try view_at(&canvas, &target, 10, 10)
+    assert(blue[0] == blue[2] and blue[1] == blue[2] and blue[2] >= 127 and blue[2] <= 128)
+    canvas.set_composite_view(false, true, true)
+    let cyan = try view_at(&canvas, &target, 10, 10)
+    assert(cyan[0] == 0 and cyan[1] == 0 and cyan[2] >= 127 and cyan[2] <= 128)
+    # An alpha channel shown alone: white where it selects, black elsewhere.
+    try canvas.select_rectangle(0, 0, 32, 64, 0)
+    discard(try canvas.save_selection_channel("Left"))
+    try canvas.deselect()
+    try canvas.set_channel_shown(0, true)
+    canvas.set_composite_view(false, false, false)
+    let inside = try view_at(&canvas, &target, 10, 10)
+    let outside = try view_at(&canvas, &target, 50, 10)
+    assert(inside[0] == 255 and inside[1] == 255 and inside[2] == 255 and outside[0] == 0 and outside[1] == 0 and outside[2] == 0)
+    # Over the picture: Quick Mask's red at half where it selects nothing.
+    canvas.set_composite_view(true, true, true)
+    let clear = try view_at(&canvas, &target, 10, 10)
+    let tinted = try view_at(&canvas, &target, 50, 10)
+    assert(clear[0] == 255 and clear[1] == 0 and clear[2] >= 127)
+    assert(tinted[0] == 255 and tinted[1] == 0 and tinted[2] >= 63 and tinted[2] <= 64)
+    try canvas.set_channel_shown(0, false)
+    assert((try view_at(&canvas, &target, 50, 10))[2] >= 127)
+    # Thumbnails: the red channel as gray, the alpha channel white where it selects.
+    let red_thumb = try thumbnail_at(&canvas, &target, 1, 10, 10)
+    assert(red_thumb[0] == 255 and red_thumb[1] == 255 and red_thumb[2] == 255)
+    let alpha_inside = try thumbnail_at(&canvas, &target, 4, 10, 10)
+    let alpha_outside = try thumbnail_at(&canvas, &target, 4, 50, 10)
+    assert(alpha_inside[0] == 255 and alpha_outside[0] == 0)

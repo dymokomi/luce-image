@@ -28,6 +28,8 @@ refining.lucb
 magnetic.lucb
 masking.lucb
 quick_mask.lucb
+channels.lucb
+package_channels.lucb
 raw_tiles.lucb
 history.lucb
 memory.lucb
@@ -42,4 +44,5 @@ shape_render_tests.lucb
 package_tests.lucb
 moat_tests.lucb
 refine_tests.lucb
+channel_tests.lucb
 mesh_warp_tests.lucb
