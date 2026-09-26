@@ -1801,6 +1801,8 @@ pub struct Canvas:
         let on_mask = try self.paints_mask(target)
         var brush = self.brush
         brush.erase = erase
+        # Edit › Fill is opaque, as Photoshop's: the brush's opacity is the brush's.
+        brush.opacity = 1.0
         let before = try fill_selection(&painter, document, (u64)target, brush, on_mask)
         try self.remember((u64)target, before, on_mask, name = "Fill")
 

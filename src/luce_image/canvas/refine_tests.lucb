@@ -268,3 +268,21 @@ test "grow takes its colors from the selection's solid pixels, not its anti-alia
     try canvas.select_ellipse(100, 50, 200, 200, 0)
     try canvas.grow_selection(layer, 48.0, true)
     assert(canvas.selected_at(200, 150) == 255 and canvas.selected_at(20, 20) == 0 and canvas.selected_at(380, 280) == 0)
+
+test "edit fill is opaque whatever the brush's opacity":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    # A half-opaque brush, then Edit › Fill with white over the black backdrop.
+    try canvas.set_brush(10.0, 1.0, 0.5, 1.0, 1.0, 1.0, 1.0, false)
+    try canvas.select_all()
+    try canvas.fill(layer, false)
+    let shown = try shown_at(&canvas, &target, 32, 32)
+    assert(shown[0] == 255 and shown[1] == 255 and shown[2] == 255)
