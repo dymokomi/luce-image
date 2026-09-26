@@ -145,3 +145,27 @@ test "free transforms and distortions map points both ways":
     assert(distort.map(-20.0, 100.0, &x, &y) and math.abs(x) < 1e-6 and math.abs(y - 50.0) < 1e-6)
     let folded: f64[8] = [0.0, 0.0, 100.0, 0.0, 0.0, 100.0, 100.0, 100.0]
     assert(not convex(folded[..<8]))
+
+test "skew keeps the sides parallel, and perspective keeps the box's middle on its axis":
+    var x = 0.0
+    var y = 0.0
+    # Skewed: the top slid right by 20, the bottom left by 20 — a parallelogram,
+    # so the map is affine (no w) and a row keeps its width.
+    let skewed: f64[8] = [20.0, 0.0, 120.0, 0.0, 80.0, 50.0, -20.0, 50.0]
+    let skew = try quad_warp(0.0, 0.0, 100.0, 50.0, skewed[..<8])
+    assert(math.abs(skew.m[6]) < 1e-12 and math.abs(skew.m[7]) < 1e-12)
+    assert(skew.map(50.0, 25.0, &x, &y) and math.abs(x - 50.0) < 1e-9 and math.abs(y - 25.0) < 1e-9)
+    assert(skew.map(60.0, 10.0, &x, &y) and math.abs(x - 48.0) < 1e-9 and math.abs(y - 10.0) < 1e-9)
+    # Perspective: the top narrowed symmetrically. The middle column stays put,
+    # and a row comes from a row: w changes with y only.
+    let narrowed: f64[8] = [30.0, 0.0, 70.0, 0.0, 100.0, 50.0, 0.0, 50.0]
+    let perspective = try quad_warp(0.0, 0.0, 100.0, 50.0, narrowed[..<8])
+    assert(math.abs(perspective.m[6]) < 1e-12 and math.abs(perspective.m[7]) > 1e-6)
+    assert(perspective.map(50.0, 20.0, &x, &y) and math.abs(x - 50.0) < 1e-9)
+    assert(perspective.map(70.0, 0.0, &x, &y) and math.abs(x - 100.0) < 1e-6 and math.abs(y) < 1e-6)
+    # Nearer the narrow top, a pixel covers more of the source.
+    var near_top = 0.0
+    var near_bottom = 0.0
+    var unused = 0.0
+    assert(perspective.map(51.0, 5.0, &near_top, &unused) and perspective.map(51.0, 45.0, &near_bottom, &unused))
+    assert(near_top - 50.0 > near_bottom - 50.0)
