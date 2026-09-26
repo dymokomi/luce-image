@@ -1,0 +1,326 @@
+#==============================================================================================
+#
+#   canvas/retouch_effects - What the retouching strokes paint, made only where they reach
+#
+#   DESCRIPTION:
+#       Clone stamp, the blur tool, dodge and burn paint an effect image through their
+#       coverage. Each is an EffectSource: the stroke asks for a cell's effect tile the first
+#       time a dab reaches that cell, so a stroke on a huge canvas costs the cells it crosses,
+#       never the whole layer. Every source reads the picture as it was when the stroke began
+#       (shared tiles, or a frozen copy of the document), so paint laid down by the stroke
+#       never feeds back into what it samples.
+#
+#       Spot healing works out its patch when the stroke ends, in a window around the spot:
+#       the spot, its ring, and as far as heal() looks for a matching patch.
+#
+#==============================================================================================
+
+# -- Clone Stamp.
+
+## A Clone Stamp's source: the layer (or with All Layers, the whole document)
+## as the stroke began, read shifted by the clone offset.
+struct CloneSource:
+    var tiles: Tiles
+    ## The frozen document, and the compositor to flatten it with, for All Layers.
+    var frozen: Document*?
+    var composer: Composer*?
+    var device: gpu.Device
+    var dx: i64
+    var dy: i64
+    var extent_x: i64
+    var extent_y: i64
+
+    ## Whether the layer has a tile in any cell of the range (inclusive).
+    func tiles_under(left: i64, top: i64, right: i64, bottom: i64) -> bool:
+        for row in top..<bottom + 1:
+            for column in left..<right + 1:
+                if self.tiles.texture((u32)column, (u32)row) != none:
+                    return true
+        return false
+
+    ## A source cell: the layer's tile, or the frozen document flattened there
+    ## (borrowed until the compositor's next request).
+    mutating func cell_at(column: u32, row: u32) -> gpu.Texture?!:
+        if let document = self.frozen:
+            let composer = self.composer else trap("a frozen clone without a compositor")
+            return try composer.tile(document, column, row, 0)
+        return self.tiles.texture(column, row)
+
+func clone_source(canvas: Canvas*, tiles: const Tiles*, dx: i64, dy: i64) -> EffectSource!:
+    let device = canvas.device else trap("cloning without a device")
+    var frozen: Document*? = none
+    var composer: Composer*? = none
+    if canvas.clone_all:
+        let document = canvas.document else trap("cloning without a document")
+        composer = canvas.composer else trap("cloning without a compositor")
+        frozen = try document.frozen()
+    var copy = tiles.clone() catch failure:
+        if let made = frozen:
+            unbox_document(made)
+        error(failure.code, failure.message)
+    let boxed = new CloneSource(tiles = copy, frozen = frozen, composer = composer, device = device, dx = dx, dy = dy,
+                                extent_x = (i64)canvas.extent_x, extent_y = (i64)canvas.extent_y) in memory.heap catch failure:
+        copy.destroy()
+        if let made = frozen:
+            unbox_document(made)
+        error(failure.code, failure.message)
+    return EffectSource(context = (void*)boxed, produce = clone_cell, release = release_clone)
+
+## A cell of the clone: the picture at the cell's place plus the offset, copied
+## from the up to four source cells under it; none where it reads nothing.
+func clone_cell(context: void*?, column: u32, row: u32) -> gpu.Texture?!:
+    let source = (CloneSource*)(context else trap("a clone without its source"))
+    let cell_x = (i64)(column * tile_size)
+    let cell_y = (i64)(row * tile_size)
+    # The source window, clipped to the picture.
+    let x0 = math.imax(0, cell_x + source.dx)
+    let y0 = math.imax(0, cell_y + source.dy)
+    let x1 = math.imin(source.extent_x, cell_x + source.dx + (i64)tile_size)
+    let y1 = math.imin(source.extent_y, cell_y + source.dy + (i64)tile_size)
+    if x1 <= x0 or y1 <= y0:
+        return none
+    let size = (i64)tile_size
+    if source.frozen == none and not source.tiles_under(x0 // size, y0 // size, (x1 - 1) // size, (y1 - 1) // size):
+        return none
+    var cell = try gpu.Texture.create(source.device, tile_size, tile_size, gpu.Format.rgba16_float)
+    errdefer cell.destroy()
+    let frame = try cell.frame()
+    defer frame.release()
+    let target = try frame.value().target()
+    defer target.release()
+    for from_row in y0 // size..<(y1 - 1) // size + 1:
+        for from_column in x0 // size..<(x1 - 1) // size + 1:
+            let texture = (try source.cell_at((u32)from_column, (u32)from_row)) else continue
+            # The part of this source cell inside the window, and where it lands.
+            let left = math.imax(x0, from_column * size)
+            let top = math.imax(y0, from_row * size)
+            let right = math.imin(x1, from_column * size + size)
+            let bottom = math.imin(y1, from_row * size + size)
+            try gpu.copy_image(target.value(), texture, gpu.Rect((f64)(left - source.dx - cell_x), (f64)(top - source.dy - cell_y), (f64)(right - left), (f64)(bottom - top)),
+                               gpu.Region((u32)(left - from_column * size), (u32)(top - from_row * size), (u32)(right - left), (u32)(bottom - top)))
+    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+    return cell
+
+func release_clone(context: void*?):
+    let source = (CloneSource*)(context else return)
+    source.tiles.destroy()
+    if let document = source.frozen:
+        unbox_document(document)
+    free(source) in memory.heap
+
+# -- Blur tool.
+
+## The blur tool's source: the layer as the stroke began, blurred a cell at a time.
+struct BlurSource:
+    var tiles: Tiles
+    var filters: Filters
+    var radius: f64
+
+func blur_source(canvas: Canvas*, tiles: const Tiles*, radius: f64) -> EffectSource!:
+    let filters = canvas.filters else trap("blurring without filters")
+    var copy = try tiles.clone()
+    let boxed = new BlurSource(tiles = copy, filters = filters, radius = radius) in memory.heap catch failure:
+        copy.destroy()
+        error(failure.code, failure.message)
+    return EffectSource(context = (void*)boxed, produce = blur_cell, release = release_blur)
+
+func blur_cell(context: void*?, column: u32, row: u32) -> gpu.Texture?!:
+    let source = (BlurSource*)(context else trap("a blur without its source"))
+    return try source.filters.blur_cell(&source.tiles, column, row, source.radius)
+
+func release_blur(context: void*?):
+    let source = (BlurSource*)(context else return)
+    source.tiles.destroy()
+    free(source) in memory.heap
+
+# -- Dodge and Burn.
+
+## Dodge and Burn's source: the layer as the stroke began through a Levels move,
+## a cell at a time.
+struct ToneSource:
+    var tiles: Tiles
+    var adjuster: Adjuster
+    var values: f64[20]
+
+## The layer lightened (`dodge`) or darkened, as Photoshop's Dodge and Burn:
+## in the shadows, midtones or highlights (`canvas.tone_range` 0, 1, 2) by
+## `canvas.tone_exposure` (0..1), a Levels move on the encoded values. The
+## stroke brushes it in by its coverage.
+func tone_source(canvas: Canvas*, tiles: const Tiles*, dodge: bool) -> EffectSource!:
+    let adjuster = canvas.adjuster else trap("toning without an adjuster")
+    let amount = math.clamp(canvas.tone_exposure, 0.0, 1.0)
+    # Levels on RGB: input black, input white, gamma, output black, output white.
+    var values: f64[20]
+    for at in 0..<(usize)20:
+        values[at] = 0.0
+    values[1] = 1.0
+    values[2] = 1.0
+    values[4] = 1.0
+    if canvas.tone_range == 0:
+        if dodge:
+            values[3] = amount * 0.3
+        else:
+            values[0] = amount * 0.3
+    elif canvas.tone_range == 2:
+        if dodge:
+            values[1] = 1.0 - amount * 0.3
+        else:
+            values[4] = 1.0 - amount * 0.3
+    else:
+        values[2] = 1.0 + amount * 0.8 if dodge else 1.0 / (1.0 + amount * 0.8)
+    var copy = try tiles.clone()
+    let boxed = new ToneSource(tiles = copy, adjuster = adjuster, values = values) in memory.heap catch failure:
+        copy.destroy()
+        error(failure.code, failure.message)
+    return EffectSource(context = (void*)boxed, produce = tone_cell, release = release_tone)
+
+func tone_cell(context: void*?, column: u32, row: u32) -> gpu.Texture?!:
+    let source = (ToneSource*)(context else trap("a tone without its source"))
+    let texture = source.tiles.texture(column, row) else return none
+    return try source.adjuster.adjusted(texture, levels, source.values[..<20])
+
+func release_tone(context: void*?):
+    let source = (ToneSource*)(context else return)
+    source.tiles.destroy()
+    free(source) in memory.heap
+
+# -- Spot healing.
+
+## End a spot healing stroke: the painted spot (the stroke's coverage) filled
+## from the picture beside it, mixed in by the coverage at the tool's opacity.
+## Only a window around the spot is read, healed and written back.
+func finish_heal(canvas: Canvas*, stroke: Stroke*) -> !:
+    let document = canvas.document else trap("stroke without a document")
+    var painter = canvas.painter else trap("stroke without a painter")
+    let device = canvas.device else trap("stroke without a device")
+    let original = stroke.original()
+    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    defer free(bytes) in memory.heap
+    let hole = (try spot_bounds(stroke, original, bytes)) else return
+    let window = heal_window(hole, (i64)canvas.extent_x, (i64)canvas.extent_y)
+    let width = (usize)(window.right - window.left)
+    let height = (usize)(window.bottom - window.top)
+    let pixels = try alloc f32[width * height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    let painted = try alloc u8[width * height] in memory.heap
+    defer free(painted) in memory.heap
+    try gather_spot(stroke, original, window, pixels, painted, bytes)
+    if not (try heal(pixels, width, height, painted)):
+        return
+    # Back to straight alpha for the effect tiles.
+    for at in 0..<width * height:
+        let alpha = pixels[at * 4 + 3]
+        for channel in 0..<(usize)3:
+            pixels[at * 4 + channel] = pixels[at * 4 + channel] / alpha if alpha > 0.0 else 0.0
+    # The effect: in each cell the stroke reached, the layer as it was with the window's part healed.
+    var healed = try Tiles.create(device, canvas.extent_x, canvas.extent_y)
+    errdefer healed.destroy()
+    for row in 0..<original.rows():
+        for column in 0..<original.columns():
+            if stroke.coverage_at(column, row) == none:
+                continue
+            try read_cell(original, column, row, bytes)
+            spot_into_cell(pixels, window, column, row, bytes)
+            var texture = try gpu.Texture.create(device, tile_size, tile_size, gpu.Format.rgba16_float)
+            errdefer texture.destroy()
+            try texture.upload(bytes)
+            try healed.set(column, row, texture)
+    try stroke.use_effect(&painter, document, healed, 2.0, canvas.heal_opacity)
+
+## The box of the pixels the stroke painted (coverage past 1%); none when it painted nothing.
+func spot_bounds(stroke: Stroke*, original: const Tiles*, bytes: u8[]) -> Bounds?!:
+    var found = false
+    var bounds = Bounds(left = 0, top = 0, right = 0, bottom = 0)
+    for row in 0..<original.rows():
+        for column in 0..<original.columns():
+            let coverage = stroke.coverage_at(column, row) else continue
+            let area = original.region(column, row)
+            try coverage.read(bytes[..<((usize)area.height * (usize)tile_size * 8)], gpu.Region(0, 0, tile_size, area.height))
+            for y in 0..<(usize)area.height:
+                for x in 0..<(usize)area.width:
+                    if not painted_at(bytes, x, y):
+                        continue
+                    let px = (i64)(column * tile_size) + (i64)x
+                    let py = (i64)(row * tile_size) + (i64)y
+                    if not found:
+                        bounds = Bounds(left = px, top = py, right = px + 1, bottom = py + 1)
+                        found = true
+                        continue
+                    bounds.left = math.imin(bounds.left, px)
+                    bounds.top = math.imin(bounds.top, py)
+                    bounds.right = math.imax(bounds.right, px + 1)
+                    bounds.bottom = math.imax(bounds.bottom, py + 1)
+    return bounds if found else none
+
+## Whether the coverage texel at (`x`, `y`) of a read-back cell counts as painted.
+func painted_at(bytes: const u8[], x: usize, y: usize) -> bool:
+    let at = (y * (usize)tile_size + x) * 8
+    return from_half((u16)bytes[at + 6] | ((u16)bytes[at + 7] << 8)) > 0.01
+
+## Everything heal() reads for a spot in `hole`: the spot, the ring around it
+## (a band up to 16 pixels), and every shift it tries (up to 2.8 times the
+## ring's box, and 3 pixels of refinement), inside the picture. Healing within
+## this window gives what healing the whole picture would.
+func heal_window(hole: Bounds, extent_x: i64, extent_y: i64) -> Bounds:
+    let size = math.imax(hole.right - hole.left, hole.bottom - hole.top)
+    let band = math.imin(16, math.imax(2, size // 8))
+    let box_width = math.imin(extent_x, hole.right + band) - math.imax(0, hole.left - band)
+    let box_height = math.imin(extent_y, hole.bottom + band) - math.imax(0, hole.top - band)
+    let reach = (i64)math.ceil((f64)math.imax(box_width, box_height) * 2.8) + band + 8
+    return Bounds(left = math.imax(0, hole.left - reach), top = math.imax(0, hole.top - reach),
+                  right = math.imin(extent_x, hole.right + reach), bottom = math.imin(extent_y, hole.bottom + reach))
+
+## The window's pixels (premultiplied) from the layer as it was, and where the stroke painted.
+func gather_spot(stroke: Stroke*, original: const Tiles*, window: Bounds, pixels: f32[], painted: u8[], bytes: u8[]) -> !:
+    for index in 0..<pixels.length:
+        pixels[index] = 0.0
+    for index in 0..<painted.length:
+        painted[index] = 0
+    let width = (usize)(window.right - window.left)
+    let size = (i64)tile_size
+    for row in window.top // size..<(window.bottom - 1) // size + 1:
+        for column in window.left // size..<(window.right - 1) // size + 1:
+            let cell_x = column * size
+            let cell_y = row * size
+            let x0 = math.imax(window.left, cell_x)
+            let y0 = math.imax(window.top, cell_y)
+            let x1 = math.imin(window.right, cell_x + size)
+            let y1 = math.imin(window.bottom, cell_y + size)
+            if let texture = original.texture((u32)column, (u32)row):
+                try texture.read(bytes)
+                for y in y0..<y1:
+                    for x in x0..<x1:
+                        let source = (usize)((y - cell_y) * size + x - cell_x) * 8
+                        let target = ((usize)(y - window.top) * width + (usize)(x - window.left)) * 4
+                        let alpha = from_half((u16)bytes[source + 6] | ((u16)bytes[source + 7] << 8))
+                        for channel in 0..<(usize)3:
+                            pixels[target + channel] = from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8)) * alpha
+                        pixels[target + 3] = alpha
+            if let coverage = stroke.coverage_at((u32)column, (u32)row):
+                try coverage.read(bytes)
+                for y in y0..<y1:
+                    for x in x0..<x1:
+                        if painted_at(bytes, (usize)(x - cell_x), (usize)(y - cell_y)):
+                            painted[(usize)(y - window.top) * width + (usize)(x - window.left)] = 1
+
+## A cell of `tiles` read back into `bytes` (zero where it has no tile).
+func read_cell(tiles: const Tiles*, column: u32, row: u32, bytes: u8[]) -> !:
+    if let texture = tiles.texture(column, row):
+        try texture.read(bytes)
+        return
+    memory.set(bytes, 0)
+
+## The healed window's straight-alpha pixels written over a read-back cell.
+func spot_into_cell(pixels: const f32[], window: Bounds, column: u32, row: u32, bytes: u8[]):
+    let size = (i64)tile_size
+    let cell_x = (i64)column * size
+    let cell_y = (i64)row * size
+    let width = (usize)(window.right - window.left)
+    for y in math.imax(window.top, cell_y)..<math.imin(window.bottom, cell_y + size):
+        for x in math.imax(window.left, cell_x)..<math.imin(window.right, cell_x + size):
+            let source = ((usize)(y - window.top) * width + (usize)(x - window.left)) * 4
+            let target = (usize)((y - cell_y) * size + x - cell_x) * 8
+            for channel in 0..<(usize)4:
+                let half = to_half(pixels[source + channel])
+                bytes[target + channel * 2] = (u8)(half & 0xff)
+                bytes[target + channel * 2 + 1] = (u8)(half >> 8)

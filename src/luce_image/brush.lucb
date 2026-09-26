@@ -157,6 +157,15 @@ func pressure_scale(pressure: f64) -> f64:
         return 1.0
     return math.max(0.05, pressure)
 
+## Where a retouching stroke's effect comes from, a cell at a time: `produce`
+## makes the effect tile for a cell (none where there is nothing), the first
+## time the stroke reaches it, so no effect is ever made for the whole layer;
+## `release` frees `context` when the stroke ends.
+pub struct EffectSource:
+    pub var context: void*?
+    pub var produce: func(void*?, u32, u32) -> gpu.Texture?!
+    pub var release: func(void*?) -> unit
+
 ## A stroke in progress on one layer: its dabs so far, and each tile it has
 ## reached with the paint laid on it and the tile as it was before.
 pub struct Stroke:
@@ -189,6 +198,10 @@ pub struct Stroke:
     ## goes on: 1 over the original, 2 mixed with it; 0 paints the color.
     var effect: Tiles? = none
     var effect_mode: f64 = 0.0
+    ## Where the effect's cells come from when made on demand, and which cells
+    ## have been asked for already.
+    var source: EffectSource? = none
+    var tried: bool[]
 
     ## Begin at a point on `layer`'s pixels, or on its mask, painting the first
     ## dab there. A mask's missing cells count as white (revealing).
@@ -409,9 +422,7 @@ pub struct Stroke:
                                (f32)self.brush.opacity, 1.0 if self.brush.erase else 0.0, 0.0, 0.0,
                                (f32)(entry.column * tile_size), (f32)(entry.row * tile_size), (f32)self.brush.texture, (f32)self.brush.texture_scale,
                                (f32)self.brush.texture_depth, (f32)self.effect_mode, 0.0, 0.0]
-        var effect_tile = painter.clear
-        if let effect = self.effect:
-            effect_tile = effect.texture(entry.column, entry.row) else painter.clear
+        let effect_tile = (try self.effect_at(entry.column, entry.row)) else painter.clear
         var clip = painter.white
         if let selected = self.selection:
             params[7] = 1.0
@@ -423,6 +434,19 @@ pub struct Stroke:
         let original = self.before.texture(entry.column, entry.row) else try self.blank_tile(tiles)
         try gpu.shade(target.value(), painter.paint, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 64), [original, entry.coverage, clip, effect_tile], gpu.Filter.nearest)
         discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+
+    ## The effect's tile at a cell, made by the source the first time; none
+    ## where there is no effect.
+    mutating func effect_at(column: u32, row: u32) -> gpu.Texture?!:
+        var effect = self.effect else return none
+        if let source = self.source:
+            let cell = (usize)row * (usize)effect.columns() + (usize)column
+            if not self.tried[cell]:
+                self.tried[cell] = true
+                if let made = try source.produce(source.context, column, row):
+                    try effect.set(column, row, made)
+                    self.effect = effect
+        return effect.texture(column, row)
 
     ## One tile of the fill color standing in for cells the layer had nothing at.
     mutating func blank_tile(tiles: Tiles*) -> gpu.Texture!:
@@ -478,16 +502,50 @@ pub struct Stroke:
             free(self.dabs) in memory.heap
         var no_dabs: Dab[]
         self.dabs = no_dabs
+        self.drop_effect()
+        self.before.destroy()
+
+    ## Let go of the effect and where it came from.
+    mutating func drop_effect():
         if let effect = self.effect:
             var owned = effect
             owned.destroy()
             self.effect = none
-        self.before.destroy()
+        if let source = self.source:
+            source.release(source.context)
+            self.source = none
+        if self.tried.length > 0:
+            free(self.tried) in memory.heap
+            var none_tried: bool[]
+            self.tried = none_tried
 
     ## Paint `effect` (document-aligned tiles, taken) instead of the color: 1
     ## over the original through the coverage, 2 mixed with it. Every tile
     ## reached so far is rebuilt at once, at `opacity`.
     pub mutating func use_effect(painter: Painter*, document: Document*, effect: Tiles, mode: f64, opacity: f64) -> !:
+        self.drop_effect()
+        try self.use_effect_tiles(painter, document, effect, mode, opacity)
+
+    ## Paint an effect `source` makes cell by cell (taken: released when the
+    ## stroke ends) instead of the color, as `use_effect`.
+    pub mutating func use_effect_source(painter: Painter*, document: Document*, source: EffectSource, mode: f64, opacity: f64) -> !:
+        self.drop_effect()
+        var effect = Tiles.create(painter.owner, self.before.width(), self.before.height()) catch failure:
+            source.release(source.context)
+            error(failure.code, failure.message)
+        let cells = (usize)effect.columns() * (usize)effect.rows()
+        let tried = alloc bool[cells] in memory.heap catch failure:
+            effect.destroy()
+            source.release(source.context)
+            error(failure.code, failure.message)
+        for index in 0..<cells:
+            tried[index] = false
+        self.tried = tried
+        self.source = source
+        try self.use_effect_tiles(painter, document, effect, mode, opacity)
+
+    ## Install `effect` without dropping the source, and rebuild what is reached.
+    mutating func use_effect_tiles(painter: Painter*, document: Document*, effect: Tiles, mode: f64, opacity: f64) -> !:
         if let previous = self.effect:
             var owned = previous
             owned.destroy()
