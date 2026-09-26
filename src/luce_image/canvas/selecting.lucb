@@ -1,0 +1,46 @@
+#==============================================================================================
+#
+#   canvas/selecting - Where Load Selection and the magic wand read their pixels
+#
+#   DESCRIPTION:
+#       Both read a cell at a time (selection_sources.lucb): a layer's (or mask's) tiles, or
+#       the composited picture's, each read back from the GPU as it is wanted.
+#
+#==============================================================================================
+
+## A layer's or mask's tiles as a selection's pixels.
+struct TilesSource:
+    var tiles: const Tiles*
+
+## Cell (`column`, `row`) of the tiles; false where none is painted.
+func read_tiles_cell(context: void*?, column: u32, row: u32, halves: u8[]) -> bool!:
+    let source = (TilesSource*)(context else return false)
+    let texture = source.tiles.texture(column, row) else return false
+    let area = source.tiles.region(column, row)
+    try texture.read(halves[..<(usize)area.height * (usize)tile_size * 8], gpu.Region(0, 0, tile_size, area.height))
+    return true
+
+## The composited picture (every visible layer) as a selection's pixels.
+struct PictureSource:
+    var composer: Composer*
+    var document: const Document*
+    var extent_y: u32
+
+## Cell (`column`, `row`) of the composited picture: always painted.
+func read_picture_cell(context: void*?, column: u32, row: u32, halves: u8[]) -> bool!:
+    let source = (PictureSource*)(context else return false)
+    let texture = try source.composer.tile(source.document, column, row, 0)
+    let height = min_u32(tile_size, source.extent_y - row * tile_size)
+    try texture.read(halves[..<(usize)height * (usize)tile_size * 8], gpu.Region(0, 0, tile_size, height))
+    return true
+
+## `Canvas.select_wand` once its pixels have a reader: the wand into the
+## selection, or through a shape when the selection is being shaped.
+func wand_from(canvas: Canvas*, reader: selection_sources.Reader, x: i64, y: i64, sample: i64, tolerance: f64, contiguous: bool, mode: i64) -> !:
+    if not canvas.shaping():
+        try canvas.live().wand(reader, x, y, sample, tolerance, contiguous, try selection_mode(mode))
+        return
+    var shape = try Selection.create(canvas.extent_x, canvas.extent_y)
+    defer shape.destroy()
+    try shape.wand(reader, x, y, sample, tolerance, contiguous, Mode.replace)
+    try canvas.merge_shape(&shape, mode)

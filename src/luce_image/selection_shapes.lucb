@@ -1,6 +1,6 @@
 ## Shapes drawn into a selection's cells (selection_cells.lucb), a cell at a
 ## time and on every processor: rectangles, ellipses, polygons, and coverage
-## from elsewhere (another selection, a byte a pixel, a layer's samples).
+## from elsewhere (another selection, or a byte a pixel).
 ## A cell the shape covers wholly or misses wholly is combined as one value,
 ## so only the cells along a shape's edge ever hold bytes.
 ##
@@ -288,13 +288,11 @@ func polygon_row(context: void*?, item: usize):
 # mark: Coverage from elsewhere =================================================================
 
 ## Where `from_source` takes its coverage: another selection's cells, a byte
-## a document pixel (times `scale`), or one channel of RGBA f32 samples.
+## a document pixel (times `scale`).
 pub struct Source:
     pub var other: const Cells*? = none
     pub var bytes: const u8[]
     pub var scale: u8 = 1
-    pub var samples: const f32[]
-    pub var channel: usize = 0
 
 struct SourceJob:
     var cells: Cells*
@@ -326,10 +324,5 @@ func source_item(context: void*?, index: usize):
     for row in 0..<(usize)job.cells.cell_height(index):
         let line = (y + row) * stride + x
         for column in 0..<width:
-            var value: u8 = 0
-            if job.source.samples.length > 0:
-                value = (u8)(math.clamp((f64)job.source.samples[(line + column) * 4 + job.source.channel], 0.0, 1.0) * 255.0 + 0.5)
-            else:
-                value = job.source.bytes[line + column] * job.source.scale
-            shape[row * (usize)tile_size + column] = value
+            shape[row * (usize)tile_size + column] = job.source.bytes[line + column] * job.source.scale
     combine_cell(job.cells, index, shape, job.mode)
