@@ -111,7 +111,7 @@ def package "luce-image" {
 
     def dependency "luce-gpu" {
         str owner = "dymokomi"
-        str version = "^0.1.8"
+        str version = "^0.1.11"
         str path = "../luce-gpu"
     }
 
