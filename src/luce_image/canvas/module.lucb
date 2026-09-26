@@ -48,7 +48,7 @@ from tiles import Tiles, Bounds, tile_size, tile_columns, min_u32, max_u32, flat
 from pyramid import covered_at
 from luce_image.heal import heal
 from luce_image.color_range import RangeSample, range_sample, range_coverage, range_labs
-from luce_image.warp import WarpStroke, default_smudge_spacing
+from luce_image.warp import WarpStroke, default_smudge_spacing, upload_budget_ns
 from luce_image.liquify import Liquifier, LiquifyStroke
 from luce_image.document import Style, Document, Layer, TreeState, release_snapshot, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
 from luce_image.composite import Composer, box_composer, unbox_composer

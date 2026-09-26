@@ -108,16 +108,17 @@ func settle_warp(canvas: Canvas*, warp: WarpStroke*) -> !:
     if canvas.warp_finishing and warp.finished():
         try keep_warp(canvas, warp)
         return
-    let cells = try upload_warp(canvas, warp)
+    let cells = try upload_warp(canvas, warp, upload_budget_ns)
     if tracing():
         trace_frame(serviced - started, time.now() - serviced, cells, warp.worker_stats(), warp.depth())
 
-## Upload what changed; how many cells went up.
-func upload_warp(canvas: Canvas*, warp: WarpStroke*) -> usize!:
+## Upload what changed, within `budget` nanoseconds (0: all of it); how many
+## cells went up.
+func upload_warp(canvas: Canvas*, warp: WarpStroke*, budget: u64) -> usize!:
     let document = canvas.document else trap("stroke without a document")
     let layer = document.find(canvas.warped) else error(invalid, "the retouched layer is gone")
     let tiles = layer.tiles() else error(invalid, "the retouched layer has no pixels")
-    let cells = try warp.flush(tiles)
+    let cells = try warp.flush(tiles, budget)
     if cells > 0:
         layer.revision += 1
     return cells
@@ -139,7 +140,7 @@ func keep_warp(canvas: Canvas*, warp: WarpStroke*) -> !:
     defer free(warp) in memory.heap
     defer warp.destroy()
     try warp.wait()
-    discard(try upload_warp(canvas, warp))
+    discard(try upload_warp(canvas, warp, 0))
     if tracing():
         trace_end()
     try canvas.restrict_to_selection(canvas.warped, &canvas.history[canvas.history_count - 1].tiles)
