@@ -75,7 +75,7 @@ from luce_image.selection import Selection
 from luce_image.selection_cells import Mode
 import luce_image.selection_sources as selection_sources
 from luce_image.batched_reads import Piece, read_pieces, no_piece
-from luce_image.shaders import ants_frag_words, ants_frag_msl, encode_frag_words, encode_frag_msl
+from luce_image.shaders import ants_frag_words, ants_frag_msl, quickmask_frag_words, quickmask_frag_msl, encode_frag_words, encode_frag_msl
 from half import from_half, to_half
 from binary import Buffer
 from raster_errors import invalid, limit
@@ -162,6 +162,9 @@ pub struct Canvas:
     var range_session: RangeSession*?
     var ants_shader: gpu.Shader?
     var ants: gpu.Pipeline?
+    ## Quick Mask's overlay, made when first drawn.
+    var quick_shader: gpu.Shader?
+    var quick_overlay: gpu.Pipeline?
     ## Liquify's push pipeline, made for the first push.
     var liquifier: Liquifier?
     var history: Snapshot[]
@@ -281,6 +284,8 @@ pub struct Canvas:
         self.ants_shader = none
         self.liquifier = none
         self.ants = none
+        self.quick_shader = none
+        self.quick_overlay = none
         var no_history: Snapshot[]
         self.history = no_history
         self.history_count = 0
@@ -602,6 +607,7 @@ pub struct Canvas:
         drop_liquify(&self)
         drop_filter_preview(&self)
         drop_selection_transform(&self)
+        drop_quick_mask(&self)
         if let composer = self.composer:
             composer.drop_stand_ins()
         if let source = self.backing:
@@ -630,6 +636,14 @@ pub struct Canvas:
             var owned = shader
             owned.destroy()
             self.ants_shader = none
+        if let pipeline = self.quick_overlay:
+            var owned = pipeline
+            owned.destroy()
+            self.quick_overlay = none
+        if let shader = self.quick_shader:
+            var owned = shader
+            owned.destroy()
+            self.quick_shader = none
         if let liquifier = self.liquifier:
             var owned = liquifier
             owned.destroy()
@@ -1562,8 +1576,51 @@ pub struct Canvas:
 
     ## Draw the selection's marching ants over the document as drawn by `draw`
     ## with the same rectangle, zoom and offset; `phase` animates the dashes.
+    ## While Quick Mask is on, the masked part is tinted instead.
     pub mutating func draw_selection(target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, phase: f64) -> !:
+        if self.quick_mask():
+            try self.require_open()
+            if not math.is_finite(zoom) or zoom <= 0.0:
+                error(invalid, "zoom must be positive")
+            try draw_quick_overlay(&self, target, rectangle, zoom, offset_x, offset_y)
+            return
         try draw_canvas_selection(&self, target, rectangle, zoom, offset_x, offset_y, phase)
+
+    ## Select › Quick Mask on: the selection becomes a mask the painting tools
+    ## edit (white selects, black masks), one undo step.
+    pub mutating func enter_quick_mask() -> !:
+        try enter_quick_mask(&self)
+
+    ## Quick Mask off: the mask painted becomes the selection, one undo step.
+    pub mutating func exit_quick_mask() -> !:
+        try exit_quick_mask(&self)
+
+    pub func quick_mask() -> bool:
+        let document = self.document else return false
+        return document.quick_layer() != none
+
+    ## Where an edit to layer `id` goes: Quick Mask's layer while it is on.
+    func paint_target(id: i64) -> i64:
+        let document = self.document else return id
+        let quick = document.quick_layer() else return id
+        return (i64)quick.id
+
+    ## Whether edits to layer `id` (after `paint_target`) go to a mask.
+    mutating func paints_mask(id: i64) -> bool!:
+        if self.quick_mask():
+            return true
+        return self.mask_editing and self.records[try self.index((u64)id)].masked
+
+    mutating func quick_pipeline() -> gpu.Pipeline!:
+        if let existing = self.quick_overlay:
+            return existing
+        let device = self.device else error(invalid, "draw the document once first")
+        var shader = try gpu.Shader.create(device, quickmask_frag_words, quickmask_frag_msl)
+        errdefer shader.destroy()
+        let pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.over)
+        self.quick_shader = shader
+        self.quick_overlay = pipeline
+        return pipeline
 
     mutating func ants_pipeline() -> gpu.Pipeline!:
         if let existing = self.ants:
@@ -1633,12 +1690,12 @@ pub struct Canvas:
         try self.require_idle()
         let document = self.document else error(invalid, "draw the document once before filling")
         var painter = self.painter else error(invalid, "draw the document once before filling")
-        let index = try self.index((u64)layer)
-        let on_mask = self.mask_editing and self.records[index].masked
+        let target = self.paint_target(layer)
+        let on_mask = try self.paints_mask(target)
         var brush = self.brush
         brush.erase = erase
-        let before = try fill_selection(&painter, document, (u64)layer, brush, on_mask)
-        try self.remember((u64)layer, before, on_mask, name = "Fill")
+        let before = try fill_selection(&painter, document, (u64)target, brush, on_mask)
+        try self.remember((u64)target, before, on_mask, name = "Fill")
 
     ## Set the brush every following stroke paints with: its size, edge, color
     ## and strength. The tip shape, dynamics and texture set separately stay.
@@ -1717,11 +1774,11 @@ pub struct Canvas:
             return
         let document = self.document else error(invalid, "draw the document once before painting")
         var painter = self.painter else error(invalid, "draw the document once before painting")
-        let index = try self.index((u64)layer)
-        let on_mask = self.mask_editing and self.records[index].masked
-        let stroke = try begin_boxed(&painter, document, (u64)layer, self.brush, x, y, on_mask, pressure)
+        let target = self.paint_target(layer)
+        let on_mask = try self.paints_mask(target)
+        let stroke = try begin_boxed(&painter, document, (u64)target, self.brush, x, y, on_mask, pressure)
         errdefer finish_boxed(stroke)
-        try self.remember((u64)layer, try stroke.original().clone(), on_mask, name = "Eraser" if self.brush.erase else "Brush Stroke")
+        try self.remember((u64)target, try stroke.original().clone(), on_mask, name = "Eraser" if self.brush.erase else "Brush Stroke")
         self.stroke = stroke
 
     ## Continue the stroke to a document point.
@@ -1864,11 +1921,11 @@ pub struct Canvas:
         try gpu_check_color(to_color)
         if a0 < 0.0 or a0 > 1.0 or a1 < 0.0 or a1 > 1.0:
             error(invalid, "gradient alphas must be in 0..1")
-        let index = try self.index((u64)id)
-        let on_mask = self.mask_editing and self.records[index].masked
-        var before = try fill_gradient(&painter, document, (u64)id, x0, y0, x1, y1, from_color, to_color, radial, on_mask)
+        let target = self.paint_target(id)
+        let on_mask = try self.paints_mask(target)
+        var before = try fill_gradient(&painter, document, (u64)target, x0, y0, x1, y1, from_color, to_color, radial, on_mask)
         errdefer before.destroy()
-        try self.remember((u64)id, before, on_mask, name = "Gradient")
+        try self.remember((u64)target, before, on_mask, name = "Gradient")
 
     ## The eyedropper: read the flattened document's color at a pixel into
     ## `picked_red` and friends (linear light, straight alpha).
@@ -2190,9 +2247,12 @@ pub struct Canvas:
         try self.require_open()
         try self.require_idle()
         let document = self.document else error(invalid, "draw the document once before previewing")
-        let layer = document.find((u64)id) else error(invalid, "no such layer")
-        let tiles = ((layer.mask_tiles() else error(invalid, "the layer has no mask")) if mask else (layer.tiles() else error(invalid, "a group cannot be previewed")))
-        self.preview = Snapshot(layer = (u64)id, tiles = try tiles.clone(), mask = mask)
+        # While Quick Mask is on, filters and adjustments change its mask.
+        let on_mask = mask or self.quick_mask()
+        let target = self.paint_target(id)
+        let layer = document.find((u64)target) else error(invalid, "no such layer")
+        let tiles = ((layer.mask_tiles() else error(invalid, "the layer has no mask")) if on_mask else (layer.tiles() else error(invalid, "a group cannot be previewed")))
+        self.preview = Snapshot(layer = (u64)target, tiles = try tiles.clone(), mask = on_mask)
 
     pub func previewing() -> bool:
         return self.preview != none
@@ -2798,6 +2858,9 @@ pub struct Canvas:
         if self.history_count == 0:
             error(invalid, "nothing to undo")
         let document = self.document else trap("history without a document")
+        # Taking back the step that turned Quick Mask on takes it down first.
+        if self.quick_mask() and self.history[self.history_count - 1].name == "Quick Mask" and self.history[self.history_count - 1].state != none:
+            drop_quick_mask(&self)
         # An edit may have remembered several snapshots; they go back together.
         while self.history_count > 0:
             let entry = self.history[self.history_count - 1]

@@ -83,3 +83,53 @@ test "transform selection reshapes the outline, not the pixels, and undoes as on
     assert(canvas.selected_at(85, 95) == 255)
     try canvas.end_selection_transform(false)
     assert(canvas.selection_left() == 100 and canvas.history_steps() == steps)
+
+test "quick mask paints the selection with the painting tools and turns back into the selection":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(300, 300)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    # A white layer, so the tint shows against it.
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, false)
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.fill(layer, false)
+    try canvas.select_rectangle(0, 0, 40, 300, 0)
+    let steps = canvas.history_steps()
+    try canvas.enter_quick_mask()
+    assert(canvas.quick_mask() and canvas.undo_name() == "Quick Mask" and canvas.history_steps() == steps + 1)
+    # The document shows as it was: the red tint is the view's alone.
+    assert((try shown_at(&canvas, &target, 50, 10))[1] == 255)
+    # Black masks, white selects: a gradient masking the top third and
+    # selecting the rest, then a black stroke down the lower selected band.
+    try canvas.fill_gradient(layer, 0.0, 100.0, 0.0, 101.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    try canvas.set_brush(8.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, false)
+    try canvas.begin_stroke(layer, 20.0, 150.0)
+    try canvas.extend_stroke(20.0, 250.0)
+    try canvas.end_stroke()
+    # The layer's own pixels are as they were.
+    let pixels = try alloc f32[300 * 300 * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    try layer_tiles(&canvas, layer).read(pixels)
+    assert(pixels[(200 * 300 + 20) * 4] == 1.0 and pixels[(200 * 300 + 20) * 4 + 3] == 1.0)
+    let painted = canvas.history_steps()
+    try canvas.exit_quick_mask()
+    assert(not canvas.quick_mask() and canvas.undo_name() == "Exit Quick Mask")
+    # The strokes on the mask went with it: one step in their place.
+    assert(canvas.history_steps() == painted - 2 + 1)
+    assert(canvas.selected_at(5, 50) == 0 and canvas.selected_at(150, 150) == 255 and canvas.selected_at(20, 200) == 0 and canvas.selected_at(150, 250) == 255)
+    try canvas.undo()
+    assert(not canvas.quick_mask() and canvas.selected_at(5, 50) == 255 and canvas.selected_at(150, 250) == 0)
+    # Undoing the step that turned it on takes Quick Mask down.
+    try canvas.enter_quick_mask()
+    try canvas.undo()
+    assert(not canvas.quick_mask() and canvas.selected_at(20, 50) == 255)
+    # Nothing selected stays nothing selected through an unpainted Quick Mask.
+    try canvas.deselect()
+    try canvas.enter_quick_mask()
+    try canvas.exit_quick_mask()
+    assert(not canvas.has_selection())

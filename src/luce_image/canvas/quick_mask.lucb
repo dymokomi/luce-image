@@ -1,0 +1,173 @@
+#==============================================================================================
+#
+#   canvas/quick_mask - Quick Mask: the selection painted as a mask
+#
+#   DESCRIPTION:
+#       Entering Quick Mask puts the selection into the mask of a layer kept outside the
+#       tree (Document.begin_quick): never composited, exported or saved, but found by its
+#       id, so the brush, the eraser, fills, gradients and filters all paint it as they
+#       paint any layer's mask: white selects, black masks, gray is partial. The selection
+#       stops clipping meanwhile, and the view tints what is masked (`draw_quick_overlay`).
+#       Leaving reads the mask back as the selection, a cell at a time, and takes the layer
+#       down; the strokes made on it go from the history with it, the change they made
+#       being the step leaving records. Each way is one undo step.
+#
+#==============================================================================================
+
+## The overlay's tint and strength, as Photoshop's default: red at half.
+let quick_red: f32 = 1.0
+let quick_opacity: f32 = 0.5
+
+## `Canvas.enter_quick_mask`.
+func enter_quick_mask(canvas: Canvas*) -> !:
+    try canvas.require_open()
+    try canvas.require_idle()
+    let document = canvas.document else error(invalid, "draw the document once before using Quick Mask")
+    if document.quick_layer() != none:
+        return
+    try canvas.remember_state("Quick Mask")
+    let tiles = try quick_tiles_from(canvas, &document.selection)
+    discard(try document.begin_quick(tiles))
+
+## The selection as a mask's tiles: a wholly selected cell has no tile (a mask
+## reveals where it has none), a wholly masked one shares one black tile, the
+## rest carry their coverage in red, green and blue, alpha one.
+func quick_tiles_from(canvas: Canvas*, selection: const Selection*) -> Tiles!:
+    let device = canvas.device else error(invalid, "draw the document once before using Quick Mask")
+    var tiles = try Tiles.create(device, canvas.extent_x, canvas.extent_y)
+    errdefer tiles.destroy()
+    if selection.is_empty():
+        # Nothing selected: nothing masked.
+        return tiles
+    var halves: u16[256]
+    for value in 0..<(usize)256:
+        halves[value] = to_half((f32)value / 255.0)
+    let one = to_half(1.0)
+    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    defer free(bytes) in memory.heap
+    var black_column: i64 = -1
+    var black_row: u32 = 0
+    for row in 0..<tiles.rows():
+        for column in 0..<tiles.columns():
+            let value = selection.cell_value(column, row)
+            if value == 255:
+                continue
+            if value == 0 and black_column >= 0:
+                try tiles.share(column, row, (u32)black_column, black_row)
+                continue
+            let area = tiles.region(column, row)
+            let coverage = selection.cell_bytes(column, row)
+            for y in 0..<(usize)area.height:
+                for x in 0..<(usize)tile_size:
+                    var covered: u8 = 0
+                    if let cells = coverage:
+                        covered = cells[y * (usize)tile_size + x]
+                    let half = halves[(usize)covered]
+                    let at = (y * (usize)tile_size + x) * 8
+                    for channel in 0..<(usize)3:
+                        bytes[at + channel * 2] = (u8)(half & 0xff)
+                        bytes[at + channel * 2 + 1] = (u8)(half >> 8)
+                    bytes[at + 6] = (u8)(one & 0xff)
+                    bytes[at + 7] = (u8)(one >> 8)
+            var texture = try tiles.blank()
+            errdefer texture.destroy()
+            try texture.upload(bytes[..<(usize)area.height * (usize)tile_size * 8], gpu.Region(0, 0, tile_size, area.height))
+            try tiles.set(column, row, texture)
+            if value == 0 and area.width == tile_size and area.height == tile_size:
+                black_column = (i64)column
+                black_row = row
+    return tiles
+
+## `Canvas.exit_quick_mask`: the mask becomes the selection, one step.
+func exit_quick_mask(canvas: Canvas*) -> !:
+    try canvas.require_open()
+    try canvas.require_idle()
+    let document = canvas.document else return
+    let quick = document.quick_layer() else return
+    let mask = quick.mask_tiles() else trap("Quick Mask's layer has a mask")
+    let device = canvas.device else trap("Quick Mask without a device")
+    let was_empty = document.selection.is_empty()
+    var found = try Selection.create(canvas.extent_x, canvas.extent_y)
+    errdefer found.destroy()
+    var source = TilesSource(tiles = mask)
+    # Where the mask has no tile it reveals: selected.
+    try found.load(selection_sources.gpu_reader((void*)&source, device, tiles_cell_texture), 0, 255, Mode.replace)
+    let id = quick.id
+    try canvas.remember_state("Exit Quick Mask")
+    document.end_quick()
+    purge_layer_steps(canvas, id)
+    # Nothing masked from nothing selected stays nothing selected.
+    if was_empty and full(&found):
+        found.clear()
+    document.selection.destroy()
+    document.selection = found
+
+## Take Quick Mask down without keeping it (the step that entered it undone,
+## or the canvas closing).
+func drop_quick_mask(canvas: Canvas*):
+    let document = canvas.document else return
+    let quick = document.quick_layer() else return
+    let id = quick.id
+    document.end_quick()
+    purge_layer_steps(canvas, id)
+
+## Whether every pixel is selected.
+func full(selection: const Selection*) -> bool:
+    if selection.is_empty():
+        return false
+    for row in 0..<tile_columns(selection.height()):
+        for column in 0..<tile_columns(selection.width()):
+            if selection.cell_value(column, row) != 255:
+                return false
+    return true
+
+## Drop the history's and the future's pixel steps on layer `id` (gone).
+func purge_layer_steps(canvas: Canvas*, id: u64):
+    purge_steps(&canvas.history, &canvas.history_count, id)
+    purge_steps(&canvas.future, &canvas.future_count, id)
+
+func purge_steps(entries: Snapshot[]*, count: usize*, id: u64):
+    var kept: usize = 0
+    for index in 0..<*count:
+        var entry = (*entries)[index]
+        if entry.state == none and entry.layer == id:
+            drop_snapshot(&entry)
+            continue
+        (*entries)[kept] = entry
+        kept += 1
+    *count = kept
+
+## Tint what Quick Mask masks over the document as `draw` drew it, at the
+## view's level, only the cells on screen that hold a tile.
+func draw_quick_overlay(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64) -> !:
+    let document = canvas.document else return
+    let quick = document.quick_layer() else return
+    let mask = quick.mask_tiles() else return
+    let checked = try target.get()
+    let pipeline = try canvas.quick_pipeline()
+    let clipped = try checked.clipped(rectangle)
+    defer clipped.release()
+    let area = clipped.value()
+    let size = try checked.size()
+    let scale = size.pixel_width / size.width if size.width > 0.0 else 1.0
+    let placement = try checked.placement()
+    let composer = canvas.composer else return
+    composer.hold()
+    let level = view_level(zoom)
+    let span = (f64)((u64)tile_size << level)
+    let step = (f64)(1u64 << level)
+    for row in 0..<level_cells(canvas.extent_y, level):
+        for column in 0..<level_cells(canvas.extent_x, level):
+            let covered_x = covered_at(canvas.extent_x, column, level)
+            let covered_y = covered_at(canvas.extent_y, row, level)
+            let left = rectangle.x + offset_x + (f64)column * span * zoom
+            let top = rectangle.y + offset_y + (f64)row * span * zoom
+            let width = (f64)covered_x * step * zoom
+            let height = (f64)covered_y * step * zoom
+            if left >= rectangle.x + rectangle.width or top >= rectangle.y + rectangle.height or left + width <= rectangle.x or top + height <= rectangle.y:
+                continue
+            # A cell without a tile reveals: nothing to tint.
+            let texture = (try composer.level_texture(mask, column, row, level, true)) else continue
+            var params: f32[12] = [(f32)((placement.x + left) * scale), (f32)((placement.y + top) * scale), (f32)(zoom * step * scale), quick_opacity,
+                                   (f32)covered_x, (f32)covered_y, 0.0, 0.0, quick_red, 0.0, 0.0, 1.0]
+            try gpu.shade(area, pipeline, gpu.Rect(left, top, width, height), u8[]((u8*)&params[0], 48), [texture], gpu.Filter.nearest if zoom * step >= 1.0 else gpu.Filter.linear)

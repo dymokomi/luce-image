@@ -292,6 +292,17 @@ pub struct Selection:
             return false
         return self.cells.uniform((usize)row * (usize)self.cells.columns() + (usize)column) == 255
 
+    ## Cell (`column`, `row`)'s one value (0..255), or -1 when it holds bytes.
+    pub func cell_value(column: u32, row: u32) -> i64:
+        if self.empty:
+            return 0
+        return self.cells.uniform((usize)row * (usize)self.cells.columns() + (usize)column)
+
+    ## Cell (`column`, `row`)'s coverage bytes, rows of 256, when it holds any.
+    pub func cell_bytes(column: u32, row: u32) -> const u8[]?:
+        let block = self.cells.block((usize)row * (usize)self.cells.columns() + (usize)column) else return none
+        return block.bytes
+
     ## Let the GPU tiles go (a selection put away in history); they are made
     ## again when wanted.
     pub mutating func drop_gpu_tiles():
