@@ -51,6 +51,10 @@ from luce_image.heal import heal
 from luce_image.color_range import RangeSample, range_sample, range_coverage, range_labs
 from luce_image.warp import WarpStroke, default_smudge_spacing, upload_budget_ns
 from luce_image.liquify import Liquifier, LiquifyStroke
+from luce_image.mesh_map import MeshMap
+from luce_image.mesh_render import Mesher
+from luce_image.warp_patch import identity_patch, bend_patch, patch_mesh, patch_points
+from luce_image.puppet import Puppet
 from luce_image.document import Style, Document, Layer, TreeState, release_snapshot, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
 from luce_image.composite import Composer, box_composer, unbox_composer
 from luce_image.brush import Brush, Painter, Stroke, EffectSource, begin_boxed, finish_boxed, fill_selection, fill_gradient, simulate_fill_failure
@@ -169,6 +173,8 @@ pub struct Canvas:
     var quick_overlay: gpu.Pipeline?
     ## Liquify's push pipeline, made for the first push.
     var liquifier: Liquifier?
+    ## Warp and Puppet Warp's pipeline, made for the first warp.
+    var mesher: Mesher?
     var history: Snapshot[]
     var history_count: usize
     var future: Snapshot[]
@@ -218,6 +224,8 @@ pub struct Canvas:
     var smudge_spacing: f64
     ## A Liquify push under way (canvas/liquifying.lucb).
     var liquify: Liquifying*?
+    ## A Warp or Puppet Warp under way (canvas/mesh_warping.lucb).
+    var mesh_warp: MeshWarping*?
     var heal_opacity: f64
     ## Inside `begin_edit`: changes record nothing more, the edit's first snapshot covers them.
     var edit_depth: i64
@@ -291,6 +299,7 @@ pub struct Canvas:
         self.range_session = none
         self.ants_shader = none
         self.liquifier = none
+        self.mesher = none
         self.ants = none
         self.quick_shader = none
         self.quick_overlay = none
@@ -326,6 +335,7 @@ pub struct Canvas:
         self.warp_finishing = false
         self.warp_async = true
         self.liquify = none
+        self.mesh_warp = none
         self.smudge_spacing = default_smudge_spacing
         self.transform_session = none
         self.selection_origin = none
@@ -401,7 +411,7 @@ pub struct Canvas:
         try self.wait_idle()
         if self.stroke != none or self.warp != none or self.liquify != none:
             error(invalid, "finish the stroke first")
-        if self.transform_session != none:
+        if self.transform_session != none or self.mesh_warp != none:
             error(invalid, "finish the transform first")
         if self.preview != none:
             error(invalid, "finish the preview first")
@@ -616,6 +626,7 @@ pub struct Canvas:
             warp.destroy()
             free(warp) in memory.heap
         drop_liquify(&self)
+        drop_mesh_warp(&self)
         drop_filter_preview(&self)
         drop_selection_transform(&self)
         cancel_magnetic(&self)
@@ -661,6 +672,10 @@ pub struct Canvas:
             var owned = liquifier
             owned.destroy()
             self.liquifier = none
+        if let mesher = self.mesher:
+            var owned = mesher
+            owned.destroy()
+            self.mesher = none
         end_range(&self)
         self.selection.destroy()
         if self.polygon.length > 0:
@@ -1961,6 +1976,9 @@ pub struct Canvas:
         if let shown = self.liquify:
             try settle_liquify(&self, shown)
             return
+        if let shown = self.mesh_warp:
+            try settle_mesh_warp(&self, shown)
+            return
         let stroke = self.stroke else return
         let document = self.document else return
         var painter = self.painter else return
@@ -2661,6 +2679,99 @@ pub struct Canvas:
     ## Keep what the transform shows as one undo step, or put it all back.
     pub mutating func end_transform(keep: bool) -> !:
         try end_session(&self, keep)
+
+    # mark: Warp and Puppet Warp ==================================================================
+
+    ## Edit › Transform › Warp on layer `id`: a Bézier patch over its painted
+    ## box, as found (`warp_point_*`, `set_warp_point`, `set_warp_preset`),
+    ## shown live until `end_mesh_warp`.
+    pub mutating func begin_warp(id: i64) -> !:
+        try begin_mesh_warp(&self, (u64)id, false, 0)
+
+    ## Edit › Puppet Warp on layer `id`: a mesh over its painted box at
+    ## `density` (0 fewer, 1 normal, 2 more) with no pins yet.
+    pub mutating func begin_puppet(id: i64, density: i64 = 1) -> !:
+        try begin_mesh_warp(&self, (u64)id, true, density)
+
+    ## Whether a warp or puppet warp is under way.
+    pub func mesh_warping() -> bool:
+        return self.mesh_warp != none
+
+    ## The box the warp's mesh covers: the layer's painted box.
+    pub mutating func mesh_box_left() -> f64!:
+        return (try mesh_session(&self)).box.left
+
+    pub mutating func mesh_box_top() -> f64!:
+        return (try mesh_session(&self)).box.top
+
+    pub mutating func mesh_box_right() -> f64!:
+        return (try mesh_session(&self)).box.right
+
+    pub mutating func mesh_box_bottom() -> f64!:
+        return (try mesh_session(&self)).box.bottom
+
+    ## Warp's control point `index` (0..15, row by row across the 4 by 4 grid).
+    pub mutating func warp_point_x(index: i64) -> f64!:
+        return (try mesh_session(&self)).points[(usize)(try warp_index(index)) * 2]
+
+    pub mutating func warp_point_y(index: i64) -> f64!:
+        return (try mesh_session(&self)).points[(usize)(try warp_index(index)) * 2 + 1]
+
+    ## Move Warp's control point `index` to (`x`, `y`); the next frame shows it.
+    pub mutating func set_warp_point(index: i64, x: f64, y: f64) -> !:
+        let shown = try mesh_session(&self)
+        let at = (usize)(try warp_index(index))
+        if not math.is_finite(x) or not math.is_finite(y):
+            error(invalid, "warp points must be finite")
+        shown.points[at * 2] = x
+        shown.points[at * 2 + 1] = y
+        shown.changed = true
+
+    ## Warp's header preset `kind` (warp_patch.lucb's `warp_*`) at `bend` (-1..1):
+    ## the points as the preset puts them; -1 puts them back as found.
+    pub mutating func set_warp_preset(kind: i64, bend: f64) -> !:
+        let shown = try mesh_session(&self)
+        if kind < 0:
+            try identity_patch(shown.box, shown.points[0..])
+        else:
+            try bend_patch(shown.box, kind, bend, shown.points[0..])
+        shown.changed = true
+
+    ## Put a puppet pin at (`x`, `y`); its index.
+    pub mutating func puppet_add_pin(x: f64, y: f64) -> i64!:
+        let puppet = try puppet_session(&self)
+        let index = try puppet.add_pin(x, y)
+        (try mesh_session(&self)).changed = true
+        return (i64)index
+
+    ## Drag puppet pin `index` to (`x`, `y`); the next frame shows it.
+    pub mutating func puppet_move_pin(index: i64, x: f64, y: f64) -> !:
+        let puppet = try puppet_session(&self)
+        try puppet.move_pin((usize)math.imax(0, index), x, y)
+        (try mesh_session(&self)).changed = true
+
+    ## Take puppet pin `index` away.
+    pub mutating func puppet_remove_pin(index: i64) -> !:
+        let puppet = try puppet_session(&self)
+        try puppet.remove_pin((usize)math.imax(0, index))
+        (try mesh_session(&self)).changed = true
+
+    pub mutating func puppet_pin_count() -> i64!:
+        return (i64)(try puppet_session(&self)).pin_count
+
+    pub mutating func puppet_pin_x(index: i64) -> f64!:
+        return (try puppet_session(&self)).pin_x((usize)math.imax(0, index))
+
+    pub mutating func puppet_pin_y(index: i64) -> f64!:
+        return (try puppet_session(&self)).pin_y((usize)math.imax(0, index))
+
+    ## The pin within `reach` pixels of (`x`, `y`); -1 for none.
+    pub mutating func puppet_hit(x: f64, y: f64, reach: f64) -> i64!:
+        return (try puppet_session(&self)).hit(x, y, reach)
+
+    ## Keep the warp as one undo step (`keep`), or leave the layer as it was.
+    pub mutating func end_mesh_warp(keep: bool) -> !:
+        try end_mesh_warp(&self, keep)
 
     ## Free transform (as `preview_transform`) of layer `id` at once, one undo step.
     pub mutating func transform_layer(id: i64, scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64, pivot_x: f64, pivot_y: f64) -> !:

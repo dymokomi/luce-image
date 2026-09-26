@@ -11,6 +11,7 @@ warp_trace.lucb
 retouch.lucb
 retouch_effects.lucb
 liquifying.lucb
+mesh_warping.lucb
 transforming.lucb
 filter_previews.lucb
 type_layers.lucb
@@ -37,3 +38,4 @@ memory_tests.lucb
 shape_render_tests.lucb
 package_tests.lucb
 refine_tests.lucb
+mesh_warp_tests.lucb

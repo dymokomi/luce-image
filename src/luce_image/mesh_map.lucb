@@ -1,0 +1,330 @@
+#==============================================================================================
+#
+#   mesh_map - A deformation given by a triangle mesh, read backwards a cell at a time
+#
+#   DESCRIPTION:
+#       Warp and Puppet Warp move a mesh: each vertex keeps the document point it came from
+#       and gets the point it lands on. Drawing needs the map the other way round, from where
+#       a pixel lands to where it comes from, so a cell's field is made by walking the
+#       landed triangles over the cell's samples: a sample inside a triangle comes from the
+#       same barycentric mix of the triangle's source corners. Samples outside every triangle
+#       show nothing; the mesh's own outer edges are softened over half a sample, and the
+#       samples just past them borrow their neighbour's displacement, so the resampling at
+#       the rim reads the picture's own edge rather than smearing into the middle.
+#
+#       Triangles are filed by the 256-pixel cells their landed boxes touch, so a cell's
+#       field looks only at the few triangles over it. The field is what mesh.frag reads: a
+#       displacement per sample as liquify's (coarse and fine half floats) and a coverage.
+#
+#==============================================================================================
+
+import math
+import memory
+from half import to_half, from_half
+from luce_image.transform_window import Footprint
+from luce_image.liquify_grid import Reach
+from raster_errors import invalid
+
+## Document pixels a bucket spans: the canvas grid's cell.
+let bucket_side: f64 = 256.0
+
+## A mesh and where its vertices land.
+pub struct MeshMap:
+    ## Four values a vertex: where it comes from (x, y) and where it lands (x, y).
+    var points: f64[]
+    ## Three vertex indices a triangle, and each triangle's outer edges (bit
+    ## e for the edge from its corner e to the next).
+    var corners: u32[]
+    var outer: u8[]
+    ## Triangles by bucket, from bucket (`first_x`, `first_y`), `across` by `down`.
+    var first_x: i64
+    var first_y: i64
+    var across: i64
+    var down: i64
+    var starts: u32[]
+    var items: u32[]
+    ## The box the mesh covers in the source, and the box it lands in.
+    pub var source: Footprint
+    pub var landed: Footprint
+
+    ## A lattice of `columns` by `rows` quads over `source`, each split into
+    ## two triangles; `landing` holds where each of its (columns + 1) by
+    ## (rows + 1) points lands, x and y, row by row.
+    pub static func lattice(source: Footprint, columns: usize, rows: usize, landing: const f64[]) -> MeshMap!:
+        if columns < 1 or rows < 1 or landing.length != (columns + 1) * (rows + 1) * 2:
+            error(invalid, "a mesh lattice needs a point landed for each of its corners")
+        let count = (columns + 1) * (rows + 1)
+        let points = try alloc f64[count * 4] in memory.heap
+        errdefer free(points) in memory.heap
+        let width = source.right - source.left
+        let height = source.bottom - source.top
+        var landed = Footprint(left = 1.0e18, top = 1.0e18, right = -1.0e18, bottom = -1.0e18)
+        for r in 0..<rows + 1:
+            for c in 0..<columns + 1:
+                let at = r * (columns + 1) + c
+                points[at * 4] = source.left + width * (f64)c / (f64)columns
+                points[at * 4 + 1] = source.top + height * (f64)r / (f64)rows
+                let x = landing[at * 2]
+                let y = landing[at * 2 + 1]
+                if not math.is_finite(x) or not math.is_finite(y):
+                    error(invalid, "a mesh point must land somewhere finite")
+                points[at * 4 + 2] = x
+                points[at * 4 + 3] = y
+                landed = Footprint(left = math.min(landed.left, x), top = math.min(landed.top, y), right = math.max(landed.right, x), bottom = math.max(landed.bottom, y))
+        let triangles = columns * rows * 2
+        let corners = try alloc u32[triangles * 3] in memory.heap
+        errdefer free(corners) in memory.heap
+        let outer = try alloc u8[triangles] in memory.heap
+        errdefer free(outer) in memory.heap
+        for r in 0..<rows:
+            for c in 0..<columns:
+                let a = (u32)(r * (columns + 1) + c)
+                let b = a + 1
+                let d = a + (u32)(columns + 1)
+                let e = d + 1
+                let t = (r * columns + c) * 2
+                # (a, b, e): its top edge and its right edge may be the mesh's.
+                corners[t * 3] = a
+                corners[t * 3 + 1] = b
+                corners[t * 3 + 2] = e
+                outer[t] = (1 if r == 0 else 0) | (2 if c == columns - 1 else 0)
+                # (a, e, d): its bottom edge and its left edge.
+                corners[t * 3 + 3] = a
+                corners[t * 3 + 4] = e
+                corners[t * 3 + 5] = d
+                outer[t + 1] = (2 if r == rows - 1 else 0) | (4 if c == 0 else 0)
+        var none_yet: u32[]
+        var mesh = MeshMap(points = points, corners = corners, outer = outer, first_x = 0, first_y = 0, across = 0, down = 0,
+                           starts = none_yet, items = none_yet, source = source, landed = landed)
+        errdefer mesh.destroy()
+        try mesh.file()
+        return mesh
+
+    pub mutating func destroy():
+        free(self.points) in memory.heap
+        free(self.corners) in memory.heap
+        free(self.outer) in memory.heap
+        if self.starts.length > 0:
+            free(self.starts) in memory.heap
+        if self.items.length > 0:
+            free(self.items) in memory.heap
+
+    ## The triangles' count.
+    pub func triangles() -> usize:
+        return self.outer.length
+
+    ## File every triangle under the buckets its landed box touches.
+    mutating func file() -> !:
+        self.first_x = (i64)math.floor(self.landed.left / bucket_side)
+        self.first_y = (i64)math.floor(self.landed.top / bucket_side)
+        self.across = (i64)math.floor(self.landed.right / bucket_side) - self.first_x + 1
+        self.down = (i64)math.floor(self.landed.bottom / bucket_side) - self.first_y + 1
+        let buckets = (usize)(self.across * self.down)
+        self.starts = try alloc u32[buckets + 1] in memory.heap
+        for index in 0..<self.starts.length:
+            self.starts[index] = 0
+        # Count, then place: each bucket's triangles side by side.
+        for pass in 0..<(usize)2:
+            if pass == 1:
+                var total: u32 = 0
+                for index in 0..<buckets:
+                    let here = self.starts[index]
+                    self.starts[index] = total
+                    total += here
+                self.starts[buckets] = total
+                self.items = try alloc u32[(usize)total] in memory.heap
+            let filled = try alloc u32[buckets] in memory.heap
+            defer free(filled) in memory.heap
+            for index in 0..<buckets:
+                filled[index] = 0
+            for t in 0..<self.triangles():
+                let box = self.triangle_box(t)
+                let x0 = (i64)math.floor(box.left / bucket_side) - self.first_x
+                let y0 = (i64)math.floor(box.top / bucket_side) - self.first_y
+                let x1 = (i64)math.floor(box.right / bucket_side) - self.first_x
+                let y1 = (i64)math.floor(box.bottom / bucket_side) - self.first_y
+                for by in y0..<y1 + 1:
+                    for bx in x0..<x1 + 1:
+                        let bucket = (usize)(by * self.across + bx)
+                        if pass == 0:
+                            self.starts[bucket] += 1
+                        else:
+                            self.items[(usize)self.starts[bucket] + (usize)filled[bucket]] = (u32)t
+                            filled[bucket] += 1
+
+    ## Where triangle `t` lands, as a box.
+    func triangle_box(t: usize) -> Footprint:
+        var box = Footprint(left = 1.0e18, top = 1.0e18, right = -1.0e18, bottom = -1.0e18)
+        for k in 0..<(usize)3:
+            let v = (usize)self.corners[t * 3 + k]
+            let x = self.points[v * 4 + 2]
+            let y = self.points[v * 4 + 3]
+            box = Footprint(left = math.min(box.left, x), top = math.min(box.top, y), right = math.max(box.right, x), bottom = math.max(box.bottom, y))
+        return box
+
+    ## Whether any triangle lands over `left`..`right`, `top`..`bottom`.
+    pub func touches(left: f64, top: f64, right: f64, bottom: f64) -> bool:
+        return left < self.landed.right and right > self.landed.left and top < self.landed.bottom and bottom > self.landed.top
+
+    ## The field over a cell for mesh.frag: `n` by `n` samples `spacing`
+    ## pixels apart from pixel (`x0`, `y0`); into `bytes` (rgba16_float: each
+    ## displacement as liquify's coarse and fine halves) and `cover` (r8,
+    ## coverage 0..255). `rim` is how far the rim softens, in pixels. Also the
+    ## box of pixels the covered samples come from (`moved`: any covered).
+    pub func field(x0: f64, y0: f64, spacing: f64, n: i64, rim: f64, bytes: u8[], cover: u8[]) -> Reach:
+        var reach = Reach(moved = false, left = 1.0e18, top = 1.0e18, right = -1.0e18, bottom = -1.0e18)
+        let count = (usize)(n * n)
+        let shift = alloc f32[count * 2] in memory.heap catch failure:
+            trap("out of memory for a mesh field")
+        defer free(shift) in memory.heap
+        for index in 0..<count:
+            cover[index] = 0
+            shift[index * 2] = 0.0
+            shift[index * 2 + 1] = 0.0
+        let x1 = x0 + (f64)(n - 1) * spacing
+        let y1 = y0 + (f64)(n - 1) * spacing
+        if self.touches(x0 - spacing, y0 - spacing, x1 + spacing, y1 + spacing):
+            let bx0 = math.imax(0, (i64)math.floor((x0 - spacing) / bucket_side) - self.first_x)
+            let by0 = math.imax(0, (i64)math.floor((y0 - spacing) / bucket_side) - self.first_y)
+            let bx1 = math.imin(self.across - 1, (i64)math.floor((x1 + spacing) / bucket_side) - self.first_x)
+            let by1 = math.imin(self.down - 1, (i64)math.floor((y1 + spacing) / bucket_side) - self.first_y)
+            for by in by0..<by1 + 1:
+                for bx in bx0..<bx1 + 1:
+                    let bucket = (usize)(by * self.across + bx)
+                    for item in self.starts[bucket]..<self.starts[bucket + 1]:
+                        self.cover_triangle((usize)self.items[(usize)item], x0, y0, spacing, n, rim, shift, cover, &reach)
+        # Samples just past the rim borrow a covered neighbour's displacement.
+        for j in 0..<n:
+            for i in 0..<n:
+                let at = (usize)(j * n + i)
+                if cover[at] == 0:
+                    borrow(shift, cover, n, i, j)
+                put_split(bytes, at * 8, (f64)shift[at * 2])
+                put_split(bytes, at * 8 + 2, (f64)shift[at * 2 + 1])
+        return reach
+
+    ## Triangle `t`'s samples: where they come from, how much it covers them.
+    func cover_triangle(t: usize, x0: f64, y0: f64, spacing: f64, n: i64, rim: f64, shift: f32[], cover: u8[], reach: Reach*):
+        let a = (usize)self.corners[t * 3] * 4
+        let b = (usize)self.corners[t * 3 + 1] * 4
+        let c = (usize)self.corners[t * 3 + 2] * 4
+        let p = self.points
+        let ax = p[a + 2]
+        let ay = p[a + 3]
+        let bx = p[b + 2]
+        let by = p[b + 3]
+        let cx = p[c + 2]
+        let cy = p[c + 3]
+        let area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+        if math.abs(area) < 1e-9:
+            return
+        let box = self.triangle_box(t)
+        let i0 = math.imax(0, (i64)math.ceil((box.left - x0) / spacing))
+        let j0 = math.imax(0, (i64)math.ceil((box.top - y0) / spacing))
+        let i1 = math.imin(n - 1, (i64)math.floor((box.right - x0) / spacing))
+        let j1 = math.imin(n - 1, (i64)math.floor((box.bottom - y0) / spacing))
+        let edges = self.outer[t]
+        for j in j0..<j1 + 1:
+            let y = y0 + (f64)j * spacing
+            for i in i0..<i1 + 1:
+                let x = x0 + (f64)i * spacing
+                # Barycentric weights of b and c; a has what is left.
+                let wb = ((x - ax) * (cy - ay) - (y - ay) * (cx - ax)) / area
+                let wc = ((bx - ax) * (y - ay) - (by - ay) * (x - ax)) / area
+                let wa = 1.0 - wb - wc
+                if wa < -1e-9 or wb < -1e-9 or wc < -1e-9:
+                    continue
+                let at = (usize)(j * n + i)
+                let sx = wa * p[a] + wb * p[b] + wc * p[c]
+                let sy = wa * p[a + 1] + wb * p[b + 1] + wc * p[c + 1]
+                shift[at * 2] = (f32)(sx - x)
+                shift[at * 2 + 1] = (f32)(sy - y)
+                var coverage = 1.0
+                if edges != 0 and rim > 0.0:
+                    let inside = edge_distance(edges, x, y, ax, ay, bx, by, cx, cy)
+                    coverage = math.clamp(0.5 + inside / rim, 0.5, 1.0)
+                let value = (u8)(coverage * 255.0 + 0.5)
+                if value > cover[at]:
+                    cover[at] = value
+                reach.moved = true
+                reach.left = math.min(reach.left, sx)
+                reach.top = math.min(reach.top, sy)
+                reach.right = math.max(reach.right, sx)
+                reach.bottom = math.max(reach.bottom, sy)
+
+## How far (`x`, `y`) lies inside the nearest of the triangle's outer edges `edges`.
+func edge_distance(edges: u8, x: f64, y: f64, ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64) -> f64:
+    var nearest = 1.0e18
+    if edges & 1 != 0:
+        nearest = math.min(nearest, line_distance(x, y, ax, ay, bx, by))
+    if edges & 2 != 0:
+        nearest = math.min(nearest, line_distance(x, y, bx, by, cx, cy))
+    if edges & 4 != 0:
+        nearest = math.min(nearest, line_distance(x, y, cx, cy, ax, ay))
+    return nearest
+
+## The distance from (`x`, `y`) to the line through (`x0`, `y0`) and (`x1`, `y1`).
+func line_distance(x: f64, y: f64, x0: f64, y0: f64, x1: f64, y1: f64) -> f64:
+    let dx = x1 - x0
+    let dy = y1 - y0
+    let length = math.sqrt(dx * dx + dy * dy)
+    if length < 1e-12:
+        return math.sqrt((x - x0) * (x - x0) + (y - y0) * (y - y0))
+    return math.abs((x - x0) * dy - (y - y0) * dx) / length
+
+## An uncovered sample next to a covered one takes its displacement.
+func borrow(shift: f32[], cover: const u8[], n: i64, i: i64, j: i64):
+    for step in 0..<(usize)4:
+        let ni = i + (1 if step == 0 else (-1 if step == 1 else 0))
+        let nj = j + (1 if step == 2 else (-1 if step == 3 else 0))
+        if ni < 0 or nj < 0 or ni >= n or nj >= n:
+            continue
+        let other = (usize)(nj * n + ni)
+        if cover[other] != 0:
+            let at = (usize)(j * n + i)
+            shift[at * 2] = shift[other * 2]
+            shift[at * 2 + 1] = shift[other * 2 + 1]
+            return
+
+## `value` as two half floats at `at` and `at + 4` in `bytes`, as liquify's:
+## a multiple of 64, exact in a half, and what is left.
+func put_split(bytes: u8[], at: usize, value: f64):
+    let coarse = math.round(value / 64.0) * 64.0
+    put_half(bytes, at, coarse)
+    put_half(bytes, at + 4, value - coarse)
+
+func put_half(bytes: u8[], at: usize, value: f64):
+    let half = to_half((f32)value)
+    bytes[at] = (u8)(half & 0xff)
+    bytes[at + 1] = (u8)(half >> 8)
+
+## A displacement read back from `bytes` at sample `at`: x and y.
+func read_shift(bytes: const u8[], at: usize, axis: usize) -> f64:
+    let coarse = from_half((u16)bytes[at * 8 + axis * 2] | ((u16)bytes[at * 8 + axis * 2 + 1] << 8))
+    let fine = from_half((u16)bytes[at * 8 + 4 + axis * 2] | ((u16)bytes[at * 8 + 4 + axis * 2 + 1] << 8))
+    return (f64)coarse + (f64)fine
+
+test "a moved lattice reads back as the move, covers what it lands on and nothing past it":
+    let source = Footprint(left = 0.0, top = 0.0, right = 100.0, bottom = 100.0)
+    let landing = try alloc f64[25 * 2] in memory.heap
+    defer free(landing) in memory.heap
+    for r in 0..<(usize)5:
+        for c in 0..<(usize)5:
+            landing[(r * 5 + c) * 2] = (f64)c * 25.0 + 10.0
+            landing[(r * 5 + c) * 2 + 1] = (f64)r * 25.0 + 5.0
+    var mesh = try MeshMap.lattice(source, 4, 4, landing)
+    defer mesh.destroy()
+    assert(mesh.triangles() == 32 and mesh.landed.left == 10.0 and mesh.landed.bottom == 105.0)
+    let n: i64 = 129
+    let bytes = try alloc u8[(usize)(n * n) * 8] in memory.heap
+    defer free(bytes) in memory.heap
+    let cover = try alloc u8[(usize)(n * n)] in memory.heap
+    defer free(cover) in memory.heap
+    let reach = mesh.field(0.0, 0.0, 1.0, n, 1.0, bytes, cover)
+    assert(reach.moved and math.abs(reach.left) < 1e-6 and math.abs(reach.right - 100.0) < 1e-6)
+    let inside = (usize)(50 * n + 50)
+    assert(cover[inside] == 255 and math.abs(read_shift(bytes, inside, 0) + 10.0) < 0.01 and math.abs(read_shift(bytes, inside, 1) + 5.0) < 0.01)
+    # Left of where it lands: nothing; on its left edge: half.
+    assert(cover[(usize)(50 * n + 4)] == 0 and cover[(usize)(50 * n + 10)] == 128)
+    # Just past the rim, the displacement is the neighbour's.
+    assert(math.abs(read_shift(bytes, (usize)(50 * n + 9), 0) + 10.0) < 0.01)

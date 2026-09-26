@@ -1,0 +1,138 @@
+#==============================================================================================
+#
+#   warp_patch - Edit › Transform › Warp: a bicubic Bézier patch over a box
+#
+#   DESCRIPTION:
+#       Photoshop's Warp bends a box by sixteen control points in a 4 by 4 grid: the corners,
+#       the handles along each side and four inside, one bicubic Bézier patch. The source box
+#       maps linearly onto the patch's (u, v) square and each point lands where the patch
+#       puts it. The patch is drawn through a lattice of small triangles (mesh_map.lucb), fine
+#       enough that its straight pieces follow the curves to well under a pixel on screen.
+#       The presets (Arc, Arch, Bulge, Flag, Wave, Rise) move the control points by a bend,
+#       as Photoshop's header does.
+#
+#==============================================================================================
+
+import math
+import memory
+from luce_image.transform_window import Footprint
+from luce_image.mesh_map import MeshMap
+from raster_errors import invalid
+
+## Control points a side, and in all.
+pub let patch_side: usize = 4
+pub let patch_points: usize = 16
+
+## The presets `bend_patch` makes.
+pub let warp_arc: i64 = 0
+pub let warp_arch: i64 = 1
+pub let warp_bulge: i64 = 2
+pub let warp_flag: i64 = 3
+pub let warp_wave: i64 = 4
+pub let warp_rise: i64 = 5
+
+## The patch that leaves `box` as it is: points a third of the box apart,
+## row by row, x then y.
+pub func identity_patch(box: Footprint, points: f64[]) -> !:
+    if points.length != patch_points * 2:
+        error(invalid, "a warp patch has sixteen points")
+    for j in 0..<patch_side:
+        for i in 0..<patch_side:
+            let at = (j * patch_side + i) * 2
+            points[at] = box.left + (box.right - box.left) * (f64)i / 3.0
+            points[at + 1] = box.top + (box.bottom - box.top) * (f64)j / 3.0
+
+## Preset `kind` with `bend` (-1..1): the identity patch over `box` with its
+## points moved as Photoshop's header moves them.
+pub func bend_patch(box: Footprint, kind: i64, bend: f64, points: f64[]) -> !:
+    try identity_patch(box, points)
+    let height = box.bottom - box.top
+    let b = math.clamp(bend, -1.0, 1.0)
+    for j in 0..<patch_side:
+        for i in 0..<patch_side:
+            let at = (j * patch_side + i) * 2
+            let u = (f64)i / 3.0
+            let v = (f64)j / 3.0
+            # How far along the box's middle a point is: 0 at the ends, 1 in the middle.
+            let middle = 1.0 - (2.0 * u - 1.0) * (2.0 * u - 1.0)
+            if kind == warp_arc:
+                points[at + 1] -= b * height * 0.5 * middle
+            elif kind == warp_arch:
+                points[at + 1] -= b * height * 0.5 * middle * (1.0 - v)
+            elif kind == warp_bulge:
+                points[at + 1] += b * height * 0.25 * middle * (2.0 * v - 1.0)
+            elif kind == warp_flag:
+                points[at + 1] += b * height * 0.25 * math.sin(u * 2.0 * math.pi)
+            elif kind == warp_wave:
+                points[at + 1] += b * height * 0.25 * math.sin(u * 2.0 * math.pi) * (1.0 - v)
+            elif kind == warp_rise:
+                points[at + 1] -= b * height * 0.5 * (u - 0.5)
+            else:
+                error(invalid, "no such warp preset")
+
+## The cubic Bernstein weights at `t`.
+func bernstein(t: f64, weights: f64[4]*):
+    let s = 1.0 - t
+    (*weights)[0] = s * s * s
+    (*weights)[1] = 3.0 * s * s * t
+    (*weights)[2] = 3.0 * s * t * t
+    (*weights)[3] = t * t * t
+
+## Where the patch `points` takes (u, v) of its square.
+pub func patch_point(points: const f64[], u: f64, v: f64, x: f64*, y: f64*):
+    var wu: f64[4] = ---
+    var wv: f64[4] = ---
+    bernstein(u, &wu)
+    bernstein(v, &wv)
+    var px = 0.0
+    var py = 0.0
+    for j in 0..<patch_side:
+        for i in 0..<patch_side:
+            let w = wu[i] * wv[j]
+            let at = (j * patch_side + i) * 2
+            px += w * points[at]
+            py += w * points[at + 1]
+    *x = px
+    *y = py
+
+## The lattice squares a side for a patch landing over `extent` pixels: one
+## every 16 pixels of it, 16..96, so its pieces bend with the curves.
+pub func lattice_for(extent: f64) -> usize:
+    return (usize)math.clamp(math.ceil(extent / 16.0), 16.0, 96.0)
+
+## The mesh `box` makes through the patch `points`.
+pub func patch_mesh(box: Footprint, points: const f64[]) -> MeshMap!:
+    if points.length != patch_points * 2 or not (box.right > box.left) or not (box.bottom > box.top):
+        error(invalid, "a warp takes a box with area and sixteen points")
+    var reach = 0.0
+    for index in 0..<patch_points:
+        reach = math.max(reach, math.max(math.abs(points[index * 2] - points[0]), math.abs(points[index * 2 + 1] - points[1])))
+    let side = lattice_for(math.max(reach, math.max(box.right - box.left, box.bottom - box.top)))
+    let landing = try alloc f64[(side + 1) * (side + 1) * 2] in memory.heap
+    defer free(landing) in memory.heap
+    for j in 0..<side + 1:
+        for i in 0..<side + 1:
+            let at = (j * (side + 1) + i) * 2
+            var x = 0.0
+            var y = 0.0
+            patch_point(points, (f64)i / (f64)side, (f64)j / (f64)side, &x, &y)
+            landing[at] = x
+            landing[at + 1] = y
+    return try MeshMap.lattice(box, side, side, landing)
+
+test "an identity patch lands every point where it began, and a bend moves the middle":
+    let box = Footprint(left = 100.0, top = 50.0, right = 400.0, bottom = 250.0)
+    var points: f64[32] = ---
+    try identity_patch(box, points[0..])
+    var x = 0.0
+    var y = 0.0
+    patch_point(points[0..], 0.25, 0.75, &x, &y)
+    assert(math.abs(x - 175.0) < 1e-9 and math.abs(y - 200.0) < 1e-9)
+    var mesh = try patch_mesh(box, points[0..])
+    defer mesh.destroy()
+    assert(math.abs(mesh.landed.left - 100.0) < 1e-9 and math.abs(mesh.landed.bottom - 250.0) < 1e-9)
+    try bend_patch(box, warp_arc, 0.5, points[0..])
+    patch_point(points[0..], 0.5, 0.5, &x, &y)
+    assert(math.abs(x - 250.0) < 1e-6 and y < 150.0)
+    patch_point(points[0..], 0.0, 0.0, &x, &y)
+    assert(math.abs(x - 100.0) < 1e-9 and math.abs(y - 50.0) < 1e-9)

@@ -1,0 +1,234 @@
+#==============================================================================================
+#
+#   puppet - Edit › Puppet Warp: pins bend a mesh over a layer's content
+#
+#   DESCRIPTION:
+#       A lattice of small triangles covers the layer's painted box; pins are placed on it and
+#       dragged, and every lattice point follows the pins by moving least squares with the
+#       rigid map (Schaefer, McPhail and Warren 2006): each point finds the rotation and
+#       move that best carries the pins, weighted by their nearness, so the picture bends
+#       around the pins without shearing. No pins, or pins where they were put, leave it as
+#       it is; one pin moves it whole. The landed lattice is drawn backwards a cell at a time
+#       (mesh_map.lucb, mesh_render.lucb).
+#
+#==============================================================================================
+
+import math
+import memory
+from luce_image.transform_window import Footprint
+from luce_image.mesh_map import MeshMap
+from raster_errors import invalid, limit
+
+## The most pins a puppet takes.
+pub let pin_limit: usize = 64
+
+## Mesh densities: a point every (box's longer side / this) pixels.
+pub let density_fewer: i64 = 0
+pub let density_normal: i64 = 1
+pub let density_more: i64 = 2
+
+## A puppet warp's mesh and pins.
+pub struct Puppet:
+    ## The box the mesh covers, and its squares across and down.
+    pub var box: Footprint
+    var columns: usize
+    var rows: usize
+    ## Each pin: where it was put (x, y) and where it is now (x, y).
+    var pins: f64[]
+    pub var pin_count: usize
+
+    ## A puppet over `box` at `density`.
+    pub static func create(box: Footprint, density: i64) -> Puppet!:
+        if not (box.right > box.left) or not (box.bottom > box.top):
+            error(invalid, "a puppet warp needs a box with area")
+        let across = 24.0 if density == density_fewer else (64.0 if density == density_more else 40.0)
+        let longer = math.max(box.right - box.left, box.bottom - box.top)
+        let step = longer / across
+        let columns = (usize)math.clamp(math.ceil((box.right - box.left) / step), 2.0, 128.0)
+        let rows = (usize)math.clamp(math.ceil((box.bottom - box.top) / step), 2.0, 128.0)
+        let pins = try alloc f64[pin_limit * 4] in memory.heap
+        return Puppet(box = box, columns = columns, rows = rows, pins = pins, pin_count = 0)
+
+    ## As `create`, on the heap: free it with `destroy` then `free`.
+    pub static func create_boxed(box: Footprint, density: i64) -> Puppet*!:
+        var made = try Puppet.create(box, density)
+        errdefer made.destroy()
+        return try new Puppet(box = made.box, columns = made.columns, rows = made.rows, pins = made.pins, pin_count = 0) in memory.heap
+
+    pub mutating func destroy():
+        free(self.pins) in memory.heap
+
+    ## Put a pin at (`x`, `y`); its index.
+    pub mutating func add_pin(x: f64, y: f64) -> usize!:
+        if self.pin_count == pin_limit:
+            error(limit, "a puppet warp takes at most 64 pins")
+        if not math.is_finite(x) or not math.is_finite(y):
+            error(invalid, "a pin must be somewhere finite")
+        let at = self.pin_count * 4
+        # Put on the bent picture: it holds the source point that lands under it now.
+        var source_x = x
+        var source_y = y
+        self.source_of(x, y, &source_x, &source_y)
+        self.pins[at] = source_x
+        self.pins[at + 1] = source_y
+        self.pins[at + 2] = x
+        self.pins[at + 3] = y
+        self.pin_count += 1
+        return self.pin_count - 1
+
+    ## Move pin `index` to (`x`, `y`).
+    pub mutating func move_pin(index: usize, x: f64, y: f64) -> !:
+        if index >= self.pin_count or not math.is_finite(x) or not math.is_finite(y):
+            error(invalid, "no such pin, or not somewhere finite")
+        self.pins[index * 4 + 2] = x
+        self.pins[index * 4 + 3] = y
+
+    ## Take pin `index` away.
+    pub mutating func remove_pin(index: usize) -> !:
+        if index >= self.pin_count:
+            error(invalid, "no such pin")
+        for at in index..<self.pin_count - 1:
+            for k in 0..<(usize)4:
+                self.pins[at * 4 + k] = self.pins[(at + 1) * 4 + k]
+        self.pin_count -= 1
+
+    ## Pin `index`, where it is now.
+    pub func pin_x(index: usize) -> f64:
+        return self.pins[index * 4 + 2]
+
+    pub func pin_y(index: usize) -> f64:
+        return self.pins[index * 4 + 3]
+
+    ## The pin within `reach` of (`x`, `y`), nearest first; -1 for none.
+    pub func hit(x: f64, y: f64, reach: f64) -> i64:
+        var best: i64 = -1
+        var nearest = reach
+        for index in 0..<self.pin_count:
+            let d = math.hypot(self.pin_x(index) - x, self.pin_y(index) - y)
+            if d <= nearest:
+                nearest = d
+                best = (i64)index
+        return best
+
+    ## Where source point (`x`, `y`) lands through the pins (moving least squares, rigid).
+    pub func deform(x: f64, y: f64, out_x: f64*, out_y: f64*):
+        *out_x = x
+        *out_y = y
+        if self.pin_count == 0:
+            return
+        # Weights: nearer pins count more; a point on a pin goes with it.
+        var total = 0.0
+        var px = 0.0
+        var py = 0.0
+        var qx = 0.0
+        var qy = 0.0
+        for index in 0..<self.pin_count:
+            let at = index * 4
+            let dx = self.pins[at] - x
+            let dy = self.pins[at + 1] - y
+            let d2 = dx * dx + dy * dy
+            if d2 < 1e-9:
+                *out_x = self.pins[at + 2]
+                *out_y = self.pins[at + 3]
+                return
+            let w = 1.0 / d2
+            total += w
+            px += w * self.pins[at]
+            py += w * self.pins[at + 1]
+            qx += w * self.pins[at + 2]
+            qy += w * self.pins[at + 3]
+        px /= total
+        py /= total
+        qx /= total
+        qy /= total
+        if self.pin_count == 1:
+            *out_x = x + qx - px
+            *out_y = y + qy - py
+            return
+        # The best rotation of the pins about their weighted middles, at this point.
+        let vx = x - px
+        let vy = y - py
+        var fx = 0.0
+        var fy = 0.0
+        for index in 0..<self.pin_count:
+            let at = index * 4
+            let dx = self.pins[at] - x
+            let dy = self.pins[at + 1] - y
+            let w = 1.0 / (dx * dx + dy * dy)
+            let hx = self.pins[at] - px
+            let hy = self.pins[at + 1] - py
+            let gx = self.pins[at + 2] - qx
+            let gy = self.pins[at + 3] - qy
+            # (g) times w [h; -h⊥] [v; -v⊥]ᵀ, as the rigid map's A_i has it.
+            let a = w * (hx * vx + hy * vy)
+            let b = w * (hx * vy - hy * vx)
+            fx += gx * a - gy * b
+            fy += gx * b + gy * a
+        let length = math.sqrt(fx * fx + fy * fy)
+        let reach = math.sqrt(vx * vx + vy * vy)
+        if length < 1e-12:
+            *out_x = x + qx - px
+            *out_y = y + qy - py
+            return
+        *out_x = qx + fx / length * reach
+        *out_y = qy + fy / length * reach
+
+    ## The source point that lands at (`x`, `y`), found by stepping back
+    ## (a few Newton-like steps; exact when nothing is pinned).
+    func source_of(x: f64, y: f64, out_x: f64*, out_y: f64*):
+        var sx = x
+        var sy = y
+        for step in 0..<(usize)12:
+            var lx = 0.0
+            var ly = 0.0
+            self.deform(sx, sy, &lx, &ly)
+            let ex = x - lx
+            let ey = y - ly
+            if ex * ex + ey * ey < 1e-6:
+                break
+            sx += ex
+            sy += ey
+        *out_x = sx
+        *out_y = sy
+
+    ## The landed lattice, as a mesh drawn backwards.
+    pub func mesh() -> MeshMap!:
+        let count = (self.columns + 1) * (self.rows + 1)
+        let landing = try alloc f64[count * 2] in memory.heap
+        defer free(landing) in memory.heap
+        let width = self.box.right - self.box.left
+        let height = self.box.bottom - self.box.top
+        for r in 0..<self.rows + 1:
+            for c in 0..<self.columns + 1:
+                let at = (r * (self.columns + 1) + c) * 2
+                var x = 0.0
+                var y = 0.0
+                self.deform(self.box.left + width * (f64)c / (f64)self.columns, self.box.top + height * (f64)r / (f64)self.rows, &x, &y)
+                landing[at] = x
+                landing[at + 1] = y
+        return try MeshMap.lattice(self.box, self.columns, self.rows, landing)
+
+test "a puppet with no pins, or pins left in place, changes nothing; one pin moves it whole":
+    let box = Footprint(left = 0.0, top = 0.0, right = 400.0, bottom = 300.0)
+    var puppet = try Puppet.create(box, density_normal)
+    defer puppet.destroy()
+    var x = 0.0
+    var y = 0.0
+    puppet.deform(123.0, 45.0, &x, &y)
+    assert(x == 123.0 and y == 45.0)
+    discard(try puppet.add_pin(100.0, 100.0))
+    discard(try puppet.add_pin(300.0, 200.0))
+    puppet.deform(123.0, 45.0, &x, &y)
+    assert(math.abs(x - 123.0) < 1e-6 and math.abs(y - 45.0) < 1e-6)
+    # Both pins moved by the same amount: everything moves with them.
+    try puppet.move_pin(0, 110.0, 90.0)
+    try puppet.move_pin(1, 310.0, 190.0)
+    puppet.deform(200.0, 150.0, &x, &y)
+    assert(math.abs(x - 210.0) < 1e-6 and math.abs(y - 140.0) < 1e-6)
+    # One pin taken away: the other alone moves it whole.
+    try puppet.remove_pin(0)
+    puppet.deform(0.0, 0.0, &x, &y)
+    assert(math.abs(x - 10.0) < 1e-6 and math.abs(y + 10.0) < 1e-6)
+    var mesh = try puppet.mesh()
+    defer mesh.destroy()
+    assert(math.abs(mesh.landed.left - 10.0) < 1e-6)

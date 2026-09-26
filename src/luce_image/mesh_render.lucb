@@ -1,0 +1,112 @@
+#==============================================================================================
+#
+#   mesh_render - A mesh-warped layer's cells on the GPU
+#
+#   DESCRIPTION:
+#       Warp and Puppet Warp draw a layer through a `MeshMap` a cell at a time with mesh.frag:
+#       at the level a view draws while the mesh is dragged (the canvas shows the layer
+#       through a stand-in), and once at full size, for the cells the mesh came from or
+#       lands on, when the warp is kept. A cell's field has a sample for each of its
+#       texels, so the map is followed as finely as the cell shows it; the window it reads
+#       is gathered at the cell's level, or coarser where the cell shrinks a large area.
+#
+#==============================================================================================
+
+import gpu
+import math
+import memory
+from tiles import Tiles, tile_size, tile_texture
+from pyramid import Pyramid
+from luce_image.transform_window import Footprint, gather_tiles, level_for, Window
+from luce_image.liquify_grid import Reach
+from luce_image.mesh_map import MeshMap
+from luce_image.shaders import mesh_frag_words, mesh_frag_msl
+
+## The widest window a full-size cell reads, in pixels a side; one reaching
+## farther (a cell that gathers a huge area) reads a coarser level.
+let full_window: f64 = 4096.0
+
+## Draws mesh-warped cells: mesh.frag's pipeline.
+pub struct Mesher:
+    var owner: gpu.Device
+    var shader: gpu.Shader
+    var pipeline: gpu.Pipeline
+
+    pub static func create(device: gpu.Device) -> Mesher!:
+        var shader = try gpu.Shader.create(device, mesh_frag_words, mesh_frag_msl)
+        errdefer shader.destroy()
+        var pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.replace, gpu.Format.rgba16_float)
+        return Mesher(owner = device, shader = shader, pipeline = pipeline)
+
+    pub mutating func destroy():
+        self.pipeline.destroy()
+        self.shader.destroy()
+
+    ## Cell (`column`, `row`) of pyramid `level` of `tiles` (as the warp began;
+    ## `pyramid` their levels) drawn through `mesh`; none where nothing lands.
+    pub func cell(mesh: const MeshMap*, tiles: const Tiles*, pyramid: Pyramid*, column: u32, row: u32, level: u32) -> gpu.Texture?!:
+        let scale = (f64)(1u32 << level)
+        let side = (f64)tile_size * scale
+        let x0 = (f64)column * side
+        let y0 = (f64)row * side
+        if not mesh.touches(x0 - scale, y0 - scale, x0 + side + scale, y0 + side + scale):
+            return none
+        # A sample for each texel of the cell, and one more along each side for the tap.
+        let spacing = scale
+        let n = (i64)tile_size + 1
+        let count = (usize)(n * n)
+        let bytes = try alloc u8[count * 8] in memory.heap
+        defer free(bytes) in memory.heap
+        let cover = try alloc u8[count] in memory.heap
+        defer free(cover) in memory.heap
+        let reach = mesh.field(x0, y0, spacing, n, scale, bytes, cover)
+        if not reach.moved:
+            return none
+        # The window: every place a covered sample reads, two texels of its
+        # level around it for the tap, within the layer.
+        var at = level
+        if level == 0:
+            while at < 12 and math.max(reach.right - reach.left, reach.bottom - reach.top) / (f64)(1u32 << at) > full_window:
+                at += 1
+        else:
+            let coarsest = level_for(source_box(reach, tiles, scale) else return none)
+            at = coarsest if coarsest > level else level
+        let box = source_box(reach, tiles, (f64)(1u32 << at)) else return none
+        let clear = gpu.Color(0.0, 0.0, 0.0, 0.0)
+        var window = try gather_tiles(self.owner, tiles, pyramid, box, at, false, clear)
+        defer window.destroy()
+        var field = try gpu.Texture.create(self.owner, (u32)n, (u32)n, gpu.Format.rgba16_float)
+        defer field.destroy()
+        try field.upload(bytes)
+        # As rgba8, coverage in red: rows of whole words, whatever the width.
+        let wide = try alloc u8[count * 4] in memory.heap
+        defer free(wide) in memory.heap
+        for index in 0..<count:
+            wide[index * 4] = cover[index]
+            wide[index * 4 + 1] = 0
+            wide[index * 4 + 2] = 0
+            wide[index * 4 + 3] = 255
+        var coverage = try gpu.Texture.create(self.owner, (u32)n, (u32)n, gpu.Format.rgba8_linear)
+        defer coverage.destroy()
+        try coverage.upload(wide)
+        var params: f32[12] = [(f32)x0, (f32)y0, (f32)scale, 0.0, (f32)window.left, (f32)window.top, (f32)(try window.texture.width()), (f32)(try window.texture.height()),
+                               (f32)(1u32 << at), (f32)spacing, (f32)n, 0.0]
+        var fresh = try tile_texture(self.owner)
+        errdefer fresh.destroy()
+        let frame = try fresh.frame()
+        defer frame.release()
+        let area = try frame.value().target()
+        defer area.release()
+        try gpu.shade(area.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 48),
+                      [window.texture, field, coverage], gpu.Filter.nearest)
+        discard(try frame.value().present(clear))
+        return fresh
+
+## Where a cell's samples read (`reach`), two texels of `scale` pixels around
+## for the tap, within `tiles`' layer; none when that is past it.
+func source_box(reach: Reach, tiles: const Tiles*, scale: f64) -> Footprint?:
+    let box = Footprint(left = math.max(0.0, math.floor(reach.left) - 2.0 * scale), top = math.max(0.0, math.floor(reach.top) - 2.0 * scale),
+                        right = math.min((f64)tiles.width(), math.ceil(reach.right) + 2.0 * scale), bottom = math.min((f64)tiles.height(), math.ceil(reach.bottom) + 2.0 * scale))
+    if box.right <= box.left or box.bottom <= box.top:
+        return none
+    return box
