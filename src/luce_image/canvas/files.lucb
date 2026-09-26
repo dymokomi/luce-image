@@ -336,8 +336,30 @@ func place_picture(canvas: Canvas*, id: i64, path: str, center_x: i64, center_y:
                 error(failure.code, failure.message)
             return
     let picture = try Image.open(path, max_bytes = picture_bytes, max_pixels = picture_pixels)
+    if places_in_background(picture) and canvas.document != none:
+        try place_in_background(canvas, id, picture, center_x, center_y)
+        return
     defer picture.release()
     try place_image_at(canvas, id, picture, center_x, center_y)
+
+## `place_image_at` while frames go on: the layer fills in as the picture
+## decodes (canvas/opening), after any picture still opening is in. Takes
+## `picture`.
+func place_in_background(canvas: Canvas*, id: i64, picture: interop.Reference[Image], center_x: i64, center_y: i64) -> !:
+    var width: usize = 0
+    var height: usize = 0
+    prepare_placing(canvas, id, picture, &width, &height) catch failure:
+        picture.release()
+        error(failure.code, failure.message)
+    try begin_opening(canvas, (u64)id, picture, center_x - (i64)width // 2, center_y - (i64)height // 2)
+
+## What `place_in_background` checks before it starts: the layer, the picture's size.
+func prepare_placing(canvas: Canvas*, id: i64, picture: interop.Reference[Image], width: usize*, height: usize*) -> !:
+    try canvas.require_open()
+    try canvas.finish_opening()
+    discard(try canvas.index((u64)id))
+    *width = try picture.value().width()
+    *height = try picture.value().height()
 
 ## `picture` becomes all of layer `id`'s pixels, centred on a document point;
 ## what falls outside the document is cut off.

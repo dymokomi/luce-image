@@ -127,6 +127,56 @@ pub func relocate(source: const Tiles*, dest: Tiles*, scale_x: f64, scale_y: f64
                 try dest.place(column, row, texture, inside, beyond)
     try dest.settle(empty.alpha > 0.5)
 
+## Rows `top`..<`bottom` of `dest`'s cells drawn from `source`, a picture's
+## own grid whose top-left is document pixel (`x`, `y`): a placed picture
+## landing on the canvas grid a few rows at a time as it decodes, texel for
+## texel. Cells past the canvas must be covered already; `settle` once the
+## last rows are in.
+pub func land_rows(source: const Tiles*, dest: Tiles*, x: i64, y: i64, top: i64, bottom: i64) -> !:
+    let size = (i64)tile_size
+    let range = landing_cells((f64)x, (f64)y, (f64)(x + (i64)source.width()), (f64)(y + (i64)source.height()))
+    for row in max_i64(top, range.top)..<min_i64(bottom, range.bottom):
+        let cell_y = row * size
+        # The source rows under this row of cells.
+        let first_row = max_i64(0, floor_cell(cell_y - y))
+        let last_row = min_i64((i64)source.rows() - 1, floor_cell(cell_y + size - 1 - y))
+        for column in range.left..<range.right:
+            let cell_x = column * size
+            let first_column = max_i64(0, floor_cell(cell_x - x))
+            let last_column = min_i64((i64)source.columns() - 1, floor_cell(cell_x + size - 1 - x))
+            let canvas = canvas_part(dest, column, row)
+            var texture = gpu.Texture()
+            var opened = false
+            var inside = false
+            var beyond = false
+            var holder: interop.Reference[gpu.Frame]? = none
+            for source_row in first_row..<last_row + 1:
+                for source_column in first_column..<last_column + 1:
+                    let piece = (try source.texture((u32)source_column, (u32)source_row)) else continue
+                    let area = source.region((u32)source_column, (u32)source_row)
+                    let left = (f64)(x + source_column * size - cell_x)
+                    let up = (f64)(y + source_row * size - cell_y)
+                    if not opened:
+                        texture = try dest.blank()
+                        opened = true
+                    let frame = holder else try texture.frame()
+                    holder = frame
+                    let target = try frame.value().target()
+                    defer target.release()
+                    try gpu.copy_image(target.value(), piece, gpu.Rect(left, up, (f64)area.width, (f64)area.height), area, gpu.Filter.nearest)
+                    inside = inside or (left < canvas.width and up < canvas.height)
+                    beyond = beyond or reaches_past_part(left, up, (f64)area.width, (f64)area.height, canvas)
+            if let frame = holder:
+                discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+                frame.release()
+            if opened:
+                try dest.place(column, row, texture, inside, beyond)
+
+## The cell holding document pixel `at`, below zero too.
+func floor_cell(at: i64) -> i64:
+    let size = (i64)tile_size
+    return at // size if at >= 0 else -((-at + size - 1) // size)
+
 ## The cells a box of document pixels touches.
 pub func landing_cells(left: f64, top: f64, right: f64, bottom: f64) -> CellRange:
     let size = (f64)tile_size

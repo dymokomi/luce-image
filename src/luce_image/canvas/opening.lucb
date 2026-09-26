@@ -13,6 +13,11 @@
 #       out, while the decode goes on. A few bands are packed ahead at most: the worker
 #       waits for a free slot, so memory stays a few rows of tiles whatever the picture.
 #
+#       A picture placed as a new layer (File › Import, a drop on the Layers panel) loads
+#       the same way. Off the canvas's grid, its bands go into a grid of its own first,
+#       and each row of the layer's cells lands (`land_rows`) once the picture rows under
+#       it are in; the picture's cells no row needs any more are let go as it goes.
+#
 #       Edits and saves are refused until it is done (`require_loaded`); `opening_percent`
 #       is the progress for the window to show.
 #
@@ -36,8 +41,19 @@ struct Opening:
     var picture: interop.Reference[Image]
     var image: Image*
     var layer: u64
+    ## The picture's size, which its bands are packed for.
     var extent_x: u32
     var extent_y: u32
+    ## A placed picture off the canvas's grid: its own grid, where its top-left
+    ## lands, the next row of the layer's cells to land and the row after the
+    ## last, and the picture's cell rows let go so far.
+    var placed: bool
+    var source: Tiles
+    var offset_x: i64
+    var offset_y: i64
+    var landed: i64
+    var land_end: i64
+    var source_freed: u32
     var slots: OpeningSlot[3]
     ## Each code's half float, made at the first band of encoded samples.
     var color: u16[]
@@ -65,19 +81,45 @@ struct Opening:
 func opens_in_background(canvas: const Canvas*, picture: interop.Reference[Image]) -> bool:
     return canvas.open_in_background and progressive_loading and not picture.value().is_camera_raw()
 
-## Start loading `picture` into record `index`'s layer: the layer gets empty
-## tiles now, and a worker begins decoding.
-func begin_opening(canvas: Canvas*, index: usize, picture: interop.Reference[Image]) -> !:
+## Whether `picture`, placed as a layer, loads in the background: as the
+## document's own picture does.
+func places_in_background(picture: interop.Reference[Image]) -> bool:
+    return progressive_loading and not picture.value().is_camera_raw()
+
+## Start loading `picture`, which this takes, into layer `layer` with its
+## top-left at document pixel (`x`, `y`): the layer gets empty tiles now, and
+## a worker begins decoding.
+func begin_opening(canvas: Canvas*, layer: u64, picture: interop.Reference[Image], x: i64 = 0, y: i64 = 0) -> !:
     let device = canvas.device else trap("bound")
     let document = canvas.document else trap("bound")
-    var tiles = try Tiles.create(device, canvas.extent_x, canvas.extent_y)
-    try document.set_tiles(canvas.records[index].id, tiles)
-    let opening = try new Opening(picture = picture, image = picture.value(), layer = canvas.records[index].id, extent_x = canvas.extent_x, extent_y = canvas.extent_y,
-                                  uploaded = 0, failed = false, failure_code = invalid, failure_length = 0, started = false) in memory.heap
+    let opening = new Opening(picture = picture, image = picture.value(), layer = layer, offset_x = x, offset_y = y,
+                              uploaded = 0, failed = false, failure_code = invalid, failure_length = 0, started = false) in memory.heap catch failure:
+        picture.release()
+        error(failure.code, failure.message)
     errdefer free_opening(opening)
+    let width = (u32)(try picture.value().width())
+    let height = (u32)(try picture.value().height())
+    opening.extent_x = width
+    opening.extent_y = height
+    var tiles = try Tiles.create(device, canvas.extent_x, canvas.extent_y)
+    opening.placed = x != 0 or y != 0 or width != canvas.extent_x or height != canvas.extent_y
+    if opening.placed:
+        # What lies past the canvas is kept past it, as a moved layer keeps it.
+        let range = landing_cells((f64)x, (f64)y, (f64)(x + (i64)width), (f64)(y + (i64)height))
+        if x < 0 or y < 0 or x + (i64)width > (i64)canvas.extent_x or y + (i64)height > (i64)canvas.extent_y:
+            tiles.cover(range) catch failure:
+                tiles.destroy()
+                error(failure.code, failure.message)
+        opening.landed = range.top
+        opening.land_end = range.bottom
+        opening.source = Tiles.create(device, width, height) catch failure:
+            opening.placed = false
+            tiles.destroy()
+            error(failure.code, failure.message)
+    try document.set_tiles(layer, tiles)
     for slot in 0..<opening_slots:
-        opening.slots[slot].band = try alloc u8[packed_band_bytes(canvas.extent_x)] in memory.heap
-        opening.slots[slot].painted = try alloc bool[(usize)tile_columns(canvas.extent_x)] in memory.heap
+        opening.slots[slot].band = try alloc u8[packed_band_bytes(width)] in memory.heap
+        opening.slots[slot].painted = try alloc bool[(usize)tile_columns(width)] in memory.heap
     for unused in 0..<opening_slots:
         opening.free_slots.release()
     opening.handle = try thread.spawn(opening_worker, (void*)opening, name = "picture open")
@@ -151,10 +193,14 @@ func collect_opening(canvas: Canvas*) -> !:
     let started = time.now()
     while opening.uploaded < opening.packed.load(.acquire):
         let slot = &opening.slots[opening.uploaded % opening_slots]
-        # What was made from this row so far is stale once it is in.
-        composer.forget_band(document, tiles, slot.row)
-        try tiles.write_packed(slot.row, slot.band, slot.painted)
-        try build_band_levels(canvas, composer, tiles, slot.row)
+        if opening.placed:
+            try opening.source.write_packed(slot.row, slot.band, slot.painted)
+            try land_opening(canvas, composer, document, tiles, opening, slot.row)
+        else:
+            # What was made from this row so far is stale once it is in.
+            composer.forget_band(document, tiles, slot.row)
+            try tiles.write_packed(slot.row, slot.band, slot.painted)
+            try build_band_levels(canvas, composer, tiles, slot.row)
         opening.uploaded += 1
         opening.free_slots.release()
         try settle_job(canvas)
@@ -173,6 +219,34 @@ func collect_opening(canvas: Canvas*) -> !:
     free_opening(opening)
     if failed:
         error(code, (str)canvas.open_failure[..<length])
+
+## A placed picture's cell row `row` is in: the rows of the layer's cells
+## whose picture rows are all in now land, their levels made as a band's are,
+## and the picture's cells no later row needs are let go.
+func land_opening(canvas: Canvas*, composer: Composer*, document: const Document*, tiles: Tiles*, opening: Opening*, row: u32) -> !:
+    let size = (i64)tile_size
+    let loaded = min_i64((i64)(row + 1) * size, (i64)opening.extent_y)
+    # The last band lands everything left; before it, only whole cell rows.
+    var through = opening.land_end
+    if loaded < (i64)opening.extent_y:
+        let bottom = opening.offset_y + loaded
+        through = min_i64(opening.land_end, bottom // size if bottom >= 0 else -((-bottom + size - 1) // size))
+    if through <= opening.landed:
+        return
+    try land_rows(&opening.source, tiles, opening.offset_x, opening.offset_y, opening.landed, through)
+    for landed in opening.landed..<through:
+        if landed >= 0 and landed < (i64)tile_columns(canvas.extent_y):
+            composer.forget_band(document, tiles, (u32)landed)
+            try build_band_levels(canvas, composer, tiles, (u32)landed)
+    opening.landed = through
+    if through == opening.land_end:
+        try tiles.settle()
+    # Picture cell rows wholly above the next row to land are done with.
+    let needed = through * size - opening.offset_y
+    while opening.source_freed < opening.source.rows() and ((i64)opening.source_freed + 1) * size <= needed:
+        for column in 0..<opening.source.columns():
+            try opening.source.clear(column, opening.source_freed)
+        opening.source_freed += 1
 
 ## The level tiles row `row` of cells completes, each level's row made once
 ## every row of cells under it is in: a zoomed-out view has the rows loaded so
@@ -207,6 +281,8 @@ func free_opening(opening: Opening*):
         opening.handle.join() catch _:
             recover ()
     opening.picture.release()
+    if opening.placed:
+        opening.source.destroy()
     if opening.color.length > 0:
         free(opening.color) in memory.heap
         free(opening.alpha) in memory.heap

@@ -239,3 +239,76 @@ test "a picture loaded in the background makes the same tiles as one loaded at o
         try first_layer_texels(loading, in_background)
         for index in 0..<cells:
             assert(at_once[index] == in_background[index])
+
+## A 900 by 700 document with the picture at `path` placed on a new layer
+## centred on (`center_x`, `center_y`), loaded in the background or at once;
+## the layer's pixels past the canvas too, as half floats, from `left`, `top`.
+struct PlacedLayer:
+    var texels: u8[]
+    var left: i64
+    var top: i64
+
+func placed_layer(device: gpu.Device, target: gpu.Texture*, path: str, center_x: i64, center_y: i64, background: bool) -> PlacedLayer!:
+    var canvas = try Canvas(900, 700)
+    defer canvas.close()
+    # A first frame binds the document, as the window's does before a place.
+    try draw_opening_frame(&canvas, target, 0.05)
+    let layer = try canvas.add_layer("Placed")
+    let layers = canvas.layer_count()
+    Canvas.set_progressive_loading(background)
+    canvas.place_layer(layer, path, center_x, center_y) catch failure:
+        Canvas.set_progressive_loading(false)
+        error(failure.code, failure.message)
+    assert(canvas.is_opening() == background)
+    while canvas.is_opening():
+        # Meanwhile the document takes no edits.
+        canvas.add_layer("Too soon") catch failure:
+            assert(failure.code == invalid)
+            recover 0
+        draw_opening_frame(&canvas, target, 0.05) catch failure:
+            Canvas.set_progressive_loading(false)
+            error(failure.code, failure.message)
+    Canvas.set_progressive_loading(false)
+    assert(canvas.layer_count() == layers)
+    let document = canvas.document else trap("bound")
+    let found = document.find((u64)layer) else trap("the placed layer")
+    let tiles = found.tiles() else trap("pixels")
+    var flat = try flatten_all(device, tiles)
+    defer flat.destroy()
+    let texels = try alloc u8[(usize)(try flat.texture.width()) * (usize)(try flat.texture.height()) * 8] in memory.heap
+    errdefer free(texels) in memory.heap
+    try flat.texture.read(texels)
+    return PlacedLayer(texels = texels, left = flat.left, top = flat.top)
+
+test "a picture placed in the background makes the same layer as one placed at once, past the canvas too":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    # Soft alpha over a partial last row and column, as a PNG and a JPEG.
+    let width: usize = 700
+    let height: usize = 600
+    let bytes = try alloc u8[width * height * 4] in memory.heap
+    defer free(bytes) in memory.heap
+    for index in 0..<bytes.length:
+        bytes[index] = (u8)((index * 7 + index // 2801) % 256)
+    let picture = try Image.from_rgba8(width, height, bytes)
+    defer picture.release()
+    try picture.value().save("build/background-place.png")
+    let opaque = try picture.value().convert("RGB")
+    defer opaque.release()
+    try opaque.value().save("build/background-place.jpg", quality = 85)
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    for path in ["build/background-place.png", "build/background-place.jpg"]:
+        # Off the grid inside the canvas; past its left and bottom edges.
+        for center in 0..<2:
+            let x: i64 = 450 if center == 0 else 100
+            let y: i64 = 350 if center == 0 else 650
+            var at_once = try placed_layer(device, &target, path, x, y, false)
+            defer free(at_once.texels) in memory.heap
+            var loaded = try placed_layer(device, &target, path, x, y, true)
+            defer free(loaded.texels) in memory.heap
+            assert(loaded.left == at_once.left and loaded.top == at_once.top and loaded.texels.length == at_once.texels.length)
+            for index in 0..<at_once.texels.length:
+                assert(loaded.texels[index] == at_once.texels[index])

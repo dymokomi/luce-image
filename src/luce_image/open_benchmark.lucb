@@ -3,26 +3,35 @@
 ## 1/60 s as a window draws, until the picture is whole. It prints milliseconds to the file read
 ## and probed, to the first frame showing the picture's top rows, and to the
 ## whole picture, then the frames drawn. `--background` loads as the window does
-## (canvas/opening); without it the first draw decodes it all. Peak memory is
-## the caller's to measure (`/usr/bin/time -l`).
+## (canvas/opening); without it the first draw decodes it all. `--place`
+## places it instead on a new layer of a document 500 pixels bigger each way,
+## centred, so off the cells' grid, as File › Import does. Peak memory is the
+## caller's to measure (`/usr/bin/time -l`).
 import gpu
 import thread
 import time
 from luce_image.canvas import Canvas
+from luce_image.image import Image
 
 let view_width: u32 = 1600
 let view_height: u32 = 1000
 
 pub func main(arguments: str[]) -> i32!:
     if arguments.length < 2:
-        print("usage: open_benchmark PICTURE [--background]")
+        print("usage: open_benchmark PICTURE [--background] [--place]")
         return 2
-    let background = arguments.length > 2 and arguments[2] == "--background"
+    var background = false
+    var placing = false
+    for index in 2..<arguments.length:
+        background = background or arguments[index] == "--background"
+        placing = placing or arguments[index] == "--place"
     Canvas.set_progressive_loading(background)
     var device = try gpu.Device.open()
     defer device.destroy()
     var target = try gpu.Texture.create(device, view_width, view_height, gpu.Format.rgba8_linear)
     defer target.destroy()
+    if placing:
+        return try place_benchmark(&target, arguments[1])
     let started = time.now()
     let opened = try Canvas.open(arguments[1])
     defer opened.release()
@@ -56,6 +65,47 @@ pub func main(arguments: str[]) -> i32!:
     print(f"read {(probed - started) // 1000000} ms  first {(first - started) // 1000000} ms  whole {(whole - started) // 1000000} ms  frames {frames}")
     print(f"tiles on the GPU {canvas.memory_gpu_bytes() // 1048576} MiB, in RAM {canvas.memory_ram_bytes() // 1048576} MiB, derived {canvas.memory_derived_bytes() // 1048576} MiB, process {canvas.memory_process_bytes() // 1048576} MiB")
     canvas.close()
+    return 0
+
+## `--place`: the picture placed centred on a new layer of a bigger document.
+func place_benchmark(target: gpu.Texture*, path: str) -> i32!:
+    let info = try Image.open(path, max_bytes = (usize)1 << 40, max_pixels = (usize)1 << 32)
+    let picture_width = try info.value().width()
+    let picture_height = try info.value().height()
+    info.release()
+    let margin: usize = 500
+    var canvas = try Canvas((i64)(picture_width + margin), (i64)(picture_height + margin))
+    defer canvas.close()
+    let width = (f64)canvas.width()
+    let height = (f64)canvas.height()
+    let zoom = (f64)view_width / width if (f64)view_width / width < (f64)view_height / height else (f64)view_height / height
+    let middle = (u32)(width * zoom / 2.0)
+    # The picture's top rows in the view, a little below its top edge.
+    let top = (u32)((f64)(margin // 2 + 64) * zoom)
+    try draw_fitted(&canvas, target, zoom)
+    let layer = try canvas.add_layer("Placed")
+    let started = time.now()
+    try canvas.place_layer(layer, path, (i64)canvas.width() // 2, (i64)canvas.height() // 2)
+    let placed = time.now()
+    var first: u64 = 0
+    var frames: u64 = 0
+    while true:
+        let frame_started = time.now()
+        try draw_fitted(&canvas, target, zoom)
+        frames += 1
+        if first == 0 and not black(try pixel(target, middle, top)):
+            first = time.now()
+        if not canvas.is_opening():
+            break
+        let spent = (time.now() - frame_started) // 1000000
+        if spent < 16:
+            thread.sleep(16 - spent)
+    let whole = time.now()
+    let bottom = (u32)((f64)(margin // 2 + picture_height - 64) * zoom)
+    if black(try pixel(target, middle, bottom)):
+        print("the picture's bottom rows are missing")
+        return 1
+    print(f"place {(placed - started) // 1000000} ms  first {(first - started) // 1000000} ms  whole {(whole - started) // 1000000} ms  frames {frames}")
     return 0
 
 func draw_fitted(canvas: Canvas*, target: gpu.Texture*, zoom: f64) -> !:

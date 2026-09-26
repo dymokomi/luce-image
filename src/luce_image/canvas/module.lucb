@@ -49,7 +49,7 @@ import sync
 from luce_image.image import Image, Pixel
 from luce_image.streaming import encoded_tables
 from luce_image.svg_import import is_svg
-from tiles import pack_band, pack_band_coded, packed_band_bytes, Cell, CellRange, read_cells, transient_mark, release_transients, Tiles, Bounds, tile_size, tile_columns, min_u32, max_u32, flatten, tiles_alive, tile_texture, residency_configure, residency_budgets, residency_advance, residency_frame, residency_over_budget, residency_begin_marking, residency_mark_live, residency_settle, residency_report, set_scratch_directory, residency_codec, clear_residency_codec, Gathering, prefetch_collect, prefetch_pending, prefetch_had_failure, prefetch_wait, release_scratch, TileSource, open_tile_source, release_tile_source, back_cell, detach_tile_source, tile_source_is
+from tiles import pack_band, pack_band_coded, packed_band_bytes, Cell, CellRange, read_cells, transient_mark, release_transients, Tiles, Bounds, tile_size, tile_columns, min_u32, max_u32, min_i64, flatten, tiles_alive, tile_texture, residency_configure, residency_budgets, residency_advance, residency_frame, residency_over_budget, residency_begin_marking, residency_mark_live, residency_settle, residency_report, set_scratch_directory, residency_codec, clear_residency_codec, Gathering, prefetch_collect, prefetch_pending, prefetch_had_failure, prefetch_wait, release_scratch, TileSource, open_tile_source, release_tile_source, back_cell, detach_tile_source, tile_source_is
 from pyramid import covered_at
 from luce_image.heal import heal
 from luce_image.color_range import RangeSample, range_sample, range_coverage, range_labs
@@ -72,7 +72,7 @@ from luce_image.projective import Warp, affine_warp, quad_warp, multiply
 import luce_image.live_wire as live_wire
 from luce_image.selection_refine import Refinement, CellBox, RefineWork, pending_cells, needed_cells
 from luce_image.background import Background, start_background, background_done, join_background, wake_frames
-from luce_image.extent import full_bounds, pieces, relocate, Pieces
+from luce_image.extent import full_bounds, pieces, relocate, Pieces, land_rows, landing_cells, flatten_all
 from luce_image.transform_window import Footprint
 from luce_image.transform_preview import warp_preview_cell, lifted_preview_cell
 from luce_image.filter_preview import resample_level_cell, blur_level_cell
@@ -679,7 +679,7 @@ pub struct Canvas:
                 self.records[index].picture = none
                 if opens_in_background(&self, picture):
                     # The document's own picture fills in while frames go on.
-                    try begin_opening(&self, index, picture)
+                    try begin_opening(&self, self.records[index].id, picture)
                     continue
                 self.load_picture(index, picture, self.records[index].picture_x, self.records[index].picture_y, false) catch failure:
                     if failed == none:
@@ -2160,6 +2160,14 @@ pub struct Canvas:
     ## frame. A failed load is reported here, once.
     pub mutating func continue_opening() -> !:
         try collect_opening(&self)
+
+    ## Wait for the picture opening, if any, to be in: before another is
+    ## placed, for one loads at a time.
+    pub mutating func finish_opening() -> !:
+        while self.opening != none:
+            try collect_opening(&self)
+            if self.opening != none:
+                thread.sleep(1)
 
     ## Wait for a smudge still finishing and keep it. Everything that
     ## changes or reads the whole document calls this first.
