@@ -50,3 +50,39 @@ test "a mask filled from the selection matches it pixel for pixel; a black mask 
     let black = (document.find((u64)layer) else trap("layer")).mask_tiles() else trap("masked")
     assert(black.stamp(0, 0) == black.stamp(3, 2) and black.painted(3, 2))
     assert((try mask_value_at(black, samples, 850, 650)) == 0.0)
+
+test "copy reads only the selection's box, from the layer or merged, across cell edges":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(700, 500)
+    defer canvas.close()
+    let background = try canvas.add_layer("Background")
+    let paint = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, false)
+    try canvas.fill(background, false)
+    try canvas.select_rectangle(200, 150, 300, 250)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.fill(paint, false)
+    try canvas.deselect()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    # A box across the square's corner and three cell edges.
+    let width: usize = 180
+    let height: usize = 140
+    let rgba = try alloc u8[width * height * 4] in memory.heap
+    defer free(rgba) in memory.heap
+    let document = canvas.document else trap("bound")
+    let tiles = (document.find((u64)paint) else trap("layer")).tiles() else trap("pixels")
+    try copy_layer_window(tiles, rgba, 150, 100, width, height)
+    # (150,100) is outside the square: clear. (260,200) inside: opaque red.
+    assert(rgba[3] == 0)
+    let inside = ((200 - 100) * width + (260 - 150)) * 4
+    assert(rgba[inside] == 255 and rgba[inside + 1] == 0 and rgba[inside + 3] == 255)
+    try copy_merged_window(&canvas, rgba, 150, 100, width, height)
+    # Merged: white where the square is not, red where it is.
+    assert(rgba[0] == 255 and rgba[1] == 255 and rgba[2] == 255 and rgba[3] == 255)
+    assert(rgba[inside] == 255 and rgba[inside + 1] == 0 and rgba[inside + 3] == 255)

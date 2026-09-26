@@ -33,33 +33,27 @@ func copy_to_clipboard(canvas: Canvas*, id: i64, merged: bool, cut: bool) -> !:
     let bottom = (i64)canvas.extent_y if whole else selection.bottom
     let width = (usize)(right - left)
     let height = (usize)(bottom - top)
-    var pixels: f32[]
+    # Only the selection's box is read, straight to 8-bit sRGB: nothing the size
+    # of the document, and no float copy of the box either.
+    let rgba = try alloc u8[width * height * 4] in memory.heap
+    defer free(rgba) in memory.heap
     if merged:
-        pixels = try flattened_pixels(canvas)
+        try copy_merged_window(canvas, rgba, left, top, width, height)
     else:
         let layer = document.find((u64)id) else error(invalid, "no such layer")
         let tiles = layer.tiles() else error(invalid, "a group has no pixels to copy")
-        pixels = try alloc f32[(usize)canvas.extent_x * (usize)canvas.extent_y * 4] in memory.heap
-        errdefer free(pixels) in memory.heap
-        try tiles.read(pixels)
-    defer free(pixels) in memory.heap
-    let cropped = try alloc f32[width * height * 4] in memory.heap
-    defer free(cropped) in memory.heap
-    for y in 0..<height:
-        for x in 0..<width:
-            let source = (((usize)top + y) * (usize)canvas.extent_x + (usize)left + x) * 4
-            let target = (y * width + x) * 4
-            let cover = (f32)selection.at(left + (i64)x, top + (i64)y) / 255.0
-            cropped[target] = pixels[source]
-            cropped[target + 1] = pixels[source + 1]
-            cropped[target + 2] = pixels[source + 2]
-            cropped[target + 3] = pixels[source + 3] * cover
-    let picture = try Image.from_linear_rgba(width, height, cropped)
+        try copy_layer_window(tiles, rgba, left, top, width, height)
+    # Faded by the selection's coverage.
+    if not whole:
+        for y in 0..<height:
+            for x in 0..<width:
+                let at = (y * width + x) * 4 + 3
+                let cover = (u32)selection.at(left + (i64)x, top + (i64)y)
+                rgba[at] = (u8)(((u32)rgba[at] * cover + 127) // 255)
+    let picture = try Image.from_rgba8(width, height, rgba)
     defer picture.release()
     let encoded_png = try picture.value().encode("png")
     defer free(encoded_png) in memory.heap
-    let rgba = try picture.value().rgba8()
-    defer free(rgba) in memory.heap
     try clipboard.write_image(encoded_png, (u32)width, (u32)height, rgba)
     copied_left = left
     copied_top = top
@@ -120,3 +114,58 @@ func erase_selected(canvas: Canvas*, layer: u64) -> !:
     brush.flow = 1.0
     let before = try fill_selection(&painter, document, layer, brush, false)
     try canvas.remember(layer, before, false, name = "Cut")
+
+## The flattened document's box `left`, `top`, `width` by `height` into `rgba`
+## as straight 8-bit sRGB, from the composited bands the box's rows cross.
+func copy_merged_window(canvas: Canvas*, rgba: u8[], left: i64, top: i64, width: usize, height: usize) -> !:
+    var bands = try Bands.begin(canvas, [-1.0, -1.0, -1.0])
+    defer bands.close()
+    let extent = (usize)canvas.extent_x
+    let first = (u32)(top // (i64)tile_size)
+    let last = (u32)((top + (i64)height - 1) // (i64)tile_size)
+    for row in first..<last + 1:
+        let rows = try bands.fill(canvas, row)
+        let band_top = (i64)(row * tile_size)
+        for y in 0..<rows:
+            let document_y = band_top + (i64)y
+            if document_y < top or document_y >= top + (i64)height:
+                continue
+            let source = (y * extent + (usize)left) * 4
+            let target = (usize)(document_y - top) * width * 4
+            memory.copy(rgba[target..<target + width * 4], bands.band[source..<source + width * 4], width * 4)
+
+## Layer `tiles`' box into `rgba` as straight 8-bit sRGB, a cell at a time.
+func copy_layer_window(tiles: const Tiles*, rgba: u8[], left: i64, top: i64, width: usize, height: usize) -> !:
+    let side = (usize)tile_size
+    let samples = try alloc f32[side * side * 4] in memory.heap
+    defer free(samples) in memory.heap
+    var steps: u8[4097] = ---
+    for step in 0..<(usize)4097:
+        steps[step] = srgb_byte((f64)step / 4096.0)
+    memory.set(rgba, 0)
+    let first_column = (u32)(left // (i64)tile_size)
+    let last_column = (u32)((left + (i64)width - 1) // (i64)tile_size)
+    let first_row = (u32)(top // (i64)tile_size)
+    let last_row = (u32)((top + (i64)height - 1) // (i64)tile_size)
+    for row in first_row..<last_row + 1:
+        for column in first_column..<last_column + 1:
+            if not tiles.painted(column, row):
+                continue
+            try tiles.read_cell(column, row, samples)
+            let cell_x = (i64)(column * tile_size)
+            let cell_y = (i64)(row * tile_size)
+            let x0 = math.imax(left, cell_x)
+            let x1 = math.imin(left + (i64)width, cell_x + (i64)tile_size)
+            let y0 = math.imax(top, cell_y)
+            let y1 = math.imin(top + (i64)height, cell_y + (i64)tile_size)
+            var y = y0
+            while y < y1:
+                var x = x0
+                while x < x1:
+                    let source = (usize)((y - cell_y) * (i64)tile_size + (x - cell_x)) * 4
+                    let target = ((usize)(y - top) * width + (usize)(x - left)) * 4
+                    for channel in 0..<(usize)3:
+                        rgba[target + channel] = steps[(usize)(math.clamp((f64)samples[source + channel], 0.0, 1.0) * 4096.0 + 0.5)]
+                    rgba[target + 3] = (u8)(math.clamp((f64)samples[source + 3], 0.0, 1.0) * 255.0 + 0.5)
+                    x += 1
+                y += 1
