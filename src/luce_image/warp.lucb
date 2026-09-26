@@ -26,8 +26,8 @@ import time
 from tiles import Tiles, Cell, tile_size
 from raster_errors import invalid
 from luce_image.warp_queue import WarpQueue
-from luce_image.warp_upload import PackCell, pack_cells
-from luce_image.warp_loads import CellLoader, cell_samples, unpack_cell
+from luce_image.warp_loads import CellLoader, cell_samples, cell_bytes, unpack_cell
+from half import to_half
 import gpu
 
 ## Smudge's dab spacing by default, a fraction of the diameter: nearly twice
@@ -35,12 +35,21 @@ import gpu
 ## pixels jump a whole step between dabs, and from about 0.2 their edges repeat
 ## as beads along a soft stroke (0.25 and up plainly).
 pub let default_smudge_spacing: f64 = 0.15
-## How many changed cells are converted together before they go up.
-let upload_batch: usize = 64
+## How long a frame may spend sending a smudge's changes up, in nanoseconds;
+## what is left goes next frame. Keeping a finished stroke sends everything.
+pub let upload_budget_ns: u64 = 8000000
 
-## One cell of the working copy: 256 rows of 256 premultiplied RGBA f32 samples.
+## One cell of the working copy: 256 rows of 256 premultiplied RGBA f32 samples
+## for the dabs, and beside them the same pixels as the tile holds them
+## (straight-alpha half floats), kept up to date by the dabs themselves, so a
+## frame only copies bytes up and converts nothing. `top..<bottom` are the rows
+## changed since they last went up (none while bottom <= top); guarded by the
+## queue's lock when a worker walks.
 struct WarpCell:
     var pixels: f32[]
+    var halves: u8[]
+    var top: u32
+    var bottom: u32
 
 pub struct WarpStroke:
     var width: usize
@@ -150,10 +159,14 @@ pub struct WarpStroke:
         self.last_x = x
         self.last_y = y
 
-    ## Upload the cells changed since the last upload into `tiles`; how many
-    ## went up. A cell the worker is writing meanwhile goes up as it is, and
-    ## again once its dab is done.
-    pub mutating func flush(tiles: Tiles*) -> usize!:
+    ## Send the rows changed since the last upload into `tiles`, as one upload
+    ## batch; how many cells went up. A tile only this layer holds takes the
+    ## rows in place; any other gets a whole new tile. With `budget` nanoseconds
+    ## (0: no limit) spent, the cells not yet sent keep their rows for the next
+    ## frame. A cell the worker is writing meanwhile goes up as it is, and again
+    ## once its dab is done.
+    pub mutating func flush(tiles: Tiles*, budget: u64 = 0) -> usize!:
+        let started = time.now()
         var dirty: i64[4] = [self.dirty_left, self.dirty_top, self.dirty_right, self.dirty_bottom]
         if let queue = self.queue:
             dirty = queue.take_dirty()
@@ -162,31 +175,77 @@ pub struct WarpStroke:
             self.dirty_right = 0
         if dirty[2] < dirty[0]:
             return 0
-        # The loaded cells in the rectangle, a batch at a time: converted across
-        # the processors, uploaded here, where the GPU is. A cell no dab came
-        # near is as it was.
-        let per_cell = (usize)tile_size * (usize)tile_size * 8
-        var packs: PackCell[upload_batch] = ---
-        let bytes = try alloc u8[upload_batch * per_cell] in memory.heap
-        defer free(bytes) in memory.heap
-        var places: u32[upload_batch * 2] = ---
-        var count: usize = 0
+        var batch = try gpu.UploadBatch.begin(tiles.device())
+        defer batch.finish()
+        let row_bytes = (usize)tile_size * 8
         var sent: usize = 0
-        for row in dirty[1]..<dirty[3] + 1:
-            for column in dirty[0]..<dirty[2] + 1:
-                let cell = self.cells[(usize)row * self.columns + (usize)column] else continue
-                let region = tiles.region((u32)column, (u32)row)
-                packs[count] = PackCell(pixels = cell.pixels, bytes = bytes[count * per_cell..<(count + 1) * per_cell],
-                                        width = (usize)region.width, height = (usize)region.height, painted = false)
-                places[count * 2] = (u32)column
-                places[count * 2 + 1] = (u32)row
-                count += 1
+        var row = dirty[1]
+        while row <= dirty[3]:
+            var column = dirty[0]
+            while column <= dirty[2]:
+                if budget > 0 and sent > 0 and time.now() - started > budget:
+                    # Out of time: the rest stays marked for the next frame.
+                    self.remark(dirty)
+                    try batch.submit()
+                    return sent
+                let index = (usize)row * self.columns + (usize)column
+                column += 1
+                let cell = self.cells[index] else continue
+                let rows = self.take_rows(cell)
+                if rows[1] <= rows[0]:
+                    continue
+                let at_column = (u32)(column - 1)
+                let at_row = (u32)row
+                let height = tiles.region(at_column, at_row).height
+                let top = rows[0] if rows[0] < height else height
+                let bottom = rows[1] if rows[1] < height else height
+                if bottom <= top:
+                    continue
+                if tiles.owns(at_column, at_row):
+                    let texture = (try tiles.texture(at_column, at_row)) else trap("an owned cell has a tile")
+                    try batch.add(texture, cell.halves[(usize)top * row_bytes..<(usize)bottom * row_bytes], gpu.Region(0, top, tile_size, bottom - top))
+                    try tiles.redrawn(at_column, at_row)
+                else:
+                    # First change this stroke makes here: a tile of its own, whole.
+                    var texture = try tiles.blank()
+                    errdefer texture.destroy()
+                    try batch.add(texture, cell.halves[..<(usize)height * row_bytes], gpu.Region(0, 0, tile_size, height))
+                    try tiles.set(at_column, at_row, texture)
                 sent += 1
-                if count == upload_batch:
-                    try upload_packed(tiles, packs[..<count], places)
-                    count = 0
-        try upload_packed(tiles, packs[..<count], places)
+            row += 1
+        try batch.submit()
         return sent
+
+    ## A cell's changed rows, taken: none are left marked.
+    mutating func take_rows(cell: WarpCell*) -> u32[2]:
+        if let queue = self.queue:
+            queue.lock()
+            let taken: u32[2] = [cell.top, cell.bottom]
+            cell.top = 0
+            cell.bottom = 0
+            queue.unlock()
+            return taken
+        let taken: u32[2] = [cell.top, cell.bottom]
+        cell.top = 0
+        cell.bottom = 0
+        return taken
+
+    ## Mark cells `dirty` (first and last column and row) changed again: their
+    ## rows were not all sent.
+    mutating func remark(dirty: i64[4]):
+        if let queue = self.queue:
+            queue.mark_dirty(dirty[0], dirty[1], dirty[2], dirty[3])
+            return
+        if self.dirty_right < self.dirty_left:
+            self.dirty_left = dirty[0]
+            self.dirty_top = dirty[1]
+            self.dirty_right = dirty[2]
+            self.dirty_bottom = dirty[3]
+            return
+        self.dirty_left = math.imin(self.dirty_left, dirty[0])
+        self.dirty_top = math.imin(self.dirty_top, dirty[1])
+        self.dirty_right = math.imax(self.dirty_right, dirty[2])
+        self.dirty_bottom = math.imax(self.dirty_bottom, dirty[3])
 
     # -- Walking on a worker.
 
@@ -333,6 +392,7 @@ pub struct WarpStroke:
         for index in 0..<self.cells.length:
             if let cell = self.cells[index]:
                 free(cell.pixels) in memory.heap
+                free(cell.halves) in memory.heap
                 free(cell) in memory.heap
         free(self.cells) in memory.heap
         self.source.destroy()
@@ -426,8 +486,12 @@ pub struct WarpStroke:
         if last_column < first_column or last_row < first_row:
             return
         if let queue = self.queue:
+            queue.lock()
+            self.mark_rows(top, bottom, first_column, first_row, last_column, last_row)
+            queue.unlock()
             queue.mark_dirty(first_column, first_row, last_column, last_row)
             return
+        self.mark_rows(top, bottom, first_column, first_row, last_column, last_row)
         if self.dirty_right < self.dirty_left:
             self.dirty_left = first_column
             self.dirty_top = first_row
@@ -438,6 +502,27 @@ pub struct WarpStroke:
         self.dirty_top = math.imin(self.dirty_top, first_row)
         self.dirty_right = math.imax(self.dirty_right, last_column)
         self.dirty_bottom = math.imax(self.dirty_bottom, last_row)
+
+    ## Grow each loaded cell's changed rows by document rows `top`..`bottom`
+    ## (inclusive), over the cells `first_column`..`last_column`,
+    ## `first_row`..`last_row`. With the queue's lock held when a worker walks.
+    mutating func mark_rows(top: i64, bottom: i64, first_column: i64, first_row: i64, last_column: i64, last_row: i64):
+        var row = first_row
+        while row <= last_row:
+            let cell_top = row * (i64)tile_size
+            let upper = (u32)math.imax(0, top - cell_top)
+            let lower = (u32)math.imin((i64)tile_size, bottom + 1 - cell_top)
+            var column = first_column
+            while column <= last_column:
+                if let cell = self.cells[(usize)row * self.columns + (usize)column]:
+                    if cell.bottom <= cell.top:
+                        cell.top = upper
+                        cell.bottom = lower
+                    else:
+                        cell.top = upper if upper < cell.top else cell.top
+                        cell.bottom = lower if lower > cell.bottom else cell.bottom
+                column += 1
+            row += 1
 
 ## Where document pixel (`x`, `y`)'s samples start within its cell.
 func offset_in_cell(x: i64, y: i64) -> usize:
@@ -456,29 +541,57 @@ func smudge_entry(context: void*?):
     smudge_rows((SmudgeJob*)(context else return))
 
 ## Lay the carried pixels down by the tip's weight, and carry `strength` of
-## what was laid, row by row.
+## what was laid, row by row: along each row a cell at a time, so the cell is
+## found once a run rather than once a pixel. Where the tip reaches, the cell's
+## tile bytes follow too (straight alpha, half floats, as `pack` made them), so
+## a frame only copies them up. Where it does not (weight 0) the pixel is as
+## it was and only the carried samples change.
 func smudge_rows(job: SmudgeJob*):
     let stroke = job.stroke
     let side = job.reach * 2 + 1
     let strength = (f32)stroke.strength
+    let tile = (i64)tile_size
+    let first_x = math.imax(0, job.cx - job.reach)
+    let last_x = math.imin((i64)stroke.width - 1, job.cx + job.reach)
     for j in job.first..<job.last:
         let py = job.cy - job.reach + j
-        if py < 0 or py >= (i64)stroke.height:
+        if py < 0 or py >= (i64)stroke.height or last_x < first_x:
             continue
-        for i in 0..<side:
-            let px = job.cx - job.reach + i
-            if px < 0 or px >= (i64)stroke.width:
-                continue
-            let w = stroke.weights[(usize)(j * side + i)]
-            let k = (usize)(j * side + i) * 4
-            let pixels = stroke.cell_pixels(px, py)
-            let at = offset_in_cell(px, py)
-            for channel in 0..<(usize)4:
-                let under = pixels[at + channel]
-                let carried = stroke.carried[k + channel]
-                let painted = under + (carried - under) * w
-                pixels[at + channel] = painted
-                stroke.carried[k + channel] = painted + (carried - painted) * strength
+        let cell_row = (usize)(py // tile)
+        let row_base = (usize)(py % tile) * (usize)tile_size
+        var px = first_x
+        while px <= last_x:
+            let cell_column = px // tile
+            let run_end = math.imin(last_x, cell_column * tile + tile - 1)
+            let cell = stroke.cells[cell_row * stroke.columns + (usize)cell_column] else trap("a warp dab reached a cell it did not load")
+            let pixels = cell.pixels
+            let halves = u16[]((u16*)cell.halves.data, cell.halves.length // 2)
+            var x = px
+            while x <= run_end:
+                let i = x - (job.cx - job.reach)
+                let w = stroke.weights[(usize)(j * side + i)]
+                let k = (usize)(j * side + i) * 4
+                let at = (row_base + (usize)(x - cell_column * tile)) * 4
+                if w > 0.0:
+                    var laid: f32[4] = ---
+                    for channel in 0..<(usize)4:
+                        let under = pixels[at + channel]
+                        let carried = stroke.carried[k + channel]
+                        let painted = under + (carried - under) * w
+                        pixels[at + channel] = painted
+                        laid[channel] = painted
+                        stroke.carried[k + channel] = painted + (carried - painted) * strength
+                    let alpha = laid[3]
+                    for channel in 0..<(usize)3:
+                        halves[at + channel] = to_half(laid[channel] / alpha if alpha > 0.0 else 0.0)
+                    halves[at + 3] = to_half(alpha)
+                else:
+                    for channel in 0..<(usize)4:
+                        let under = pixels[at + channel]
+                        let carried = stroke.carried[k + channel]
+                        stroke.carried[k + channel] = under + (carried - under) * strength
+                x += 1
+            px = run_end + 1
 
 ## `job`'s rows split across the processors; small dabs stay on this thread.
 func smudge_bands(job: SmudgeJob*) -> !:
@@ -519,38 +632,25 @@ func warp_worker(context: void*?):
             break
     queue.finish(failed)
 
-## Convert `packs` (cells at `places`, column and row after each other) and
-## upload them into `tiles`; a cell left clear is dropped.
-func upload_packed(tiles: Tiles*, packs: PackCell[], places: const u32[]) -> !:
-    try pack_cells(packs)
-    for index in 0..<packs.length:
-        let column = places[index * 2]
-        let row = places[index * 2 + 1]
-        if not packs[index].painted:
-            try tiles.clear(column, row)
-            continue
-        var texture = try tiles.blank()
-        errdefer texture.destroy()
-        let rows = packs[index].height
-        try texture.upload(packs[index].bytes[..<rows * (usize)tile_size * 8], gpu.Region(0, 0, tile_size, (u32)rows))
-        try tiles.set(column, row, texture)
-
 ## `WarpStroke.load`'s visitor: a cell read back, premultiplied, into the working copy.
 func load_cell(context: void*?, cell: Cell, bytes: const u8[]) -> !:
     let stroke = (WarpStroke*)(context else trap("a warp load lost its stroke"))
     let pixels = try alloc f32[cell_samples] in memory.heap
     errdefer free(pixels) in memory.heap
-    unpack_cell(bytes, (usize)stroke.source.region(cell.column, cell.row).width, pixels)
+    let halves = try alloc u8[cell_bytes] in memory.heap
+    errdefer free(halves) in memory.heap
+    unpack_cell(bytes, (usize)stroke.source.region(cell.column, cell.row).width, pixels, halves)
     let index = (usize)cell.row * stroke.columns + (usize)cell.column
-    stroke.cells[index] = try new WarpCell(pixels = pixels) in memory.heap
+    stroke.cells[index] = try new WarpCell(pixels = pixels, halves = halves, top = 0, bottom = 0) in memory.heap
     stroke.loader.have(index)
 
-## `CellLoader`'s visitor: cell `index`'s samples (taken), read in for the
-## worker, handed over under the queue's lock and the worker woken.
-func install_cell(context: void*?, index: usize, pixels: f32[]) -> !:
+## `CellLoader`'s visitor: cell `index`'s samples and tile bytes (taken), read
+## in for the worker, handed over under the queue's lock and the worker woken.
+func install_cell(context: void*?, index: usize, pixels: f32[], halves: u8[]) -> !:
     let stroke = (WarpStroke*)(context else trap("a warp load lost its stroke"))
-    let made = new WarpCell(pixels = pixels) in memory.heap catch failure:
+    let made = new WarpCell(pixels = pixels, halves = halves, top = 0, bottom = 0) in memory.heap catch failure:
         free(pixels) in memory.heap
+        free(halves) in memory.heap
         error(failure.code, failure.message)
     if let queue = stroke.queue:
         queue.lock()

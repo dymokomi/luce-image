@@ -18,9 +18,13 @@ from half import from_half
 
 ## A cell of the working copy: 256 rows of 256 premultiplied RGBA f32 samples.
 pub let cell_samples: usize = (usize)tile_size * (usize)tile_size * 4
+## The same cell as a tile holds it: 256 rows of 256 texels of four straight-alpha
+## half floats, 8 bytes each.
+pub let cell_bytes: usize = (usize)tile_size * (usize)tile_size * 8
 
-## What `start` and `poll` hand over: cell `index`'s samples (owned by the visitor).
-pub type CellVisit = func(void*?, usize, f32[]) -> unit!
+## What `start` and `poll` hand over: cell `index`'s samples and its bytes as
+## the tile holds them (both owned by the visitor).
+pub type CellVisit = func(void*?, usize, f32[], u8[]) -> unit!
 
 ## Where a batch put a cell: its index and its offset in the batch.
 struct Placed:
@@ -120,9 +124,12 @@ pub struct CellLoader:
                 count += 1
             else:
                 let clear = try alloc f32[cell_samples] in memory.heap
+                errdefer free(clear) in memory.heap
                 for at in 0..<clear.length:
                     clear[at] = 0.0
-                try visit(context, index, clear)
+                let none_there = try alloc u8[cell_bytes] in memory.heap
+                memory.set(none_there, 0)
+                try visit(context, index, clear, none_there)
             self.wanted_head = (self.wanted_head + 1) % self.wanted.length
             self.wanted_count -= 1
         if count == 0:
@@ -153,12 +160,19 @@ pub struct CellLoader:
             let pixels = alloc f32[cell_samples] in memory.heap catch failure:
                 for other in 0..<allocated:
                     free(made[other].pixels) in memory.heap
+                    free(made[other].halves) in memory.heap
                 error(failure.code, failure.message)
-            made[at] = Unpack(bytes = try self.batch.bytes(place.offset, (usize)place.rows * (usize)tile_size * 8), pixels = pixels, columns = (usize)place.columns)
+            let halves = alloc u8[cell_bytes] in memory.heap catch failure:
+                free(pixels) in memory.heap
+                for other in 0..<allocated:
+                    free(made[other].pixels) in memory.heap
+                    free(made[other].halves) in memory.heap
+                error(failure.code, failure.message)
+            made[at] = Unpack(bytes = try self.batch.bytes(place.offset, (usize)place.rows * (usize)tile_size * 8), pixels = pixels, halves = halves, columns = (usize)place.columns)
             allocated += 1
         try unpack_all(made)
         for at in 0..<count:
-            try visit(context, (usize)self.placed[at].index, made[at].pixels)
+            try visit(context, (usize)self.placed[at].index, made[at].pixels, made[at].halves)
         self.batch.finish()
         self.sent = false
         self.placed_count = 0
@@ -168,15 +182,22 @@ pub struct CellLoader:
 struct Unpack:
     var bytes: const u8[]
     var pixels: f32[]
+    var halves: u8[]
     var columns: usize
 
 ## A cell's read-back bytes (rows of 256 texels of four half floats, straight
-## alpha) as premultiplied f32 samples in `pixels`, 256 by 256: only the
-## document's `columns` of each row; the rest, and rows not read, clear.
-pub func unpack_cell(bytes: const u8[], columns: usize, pixels: f32[]):
+## alpha) as premultiplied f32 samples in `pixels`, 256 by 256, and kept as
+## they are in `halves` (the tile's own bytes, for uploading the cell again
+## without converting it): only the document's `columns` of each row; the rest,
+## and rows not read, clear.
+pub func unpack_cell(bytes: const u8[], columns: usize, pixels: f32[], halves: u8[]):
     for index in 0..<pixels.length:
         pixels[index] = 0.0
-    for y in 0..<bytes.length // ((usize)tile_size * 8):
+    memory.set(halves, 0)
+    let row_bytes = (usize)tile_size * 8
+    for y in 0..<bytes.length // row_bytes:
+        let start = y * row_bytes
+        memory.copy(halves[start..<start + columns * 8], bytes[start..<start + columns * 8], columns * 8)
         for x in 0..<columns:
             let at = y * (usize)tile_size + x
             let alpha = from_half((u16)bytes[at * 8 + 6] | ((u16)bytes[at * 8 + 7] << 8))
@@ -195,7 +216,7 @@ func unpack_entry(context: void*?):
 
 func unpack_share(share: UnpackShare*):
     for at in share.first..<share.last:
-        unpack_cell(share.cells[at].bytes, share.cells[at].columns, share.cells[at].pixels)
+        unpack_cell(share.cells[at].bytes, share.cells[at].columns, share.cells[at].pixels, share.cells[at].halves)
 
 ## Every cell of `cells` unpacked, split across the processors.
 func unpack_all(cells: Unpack[]) -> !:
