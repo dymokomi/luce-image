@@ -160,3 +160,47 @@ test "a large document refuses TIFF clearly instead of flattening; a small one s
     large.save("build/moat-large.tif") catch failure:
         refused = failure.code == limit
     assert(refused)
+
+test "a placed picture goes in a band at a time and lands exactly where it was put":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(900, 700)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Placed")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    let width: usize = 700
+    let height: usize = 530
+    let pixels = try alloc f32[width * height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    for at in 0..<width * height:
+        pixels[at * 4] = (f32)(at % width) / (f32)width
+        pixels[at * 4 + 1] = (f32)(at // width) / (f32)height
+        pixels[at * 4 + 2] = 0.5
+        pixels[at * 4 + 3] = 1.0
+    let picture = try Image.from_linear_rgba(width, height, pixels)
+    defer picture.release()
+    # Centred at (400, 300): its top-left at (50, 35).
+    try place_image_at(&canvas, layer, picture, 400, 300)
+    let document = canvas.document else trap("bound")
+    let tiles = (document.find((u64)layer) else trap("layer")).tiles() else trap("pixels")
+    let samples = try alloc f32[(usize)tile_size * (usize)tile_size * 4] in memory.heap
+    defer free(samples) in memory.heap
+    # The picture went through 8-bit sRGB: compare what it holds now.
+    let expected = try alloc f32[width * height * 4] in memory.heap
+    defer free(expected) in memory.heap
+    try picture.value().linear_rgba(expected)
+    for (x, y) in [(50, 35), (299, 290), (749, 564), (400, 300), (260, 260)]:
+        let column = (u32)(x // 256)
+        let row = (u32)(y // 256)
+        try tiles.read_cell(column, row, samples)
+        let at = (usize)(((y % 256) * 256 + x % 256) * 4)
+        let source = (usize)(((y - 35) * (i64)width + (x - 50)) * 4)
+        for channel in 0..<(usize)4:
+            assert(math.abs((f64)(samples[at + channel] - expected[source + channel])) < 0.002)
+    # Outside the picture: clear.
+    try tiles.read_cell(0, 0, samples)
+    assert(samples[(10 * 256 + 10) * 4 + 3] == 0.0)

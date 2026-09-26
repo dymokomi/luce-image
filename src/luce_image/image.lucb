@@ -458,13 +458,21 @@ pub struct Image:
     ## linear already. For the editor's tiles; Base only.
     pub mutating func linear_rgba(pixels: f32[]) -> !:
         try self.load()
-        if pixels.length != self.raster.width * self.raster.height * 4:
-            error(invalid, "pixel buffer must hold width * height RGBA samples")
+        try self.linear_rgba_rows(0, self.raster.height, pixels)
+
+    ## Rows `first..<first + count` as `linear_rgba` gives them, into `pixels`
+    ## (`count` rows of RGBA f32): a picture turned into tiles a band at a time.
+    pub mutating func linear_rgba_rows(first: usize, count: usize, pixels: f32[]) -> !:
+        try self.load()
+        if first + count > self.raster.height or pixels.length != self.raster.width * count * 4:
+            error(invalid, "pixel buffer must hold width * count RGBA samples of rows in the picture")
         let kind = self.raster.channels[0].kind
+        let stride = self.raster.channels.length
+        let rows = self.raster.pixels[first * self.raster.width * stride..<(first + count) * self.raster.width * stride]
         # Which sample is which, worked out once as `getpixel` reads them.
-        var job = LinearJob(source = self.raster.pixels, pixels = pixels, stride = self.raster.channels.length, width = self.raster.width,
+        var job = LinearJob(source = rows, pixels = pixels, stride = stride, width = self.raster.width,
                             red = -1, green = -1, blue = -1, alpha = -1, scale = 1.0 / model.maximum(kind), encoded = kind != .float16 and kind != .float32 and kind != .float64,
-                            table = none, first = 0, last = self.raster.height)
+                            table = none, first = 0, last = count)
         for c in 0..<self.raster.channels.length:
             let name = self.raster.channels[c].name
             if name == "Y":

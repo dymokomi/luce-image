@@ -338,33 +338,9 @@ func place_image_at(canvas: Canvas*, id: i64, picture: interop.Reference[Image],
     discard(try canvas.index((u64)id))
     let width = try picture.value().width()
     let height = try picture.value().height()
-    let source = try alloc f32[width * height * 4] in memory.heap
-    defer free(source) in memory.heap
-    try picture.value().linear_rgba(source)
-    let x = center_x - (i64)width // 2
-    let y = center_y - (i64)height // 2
-    let columns = (usize)canvas.extent_x
-    let rows = (usize)canvas.extent_y
-    let pixels = try alloc f32[columns * rows * 4] in memory.heap
-    defer free(pixels) in memory.heap
-    for index in 0..<pixels.length:
-        pixels[index] = 0.0
-    for row in 0..<height:
-        let target_y = y + (i64)row
-        if target_y < 0 or target_y >= (i64)canvas.extent_y:
-            continue
-        for column in 0..<width:
-            let target_x = x + (i64)column
-            if target_x < 0 or target_x >= (i64)canvas.extent_x:
-                continue
-            let from_index = (row * width + column) * 4
-            let to_index = ((usize)target_y * columns + (usize)target_x) * 4
-            for channel in 0..<(usize)4:
-                pixels[to_index + channel] = source[from_index + channel]
-    let device = canvas.device else error(invalid, "the document is not bound to a device")
-    var tiles = try Tiles.create(device, canvas.extent_x, canvas.extent_y)
-    errdefer tiles.destroy()
-    try tiles.write(pixels)
+    # The picture's tiles a band at a time, moved onto the canvas's grid: what
+    # lies past the canvas is kept past it, as a moved layer keeps it.
+    let tiles = try canvas.tiles_of(picture, center_x - (i64)width // 2, center_y - (i64)height // 2)
     try document.set_tiles((u64)id, tiles)
 
 ## `Canvas.open`: a picture, a Photoshop document or an `.l2d` package, by extension.

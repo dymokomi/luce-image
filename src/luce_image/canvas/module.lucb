@@ -862,12 +862,17 @@ pub struct Canvas:
             # A raw develops a tile at a time straight into the grid.
             whole = try raw_tiles(device, picture)
         else:
-            let pixels = try alloc f32[width * height * 4] in memory.heap
-            defer free(pixels) in memory.heap
-            try picture.value().linear_rgba(pixels)
+            # A band of 256 rows at a time: never the picture whole in floats.
             whole = try Tiles.create(device, (u32)width, (u32)height)
             errdefer whole.destroy()
-            try whole.write(pixels)
+            let band = try alloc f32[width * (usize)tile_size * 4] in memory.heap
+            defer free(band) in memory.heap
+            for row in 0..<whole.rows():
+                let top = (usize)row * (usize)tile_size
+                let rows = min_usize((usize)tile_size, height - top)
+                try picture.value().linear_rgba_rows(top, rows, band[..<width * rows * 4])
+                try whole.write_band(row, band[..<width * rows * 4])
+                try settle_job(&self)
         errdefer whole.destroy()
         if x == 0 and y == 0 and width == (usize)self.extent_x and height == (usize)self.extent_y:
             return whole
