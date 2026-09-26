@@ -172,15 +172,12 @@ func copy_records(records: const Record[], count: usize) -> Record[]!:
         copy_type(&copies[index]) catch failure:
             strings.release(name)
             copies[index].typed = false
-            var no_path: f64[]
-            copies[index].shape.path = no_path
             release_records(copies, index)
             error(failure.code, failure.message)
-        copy_path(&copies[index]) catch failure:
+        # On failure the copy holds no elements, and its text is its own to free.
+        copy_elements(&copies[index]) catch failure:
             strings.release(name)
             release_type(&copies[index])
-            var no_path: f64[]
-            copies[index].shape.path = no_path
             release_records(copies, index)
             error(failure.code, failure.message)
         copies[index].picture = none
@@ -192,7 +189,7 @@ func release_records(records: Record[], count: usize):
     for index in 0..<count:
         strings.release(records[index].name)
         release_type(&records[index])
-        release_path(&records[index])
+        release_elements(&records[index])
     free(records) in memory.heap
 
 ## The user steps of a history stack, `count` entries of `entries`: on the undo

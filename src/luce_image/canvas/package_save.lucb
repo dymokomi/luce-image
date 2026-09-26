@@ -474,7 +474,7 @@ func package_manifest(canvas: Canvas*) -> interop.Reference[prism.Document]!:
         if record.typed:
             try write_type(manifest.value(), element, record.typeset)
         if record.shaped:
-            try write_shape(manifest.value(), element, record.shape)
+            try write_elements(manifest.value(), element, record.elements)
         if record.style.any():
             let names = style_field_names()
             for field in 0..<style_field_count:

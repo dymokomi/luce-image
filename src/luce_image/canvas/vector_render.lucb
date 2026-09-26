@@ -1,0 +1,243 @@
+#==============================================================================================
+#
+#   canvas/vector_render - A vector layer drawn again only where an edit reaches
+#
+#   DESCRIPTION:
+#       A vector layer's pixels are its visible elements drawn in order. Each element sorts
+#       the cells it reaches into edge, inside and outside cells (shape_cells.lucb); the layer
+#       merges them bottom up: an element's edge makes a cell an edge cell, and its inside,
+#       one opaque fill over everything below, makes the cell inside that element alone.
+#       Edge cells are drawn from one drawing of every element that matters, a window at a
+#       time on the processors (shape_render.lucb); the inside cells of each element come out
+#       one color, so one of them is drawn and the others share its tile.
+#
+#       An edit marks the cells the changed element covered before and covers after
+#       (`CellMask`); only those are cleared and drawn again, the rest of the layer's tiles
+#       shared untouched. The cost is the changed element's outline, never the layer's area.
+#
+#==============================================================================================
+
+## A cell drawn whole because its element's inside did not come out one color.
+let cell_redraw: u8 = 3
+
+## Which cells of the canvas grid an edit reaches, a byte a cell.
+struct CellMask:
+    var columns: u32
+    var rows: u32
+    var width: u32
+    var height: u32
+    var marks: u8[]
+
+    static func create(width: u32, height: u32) -> CellMask!:
+        let columns = tile_columns(width)
+        let rows = tile_columns(height)
+        let marks = try alloc u8[(usize)columns * (usize)rows] in memory.heap
+        memory.set(marks, 0)
+        return CellMask(columns = columns, rows = rows, width = width, height = height, marks = marks)
+
+    mutating func close():
+        if self.marks.length > 0:
+            free(self.marks) in memory.heap
+        var none_left: u8[]
+        self.marks = none_left
+
+    func marked(column: u32, row: u32) -> bool:
+        return self.marks[(usize)row * (usize)self.columns + (usize)column] != 0
+
+    mutating func set(column: u32, row: u32):
+        self.marks[(usize)row * (usize)self.columns + (usize)column] = 1
+
+    ## Mark the cells `element` draws in, when it is shown.
+    mutating func mark(element: VectorElement) -> !:
+        if not element.visible:
+            return
+        var plan = try spec_plan(element.spec, self.width, self.height) else return
+        for row in plan.reach.top..<plan.reach.bottom:
+            for column in plan.reach.left..<plan.reach.right:
+                if plan.kind(column, row) != cell_outside:
+                    self.set(column, row)
+        plan.close()
+
+    ## How many cells are marked.
+    func count() -> usize:
+        var total: usize = 0
+        for value in self.marks:
+            if value != 0:
+                total += 1
+        return total
+
+    ## The box of the marked cells; none when none is.
+    func bounds() -> ShapeReach?:
+        var box = ShapeReach(left = self.columns, top = self.rows, right = 0, bottom = 0)
+        for row in 0..<self.rows:
+            for column in 0..<self.columns:
+                if self.marked(column, row):
+                    box.left = min_u32(box.left, column)
+                    box.top = min_u32(box.top, row)
+                    box.right = max_u32(box.right, column + 1)
+                    box.bottom = max_u32(box.bottom, row + 1)
+        if box.right <= box.left:
+            return none
+        return box
+
+## The cell plan of `spec` alone on a `width` by `height` canvas; none when it
+## draws nothing there.
+func spec_plan(spec: ShapeSpec, width: u32, height: u32) -> CellPlan?!:
+    if not drawable(spec):
+        return none
+    let reach = shape_reach(spec, width, height) else return none
+    var text = try strings.Builder.create()
+    defer text.destroy()
+    try shape_svg(&text, spec, 0, 0, width, height)
+    let parsed = try svg.parse(text.view())
+    defer parsed.release()
+    return try CellPlan.make(parsed.value(), spec, reach, width, height)
+
+## Whether two boxes of cells share a cell.
+func reaches_overlap(a: ShapeReach, b: ShapeReach) -> bool:
+    return a.left < b.right and b.left < a.right and a.top < b.bottom and b.top < a.bottom
+
+## Layer `id`'s pixels for `list`: when `dirty` marks cells, its tiles as they
+## are with those cells drawn again; else every cell drawn afresh.
+func vector_tiles(canvas: Canvas*, id: u64, list: const VectorElement[], dirty: CellMask*?) -> Tiles!:
+    let device = canvas.device else error(invalid, "draw the document once before drawing a shape")
+    let width = canvas.extent_x
+    let height = canvas.extent_y
+    var tiles = try starting_tiles(canvas, device, id, dirty)
+    errdefer tiles.destroy()
+    let whole = ShapeReach(left = 0, top = 0, right = tile_columns(width), bottom = tile_columns(height))
+    var region = whole
+    if let cells = dirty:
+        region = cells.bounds() else return tiles
+    # Every cell's kind for the elements together, and whose inside an inside cell is.
+    let cell_count = (usize)whole.right * (usize)whole.bottom
+    let kinds = try alloc u8[cell_count] in memory.heap
+    defer free(kinds) in memory.heap
+    memory.set(kinds, cell_outside)
+    let owners = try alloc u32[cell_count] in memory.heap
+    defer free(owners) in memory.heap
+    var text = try strings.Builder.create()
+    defer text.destroy()
+    try svg_open(&text, 0, 0, width, height)
+    var included: usize = 0
+    for at in 0..<list.length:
+        let spec = list[at].spec
+        if not list[at].visible or not drawable(spec):
+            continue
+        let reach = shape_reach(spec, width, height) else continue
+        if not reaches_overlap(reach, region):
+            continue
+        var plan = try spec_plan(spec, width, height) else continue
+        merge_plan(&plan, dirty, kinds, owners, whole.right, (u32)at)
+        plan.close()
+        try shape_group(&text, spec)
+        included += 1
+    try text.put("</svg>")
+    if included == 0:
+        return tiles
+    let parsed = try svg.parse(text.view())
+    defer parsed.release()
+    var plan = CellPlan(reach = whole, kinds = kinds, width = width, height = height)
+    var painter = try WindowPainter.make(device, parsed.value(), width, height)
+    defer painter.close()
+    try painter.draw_runs(&plan, cell_edge, &tiles)
+    try draw_insides(&painter, &plan, owners, list.length, &tiles)
+    return tiles
+
+## The tiles an edit starts from: the layer's own, shared, with the marked cells
+## cleared; or none painted when every cell is drawn.
+func starting_tiles(canvas: Canvas*, device: gpu.Device, id: u64, dirty: CellMask*?) -> Tiles!:
+    let cells = dirty else return try Tiles.create(device, canvas.extent_x, canvas.extent_y)
+    let document = canvas.document else error(invalid, "draw the document once before drawing a shape")
+    let layer = document.find(id) else error(invalid, "no such layer")
+    let current = layer.tiles() else error(invalid, "a group has no pixels")
+    var tiles = try current.clone()
+    errdefer tiles.destroy()
+    for row in 0..<cells.rows:
+        for column in 0..<cells.columns:
+            if cells.marked(column, row):
+                try tiles.clear(column, row)
+    return tiles
+
+## One element's plan merged into the layer's kinds, bottom up, in the marked cells
+## (every cell when `dirty` is none): its edge makes an edge cell; its inside, an opaque
+## fill over what is below, makes the cell its own.
+func merge_plan(plan: const CellPlan*, dirty: CellMask*?, kinds: u8[], owners: u32[], columns: u32, owner: u32):
+    for row in plan.reach.top..<plan.reach.bottom:
+        for column in plan.reach.left..<plan.reach.right:
+            if let cells = dirty:
+                if not cells.marked(column, row):
+                    continue
+            let at = (usize)row * (usize)columns + (usize)column
+            let kind = plan.kind(column, row)
+            if kind == cell_edge:
+                kinds[at] = cell_edge
+            elif kind == cell_inside:
+                kinds[at] = cell_inside
+                owners[at] = owner
+
+## The inside cells of `plan`: each element's first drawn, and when it comes out
+## one color the element's others share its tile; when not, they are drawn too.
+func draw_insides(painter: WindowPainter*, plan: CellPlan*, owners: const u32[], elements: usize, tiles: Tiles*) -> !:
+    if elements == 0:
+        return
+    let columns = plan.reach.right
+    let samples = try alloc i64[elements] in memory.heap
+    defer free(samples) in memory.heap
+    let uniform = try alloc bool[elements] in memory.heap
+    defer free(uniform) in memory.heap
+    for owner in 0..<elements:
+        samples[owner] = -1
+        uniform[owner] = false
+    for at in 0..<plan.kinds.length:
+        if plan.kinds[at] == cell_inside and samples[(usize)owners[at]] < 0:
+            samples[(usize)owners[at]] = (i64)at
+    # The samples a wave at a time, one a worker.
+    var runs: CellRun[16] = ---
+    var whose: usize[16] = ---
+    var count: usize = 0
+    for owner in 0..<elements:
+        let sample = samples[owner]
+        if sample < 0:
+            continue
+        runs[count] = CellRun(column = (u32)((usize)sample % (usize)columns), row = (u32)((usize)sample // (usize)columns), across = 1)
+        whose[count] = owner
+        count += 1
+        if count == painter.workers:
+            try painter.draw(runs[..<count], tiles)
+            for index in 0..<count:
+                uniform[whose[index]] = painter.windows[index].uniform[0]
+            count = 0
+    if count > 0:
+        try painter.draw(runs[..<count], tiles)
+        for index in 0..<count:
+            uniform[whose[index]] = painter.windows[index].uniform[0]
+    for at in 0..<plan.kinds.length:
+        if plan.kinds[at] != cell_inside:
+            continue
+        let owner = (usize)owners[at]
+        let sample = (usize)samples[owner]
+        plan.kinds[at] = cell_outside
+        if at == sample:
+            continue
+        if uniform[owner]:
+            try tiles.share((u32)(at % (usize)columns), (u32)(at // (usize)columns), (u32)(sample % (usize)columns), (u32)(sample // (usize)columns))
+        else:
+            plan.kinds[at] = cell_redraw
+    try painter.draw_runs(plan, cell_redraw, tiles)
+
+## Draw the vector layer at `index` again whole from its elements.
+func redraw_vector(canvas: Canvas*, index: usize) -> !:
+    let document = canvas.document else error(invalid, "draw the document once before drawing a shape")
+    let id = canvas.records[index].id
+    var tiles = try vector_tiles(canvas, id, canvas.records[index].elements, none)
+    errdefer tiles.destroy()
+    try document.set_tiles(id, tiles)
+
+## Draw the vector layer at `index` again in the cells `dirty` marks.
+func redraw_vector_cells(canvas: Canvas*, index: usize, dirty: CellMask*) -> !:
+    let document = canvas.document else error(invalid, "draw the document once before drawing a shape")
+    let id = canvas.records[index].id
+    var tiles = try vector_tiles(canvas, id, canvas.records[index].elements, dirty)
+    errdefer tiles.destroy()
+    try document.set_tiles(id, tiles)

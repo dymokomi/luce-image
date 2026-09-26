@@ -45,6 +45,7 @@ import os
 import time
 import thread
 from luce_image.image import Image, Pixel
+from luce_image.svg_import import is_svg
 from tiles import Cell, CellRange, read_cells, transient_mark, release_transients, Tiles, Bounds, tile_size, tile_columns, min_u32, max_u32, flatten, tiles_alive, tile_texture, residency_configure, residency_budgets, residency_advance, residency_frame, residency_over_budget, residency_begin_marking, residency_mark_live, residency_settle, residency_report, set_scratch_directory, residency_codec, clear_residency_codec, Gathering, prefetch_collect, prefetch_pending, prefetch_had_failure, prefetch_wait, release_scratch, TileSource, open_tile_source, release_tile_source, back_cell, detach_tile_source, tile_source_is
 from pyramid import covered_at
 from luce_image.heal import heal
@@ -112,9 +113,11 @@ struct Record:
     ## A text layer's words and how they are set (type_layers.lucb).
     var typed: bool = false
     var typeset: TypeSpec = TypeSpec()
-    ## A shape layer's shape (shape_layers.lucb).
+    ## A vector layer's elements, bottom first, and the one edits act on
+    ## alone, -1 for none (vector_elements.lucb).
     var shaped: bool = false
-    var shape: ShapeSpec = ShapeSpec()
+    var elements: VectorElement[]
+    var active: i64 = -1
     ## A picture waiting to become tiles once a device is bound, and a mask
     ## likewise, each with the document pixel its top-left goes at (a picture
     ## may reach past the canvas).
@@ -162,6 +165,10 @@ pub struct Canvas:
     var selection: Selection
     var polygon: f64[]
     var polygon_count: usize
+    ## The last element outline asked for (`element_outline`): x, y and whether
+    ## the point starts a run, three values a point.
+    var outline: f64[]
+    var outline_count: usize
     ## Color Range's sampled colors (`add_range_sample`).
     var range_samples: RangeSample[32]
     var range_count: usize
@@ -309,6 +316,8 @@ pub struct Canvas:
         var no_points: f64[]
         self.polygon = no_points
         self.polygon_count = 0
+        self.outline = no_points
+        self.outline_count = 0
         var no_samples: RangeSample[32]
         self.range_samples = no_samples
         self.range_count = 0
@@ -760,6 +769,8 @@ pub struct Canvas:
         self.selection.destroy()
         if self.polygon.length > 0:
             free(self.polygon) in memory.heap
+        if self.outline.length > 0:
+            free(self.outline) in memory.heap
         clear_snapshots(&self.history, &self.history_count)
         clear_snapshots(&self.future, &self.future_count)
         if self.history.length > 0:
@@ -779,7 +790,7 @@ pub struct Canvas:
         for index in 0..<self.count:
             strings.release(self.records[index].name)
             release_type(&self.records[index])
-            release_path(&self.records[index])
+            release_elements(&self.records[index])
             if let picture = self.records[index].picture:
                 picture.release()
             if let picture = self.records[index].mask_picture:
@@ -1024,7 +1035,7 @@ pub struct Canvas:
     mutating func drop_record(index: usize):
         strings.release(self.records[index].name)
         release_type(&self.records[index])
-        release_path(&self.records[index])
+        release_elements(&self.records[index])
         if let picture = self.records[index].picture:
             picture.release()
         if let picture = self.records[index].mask_picture:
@@ -1084,6 +1095,12 @@ pub struct Canvas:
         self.records[copy].clipped = self.records[index].clipped
         self.records[copy].style = self.records[index].style
         self.records[copy].masked = self.records[index].masked
+        # A vector layer's copy is a vector layer of copies of its elements.
+        if self.records[index].shaped:
+            self.records[copy].elements = self.records[index].elements
+            try copy_elements(&self.records[copy])
+            self.records[copy].shaped = true
+            self.records[copy].active = self.records[index].active
         if let document = self.document:
             # The GPU copy carries the pixels; the record added above is replaced by it.
             try document.remove((u64)created)
@@ -1121,7 +1138,7 @@ pub struct Canvas:
         release_type(&self.records[index - 1])
         strings.release(self.records[index].name)
         release_type(&self.records[index])
-        release_path(&self.records[index])
+        release_elements(&self.records[index])
         if let picture = self.records[index].picture:
             picture.release()
         for shift in index..<(self.count - 1):
@@ -2257,12 +2274,13 @@ pub struct Canvas:
         try set_layer_type(&self, (u64)id, TypeSpec(text = text, family = family, style = style, size = size, red = red, green = green, blue = blue, x = x, y = y,
                                                     box_width = box_width, alignment = alignment, tracking = tracking, leading = leading))
 
-    ## Make layer `id` a shape layer — `kind` 0 a rectangle (corners rounded
-    ## by `radius`), 1 an ellipse, 2 a line from (`x`, `y`) by (`width`,
-    ## `height`), 3 a regular polygon of `sides` — in the box (`x`, `y`,
-    ## `width`, `height`), filled and stroked as given (linear colors; a line
-    ## is its stroke). It stays a shape, crisp however it is moved, scaled or
-    ## turned. One step.
+    ## Make layer `id` a vector layer of one shape — `kind` 0 a rectangle
+    ## (corners rounded by `radius`), 1 an ellipse, 2 a line from (`x`, `y`) by
+    ## (`width`, `height`), 3 a regular polygon of `sides` — in the box (`x`,
+    ## `y`, `width`, `height`), filled and stroked as given (linear colors; a
+    ## line is its stroke). On a vector layer the shape replaces its target
+    ## element (the active one, else the topmost). It stays a shape, crisp
+    ## however it is moved, scaled or turned. One step.
     pub mutating func set_shape(id: i64, kind: i64, x: f64, y: f64, width: f64, height: f64, sides: i64, radius: f64,
                                 filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
                                 stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64) -> !:
@@ -2270,91 +2288,195 @@ pub struct Canvas:
                                1.0 if stroked else 0.0, stroke_red, stroke_green, stroke_blue, stroke_width, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
         try set_layer_shape(&self, (u64)id, try shape_from_values(values))
 
-    ## A shape layer's fill, stroke, corner radius and sides changed, its
-    ## geometry and transform kept. One step.
+    ## `set_shape`'s shape added on top of layer `id`'s elements instead, named
+    ## after its kind and active: a pixel layer with nothing painted becomes a
+    ## vector layer. One step.
+    pub mutating func add_shape(id: i64, kind: i64, x: f64, y: f64, width: f64, height: f64, sides: i64, radius: f64,
+                                filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
+                                stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64) -> !:
+        let values: f64[22] = [(f64)kind, x, y, width, height, (f64)sides, radius, 1.0 if filled else 0.0, fill_red, fill_green, fill_blue,
+                               1.0 if stroked else 0.0, stroke_red, stroke_green, stroke_blue, stroke_width, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+        try add_vector_element(&self, (u64)id, try shape_from_values(values), "", "Shape")
+
+    ## The target element's fill, stroke, corner radius and sides changed, its
+    ## geometry and transform kept. One step; a slider dragged coalesces.
     pub mutating func restyle_shape(id: i64, filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
                                     stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64, radius: f64, sides: i64) -> !:
-        let index = try self.index((u64)id)
-        if not self.records[index].shaped:
-            error(invalid, "the layer is not a shape")
-        var values = shape_values(self.records[index].shape)
-        values[5] = (f64)sides
-        values[6] = radius
-        values[7] = 1.0 if filled else 0.0
-        values[8] = fill_red
-        values[9] = fill_green
-        values[10] = fill_blue
-        values[11] = 1.0 if stroked else 0.0
-        values[12] = stroke_red
-        values[13] = stroke_green
-        values[14] = stroke_blue
-        values[15] = stroke_width
-        var spec = try shape_from_values(values)
-        # A path keeps its anchors: a copy for the new spec, which the record will own.
-        let old = self.records[index].shape
-        spec.closed = old.closed
-        if old.path.length > 0:
-            spec.path = try owned_path(old.path)
-        try set_layer_shape(&self, (u64)id, spec)
+        let style: f64[11] = [(f64)sides, radius, 1.0 if filled else 0.0, fill_red, fill_green, fill_blue,
+                              1.0 if stroked else 0.0, stroke_red, stroke_green, stroke_blue, stroke_width]
+        try restyle_target(&self, (u64)id, style[..<11])
 
-    ## Layer `id` made (or kept) a pen path drawn from the points collected with
-    ## `add_point`, three an anchor in document pixels — the point, the handle
-    ## coming in, the handle going out — joined by cubic curves, closed back to
-    ## the first when `closed`; filled and stroked as `set_shape`. One step.
+    ## Layer `id` made a vector layer of a pen path (or, on a vector layer, its
+    ## target element drawn as one) from the points collected with `add_point`,
+    ## three an anchor in document pixels — the point, the handle coming in, the
+    ## handle going out — joined by cubic curves, closed back to the first when
+    ## `closed`; filled and stroked as `set_shape`. One step.
     pub mutating func set_path(id: i64, closed: bool, filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
                                stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64) -> !:
+        let style: f64[11] = [3.0, 0.0, 1.0 if filled else 0.0, fill_red, fill_green, fill_blue,
+                              1.0 if stroked else 0.0, stroke_red, stroke_green, stroke_blue, stroke_width]
+        try set_layer_shape(&self, (u64)id, try self.collected_path(closed, style[..<11]))
+
+    ## `set_path`'s path added on top of layer `id`'s elements instead, active. One step.
+    pub mutating func add_path(id: i64, closed: bool, filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
+                               stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64) -> !:
+        let style: f64[11] = [3.0, 0.0, 1.0 if filled else 0.0, fill_red, fill_green, fill_blue,
+                              1.0 if stroked else 0.0, stroke_red, stroke_green, stroke_blue, stroke_width]
+        try add_vector_element(&self, (u64)id, try self.collected_path(closed, style[..<11]), "", "Path")
+
+    ## The Vector panel's new path: an empty path element named `name` on top of
+    ## layer `id`, active, for the Pen to draw into. One step.
+    pub mutating func add_empty_path(id: i64, name: str) -> !:
+        var no_path: f64[]
+        try add_vector_element(&self, (u64)id, ShapeSpec(kind = 4, filled = false, stroked = true, stroke_width = 1.0, path = no_path), name, "New Path")
+
+    ## The collected points (`add_point`) as a path spec styled by `style`
+    ## (`restyle_shape`'s values from sides on), which the caller owns.
+    mutating func collected_path(closed: bool, style: const f64[]) -> ShapeSpec!:
         let collected = self.polygon[..<self.polygon_count]
         self.polygon_count = 0
         if collected.length < 2 * anchor_values:
             error(invalid, "a path needs at least two anchors")
-        let values: f64[22] = [4.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 1.0 if filled else 0.0, fill_red, fill_green, fill_blue,
-                               1.0 if stroked else 0.0, stroke_red, stroke_green, stroke_blue, stroke_width, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
-        var spec = try shape_from_values(values)
+        var values: f64[22] = [4.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+        for at in 0..<(usize)11:
+            values[5 + at] = style[at]
+        var spec = try shape_from_values(values[..<22])
         spec.closed = closed
         spec.path = try owned_path(collected)
-        try set_layer_shape(&self, (u64)id, spec)
+        return spec
 
-    ## How many anchors the path layer at `index` has; 0 for any other layer.
+    ## How many anchors the path the layer at `index` targets has; 0 for any
+    ## other layer or element, and for an outline of several runs.
     pub func layer_path_count(index: i64) -> i64!:
-        let record = try self.record(index)
-        if not record.shaped or record.shape.kind != 4:
+        let spec = target_spec(try self.record(index)) else return 0
+        if spec.kind != 4 or spec.subpaths.length > 0:
             return 0
-        return (i64)(record.shape.path.length // anchor_values)
+        return (i64)(spec.path.length // anchor_values)
 
-    ## Whether the path layer at `index` is closed.
+    ## Whether the targeted path of the layer at `index` is closed.
     pub func layer_path_closed(index: i64) -> bool!:
-        return (try self.record(index)).shape.closed
+        let spec = target_spec(try self.record(index)) else return false
+        return spec.closed
 
-    ## Value `field` of anchor `anchor` of the path layer at `index`, in document
-    ## pixels: 0 and 1 the point, 2 and 3 the handle coming in, 4 and 5 the
-    ## handle going out.
+    ## Value `field` of anchor `anchor` of the path the layer at `index`
+    ## targets, in document pixels: 0 and 1 the point, 2 and 3 the handle
+    ## coming in, 4 and 5 the handle going out.
     pub func layer_path_value(index: i64, anchor: i64, field: i64) -> f64!:
-        let record = try self.record(index)
-        if not record.shaped or record.shape.kind != 4:
+        let spec = target_spec(try self.record(index)) else error(invalid, "the layer is not a path")
+        if spec.kind != 4:
             error(invalid, "the layer is not a path")
-        let count = (i64)(record.shape.path.length // anchor_values)
+        let count = (i64)(spec.path.length // anchor_values)
         if anchor < 0 or anchor >= count or field < 0 or field > 5:
             error(invalid, "no such path value")
         let at = (usize)anchor * anchor_values + (usize)(field - field % 2)
-        let x = record.shape.path[at]
-        let y = record.shape.path[at + 1]
-        let m = record.shape.matrix
+        let x = spec.path[at]
+        let y = spec.path[at + 1]
+        let m = spec.matrix
         return m[0] * x + m[2] * y + m[4] if field % 2 == 0 else m[1] * x + m[3] * y + m[5]
 
-    ## Whether the layer at `index` is a shape layer.
+    ## Whether the layer at `index` is a vector layer.
     pub func layer_shaped(index: i64) -> bool!:
         return (try self.record(index)).shaped
 
-    ## Value `field` of a shape layer's shape: 0 kind, 1..4 the box, 5 sides,
-    ## 6 radius, 7 filled, 8..10 the fill, 11 stroked, 12..14 the stroke, 15
-    ## its width, 16..21 the transform.
+    ## Value `field` of the shape the layer at `index` targets: 0 kind, 1..4
+    ## the box, 5 sides, 6 radius, 7 filled, 8..10 the fill, 11 stroked,
+    ## 12..14 the stroke, 15 its width, 16..21 the transform.
     pub func layer_shape_value(index: i64, field: i64) -> f64!:
-        let record = try self.record(index)
-        if not record.shaped:
-            error(invalid, "the layer is not a shape")
+        let spec = target_spec(try self.record(index)) else error(invalid, "the layer is not a shape")
         if field < 0 or field >= 22:
             error(invalid, "a shape has values 0..21")
-        return shape_values(record.shape)[(usize)field]
+        return shape_values(spec)[(usize)field]
+
+    # mark: Vector elements =======================================================================
+
+    ## How many vector elements the layer at `index` holds, bottom first.
+    pub func element_count(index: i64) -> i64!:
+        return (i64)(try self.record(index)).elements.length
+
+    pub func element_name(index: i64, element: i64) -> str!:
+        return (try element_of(try self.record(index), element)).name
+
+    pub func element_visible(index: i64, element: i64) -> bool!:
+        return (try element_of(try self.record(index), element)).visible
+
+    ## Value `field` of element `element`, numbered as `layer_shape_value`'s;
+    ## 22 is its anchor count, 23 its runs (0 for one), 24 whether it is closed.
+    pub func element_value(index: i64, element: i64, field: i64) -> f64!:
+        let spec = (try element_of(try self.record(index), element)).spec
+        if field == 22:
+            return (f64)(spec.path.length // anchor_values)
+        if field == 23:
+            return (f64)spec.subpaths.length
+        if field == 24:
+            return 1.0 if spec.closed else 0.0
+        if field < 0 or field >= 22:
+            error(invalid, "an element has values 0..24")
+        return shape_values(spec)[(usize)field]
+
+    ## The layer at `index`'s active element, -1 for none.
+    pub func active_element(index: i64) -> i64!:
+        let record = try self.record(index)
+        return record.active if record.active < (i64)record.elements.length else -1
+
+    ## Make element `element` of layer `id` the one edits act on (-1: none, the
+    ## whole layer). Not a step: it is where the Vector panel points.
+    pub mutating func set_active_element(id: i64, element: i64) -> !:
+        let index = try self.index((u64)id)
+        if element < -1 or element >= (i64)self.records[index].elements.length:
+            error(invalid, "no such vector element")
+        self.records[index].active = element
+
+    ## Show or hide element `element` of layer `id`. One step.
+    pub mutating func set_element_visible(id: i64, element: i64, visible: bool) -> !:
+        try show_vector_element(&self, (u64)id, element, visible)
+
+    pub mutating func rename_element(id: i64, element: i64, name: str) -> !:
+        try rename_vector_element(&self, (u64)id, element, name)
+
+    ## Element `element` of layer `id` moved to place `to` (0 the bottom). One step.
+    pub mutating func move_element(id: i64, element: i64, to: i64) -> !:
+        try reorder_vector_element(&self, (u64)id, element, to)
+
+    pub mutating func duplicate_element(id: i64, element: i64) -> !:
+        try duplicate_vector_element(&self, (u64)id, element)
+
+    pub mutating func delete_element(id: i64, element: i64) -> !:
+        try delete_vector_element(&self, (u64)id, element)
+
+    ## Element `element` of layer `id` scaled, turned by `angle` degrees and
+    ## moved about the pivot, as `preview_transform`'s box. One step.
+    pub mutating func transform_element(id: i64, element: i64, scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64, pivot_x: f64, pivot_y: f64) -> !:
+        try transform_vector_element(&self, (u64)id, element, try affine_warp(scale_x, scale_y, angle * math.pi / 180.0, dx, dy, pivot_x, pivot_y), "Free Transform")
+
+    ## The topmost shown element of the layer at `index` under document point
+    ## (`x`, `y`) — inside its fill or within `reach` pixels of its outline;
+    ## -1 for none.
+    pub func element_at(index: i64, x: f64, y: f64, reach: f64) -> i64!:
+        return try element_under(&self, try self.record(index), x, y, reach)
+
+    ## Select element `element`'s outline, combined with the selection by
+    ## `mode` (0 replace, 1 add, 2 subtract, 3 intersect). One step.
+    pub mutating func select_element(index: i64, element: i64, mode: i64 = 0) -> !:
+        try select_element_outline(&self, (usize)(try self.checked_index(index)), element, mode)
+
+    ## Element `element`'s outline in document pixels, flattened, for drawing
+    ## it: how many points; `outline_x`, `outline_y` and `outline_starts` (a
+    ## point beginning a new run) read them until the next call.
+    pub mutating func element_outline(index: i64, element: i64) -> i64!:
+        return try stage_outline(&self, (usize)(try self.checked_index(index)), element)
+
+    pub func outline_x(point: i64) -> f64:
+        return self.outline[(usize)point * 3] if point >= 0 and (usize)point < self.outline_count else 0.0
+
+    pub func outline_y(point: i64) -> f64:
+        return self.outline[(usize)point * 3 + 1] if point >= 0 and (usize)point < self.outline_count else 0.0
+
+    pub func outline_starts(point: i64) -> bool:
+        return point >= 0 and (usize)point < self.outline_count and self.outline[(usize)point * 3 + 2] != 0.0
+
+    func checked_index(index: i64) -> i64!:
+        discard(try self.record(index))
+        return index
 
     ## Whether the layer at `index` is a text layer, and what it is set from.
     pub func layer_typed(index: i64) -> bool!:
@@ -2423,14 +2545,14 @@ pub struct Canvas:
             self.records[index].typeset.x += (f64)dx
             self.records[index].typeset.y += (f64)dy
             return
-        # A shape layer is drawn again where it went: past the canvas and back it stays whole.
+        # A vector layer is drawn again where it went, only the cells its elements left
+        # or reach (the active one alone when there is one): past the canvas and back it
+        # stays whole.
         if not on_mask and self.records[index].shaped:
             try self.begin_edit("Move")
             defer self.end_edit()
             try self.remember_state("Move")
-            self.records[index].shape.matrix[4] += (f64)dx
-            self.records[index].shape.matrix[5] += (f64)dy
-            try redraw_shape(&self, index)
+            try shift_vector_elements(&self, index, (f64)dx, (f64)dy, true)
             return
         try self.shift_layer(document, index, dx, dy, on_mask)
 
@@ -2812,17 +2934,18 @@ pub struct Canvas:
     ## Show the transform's layers scaled by (`scale_x`, `scale_y`) — negative
     ## flips — and turned `angle` degrees about (`pivot_x`, `pivot_y`), then
     ## moved by (`dx`, `dy`).
-    pub mutating func preview_transform(scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64, pivot_x: f64, pivot_y: f64) -> !:
-        try show_session(&self, try affine_warp(scale_x, scale_y, angle * math.pi / 180.0, dx, dy, pivot_x, pivot_y), "Free Transform")
+    ## `name` is the step's (Edit › Transform's Skew, say), kept as History names it.
+    pub mutating func preview_transform(scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64, pivot_x: f64, pivot_y: f64, name: str = "Free Transform") -> !:
+        try show_session(&self, try affine_warp(scale_x, scale_y, angle * math.pi / 180.0, dx, dy, pivot_x, pivot_y), transform_step_name(name))
 
     ## Show the transform's layers distorted: the box at (`left`, `top`),
     ## `width` by `height`, with its corners (top-left, top-right,
     ## bottom-right, bottom-left) taken to the points given, in perspective.
     pub mutating func preview_distort(left: f64, top: f64, width: f64, height: f64, x0: f64, y0: f64, x1: f64, y1: f64,
-                                      x2: f64, y2: f64, x3: f64, y3: f64) -> !:
+                                      x2: f64, y2: f64, x3: f64, y3: f64, name: str = "Distort") -> !:
         let corners: f64[8] = [x0, y0, x1, y1, x2, y2, x3, y3]
         let box = Landed(left = left, top = top, right = left + width, bottom = top + height)
-        try show_session(&self, try quad_warp(left, top, width, height, corners[..<8]), "Distort", box)
+        try show_session(&self, try quad_warp(left, top, width, height, corners[..<8]), transform_step_name(name), box)
 
     ## How the transform resamples from now on: 0 nearest, 1 smooth
     ## (bilinear), 2 high quality (bicubic). `preview_*` again to show it.
@@ -3153,10 +3276,11 @@ pub struct Canvas:
         try self.adopt_extent((u32)width, (u32)height)
         for index in 0..<self.count:
             if self.records[index].shaped:
-                for at in [0, 2, 4]:
-                    self.records[index].shape.matrix[(usize)at] *= scale_x
-                    self.records[index].shape.matrix[(usize)at + 1] *= scale_y
-                try redraw_shape(&self, index)
+                for element in 0..<self.records[index].elements.length:
+                    for at in [0, 2, 4]:
+                        self.records[index].elements[element].spec.matrix[(usize)at] *= scale_x
+                        self.records[index].elements[element].spec.matrix[(usize)at + 1] *= scale_y
+                try redraw_vector(&self, index)
 
     # mark: Guides ================================================================================
 

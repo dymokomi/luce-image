@@ -1,0 +1,208 @@
+#==============================================================================================
+#
+#   canvas/vector_tests - Vector layers of many elements: edits, undo, files and cells
+#
+#==============================================================================================
+
+## Layer `id`'s pixels read back into `pixels`.
+func layer_pixels(canvas: Canvas*, id: i64, pixels: f32[]) -> !:
+    let document = canvas.document else trap("bound")
+    try ((document.find((u64)id) else trap("layer")).tiles() else trap("tiles")).read(pixels)
+
+## The straight color at (`x`, `y`) of a `width`-wide picture: red, green, blue, alpha.
+func color_at(pixels: const f32[], width: usize, x: usize, y: usize) -> f32[4]:
+    let at = (y * width + x) * 4
+    return [pixels[at], pixels[at + 1], pixels[at + 2], pixels[at + 3]]
+
+test "a vector layer holds a list of elements: added, stacked, hidden, renamed, copied, deleted, each undone":
+    var canvas = try Canvas(64, 48)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Vector")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    let pixels = try alloc f32[64 * 48 * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    # A red rectangle, then a blue ellipse over part of it.
+    try canvas.set_shape(layer, 0, 8.0, 8.0, 32.0, 24.0, 5, 0.0, true, 1.0, 0.0, 0.0, false, 0.0, 0.0, 0.0, 1.0)
+    try canvas.add_shape(layer, 1, 24.0, 16.0, 32.0, 24.0, 5, 0.0, true, 0.0, 0.0, 1.0, false, 0.0, 0.0, 0.0, 1.0)
+    assert((try canvas.element_count(0)) == 2 and (try canvas.active_element(0)) == 1 and canvas.undo_name() == "Shape")
+    assert((try canvas.element_name(0, 0)) == "Rectangle" and (try canvas.element_name(0, 1)) == "Ellipse")
+    try layer_pixels(&canvas, layer, pixels)
+    assert(color_at(pixels, 64, 34, 26)[2] > 0.99 and color_at(pixels, 64, 12, 12)[0] > 0.99)
+    # Sent backward, the rectangle covers the overlap; undone, the ellipse again.
+    try canvas.move_element(layer, 1, 0)
+    assert(canvas.undo_name() == "Send Backward" and (try canvas.element_name(0, 0)) == "Ellipse" and (try canvas.active_element(0)) == 0)
+    try layer_pixels(&canvas, layer, pixels)
+    assert(color_at(pixels, 64, 34, 26)[0] > 0.99)
+    try canvas.undo()
+    try layer_pixels(&canvas, layer, pixels)
+    assert((try canvas.element_name(0, 1)) == "Ellipse" and color_at(pixels, 64, 34, 26)[2] > 0.99)
+    # Hidden, the ellipse shows the rectangle under it and nothing past it.
+    try canvas.set_element_visible(layer, 1, false)
+    try layer_pixels(&canvas, layer, pixels)
+    assert(not (try canvas.element_visible(0, 1)) and color_at(pixels, 64, 34, 26)[0] > 0.99 and color_at(pixels, 64, 50, 36)[3] < 0.01)
+    try canvas.undo()
+    try layer_pixels(&canvas, layer, pixels)
+    assert((try canvas.element_visible(0, 1)) and color_at(pixels, 64, 50, 36)[2] > 0.99)
+    # Renamed, and back.
+    try canvas.rename_element(layer, 1, "Moon")
+    assert((try canvas.element_name(0, 1)) == "Moon" and canvas.undo_name() == "Rename Vector")
+    try canvas.undo()
+    assert((try canvas.element_name(0, 1)) == "Ellipse")
+    # Copied just above itself, then the copy deleted.
+    try canvas.duplicate_element(layer, 0)
+    assert((try canvas.element_count(0)) == 3 and (try canvas.element_name(0, 1)) == "Rectangle copy" and (try canvas.active_element(0)) == 1)
+    try canvas.delete_element(layer, 1)
+    assert((try canvas.element_count(0)) == 2 and (try canvas.element_name(0, 1)) == "Ellipse" and (try canvas.active_element(0)) == -1)
+    try canvas.undo()
+    assert((try canvas.element_count(0)) == 3)
+    try canvas.undo()
+    assert((try canvas.element_count(0)) == 2)
+    # A new empty path draws nothing; the pen's path then goes into it, as it is active.
+    try canvas.add_empty_path(layer, "Path 1")
+    assert((try canvas.element_count(0)) == 3 and (try canvas.element_value(0, 2, 0)) == 4.0 and (try canvas.element_value(0, 2, 22)) == 0.0)
+    try canvas.add_point(2.0, 44.0)
+    try canvas.add_point(2.0, 44.0)
+    try canvas.add_point(2.0, 44.0)
+    try canvas.add_point(60.0, 44.0)
+    try canvas.add_point(60.0, 44.0)
+    try canvas.add_point(60.0, 44.0)
+    try canvas.set_path(layer, false, false, 0.0, 0.0, 0.0, true, 0.0, 1.0, 0.0, 2.0)
+    assert((try canvas.element_count(0)) == 3 and (try canvas.element_value(0, 2, 22)) == 2.0 and (try canvas.element_name(0, 2)) == "Path 1")
+    try layer_pixels(&canvas, layer, pixels)
+    assert(color_at(pixels, 64, 30, 44)[1] > 0.99)
+    # Undone step by step back to an empty pixel layer.
+    while canvas.can_undo():
+        try canvas.undo()
+    assert(not (try canvas.layer_shaped(0)) and (try canvas.element_count(0)) == 0)
+
+test "an element is found under the pointer, transformed alone, selected and outlined":
+    var canvas = try Canvas(64, 48)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Vector")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try canvas.set_shape(layer, 0, 8.0, 8.0, 32.0, 24.0, 5, 0.0, true, 1.0, 0.0, 0.0, false, 0.0, 0.0, 0.0, 1.0)
+    try canvas.add_shape(layer, 1, 24.0, 16.0, 32.0, 24.0, 5, 0.0, true, 0.0, 0.0, 1.0, false, 0.0, 0.0, 0.0, 1.0)
+    assert((try canvas.element_at(0, 34.0, 26.0, 1.0)) == 1 and (try canvas.element_at(0, 12.0, 12.0, 1.0)) == 0 and (try canvas.element_at(0, 2.0, 44.0, 1.0)) == -1)
+    # The rectangle alone doubled about its corner: the ellipse stays.
+    try canvas.transform_element(layer, 0, 2.0, 2.0, 0.0, 0.0, 0.0, 8.0, 8.0)
+    assert(canvas.undo_name() == "Free Transform" and (try canvas.element_value(0, 0, 16)) == 2.0 and (try canvas.element_value(0, 1, 16)) == 1.0)
+    try canvas.undo()
+    assert((try canvas.element_value(0, 0, 16)) == 1.0)
+    # A move with an element active moves it alone.
+    try canvas.set_active_element(layer, 1)
+    try canvas.move_layer(layer, 4, 0)
+    assert((try canvas.element_value(0, 1, 20)) == 4.0 and (try canvas.element_value(0, 0, 20)) == 0.0)
+    # Its outline, closed, round the ellipse's box.
+    let points = try canvas.element_outline(0, 1)
+    assert(points > 16 and canvas.outline_starts(0) and not canvas.outline_starts(1))
+    var left = 1e9
+    var right = -1e9
+    for point in 0..<points:
+        left = math.min(left, canvas.outline_x(point))
+        right = math.max(right, canvas.outline_x(point))
+    assert(math.abs(left - 28.0) < 0.5 and math.abs(right - 60.0) < 0.5)
+    # Made a selection: the ellipse's box.
+    try canvas.select_element(0, 1)
+    assert(canvas.undo_name() == "Make Selection" and canvas.has_selection())
+    assert(math.abs((f64)canvas.selection_left() - 28.0) <= 1.0 and math.abs((f64)canvas.selection_width() - 32.0) <= 1.0)
+
+test "an .l2d keeps every element: names, eyes, order, paths and runs":
+    var canvas = try Canvas(64, 48)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Vector")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try canvas.set_shape(layer, 3, 8.0, 8.0, 32.0, 24.0, 7, 0.0, true, 0.5, 0.25, 0.0, true, 0.0, 0.0, 1.0, 3.0)
+    try canvas.add_point(10.0, 40.0)
+    try canvas.add_point(10.0, 40.0)
+    try canvas.add_point(30.0, 30.0)
+    try canvas.add_point(50.0, 40.0)
+    try canvas.add_point(30.0, 50.0)
+    try canvas.add_point(50.0, 40.0)
+    try canvas.add_path(layer, true, true, 0.0, 1.0, 0.0, false, 0.0, 0.0, 0.0, 1.0)
+    try canvas.rename_element(layer, 1, "Leaf")
+    try canvas.set_element_visible(layer, 0, false)
+    try canvas.save_package("build/canvas-vectors.l2d")
+    let reopened = try Canvas.open("build/canvas-vectors.l2d")
+    defer reopened.release()
+    let opened = reopened.value()
+    assert((try opened.layer_shaped(0)) and (try opened.element_count(0)) == 2)
+    assert((try opened.element_name(0, 0)) == "Polygon" and (try opened.element_name(0, 1)) == "Leaf")
+    assert(not (try opened.element_visible(0, 0)) and (try opened.element_visible(0, 1)))
+    assert((try opened.element_value(0, 0, 5)) == 7.0 and (try opened.element_value(0, 0, 15)) == 3.0 and (try opened.element_value(0, 0, 8)) == 0.5)
+    assert((try opened.element_value(0, 1, 22)) == 2.0 and (try opened.element_value(0, 1, 24)) == 1.0 and (try opened.element_value(0, 1, 9)) == 1.0)
+    # The pen's anchors come back where they were.
+    try opened.set_active_element((try opened.layer_id(0)), 1)
+    assert((try opened.layer_path_value(0, 1, 2)) == 30.0 and (try opened.layer_path_value(0, 1, 3)) == 50.0)
+
+test "an SVG comes in as vector elements, one an element, a hole kept open":
+    let path = "/tmp/luce-image-svg-vectors.svg"
+    # 32 by 16 units, drawn 32 times over: a red square, and a blue ring cut by the nonzero rule.
+    try files.write_text(path, "<svg viewBox=\"0 0 32 16\"><rect width=\"14\" height=\"14\" fill=\"#ff0000\"/><path d=\"M16 0 H32 V16 H16 Z M20 4 V12 H28 V4 Z\" fill=\"blue\"/></svg>")
+    var canvas = try Canvas(1024, 512)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Placed")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try canvas.place_layer(layer, path, 512, 256)
+    assert((try canvas.layer_shaped(0)) and (try canvas.element_count(0)) == 2)
+    assert((try canvas.element_value(0, 0, 8)) > 0.99 and (try canvas.element_value(0, 1, 10)) > 0.99 and (try canvas.element_value(0, 1, 23)) == 2.0)
+    let pixels = try alloc f32[1024 * 512 * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    try layer_pixels(&canvas, layer, pixels)
+    # The square, the ring, and the hole in it.
+    assert(color_at(pixels, 1024, 200, 200)[0] > 0.99 and color_at(pixels, 1024, 540, 40)[2] > 0.99 and color_at(pixels, 1024, 768, 256)[3] < 0.01)
+    # Opened, the SVG is a document of one vector layer holding its elements.
+    let opened = try Canvas.open(path)
+    defer opened.release()
+    assert((try opened.value().layer_shaped(0)) and (try opened.value().element_count(0)) == 2)
+
+test "an edit draws again only the cells its element covered or covers, at 15000 by 24000":
+    var canvas = try Canvas(15000, 24000)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Vector")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    # A stroked rectangle over most of the canvas, and a small ellipse near a corner.
+    try canvas.set_shape(layer, 0, 500.0, 500.0, 14000.0, 20000.0, 5, 40.0, true, 0.2, 0.4, 0.6, true, 0.0, 0.0, 0.0, 12.0)
+    try canvas.add_shape(layer, 1, 1000.0, 22000.0, 900.0, 700.0, 5, 0.0, true, 1.0, 0.0, 0.0, true, 1.0, 1.0, 1.0, 6.0)
+    let document = canvas.document else trap("bound")
+    let tiles = (document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")
+    let columns = tiles.columns()
+    let rows = tiles.rows()
+    let before = try alloc u64[(usize)columns * (usize)rows] in memory.heap
+    defer free(before) in memory.heap
+    for row in 0..<rows:
+        for column in 0..<columns:
+            before[(usize)row * (usize)columns + (usize)column] = tiles.stamp(column, row)
+    # The ellipse cells it covers, before and after a move of 600 pixels right.
+    var expected = try CellMask.create(15000, 24000)
+    defer expected.close()
+    try expected.mark(canvas.records[0].elements[1])
+    try canvas.set_active_element(layer, 1)
+    try canvas.move_layer(layer, 600, 0)
+    try expected.mark(canvas.records[0].elements[1])
+    assert(expected.count() < 40)
+    let after = (document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")
+    var changed: usize = 0
+    for row in 0..<rows:
+        for column in 0..<columns:
+            if after.stamp(column, row) != before[(usize)row * (usize)columns + (usize)column]:
+                changed += 1
+                assert(expected.marked(column, row))
+    assert(changed > 0 and changed <= expected.count())
+    # The rectangle kept its tiles everywhere the ellipse is not: its inside shares one.
+    assert(after.stamp(20, 20) == before[20 * (usize)columns + 20] and after.stamp(20, 20) == after.stamp(30, 40))
+    # Undone, the cells are the ones from before.
+    try canvas.undo()
+    let undone = (document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")
+    for row in 0..<rows:
+        for column in 0..<columns:
+            assert(undone.stamp(column, row) == before[(usize)row * (usize)columns + (usize)column])

@@ -128,7 +128,7 @@ func copied_record(record: Record) -> Record!:
     copy_type(&copy) catch failure:
         strings.release(copy.name)
         error(failure.code, failure.message)
-    copy_path(&copy) catch failure:
+    copy_elements(&copy) catch failure:
         strings.release(copy.name)
         release_type(&copy)
         error(failure.code, failure.message)
@@ -174,9 +174,9 @@ func add_clip_records(canvas: Canvas*, clip: const LayerClip*, layer: const Laye
     if record.typed:
         record.typeset.x += dx
         record.typeset.y += dy
-    if record.shaped:
-        record.shape.matrix[4] += dx
-        record.shape.matrix[5] += dy
+    for at in 0..<record.elements.length:
+        record.elements[at].spec.matrix[4] += dx
+        record.elements[at].spec.matrix[5] += dy
     canvas.records[canvas.count] = record
     canvas.count += 1
     *next += 1

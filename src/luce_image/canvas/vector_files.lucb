@@ -1,0 +1,136 @@
+#==============================================================================================
+#
+#   canvas/vector_files - A vector layer's elements in the .l2d manifest
+#
+#   DESCRIPTION:
+#       Beside a vector layer's other settings the manifest keeps `vectors`, how many
+#       elements it holds, and for each, bottom first, by its place j:
+#
+#           vector_j_name   its name
+#           vector_j        its spec's values in `shape_values` order (22), then 1 or 0 for
+#                           visible, then 1 or 0 for closed
+#           vector_j_path   a path's anchors, six values each (none for the other kinds)
+#           vector_j_runs   anchors in each run of a path of several (none for one)
+#
+#       Its pixels are stored as any layer's are; opening does not draw it again.
+#
+#==============================================================================================
+
+## Values `vector_j` holds.
+let element_value_count: usize = 24
+
+## The most anchors an element's path may bring back from a file.
+let file_anchor_limit: usize = 1000000
+
+## `list` into the manifest's `element`.
+func write_elements(manifest: prism.Document*, element: str, list: const VectorElement[]) -> !:
+    try set_integer(manifest, element, "vectors", (i64)list.length)
+    var key: u8[48]
+    for at in 0..<list.length:
+        let spec = list[at].spec
+        let name = try prism.Value.text(list[at].name)
+        defer name.release()
+        try manifest.set(element, try format_file(key, "vector_", at, "_name"), name)
+        let shape = shape_values(spec)
+        var values: f64[24] = ---
+        for index in 0..<(usize)22:
+            values[index] = shape[index]
+        values[22] = 1.0 if list[at].visible else 0.0
+        values[23] = 1.0 if spec.closed else 0.0
+        var shape_of: i64[1] = [(i64)element_value_count]
+        let numbers = try prism.Value.numbers(shape_of[..<1], values[..<24])
+        defer numbers.release()
+        try manifest.set(element, try format_file(key, "vector_", at, ""), numbers)
+        if spec.path.length > 0:
+            shape_of[0] = (i64)spec.path.length
+            let path = try prism.Value.numbers(shape_of[..<1], spec.path)
+            defer path.release()
+            try manifest.set(element, try format_file(key, "vector_", at, "_path"), path)
+        if spec.subpaths.length > 0:
+            let runs = try alloc f64[spec.subpaths.length] in memory.heap
+            defer free(runs) in memory.heap
+            for index in 0..<runs.length:
+                runs[index] = (f64)spec.subpaths[index]
+            shape_of[0] = (i64)runs.length
+            let value = try prism.Value.numbers(shape_of[..<1], runs)
+            defer value.release()
+            try manifest.set(element, try format_file(key, "vector_", at, "_runs"), value)
+
+## The elements `element` holds, if any: the layer with id `id` is a vector layer again.
+func read_elements(doc: prism.Document*, element: str, canvas: Canvas*, id: i64) -> !:
+    let count = get_integer(doc, element, "vectors") catch _:
+        return
+    if count < 0 or count > 100000:
+        error(invalid, "a vector layer's element count is damaged")
+    var list: VectorElement[]
+    for at in 0..<(usize)count:
+        let read = read_element(doc, element, at) catch failure:
+            free_list(list)
+            error(failure.code, failure.message)
+        list = try list_with(list, at, read)
+    let index = try canvas.index((u64)id)
+    release_elements(&canvas.records[index])
+    canvas.records[index].elements = list
+    canvas.records[index].shaped = true
+
+## Element `at` of `element`, owning its name and path.
+func read_element(doc: prism.Document*, element: str, at: usize) -> VectorElement!:
+    var key: u8[48]
+    let holder = try doc.get(element, try format_file(key, "vector_", at, ""))
+    defer holder.release()
+    let numbers = holder.value()
+    if numbers.count() != element_value_count:
+        error(invalid, "a vector element's values are damaged")
+    var values: f64[24] = ---
+    for index in 0..<element_value_count:
+        values[index] = try numbers.number_at(index)
+    var spec = try shape_from_values(values[..<22])
+    spec.closed = values[23] != 0.0
+    if spec.kind == 4:
+        spec.path = try read_numbers(doc, element, try format_file(key, "vector_", at, "_path"), anchor_values)
+        errdefer release_spec_path(&spec)
+        let runs = read_numbers(doc, element, try format_file(key, "vector_", at, "_runs"), 1) catch _:
+            recover no_numbers()
+        defer free_numbers(runs)
+        if runs.length > 0:
+            let sizes = try alloc u32[runs.length] in memory.heap
+            defer free(sizes) in memory.heap
+            for index in 0..<runs.length:
+                if runs[index] < 1.0 or runs[index] > (f64)file_anchor_limit:
+                    error(invalid, "a path's runs are damaged")
+                sizes[index] = (u32)runs[index]
+            spec.subpaths = try owned_subpaths(sizes, spec.path.length // anchor_values)
+    let name_value = doc.get(element, try format_file(key, "vector_", at, "_name")) catch failure:
+        release_spec_path(&spec)
+        error(failure.code, failure.message)
+    defer name_value.release()
+    let name = name_value.value().text_at() catch failure:
+        release_spec_path(&spec)
+        error(failure.code, failure.message)
+    var made = try made_element(name, spec)
+    made.visible = values[22] != 0.0
+    return made
+
+## Numbers at `element`.`name` as a new heap array, a multiple of `step` long.
+func read_numbers(doc: prism.Document*, element: str, name: str, step: usize) -> f64[]!:
+    let holder = try doc.get(element, name)
+    defer holder.release()
+    let value = holder.value()
+    let count = value.count()
+    if count == 0 or count % step != 0 or count > file_anchor_limit * anchor_values:
+        error(invalid, "a vector element's numbers are damaged")
+    let numbers = try alloc f64[count] in memory.heap
+    errdefer free(numbers) in memory.heap
+    for index in 0..<count:
+        numbers[index] = try value.number_at(index)
+        if not math.is_finite(numbers[index]):
+            error(invalid, "a vector element's numbers must be finite")
+    return numbers
+
+func no_numbers() -> f64[]:
+    var none_here: f64[]
+    return none_here
+
+func free_numbers(numbers: f64[]):
+    if numbers.length > 0:
+        free(numbers) in memory.heap

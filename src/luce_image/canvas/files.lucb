@@ -272,52 +272,6 @@ func read_type(doc: prism.Document*, element: str, canvas: Canvas*, id: i64) -> 
     canvas.records[index].typeset = spec
     canvas.records[index].typed = true
 
-## A shape layer's shape as numbered values (`shape_values`), `shape_0`…
-func write_shape(manifest: prism.Document*, element: str, spec: ShapeSpec) -> !:
-    let values = shape_values(spec)
-    var key_buffer: u8[32]
-    for at in 0..<(usize)22:
-        let number = try prism.Value.number(values[at])
-        defer number.release()
-        try manifest.set(element, try format_file(key_buffer, "shape_", at, ""), number)
-    if spec.kind != 4:
-        return
-    # A path's anchors, six values each, and whether it closes.
-    let closed = try prism.Value.number(1.0 if spec.closed else 0.0)
-    defer closed.release()
-    try manifest.set(element, "path_closed", closed)
-    let count = try prism.Value.number((f64)spec.path.length)
-    defer count.release()
-    try manifest.set(element, "path_values", count)
-    for at in 0..<spec.path.length:
-        let number = try prism.Value.number(spec.path[at])
-        defer number.release()
-        try manifest.set(element, try format_file(key_buffer, "path_", at, ""), number)
-
-## The shape a layer's element holds, if any: the layer is a shape again.
-func read_shape(doc: prism.Document*, element: str, canvas: Canvas*, id: i64) -> !:
-    var key_buffer: u8[32]
-    discard(get_number(doc, element, try format_file(key_buffer, "shape_", 0, "")) catch _:
-        return)
-    var values: f64[22]
-    for at in 0..<(usize)22:
-        values[at] = try get_number(doc, element, try format_file(key_buffer, "shape_", at, ""))
-    let index = try canvas.index((u64)id)
-    var spec = try shape_from_values(values)
-    if spec.kind == 4:
-        let count = (usize)(try get_number(doc, element, "path_values"))
-        if count == 0 or count % anchor_values != 0 or count > 6 * 100000:
-            error(invalid, "a path's anchors are damaged")
-        let read = try alloc f64[count] in memory.heap
-        defer free(read) in memory.heap
-        for at in 0..<count:
-            read[at] = try get_number(doc, element, try format_file(key_buffer, "path_", at, ""))
-        spec.closed = (try get_number(doc, element, "path_closed")) != 0.0
-        spec.path = try owned_path(read)
-    release_path(&canvas.records[index])
-    canvas.records[index].shape = spec
-    canvas.records[index].shaped = true
-
 func type_value_names() -> str[10]:
     return ["type_size", "type_red", "type_green", "type_blue", "type_x", "type_y", "box_width", "alignment", "tracking", "leading"]
 
@@ -339,7 +293,17 @@ func picture_band(context: void*?, first: usize, count: usize, pixels: f32[]) ->
     try settle_job(banding.canvas)
 
 ## `Canvas.place_layer`: the picture at `path` on layer `id`, centred on a document point.
+## An SVG comes in as vector elements (svg_vectors.lucb) unless it holds text.
 func place_picture(canvas: Canvas*, id: i64, path: str, center_x: i64, center_y: i64) -> !:
+    if is_svg(path):
+        if let found = try svg_vectors(path):
+            var imported = found
+            let left = (f64)(center_x - (i64)imported.width // 2)
+            let top = (f64)(center_y - (i64)imported.height // 2)
+            adopt_svg_vectors(canvas, (u64)id, &imported, left, top) catch failure:
+                imported.close()
+                error(failure.code, failure.message)
+            return
     let picture = try Image.open(path, max_bytes = picture_bytes, max_pixels = picture_pixels)
     defer picture.release()
     try place_image_at(canvas, id, picture, center_x, center_y)
@@ -373,6 +337,13 @@ func open_canvas(path: str) -> interop.Reference[Canvas]!:
     errdefer native.close()
     let id = try native.add_layer("Background")
     try native.place((u64)id, picture)
+    # An SVG keeps its elements too: the picture is what they draw, until one is edited.
+    if is_svg(path):
+        if let found = try svg_vectors(path):
+            var imported = found
+            adopt_svg_vectors(native, (u64)id, &imported, 0.0, 0.0) catch failure:
+                imported.close()
+                error(failure.code, failure.message)
     return reservation.publish(native, memory.heap)
 
 ## Whether `text` ends with `suffix`, byte for byte.

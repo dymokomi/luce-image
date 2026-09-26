@@ -1,9 +1,9 @@
 #==============================================================================================
 #
-#   canvas/shape_render - A shape layer drawn only where its edges are
+#   canvas/shape_render - Vector elements drawn only where their edges are
 #
 #   DESCRIPTION:
-#       A shape layer costs its edges, not its area. The shape's SVG is parsed once over the
+#       A vector element costs its edges, not its area. Its SVG is parsed once over the
 #       whole canvas, and its outlines (already flattened to segments by luce-svg) sort the
 #       256-pixel cells it can reach into three kinds (shape_cells.lucb):
 #         - edge cells, within a band of any segment (the stroke's reach and a pixel or two
@@ -11,9 +11,10 @@
 #         - inside cells, wholly within the fill, which are one color throughout: one of
 #           them is drawn and every other shares its tile;
 #         - outside cells, which stay empty.
-#       The processors draw a wave of windows from the one parsed drawing and turn their
-#       cells into half floats; the main thread uploads them (the GPU is its), sharing one
-#       tile among cells that came out one color throughout.
+#       The processors draw a wave of windows from the one parsed drawing (every element of
+#       the layer the cells need, vector_render.lucb) and turn their cells into half floats;
+#       the main thread uploads them (the GPU is its), sharing one tile among cells that came
+#       out one color throughout.
 #
 #==============================================================================================
 
@@ -50,48 +51,6 @@ struct SharedTile:
     var column: u32
     var row: u32
 
-## The layer's pixels for `spec`: edge cells drawn, inside cells sharing one tile.
-func rendered_shape(canvas: Canvas*, spec: ShapeSpec) -> Tiles!:
-    let device = canvas.device else error(invalid, "draw the document once before drawing a shape")
-    var tiles = try Tiles.create(device, canvas.extent_x, canvas.extent_y)
-    errdefer tiles.destroy()
-    let reach = shape_reach(spec, canvas.extent_x, canvas.extent_y) else return tiles
-    # The shape once, over the whole canvas: every window draws from this drawing.
-    var text = try strings.Builder.create()
-    defer text.destroy()
-    try shape_svg(&text, spec, 0, 0, canvas.extent_x, canvas.extent_y)
-    let parsed = try svg.parse(text.view())
-    defer parsed.release()
-    let drawing = parsed.value()
-    var plan = try CellPlan.make(drawing, spec, reach, canvas.extent_x, canvas.extent_y)
-    defer plan.close()
-    var painter = try WindowPainter.make(device, drawing, canvas.extent_x, canvas.extent_y)
-    defer painter.close()
-    # One inside cell is drawn first: when it comes out one color throughout, as the
-    # inside of a fill does, every other inside cell shares its tile.
-    var sample: CellRun[1] = [CellRun(column = 0, row = 0, across = 0)]
-    var sampled = false
-    var sample_uniform = false
-    if let first = plan.first_inside():
-        sample[0] = CellRun(column = first[0], row = first[1], across = 1)
-        try painter.draw(sample[..<1], &tiles)
-        sampled = true
-        sample_uniform = painter.last_uniform
-    try painter.draw_runs(&plan, cell_edge, &tiles)
-    if not sampled:
-        return tiles
-    let chosen = sample[0]
-    if sample_uniform:
-        for row in reach.top..<reach.bottom:
-            for column in reach.left..<reach.right:
-                if plan.kind(column, row) == cell_inside and not (column == chosen.column and row == chosen.row):
-                    try tiles.share(column, row, chosen.column, chosen.row)
-    else:
-        # Not one color after all (an unusual paint): draw the inside cells too.
-        plan.set(chosen.column, chosen.row, cell_outside)
-        try painter.draw_runs(&plan, cell_inside, &tiles)
-    return tiles
-
 ## Draws windows of cells from one parsed drawing on the processors and uploads them.
 struct WindowPainter:
     var device: gpu.Device
@@ -99,8 +58,6 @@ struct WindowPainter:
     var workers: usize
     var shared: SharedTile[16]
     var shared_count: usize
-    ## Whether the last window drawn, first cell, came out one color throughout.
-    var last_uniform: bool
 
     static func make(device: gpu.Device, drawing: const svg.Drawing*, width: u32, height: u32) -> WindowPainter!:
         let workers = (usize)math.imin(16, math.imax(1, (i64)os.cpus()))
@@ -119,7 +76,7 @@ struct WindowPainter:
                                          pixels = pixels, cells = cells, painted = [false, false, false, false], uniform = [false, false, false, false], failed = false)
             made += 1
         var shared: SharedTile[16] = ---
-        return WindowPainter(device = device, windows = windows, workers = workers, shared = shared, shared_count = 0, last_uniform = false)
+        return WindowPainter(device = device, windows = windows, workers = workers, shared = shared, shared_count = 0)
 
     ## Draw every run of cells of kind `kind` in `plan`, row by row, a window at most
     ## `window_cells` across, a wave of windows at a time.
@@ -161,7 +118,6 @@ struct WindowPainter:
             if self.windows[index].failed:
                 error(invalid, "a shape window could not be drawn")
             try upload_window(self.device, tiles, &self.windows[index], self.shared[..<16], &self.shared_count)
-        self.last_uniform = self.windows[runs.length - 1].uniform[0]
 
     mutating func close():
         release_windows(self.windows)

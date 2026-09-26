@@ -1,18 +1,18 @@
 #==============================================================================================
 #
-#   canvas/shape_layers - Shape layers that stay shapes
+#   canvas/shape_layers - Shapes that stay shapes
 #
 #   DESCRIPTION:
 #       A rectangle (with rounded corners), an ellipse, a line, a regular polygon or a pen
-#       path (path_layers.lucb) kept as
-#       what it is — its box, its fill and stroke, and a 2×3 transform — and drawn again from
-#       that, through luce-svg, on every change: moved, scaled or turned it stays crisp, as
-#       Photoshop's shape layers. Painting, filtering or distorting its pixels turns it into
-#       an ordinary layer, as with text.
+#       path (path_layers.lucb) kept as what it is — its box, its fill and stroke, and a 2×3
+#       transform — and drawn again from that, through luce-svg, on every change: moved,
+#       scaled or turned it stays crisp, as Photoshop's shape layers. A vector layer holds a
+#       list of them (vector_elements.lucb). Painting, filtering or distorting its pixels
+#       turns it into an ordinary layer, as with text.
 #
 #==============================================================================================
 
-## What a shape layer is drawn from.
+## What a vector element is drawn from.
 struct ShapeSpec:
     ## 0 rectangle, 1 ellipse, 2 line, 3 polygon, 4 path.
     var kind: i64
@@ -38,9 +38,12 @@ struct ShapeSpec:
     var matrix: f64[6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
     ## A path's anchors in shape space, six values each: the point, the handle
     ## coming in and the handle going out (a corner's handles sit on it). Heap
-    ## storage its record owns (path_layers.lucb); empty for the other kinds.
+    ## storage its element owns (path_layers.lucb); empty for the other kinds.
     var path: f64[]
     var closed: bool = false
+    ## Anchors in each run when the path has several (an SVG outline with a hole),
+    ## heap storage like `path`; empty for one run.
+    var subpaths: u32[]
 
 ## The number of a spec's values `layer_shape_value` reads, in `shape_values` order.
 let shape_value_count: i64 = 23
@@ -69,48 +72,46 @@ func shape_from_values(values: const f64[]) -> ShapeSpec!:
                      stroked = values[11] != 0.0, stroke_red = values[12], stroke_green = values[13], stroke_blue = values[14], stroke_width = math.max(0.0, values[15]),
                      matrix = [values[16], values[17], values[18], values[19], values[20], values[21]])
 
-## `Canvas.set_shape`: layer `id` made (or kept) a shape layer drawn from `spec`, as one step.
+## `Canvas.set_shape`: layer `id` made a vector layer of `spec` alone, or, when
+## it is one already, its target element (vector_elements.lucb) drawn from
+## `spec` instead, as one step.
 func set_layer_shape(canvas: Canvas*, id: u64, spec: ShapeSpec) -> !:
-    try canvas.require_open()
-    try canvas.require_idle()
-    let index = try canvas.index(id)
+    # `spec`'s path is the element's from here on; freed if it does not get there.
+    var owned = spec
+    let index = shape_layer_index(canvas, id) catch failure:
+        release_spec_path(&owned)
+        error(failure.code, failure.message)
     let record = canvas.records[index]
     if record.group or record.adjustment >= 0:
+        release_spec_path(&owned)
         error(invalid, "only a pixel layer can hold a shape")
-    # `spec`'s path is the record's from here on; freed if it does not get there.
-    var owned = spec
-    errdefer release_spec_path(&owned)
-    let document = canvas.document else error(invalid, "draw the document once before drawing a shape")
-    # Drawn first, so a shape that will not draw changes nothing.
-    var tiles = try rendered_shape(canvas, spec)
-    errdefer tiles.destroy()
-    try canvas.remember_state("Path" if spec.kind == 4 else "Shape", id)
-    release_type(&canvas.records[index])
-    release_path(&canvas.records[index])
-    canvas.records[index].shaped = true
-    canvas.records[index].shape = spec
-    try document.set_tiles(id, tiles)
+    let name = "Path" if spec.kind == 4 else "Shape"
+    if record.shaped:
+        if let at = target_element(&canvas.records[index]):
+            try replace_element_spec(canvas, index, at, owned, name)
+            return
+    let element = try made_element(kind_name(spec.kind), owned)
+    var no_list: VectorElement[]
+    try commit_elements(canvas, index, try list_with(no_list, 0, element), none, -1, name, -1)
 
-## Draw the shape layer at `index` again from its spec (after a move or transform).
-func redraw_shape(canvas: Canvas*, index: usize) -> !:
-    let document = canvas.document else error(invalid, "draw the document once before drawing a shape")
-    var tiles = try rendered_shape(canvas, canvas.records[index].shape)
-    errdefer tiles.destroy()
-    try document.set_tiles(canvas.records[index].id, tiles)
+func shape_layer_index(canvas: Canvas*, id: u64) -> usize!:
+    try canvas.require_open()
+    try canvas.require_idle()
+    return try canvas.index(id)
 
-## Pixels of layer `id` about to change as pixels: it is no longer a shape.
+## Pixels of layer `id` about to change as pixels: it is no longer a vector layer.
 func rasterize_shape(canvas: Canvas*, id: u64):
     let index = canvas.index(id) catch _:
         return
     canvas.records[index].shaped = false
-    release_path(&canvas.records[index])
+    release_elements(&canvas.records[index])
 
-## Every shape layer's shape moved by (`dx`, `dy`), with its pixels.
+## Every vector layer's elements moved by (`dx`, `dy`), with its pixels.
 func shift_shapes(canvas: Canvas*, dx: f64, dy: f64):
     for index in 0..<canvas.count:
-        if canvas.records[index].shaped:
-            canvas.records[index].shape.matrix[4] += dx
-            canvas.records[index].shape.matrix[5] += dy
+        for at in 0..<canvas.records[index].elements.length:
+            canvas.records[index].elements[at].spec.matrix[4] += dx
+            canvas.records[index].elements[at].spec.matrix[5] += dy
 
 ## `spec` with the document map `forward` (an affine map, source to
 ## destination) applied after its own; false in `ok` when the map is not
@@ -137,9 +138,21 @@ func transformed_shape(spec: ShapeSpec, forward: Warp) -> ShapeSpec?:
 ## `spec` as a one-element SVG document whose viewBox is the `width` by `height`
 ## window of the canvas from (`left`, `top`), a pixel a unit.
 func shape_svg(out: strings.Builder*, spec: ShapeSpec, left: u32, top: u32, width: u32, height: u32) -> !:
+    try svg_open(out, left, top, width, height)
+    try shape_group(out, spec)
+    try out.put("</svg>")
+
+## An SVG document's opening tag over the canvas window from (`left`, `top`).
+func svg_open(out: strings.Builder*, left: u32, top: u32, width: u32, height: u32) -> !:
+    var line: u8[256]
+    try out.put(try format(line, f"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{left} {top} {width} {height}\">"))
+
+## `spec` as one SVG element in a group carrying its transform: several of them,
+## one after another, make a vector layer's drawing in paint order.
+func shape_group(out: strings.Builder*, spec: ShapeSpec) -> !:
     var line: u8[512]
     let m = spec.matrix
-    try out.put(try format(line, f"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{left} {top} {width} {height}\"><g transform=\"matrix({m[0]} {m[1]} {m[2]} {m[3]} {m[4]} {m[5]})\">"))
+    try out.put(try format(line, f"<g transform=\"matrix({m[0]} {m[1]} {m[2]} {m[3]} {m[4]} {m[5]})\">"))
     var fill_text: u8[16]
     var stroke_text: u8[16]
     let fill = try hex_color(fill_text, spec.fill_red, spec.fill_green, spec.fill_blue) if spec.filled and spec.kind != 2 else "none"
@@ -160,7 +173,7 @@ func shape_svg(out: strings.Builder*, spec: ShapeSpec, left: u32, top: u32, widt
         try out.put(try format(line, f"<line x1=\"{spec.x}\" y1=\"{spec.y}\" x2=\"{spec.x + spec.width}\" y2=\"{spec.y + spec.height}\" stroke-linecap=\"round\" {paints}/>"))
     elif spec.kind == 4:
         try out.put("<path d=\"")
-        try path_d(out, spec.path, spec.closed)
+        try path_d(out, spec)
         try out.put(try format(line, f"\" stroke-linecap=\"round\" {paints}/>"))
     else:
         try out.put("<polygon points=\"")
@@ -170,7 +183,7 @@ func shape_svg(out: strings.Builder*, spec: ShapeSpec, left: u32, top: u32, widt
             let py = spec.y + spec.height * 0.5 + math.sin(angle) * spec.height * 0.5
             try out.put(try format(line, f"{px},{py} "))
         try out.put(try format(line, f"\" {paints}/>"))
-    try out.put("</g></svg>")
+    try out.put("</g>")
 
 ## A linear color as `#rrggbb` in sRGB, the way SVG reads it.
 func hex_color(buffer: u8[], red: f64, green: f64, blue: f64) -> str!:

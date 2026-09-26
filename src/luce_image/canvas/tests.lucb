@@ -1026,6 +1026,17 @@ test "a transform session moves several layers live, distorts, floats a selectio
     try canvas.end_transform(true)
     assert(canvas.undo_name() == "Distort" and (try shown_at(&canvas, &target, 24, 14))[0] == 255 and (try shown_at(&canvas, &target, 24, 9))[0] == 0)
     try canvas.undo()
+    # Skew and Perspective are named as Edit › Transform names them.
+    try canvas.begin_transform(bottom)
+    try canvas.preview_distort(8.0, 8.0, 8.0, 8.0, 12.0, 8.0, 20.0, 8.0, 16.0, 16.0, 8.0, 16.0, "Skew")
+    try canvas.end_transform(true)
+    assert(canvas.undo_name() == "Skew")
+    try canvas.undo()
+    try canvas.begin_transform(bottom)
+    try canvas.preview_distort(8.0, 8.0, 8.0, 8.0, 6.0, 8.0, 18.0, 8.0, 16.0, 16.0, 8.0, 16.0, "Perspective")
+    try canvas.end_transform(true)
+    assert(canvas.undo_name() == "Perspective")
+    try canvas.undo()
     # A floating selection: the left half of the red square moves down, the rest stays.
     try canvas.select_rectangle(8, 8, 4, 8, 0)
     try canvas.begin_transform(bottom)

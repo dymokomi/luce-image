@@ -25,6 +25,11 @@ func turned(spec: ShapeSpec, degrees: f64) -> ShapeSpec:
     moved.matrix = [c, s, -s, c, cx - c * cx + s * cy, cy - s * cx - c * cy]
     return moved
 
+## `spec` alone as a layer's pixels, drawn as a vector layer of that one element is.
+func rendered_shape(canvas: Canvas*, spec: ShapeSpec) -> Tiles!:
+    var list: VectorElement[1] = [VectorElement(name = "", visible = true, spec = spec)]
+    return try vector_tiles(canvas, 0, list[..<1], none)
+
 ## Whether `canvas` draws `spec` window by window as the whole canvas would, to within
 ## a step of the half floats the tiles keep.
 func matches_whole(canvas: Canvas*, spec: ShapeSpec) -> !:

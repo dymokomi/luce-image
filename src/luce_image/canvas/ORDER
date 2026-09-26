@@ -22,6 +22,11 @@ shape_layers.lucb
 shape_cells.lucb
 shape_render.lucb
 path_layers.lucb
+vector_elements.lucb
+vector_render.lucb
+vector_geometry.lucb
+vector_files.lucb
+svg_vectors.lucb
 ranging.lucb
 selecting.lucb
 selection_preview.lucb
@@ -48,3 +53,4 @@ refine_tests.lucb
 channel_tests.lucb
 mesh_warp_tests.lucb
 selection_timing_tests.lucb
+vector_tests.lucb

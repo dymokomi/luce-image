@@ -1,0 +1,180 @@
+#==============================================================================================
+#
+#   canvas/vector_geometry - Where a vector element is: its outline, hits and selection
+#
+#   DESCRIPTION:
+#       An element's outline is what luce-svg flattens it to, parsed over the whole canvas so
+#       its points are document pixels, the element's transform applied. The view draws it
+#       (the active element's outline, and a transform box's outline preview), a press finds
+#       the topmost element under it, and Make Selection turns it into a selection. None of
+#       these touch a pixel: they cost the outline.
+#
+#==============================================================================================
+
+## `spec` parsed over the `width` by `height` canvas, its points in document pixels.
+func spec_drawing(spec: ShapeSpec, width: u32, height: u32) -> interop.Reference[svg.Drawing]!:
+    var text = try strings.Builder.create()
+    defer text.destroy()
+    try shape_svg(&text, spec, 0, 0, width, height)
+    return try svg.parse(text.view())
+
+## The spec of the element the record targets (`target_element`); none when it has none.
+func target_spec(record: Record) -> ShapeSpec?:
+    let at = target_element(&record) else return none
+    return record.elements[at].spec
+
+## Element `element` of `record`, checked.
+func element_of(record: Record, element: i64) -> VectorElement!:
+    if element < 0 or element >= (i64)record.elements.length:
+        error(invalid, "no such vector element")
+    return record.elements[(usize)element]
+
+## `Canvas.restyle_shape`: the target element's values from sides on (`style`, 11
+## of them in `shape_values` order) set, its geometry and path kept. One step.
+func restyle_target(canvas: Canvas*, id: u64, style: const f64[]) -> !:
+    try canvas.require_open()
+    try canvas.require_idle()
+    let index = try canvas.index(id)
+    let at = target_element(&canvas.records[index]) else error(invalid, "the layer is not a shape")
+    let old = canvas.records[index].elements[at].spec
+    var values = shape_values(old)
+    for field in 0..<(usize)11:
+        values[5 + field] = style[field]
+    var spec = try shape_from_values(values[..<22])
+    spec.closed = old.closed
+    spec.path = old.path
+    spec.subpaths = old.subpaths
+    # A path keeps its anchors: a copy the new spec owns.
+    try copy_spec_path(&spec)
+    try replace_element_spec(canvas, index, at, spec, "Shape")
+
+## `Canvas.element_at`: the topmost shown element of `record` inside whose fill,
+## or within `reach` of whose outline (and half its stroke), (`x`, `y`) is; -1 for none.
+func element_under(canvas: const Canvas*, record: Record, x: f64, y: f64, reach: f64) -> i64!:
+    var at = record.elements.length
+    while at > 0:
+        at -= 1
+        let spec = record.elements[at].spec
+        if not record.elements[at].visible or not drawable(spec):
+            continue
+        if try spec_hit(spec, canvas.extent_x, canvas.extent_y, x, y, reach):
+            return (i64)at
+    return -1
+
+## Whether (`x`, `y`) is on `spec`: inside its fill by the nonzero rule, or near its outline.
+func spec_hit(spec: ShapeSpec, width: u32, height: u32, x: f64, y: f64, reach: f64) -> bool!:
+    let parsed = try spec_drawing(spec, width, height)
+    defer parsed.release()
+    let drawing = parsed.value()
+    let stroked = spec.stroked or spec.kind == 2
+    let band = reach + (spec.stroke_width * 0.5 if stroked else 0.0)
+    var winding: i32 = 0
+    for contour in 0..<drawing.contour_count():
+        let start = drawing.contour_start(contour)
+        let size = drawing.contour_size(contour)
+        for index in 0..<size:
+            let a = drawing.point(start + index)
+            let b = drawing.point(start + (index + 1) % size)
+            if segment_distance(x, y, a.x, a.y, b.x, b.y) <= band:
+                return true
+            if drawing.contour_filled(contour):
+                if a.y <= y and y < b.y and cross(a.x, a.y, b.x, b.y, x, y) > 0.0:
+                    winding += 1
+                elif b.y <= y and y < a.y and cross(a.x, a.y, b.x, b.y, x, y) < 0.0:
+                    winding -= 1
+    return winding != 0
+
+## Which side of the line through a and b the point p lies (positive: left, y down).
+func cross(ax: f64, ay: f64, bx: f64, by: f64, px: f64, py: f64) -> f64:
+    return (bx - ax) * (py - ay) - (px - ax) * (by - ay)
+
+## How far (`px`, `py`) is from the segment a b.
+func segment_distance(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64) -> f64:
+    let dx = bx - ax
+    let dy = by - ay
+    let length = dx * dx + dy * dy
+    let t = math.clamp(((px - ax) * dx + (py - ay) * dy) / length, 0.0, 1.0) if length > 0.0 else 0.0
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+## `Canvas.element_outline`: element `element`'s outline into the canvas's outline
+## buffer, a closed run ending on its first point again; how many points.
+func stage_outline(canvas: Canvas*, index: usize, element: i64) -> i64!:
+    canvas.outline_count = 0
+    let spec = (try element_of(canvas.records[index], element)).spec
+    if not drawable(spec):
+        return 0
+    let parsed = try spec_drawing(spec, canvas.extent_x, canvas.extent_y)
+    defer parsed.release()
+    let drawing = parsed.value()
+    for contour in 0..<drawing.contour_count():
+        let start = drawing.contour_start(contour)
+        let size = drawing.contour_size(contour)
+        if size == 0:
+            continue
+        for at in 0..<size:
+            let point = drawing.point(start + at)
+            try put_outline(canvas, point.x, point.y, at == 0)
+        if drawing.contour_closed(contour) and size > 2:
+            let first = drawing.point(start)
+            try put_outline(canvas, first.x, first.y, false)
+    return (i64)canvas.outline_count
+
+func put_outline(canvas: Canvas*, x: f64, y: f64, starts: bool) -> !:
+    if (canvas.outline_count + 1) * 3 > canvas.outline.length:
+        let capacity = 384 if canvas.outline.length == 0 else canvas.outline.length * 2
+        let grown = try alloc f64[capacity] in memory.heap
+        if canvas.outline_count > 0:
+            memory.copy(grown, canvas.outline, canvas.outline_count * 3)
+        if canvas.outline.length > 0:
+            free(canvas.outline) in memory.heap
+        canvas.outline = grown
+    let at = canvas.outline_count * 3
+    canvas.outline[at] = x
+    canvas.outline[at + 1] = y
+    canvas.outline[at + 2] = 1.0 if starts else 0.0
+    canvas.outline_count += 1
+
+## `Canvas.select_element`: element `element`'s outline as a selection, combined
+## by `mode`, one step. Its runs are made alone first: one turning the same way as
+## the first adds to it, one turning the other way cuts a hole, as the nonzero
+## rule fills a letter.
+func select_element_outline(canvas: Canvas*, index: usize, element: i64, mode: i64) -> !:
+    try canvas.require_open()
+    let spec = (try element_of(canvas.records[index], element)).spec
+    if not drawable(spec):
+        error(invalid, "the element has no outline to select")
+    let parsed = try spec_drawing(spec, canvas.extent_x, canvas.extent_y)
+    defer parsed.release()
+    let drawing = parsed.value()
+    var shape = try Selection.create(canvas.extent_x, canvas.extent_y)
+    defer shape.destroy()
+    var first_turn = 0.0
+    var runs: usize = 0
+    var points = try alloc f64[256] in memory.heap
+    defer free(points) in memory.heap
+    for contour in 0..<drawing.contour_count():
+        let start = drawing.contour_start(contour)
+        let size = drawing.contour_size(contour)
+        if size < 3:
+            continue
+        if size * 2 > points.length:
+            free(points) in memory.heap
+            points = try alloc f64[size * 2] in memory.heap
+        var turn = 0.0
+        for at in 0..<size:
+            let a = drawing.point(start + at)
+            let b = drawing.point(start + (at + 1) % size)
+            points[at * 2] = a.x
+            points[at * 2 + 1] = a.y
+            turn += a.x * b.y - b.x * a.y
+        var how = Mode.replace
+        if runs == 0:
+            first_turn = turn
+        else:
+            how = Mode.add if (turn > 0.0) == (first_turn > 0.0) else Mode.subtract
+        try shape.polygon(points[..<size * 2], how)
+        runs += 1
+    if runs == 0:
+        error(invalid, "the element has no area to select")
+    try canvas.remember_state("Make Selection")
+    try canvas.merge_shape(&shape, mode)

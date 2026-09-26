@@ -1,37 +1,50 @@
 #==============================================================================================
 #
-#   canvas/path_layers - Shape layers drawn with the Pen: Bézier paths
+#   canvas/path_layers - Vector elements drawn with the Pen: Bézier paths
 #
 #   DESCRIPTION:
-#       A pen path is a shape layer of kind 4 (shape_layers.lucb): a run of anchors, each a
+#       A pen path is a vector element of kind 4 (shape_layers.lucb): a run of anchors, each a
 #       point with a handle coming in and a handle going out, joined by cubic curves and
 #       drawn through luce-svg as an SVG path, so it stays crisp moved, scaled or turned.
-#       The anchors are heap storage the layer's record owns: copied with the record (for
-#       the history and for pasting) and freed with it, as a text layer's words are.
+#       An outline brought in from an SVG may hold several runs (a letter with a hole):
+#       `subpaths` then says how many anchors each has, filled together by the nonzero rule.
+#       The anchors are heap storage the element owns: copied with it (for the history and
+#       for pasting) and freed with it.
 #
 #==============================================================================================
 
 ## Values an anchor takes in a path: x, y, the in-handle's x and y, the out-handle's.
 let anchor_values: usize = 6
 
-## A record's path copied, for a copy of the record that owns its own.
-func copy_path(record: Record*) -> !:
-    let path = record.shape.path
-    if path.length == 0:
-        return
-    let copy = try alloc f64[path.length] in memory.heap
-    memory.copy(copy, path, path.length)
-    record.shape.path = copy
+## A spec's path copied, for a copy of the spec that owns its own.
+func copy_spec_path(spec: ShapeSpec*) -> !:
+    let path = spec.path
+    let subpaths = spec.subpaths
+    var no_path: f64[]
+    var no_subpaths: u32[]
+    spec.path = no_path
+    spec.subpaths = no_subpaths
+    if path.length > 0:
+        let copy = try alloc f64[path.length] in memory.heap
+        memory.copy(copy, path, path.length)
+        spec.path = copy
+    if subpaths.length > 0:
+        let runs = alloc u32[subpaths.length] in memory.heap catch failure:
+            release_spec_path(spec)
+            error(failure.code, failure.message)
+        memory.copy(runs, subpaths, subpaths.length)
+        spec.subpaths = runs
 
-## Free a record's path; the record keeps no anchors.
-func release_path(record: Record*):
-    release_spec_path(&record.shape)
-
+## Free a spec's path; it keeps no anchors.
 func release_spec_path(spec: ShapeSpec*):
     if spec.path.length > 0:
         free(spec.path) in memory.heap
+    if spec.subpaths.length > 0:
+        free(spec.subpaths) in memory.heap
     var none_left: f64[]
     spec.path = none_left
+    var no_runs: u32[]
+    spec.subpaths = no_runs
 
 ## `values` (anchors as `anchor_values` each) as a new heap path.
 func owned_path(values: const f64[]) -> f64[]!:
@@ -44,19 +57,48 @@ func owned_path(values: const f64[]) -> f64[]!:
     memory.copy(path, values, values.length)
     return path
 
-## The SVG path data of `path`: a move to the first anchor, then a cubic
-## curve to each next one from the handle going out to the handle coming in,
-## and when `closed` one back to the first, then Z.
-func path_d(out: strings.Builder*, path: const f64[], closed: bool) -> !:
-    let count = path.length // anchor_values
+## `sizes` (anchors a run) as new heap subpaths for a path of `anchors`: every
+## run holds one anchor at least, and together they hold them all.
+func owned_subpaths(sizes: const u32[], anchors: usize) -> u32[]!:
+    var total: usize = 0
+    for size in sizes:
+        if size == 0:
+            error(invalid, "a subpath holds one anchor at least")
+        total += (usize)size
+    if total != anchors:
+        error(invalid, "the subpaths must hold every anchor of the path")
+    let runs = try alloc u32[sizes.length] in memory.heap
+    memory.copy(runs, sizes, sizes.length)
+    return runs
+
+## Whether a spec draws anything: a path needs anchors, a box needs no more.
+func drawable(spec: ShapeSpec) -> bool:
+    return spec.kind != 4 or spec.path.length >= anchor_values
+
+## The SVG path data of `spec`'s anchors: each run a move to its first anchor,
+## then a cubic curve to each next one from the handle going out to the handle
+## coming in, and when `closed` one back to its first, then Z.
+func path_d(out: strings.Builder*, spec: ShapeSpec) -> !:
+    let count = spec.path.length // anchor_values
     if count == 0:
         return
+    if spec.subpaths.length == 0:
+        try run_d(out, spec.path, 0, count, spec.closed)
+        return
+    var first: usize = 0
+    for size in spec.subpaths:
+        try run_d(out, spec.path, first, first + (usize)size, spec.closed)
+        first += (usize)size
+
+## One run of anchors, `first..<end`, as path data.
+func run_d(out: strings.Builder*, path: const f64[], first: usize, end: usize, closed: bool) -> !:
     var text: u8[256]
-    try out.put(try format(text, f"M{path[0]} {path[1]}"))
-    for at in 1..<count:
+    let a = first * anchor_values
+    try out.put(try format(text, f"M{path[a]} {path[a + 1]}"))
+    for at in first + 1..<end:
         try curve_to(out, path, at - 1, at)
-    if closed and count > 1:
-        try curve_to(out, path, count - 1, 0)
+    if closed and end - first > 1:
+        try curve_to(out, path, end - 1, first)
         try out.put("Z")
 
 ## ` C` from anchor `start`'s out-handle and anchor `end`'s in-handle to anchor `end`.

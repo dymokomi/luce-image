@@ -53,6 +53,21 @@ struct TransformSession:
 ## The most layers one transform takes.
 let transform_limit: usize = 64
 
+## The step a transform is kept as, one of Edit › Transform's names: the history
+## holds the name past the call, so it is always one of these, never the caller's text.
+func transform_step_name(name: str) -> str:
+    if name == "Skew":
+        return "Skew"
+    if name == "Perspective":
+        return "Perspective"
+    if name == "Distort":
+        return "Distort"
+    if name == "Scale":
+        return "Scale"
+    if name == "Rotate":
+        return "Rotate"
+    return "Free Transform"
+
 ## `Canvas.begin_transform`: a session on layer `id`; with `float_selection`
 ## and a selection (not while editing a mask), only its selected pixels move.
 func begin_transform_session(canvas: Canvas*, id: u64, float_selection: bool) -> !:
@@ -215,8 +230,8 @@ func end_session(canvas: Canvas*, keep: bool) -> !:
     try canvas.begin_edit(session.name)
     defer canvas.end_edit()
     try warp_session(canvas, document, transformer, session)
-    # Transformed text is pixels; a shape follows an affine map and is drawn
-    # again, crisp, or else is pixels too.
+    # Transformed text is pixels; vector elements follow an affine map and are
+    # drawn again, crisp, or else are pixels too.
     for at in 0..<session.count:
         let id = session.entries[at].id
         rasterize_type(canvas, id)
@@ -226,12 +241,7 @@ func end_session(canvas: Canvas*, keep: bool) -> !:
             continue
         let forward = session.warp.forward((f64)canvas.extent_x * 0.5, (f64)canvas.extent_y * 0.5) catch _:
             recover session.warp
-        if session.floating:
-            rasterize_shape(canvas, id)
-        elif let moved = transformed_shape(canvas.records[index].shape, forward):
-            canvas.records[index].shape = moved
-            try redraw_shape(canvas, index)
-        else:
+        if session.floating or not (try transform_all_elements(canvas, index, forward)):
             rasterize_shape(canvas, id)
     if session.floating:
         try canvas.live().warp(session.warp)
