@@ -61,7 +61,8 @@ from luce_image.selection_passes import SelectionPasses
 import psd
 import fonts
 from luce_image.geometry import resize_canvas, resize_image
-from luce_image.selection import Selection, Mode
+from luce_image.selection import Selection
+from luce_image.selection_cells import Mode
 from luce_image.shaders import ants_frag_words, ants_frag_msl
 from half import from_half, to_half
 from binary import Buffer

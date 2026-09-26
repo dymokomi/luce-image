@@ -709,6 +709,8 @@ pub struct Document:
         let selection = self.selection
         self.selection = state.selection
         state.selection = selection
+        # History keeps the cells alone, not their GPU tiles.
+        state.selection.drop_gpu_tiles()
         self.revision += 1
         # The layers coming back carry the revisions they had when taken, and
         # counting on from there would reach numbers the compositor's cache
