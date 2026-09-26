@@ -1,0 +1,210 @@
+#==============================================================================================
+#
+#   canvas/preview_tests - Previews drawn at the view's level, against what keeping makes
+#
+#==============================================================================================
+
+## The canvas drawn at `zoom` from (`offset_x`, `offset_y`) over black into
+## `target`, read back into `pixels` (RGBA bytes, the target's size).
+func drawn(canvas: Canvas*, target: gpu.Texture*, zoom: f64, offset_x: f64, offset_y: f64, pixels: u8[]) -> !:
+    let frame = try target.frame()
+    defer frame.release()
+    let root = try frame.value().target()
+    defer root.release()
+    let width = (f64)(try target.width())
+    let height = (f64)(try target.height())
+    try canvas.draw(root, gpu.Rect(width = width, height = height), zoom, offset_x, offset_y)
+    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    try target.read(pixels)
+
+## How far apart two drawings are: the share of pixels differing by more than
+## `slack` in some channel, in percent, and the mean difference.
+struct Apart:
+    var percent: f64
+    var mean: f64
+
+func apart(first: const u8[], second: const u8[], slack: i64) -> Apart:
+    var off: usize = 0
+    var total: f64 = 0.0
+    for at in 0..<first.length // 4:
+        var worst: i64 = 0
+        for channel in 0..<(usize)3:
+            let difference = math.iabs((i64)first[at * 4 + channel] - (i64)second[at * 4 + channel])
+            total += (f64)difference
+            worst = difference if difference > worst else worst
+        if worst > slack:
+            off += 1
+    let count = (f64)(first.length // 4)
+    return Apart(percent = (f64)off * 100.0 / count, mean = total / (count * 3.0))
+
+## Three rectangles of color on layer `layer` of a 2048 by 1536 canvas.
+func paint_rectangles(canvas: Canvas*, layer: i64) -> !:
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.1, 0.1, false)
+    try canvas.select_rectangle(200, 150, 700, 500, 0)
+    try canvas.fill(layer, false)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.1, 0.9, 0.2, false)
+    try canvas.select_rectangle(900, 300, 600, 900, 0)
+    try canvas.fill(layer, false)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.2, 0.3, 1.0, false)
+    try canvas.select_rectangle(300, 1000, 1400, 300, 0)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+
+test "a transform preview drawn at a coarse level looks like the kept transform, and keeping matches a transform made at once":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(2048, 1536)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    # An eighth: level 3, 256 by 192 texels.
+    var target = try gpu.Texture.create(device, 256, 192, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    let size = (usize)256 * 192 * 4
+    let before = try alloc u8[size] in memory.heap
+    defer free(before) in memory.heap
+    let previewed = try alloc u8[size] in memory.heap
+    defer free(previewed) in memory.heap
+    let kept = try alloc u8[size] in memory.heap
+    defer free(kept) in memory.heap
+    try drawn(&canvas, &target, 0.125, 0.0, 0.0, before)
+    try paint_rectangles(&canvas, layer)
+    try drawn(&canvas, &target, 0.125, 0.0, 0.0, before)
+    try canvas.begin_transform(layer)
+    try canvas.preview_transform(0.6, 0.8, 25.0, 120.0, -60.0, 1024.0, 768.0)
+    try drawn(&canvas, &target, 0.125, 0.0, 0.0, previewed)
+    # The preview shows the transform: the drawing moved.
+    assert(apart(before, previewed, 40).percent > 10.0)
+    # Full size at 100%, where the preview is made at level 0.
+    var close_target = try gpu.Texture.create(device, 128, 128, gpu.Format.rgba8_linear)
+    defer close_target.destroy()
+    let close_size = (usize)128 * 128 * 4
+    let close_previewed = try alloc u8[close_size] in memory.heap
+    defer free(close_previewed) in memory.heap
+    let close_kept = try alloc u8[close_size] in memory.heap
+    defer free(close_kept) in memory.heap
+    try drawn(&canvas, &close_target, 1.0, -900.0, -600.0, close_previewed)
+    # The layer itself is as it was until the transform is kept.
+    let untouched = try layer_texel(&canvas, layer, 250, 200)
+    assert(untouched[0] > 0.99 and untouched[3] > 0.99)
+    try canvas.end_transform(true)
+    try drawn(&canvas, &target, 0.125, 0.0, 0.0, kept)
+    let coarse = apart(previewed, kept, 40)
+    assert(coarse.percent < 3.0 and coarse.mean < 4.0)
+    try drawn(&canvas, &close_target, 1.0, -900.0, -600.0, close_kept)
+    let close = apart(close_previewed, close_kept, 2)
+    assert(close.percent < 0.5)
+    # Keeping made what a transform made at once makes.
+    var other = try Canvas(2048, 1536)
+    defer other.close()
+    let other_layer = try other.add_layer("Paint")
+    try drawn(&other, &target, 0.125, 0.0, 0.0, before)
+    try paint_rectangles(&other, other_layer)
+    try other.transform_layer(other_layer, 0.6, 0.8, 25.0, 120.0, -60.0, 1024.0, 768.0)
+    var y: u32 = 5
+    while y < 1536:
+        var x: u32 = 7
+        while x < 2048:
+            let here = try layer_texel(&canvas, layer, x, y)
+            let there = try layer_texel(&other, other_layer, x, y)
+            for channel in 0..<(usize)4:
+                assert(here[channel] == there[channel])
+            x += 61
+        y += 53
+
+test "a floating selection's transform preview at a coarse level looks like the kept one":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(2048, 1536)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 256, 192, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    let size = (usize)256 * 192 * 4
+    let previewed = try alloc u8[size] in memory.heap
+    defer free(previewed) in memory.heap
+    let kept = try alloc u8[size] in memory.heap
+    defer free(kept) in memory.heap
+    try drawn(&canvas, &target, 0.125, 0.0, 0.0, kept)
+    try paint_rectangles(&canvas, layer)
+    try canvas.select_rectangle(800, 200, 800, 700, 0)
+    try canvas.begin_transform(layer)
+    try canvas.preview_transform(0.7, 0.7, -15.0, -300.0, 250.0, 1200.0, 550.0)
+    try drawn(&canvas, &target, 0.125, 0.0, 0.0, previewed)
+    # At 100%, across where the pixels leave and where they land.
+    var close_target = try gpu.Texture.create(device, 256, 256, gpu.Format.rgba8_linear)
+    defer close_target.destroy()
+    let close_size = (usize)256 * 256 * 4
+    let close_previewed = try alloc u8[close_size] in memory.heap
+    defer free(close_previewed) in memory.heap
+    let close_kept = try alloc u8[close_size] in memory.heap
+    defer free(close_kept) in memory.heap
+    try drawn(&canvas, &close_target, 1.0, -700.0, -550.0, close_previewed)
+    try canvas.end_transform(true)
+    try drawn(&canvas, &target, 0.125, 0.0, 0.0, kept)
+    let coarse = apart(previewed, kept, 40)
+    assert(coarse.percent < 3.0 and coarse.mean < 4.0)
+    try drawn(&canvas, &close_target, 1.0, -700.0, -550.0, close_kept)
+    assert(apart(close_previewed, close_kept, 2).percent < 0.5)
+
+test "filter previews drawn at a coarse level look like the kept filter, inside the selection only":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(2048, 1536)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 256, 192, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    let size = (usize)256 * 192 * 4
+    let before = try alloc u8[size] in memory.heap
+    defer free(before) in memory.heap
+    let previewed = try alloc u8[size] in memory.heap
+    defer free(previewed) in memory.heap
+    let kept = try alloc u8[size] in memory.heap
+    defer free(kept) in memory.heap
+    try drawn(&canvas, &target, 0.125, 0.0, 0.0, before)
+    try paint_rectangles(&canvas, layer)
+    try drawn(&canvas, &target, 0.125, 0.0, 0.0, before)
+    # Motion blur, Gaussian blur and lens correction, each previewed then kept and undone.
+    for kind in 0..<(i64)3:
+        try canvas.begin_preview(layer)
+        if kind == 0:
+            try canvas.preview_filter(0, 30.0, 400.0, 0.0)
+        elif kind == 1:
+            try canvas.preview_blur(120.0)
+        else:
+            try canvas.preview_filter(1, 0.8, 0.5, -0.5)
+        try drawn(&canvas, &target, 0.125, 0.0, 0.0, previewed)
+        assert(apart(before, previewed, 40).percent > 1.0)
+        try canvas.end_preview(true)
+        try drawn(&canvas, &target, 0.125, 0.0, 0.0, kept)
+        let coarse = apart(previewed, kept, 40)
+        assert(coarse.percent < 3.0 and coarse.mean < 4.0)
+        try canvas.undo()
+    # Within a selection: outside it the preview and the kept blur leave the picture alone.
+    try canvas.select_rectangle(0, 0, 1024, 1536, 0)
+    try canvas.begin_preview(layer)
+    try canvas.preview_filter(0, 0.0, 300.0, 0.0)
+    try drawn(&canvas, &target, 0.125, 0.0, 0.0, previewed)
+    try canvas.end_preview(true)
+    try drawn(&canvas, &target, 0.125, 0.0, 0.0, kept)
+    let coarse = apart(previewed, kept, 40)
+    assert(coarse.percent < 3.0 and coarse.mean < 4.0)
+    # The right half (from texel 136 on, clear of the edge's blend) is as it was.
+    for y in 0..<(usize)192:
+        for x in 136..<(usize)256:
+            for channel in 0..<(usize)3:
+                let at = (y * 256 + x) * 4 + channel
+                assert(math.iabs((i64)previewed[at] - (i64)before[at]) <= 1 and math.iabs((i64)kept[at] - (i64)before[at]) <= 1)
+    # Dropped, the layer shows as it was.
+    try canvas.undo()
+    try canvas.begin_preview(layer)
+    try canvas.preview_blur(80.0)
+    try canvas.end_preview(false)
+    try drawn(&canvas, &target, 0.125, 0.0, 0.0, previewed)
+    assert(apart(before, previewed, 1).percent == 0.0)

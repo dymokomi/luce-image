@@ -25,7 +25,7 @@ let window_side: f64 = 1024.0
 
 ## Pixels of margin around what a tile reads: bicubic sampling reaches two
 ## texels out, and a texel either way for rounding.
-let reach: f64 = 3.0
+pub let reach: f64 = 3.0
 
 ## A box of document pixels, fractional (see transform.lucb's Landed).
 pub struct Footprint:
@@ -50,19 +50,22 @@ pub struct Window:
 ## pixels); none when it reads nothing there. Behind a distortion's horizon the
 ## corners do not map, and the whole `limit` is taken.
 pub func footprint(warp: Warp, column: i64, row: i64, limit: Footprint) -> Footprint?:
-    let x0 = (f64)(column * (i64)tile_size)
-    let y0 = (f64)(row * (i64)tile_size)
+    return footprint_at(warp, (f64)(column * (i64)tile_size), (f64)(row * (i64)tile_size), (f64)tile_size, reach, limit)
+
+## As `footprint`, for the square of document pixels `side` wide at (`x0`, `y0`)
+## (a cell of a coarser level), `margin` pixels around what it reads.
+pub func footprint_at(warp: Warp, x0: f64, y0: f64, side: f64, margin: f64, limit: Footprint) -> Footprint?:
     var box = Footprint(left = 1.0e18, top = 1.0e18, right = -1.0e18, bottom = -1.0e18)
     for corner in 0..<(usize)4:
         var x = 0.0
         var y = 0.0
-        if not warp.map(x0 + (0.0 if corner % 2 == 0 else (f64)tile_size), y0 + (0.0 if corner < 2 else (f64)tile_size), &x, &y):
+        if not warp.map(x0 + (0.0 if corner % 2 == 0 else side), y0 + (0.0 if corner < 2 else side), &x, &y):
             box = limit
             break
-        box.left = math.min(box.left, x - reach)
-        box.top = math.min(box.top, y - reach)
-        box.right = math.max(box.right, x + reach)
-        box.bottom = math.max(box.bottom, y + reach)
+        box.left = math.min(box.left, x - margin)
+        box.top = math.min(box.top, y - margin)
+        box.right = math.max(box.right, x + margin)
+        box.bottom = math.max(box.bottom, y + margin)
     box.left = math.max(box.left, limit.left)
     box.top = math.max(box.top, limit.top)
     box.right = math.min(box.right, limit.right)

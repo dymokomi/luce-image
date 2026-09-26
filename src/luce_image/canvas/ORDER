@@ -7,6 +7,7 @@ layer_clip.lucb
 retouch.lucb
 retouch_effects.lucb
 transforming.lucb
+filter_previews.lucb
 type_layers.lucb
 shape_layers.lucb
 ranging.lucb
@@ -15,3 +16,4 @@ raw_tiles.lucb
 history.lucb
 support.lucb
 tests.lucb
+preview_tests.lucb

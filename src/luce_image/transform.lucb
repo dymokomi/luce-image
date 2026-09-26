@@ -12,7 +12,7 @@ from luce_image.transform_window import Footprint, Window, footprint, level_for,
 from pyramid import Pyramid, tile_bytes
 from luce_image.projective import Warp, affine_warp, multiply
 from luce_image.document import Document
-from luce_image.shaders import warp_frag_words, warp_frag_msl
+from luce_image.shaders import warp_frag_words, warp_frag_msl, float_frag_words, float_frag_msl
 from raster_errors import invalid
 
 ## Move `layer`'s pixels (or its mask) by (`dx`, `dy`); returns the tiles from before.
@@ -41,18 +41,32 @@ pub let sampling_high: i64 = 2
 
 ## Free transform and distort: a layer's pixels resampled through a `Warp`
 ## on the GPU with `warp.frag` — the whole layer, past the canvas too, or only
-## the selected pixels (a floating selection). Built once per device.
+## the selected pixels (a floating selection). Built once per device; a
+## floating selection's preview draws with `float.frag` (transform_preview.lucb).
 pub struct Transformer:
     var owner: gpu.Device
     var shader: gpu.Shader
     var pipeline: gpu.Pipeline
+    var float_shader: gpu.Shader
+    var floating: gpu.Pipeline
+    ## A clear tile, for a preview's cell with nothing to read.
+    var clear: gpu.Texture
 
     pub static func create(device: gpu.Device) -> Transformer!:
         var shader = try gpu.Shader.create(device, warp_frag_words, warp_frag_msl)
         errdefer shader.destroy()
         var pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.replace, gpu.Format.rgba16_float)
         errdefer pipeline.destroy()
-        return Transformer(owner = device, shader = shader, pipeline = pipeline)
+        var float_shader = try gpu.Shader.create(device, float_frag_words, float_frag_msl)
+        errdefer float_shader.destroy()
+        var floating = try gpu.Pipeline.create(device, float_shader, gpu.Blend.replace, gpu.Format.rgba16_float)
+        errdefer floating.destroy()
+        var clear = try gpu.Texture.create(device, tile_size, tile_size, gpu.Format.rgba16_float)
+        errdefer clear.destroy()
+        let frame = try clear.frame()
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        frame.release()
+        return Transformer(owner = device, shader = shader, pipeline = pipeline, float_shader = float_shader, floating = floating, clear = clear)
 
     ## Replace `layer`'s pixels (or, `on_mask`, its mask) with them taken
     ## through `warp`. What leaves the document is kept past it; a mask
@@ -178,7 +192,52 @@ pub struct Transformer:
         discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         return texture
 
+    ## The device the transformer draws on.
+    pub func device() -> gpu.Device:
+        return self.owner
+
+    ## As `shade_cell`, into a tile texture of its own rather than one of a
+    ## layer's (a preview's cell, handed to the compositor).
+    pub func shade_tile(params: f32[16]*, origin_x: f64, origin_y: f64, source: gpu.Texture, selection: gpu.Texture) -> gpu.Texture!:
+        (*params)[6] = (f32)origin_x
+        (*params)[7] = (f32)origin_y
+        var texture = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        errdefer texture.destroy()
+        let frame = try texture.frame()
+        defer frame.release()
+        let area = try frame.value().target()
+        defer area.release()
+        try gpu.shade(area.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&(*params)[0], 64), [source, selection], gpu.Filter.nearest)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        return texture
+
+    ## `float.frag` with `params` (the map at 0..5 and 11..13, as `shader_params`
+    ## lays it out) into a tile of its own: the lifted pixels of `source` and
+    ## `selection` (`size` texels) landed over `base` less `base_selection`.
+    pub func shade_floating(params: f32[16]*, origin_x: f64, origin_y: f64, source: gpu.Texture, selection: gpu.Texture,
+                            base: gpu.Texture?, base_selection: gpu.Texture?) -> gpu.Texture!:
+        let p = *params
+        # float.frag's push constants: the map, the origin, the size, the perspective row, the sampling.
+        var packed: f32[14] = [p[0], p[1], p[2], p[3], p[4], p[5], (f32)origin_x, (f32)origin_y, p[8], p[9], p[11], p[12], p[13], p[15]]
+        var texture = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        errdefer texture.destroy()
+        let frame = try texture.frame()
+        defer frame.release()
+        let area = try frame.value().target()
+        defer area.release()
+        try gpu.shade(area.value(), self.floating, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&packed[0], 56),
+                      [source, selection, base else self.clear, base_selection else self.clear], gpu.Filter.nearest)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        return texture
+
+    ## The clear tile.
+    pub func clear_tile() -> gpu.Texture:
+        return self.clear
+
     pub mutating func destroy():
+        self.clear.destroy()
+        self.floating.destroy()
+        self.float_shader.destroy()
         self.pipeline.destroy()
         self.shader.destroy()
 
@@ -208,7 +267,7 @@ pub func landing(warp: Warp, left: f64, top: f64, right: f64, bottom: f64) -> La
 ## `warp.frag`'s push constants: the map, the tile origin (set per cell), the
 ## source's size, the outside value, whether it lifts a selection, and the
 ## sampling.
-func shader_params(warp: Warp, width: f64, height: f64, outside: f64, lifting: bool, sampling: i64) -> f32[16]:
+pub func shader_params(warp: Warp, width: f64, height: f64, outside: f64, lifting: bool, sampling: i64) -> f32[16]:
     let m = warp.m
     return [(f32)m[0], (f32)m[1], (f32)m[2], (f32)m[3], (f32)m[4], (f32)m[5], 0.0, 0.0, (f32)width, (f32)height, (f32)outside,
             (f32)m[6], (f32)m[7], (f32)m[8], 1.0 if lifting else 0.0, (f32)sampling]

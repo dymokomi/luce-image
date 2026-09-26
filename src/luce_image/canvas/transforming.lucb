@@ -10,6 +10,11 @@
 #       follows them when kept. The map is a free transform (scale, turn, move about a
 #       pivot) or a distortion (the box's corners moved freely, in perspective).
 #
+#       While the box moves nothing is made at full size: each new map is a new generation
+#       of a stand-in the compositor draws the session's layers through, a cell at a time at
+#       the level the view shows (transform_preview.lucb). The layers keep their pixels as the
+#       session began; applying makes the transform once, at full size.
+#
 #==============================================================================================
 
 ## One layer in the session: its pixels and mask as the session began.
@@ -18,6 +23,12 @@ struct Transformed:
     var pixels: Tiles
     var mask: Tiles
     var masked: bool
+    ## Where the pixels (and the mask) have anything, past the canvas too; none when nothing.
+    var pixels_limit: Footprint?
+    var mask_limit: Footprint?
+    ## Their pieces, for previews at full size; made when first needed.
+    var pixels_parts: Pieces?
+    var mask_parts: Pieces?
 
 struct TransformSession:
     var entries: Transformed[]
@@ -32,6 +43,12 @@ struct TransformSession:
     var box: Landed?
     ## Nearest, smooth or high quality (transform.lucb's `sampling_*`).
     var sampling: i64
+    ## What the previews read and draw with, and which map they show.
+    var document: Document*
+    var transformer: Transformer
+    var generation: u64
+    ## The selection's pieces, for a floating selection's previews at full size.
+    var selection_parts: Pieces?
 
 ## The most layers one transform takes.
 let transform_limit: usize = 64
@@ -43,11 +60,13 @@ func begin_transform_session(canvas: Canvas*, id: u64, float_selection: bool) ->
     try canvas.require_idle()
     let document = canvas.document else error(invalid, "draw the document once before transforming")
     let floating = float_selection and canvas.has_selection() and not canvas.mask_editing
+    let transformer = canvas.transformer else error(invalid, "draw the document once before transforming")
     let entries = try alloc Transformed[transform_limit] in memory.heap
     errdefer free(entries) in memory.heap
     let session = try new TransformSession(entries = entries, count = 0, floating = floating,
                                            warp = Warp(m = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]), shown = false, name = "Free Transform", box = none,
-                                           sampling = sampling_smooth) in memory.heap
+                                           sampling = sampling_smooth, document = document, transformer = transformer, generation = 0,
+                                           selection_parts = none) in memory.heap
     canvas.transform_session = session
     add_to_session(canvas, document, session, id) catch failure:
         canvas.transform_session = none
@@ -66,7 +85,8 @@ func add_to_session(canvas: Canvas*, document: Document*, session: TransformSess
         error(limit, "a transform takes at most 64 layers")
     let layer = document.find(id) else error(invalid, "no such layer")
     let tiles = layer.tiles() else error(invalid, "a group has no pixels to transform")
-    var entry = Transformed(id = id, pixels = try tiles.clone(), mask = Tiles(), masked = false)
+    var entry = Transformed(id = id, pixels = try tiles.clone(), mask = Tiles(), masked = false, pixels_limit = occupied_limit(tiles), mask_limit = none,
+                            pixels_parts = none, mask_parts = none)
     errdefer entry.pixels.destroy()
     # A linked mask goes with the pixels; while editing a mask, the mask alone
     # moves; an unlinked mask stays unless it is the one being edited.
@@ -74,20 +94,84 @@ func add_to_session(canvas: Canvas*, document: Document*, session: TransformSess
         if let mask = layer.mask_tiles():
             entry.mask = try mask.clone()
             entry.masked = true
+            entry.mask_limit = occupied_limit(mask)
     session.entries[session.count] = entry
     session.count += 1
 
-## Show the session's layers through `warp`, from their pixels as it began.
+## Show the session's layers through `warp`, from their pixels as it began:
+## only a new generation of their stand-ins, made when a view draws them.
 func show_session(canvas: Canvas*, warp: Warp, name: str, box: Landed? = none) -> !:
     let session = canvas.transform_session else error(invalid, "no transform is in progress")
-    let document = canvas.document else trap("transform without a document")
-    let transformer = canvas.transformer else trap("transform without a transformer")
-    try restore_session(document, session)
+    let composer = canvas.composer else trap("transform without a compositor")
+    # A map that cannot be drawn fails here, as applying it would.
+    if session.count > 0:
+        discard(try preview_box(session, &session.entries[0], false, warp, box))
     session.warp = warp
     session.shown = true
     session.name = name
     session.box = box
-    try warp_session(canvas, document, transformer, session)
+    session.generation = next_generation()
+    for at in 0..<session.count:
+        let entry = session.entries[at]
+        let on_mask = canvas.mask_editing and entry.masked
+        if session.floating or not on_mask:
+            try composer.stand_in(StandIn(layer = entry.id, mask = false, generation = session.generation, context = (void*)session, make = session_cell))
+        if entry.masked and not session.floating:
+            try composer.stand_in(StandIn(layer = entry.id, mask = true, generation = session.generation, context = (void*)session, make = session_cell))
+
+## A stand-in's cell (`column`, `row`) of `level` for layer `layer` (its mask
+## when `mask`) of the session `context`, through the session's map.
+func session_cell(context: void*?, layer_levels: Pyramid*, layer: u64, mask: bool, column: u32, row: u32, level: u32) -> Made!:
+    let session = (TransformSession*)(context else return made_original())
+    var found: Transformed*? = none
+    for at in 0..<session.count:
+        if session.entries[at].id == layer:
+            found = &session.entries[at]
+    let entry = found else return made_original()
+    let transformer = &session.transformer
+    if session.floating:
+        let selection = try session.document.selection_tiles() else return made_original()
+        let outline = session.document.selection
+        let lifted = Footprint(left = (f64)outline.left, top = (f64)outline.top, right = (f64)outline.right, bottom = (f64)outline.bottom)
+        if lifted.right <= lifted.left or lifted.bottom <= lifted.top:
+            return made_original()
+        if entry.pixels_parts == none:
+            entry.pixels_parts = try pieces(&entry.pixels)
+        if session.selection_parts == none:
+            session.selection_parts = try pieces(selection)
+        let parts = entry.pixels_parts else trap("made")
+        let selection_parts = session.selection_parts else trap("made")
+        var original = false
+        let texture = try lifted_preview_cell(transformer, &entry.pixels, &parts, selection, &selection_parts, layer_levels, session.warp, lifted,
+                                              column, row, level, session.sampling, &original)
+        if original:
+            return made_original()
+        return made_texture(texture else return made_nothing())
+    let box = try preview_box(session, entry, mask, session.warp, session.box) else return made_nothing()
+    let reach = (entry.mask_limit if mask else entry.pixels_limit) else return made_nothing()
+    let tiles = &entry.mask if mask else &entry.pixels
+    if mask and entry.mask_parts == none:
+        entry.mask_parts = try pieces(&entry.mask)
+    if not mask and entry.pixels_parts == none:
+        entry.pixels_parts = try pieces(&entry.pixels)
+    let parts = (entry.mask_parts if mask else entry.pixels_parts) else trap("made")
+    let texture = try warp_preview_cell(transformer, tiles, &parts, layer_levels, session.warp, box, reach, column, row, level, mask, session.sampling)
+    return made_texture(texture else return made_nothing())
+
+## The box a preview's pixels come from: a distortion's, or where the layer
+## (its mask) has anything; none when it has nothing. Fails as `landing`
+## does when `warp` pulls it past its horizon.
+func preview_box(session: TransformSession*, entry: const Transformed*, mask: bool, warp: Warp, box: Landed?) -> Landed?!:
+    let painted = (entry.mask_limit if mask else entry.pixels_limit) else return none
+    let found = box else Landed(left = painted.left, top = painted.top, right = painted.right, bottom = painted.bottom)
+    discard(try landing(warp, found.left, found.top, found.right, found.bottom))
+    return found
+
+## Where `tiles` has anything, by whole cells, past the canvas too.
+func occupied_limit(tiles: const Tiles*) -> Footprint?:
+    let occupied = tiles.occupied() else return none
+    return Footprint(left = (f64)(occupied.left * (i64)tile_size), top = (f64)(occupied.top * (i64)tile_size),
+                     right = (f64)(occupied.right * (i64)tile_size), bottom = (f64)(occupied.bottom * (i64)tile_size))
 
 ## Every layer of the session (and its mask) through its warp; the floating
 ## pixels over what the selection leaves.
@@ -119,6 +203,8 @@ func restore_session(document: Document*, session: TransformSession*) -> !:
 func end_session(canvas: Canvas*, keep: bool) -> !:
     let session = canvas.transform_session else error(invalid, "no transform is in progress")
     canvas.transform_session = none
+    if let composer = canvas.composer:
+        composer.drop_stand_ins()
     defer drop_session(session)
     let document = canvas.document else trap("transform without a document")
     let transformer = canvas.transformer else trap("transform without a transformer")
@@ -152,9 +238,18 @@ func end_session(canvas: Canvas*, keep: bool) -> !:
 
 func drop_session(session: TransformSession*):
     for at in 0..<session.count:
+        if let parts = session.entries[at].pixels_parts:
+            var owned = parts
+            owned.destroy()
+        if let parts = session.entries[at].mask_parts:
+            var owned = parts
+            owned.destroy()
         session.entries[at].pixels.destroy()
         if session.entries[at].masked:
             session.entries[at].mask.destroy()
+    if let parts = session.selection_parts:
+        var owned = parts
+        owned.destroy()
     free(session.entries) in memory.heap
     free(session) in memory.heap
 

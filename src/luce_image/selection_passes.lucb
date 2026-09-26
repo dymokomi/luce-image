@@ -116,6 +116,21 @@ pub struct SelectionPasses:
                 try tiles.set(column, row, fresh)
         target.revision += 1
 
+    ## `edited` kept only where `coverage` (a selection's tile, in red) covers
+    ## it, over `original`: one tile of `restrict`, at any level, into a tile
+    ## of its own (a preview's cell).
+    pub func mix_tile(original: gpu.Texture, edited: gpu.Texture, coverage: gpu.Texture) -> gpu.Texture!:
+        var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        errdefer fresh.destroy()
+        let frame = try fresh.frame()
+        defer frame.release()
+        let area = try frame.value().target()
+        defer area.release()
+        var no_uniforms: u8[]
+        try gpu.shade(area.value(), self.mix, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), no_uniforms, [original, edited, coverage], gpu.Filter.nearest)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        return fresh
+
     pub mutating func destroy():
         self.mix.destroy()
         self.mix_shader.destroy()

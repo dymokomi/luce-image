@@ -104,6 +104,23 @@ pub struct Filters:
                 try tiles.set(column, row, fresh)
         target.revision += 1
 
+    ## The device the filters draw on.
+    pub func device() -> gpu.Device:
+        return self.owner
+
+    ## resample.frag with `params` over `window`, into a tile of its own (a
+    ## preview's cell, handed to the compositor).
+    pub func resample_tile(params: f32[12]*, window: gpu.Texture) -> gpu.Texture!:
+        var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        errdefer fresh.destroy()
+        let frame = try fresh.frame()
+        defer frame.release()
+        let area = try frame.value().target()
+        defer area.release()
+        try gpu.shade(area.value(), self.resample, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&(*params)[0], 48), [window], gpu.Filter.nearest)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        return fresh
+
     func resample_cell(tiles: const Tiles*, params: f32[12]*, window: gpu.Texture) -> gpu.Texture!:
         var fresh = try tiles.blank()
         errdefer fresh.destroy()
@@ -146,7 +163,7 @@ pub struct Filters:
         return try self.blur_one(tiles.region(column, row).height, taps, radius, false, up, here, down)
 
     ## One pass of the blur over three tiles in a line, into a new tile.
-    func blur_one(extent: u32, taps: f64, sigma: f64, horizontal: bool, before: gpu.Texture?, middle: gpu.Texture?, after: gpu.Texture?) -> gpu.Texture!:
+    pub func blur_one(extent: u32, taps: f64, sigma: f64, horizontal: bool, before: gpu.Texture?, middle: gpu.Texture?, after: gpu.Texture?) -> gpu.Texture!:
         var params: f32[4] = [(f32)taps, (f32)sigma, 1.0 if horizontal else 0.0, (f32)extent]
         var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
         errdefer fresh.destroy()
@@ -374,7 +391,7 @@ test "a motion blur smears along its angle only; lens correction's stretch empti
 
 ## The layer pixels resample.frag's `kind` reads for the cell at (`x0`, `y0`)
 ## of a `width` by `height` layer, a margin for the taps, within the layer.
-func resample_reads(kind: f64, a: f64, b: f64, c: f64, x0: f64, y0: f64, width: f64, height: f64) -> Footprint:
+pub func resample_reads(kind: f64, a: f64, b: f64, c: f64, x0: f64, y0: f64, width: f64, height: f64) -> Footprint:
     var reads = Footprint(left = x0, top = y0, right = x0 + (f64)tile_size, bottom = y0 + (f64)tile_size)
     if kind < 0.5:
         # Motion blur: taps along the line, half the distance either way.
