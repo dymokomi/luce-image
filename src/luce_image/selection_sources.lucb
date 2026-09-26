@@ -188,8 +188,8 @@ pub func wand(found: Cells*, reader: Reader, x: i64, y: i64, sample: i64, tolera
 
 ## Select › Grow (`contiguous`) and Similar, into `found` (empty to begin
 ## with): the pixels whose color (8-bit sRGB and alpha) lies within
-## `tolerance` of the range of colors `selection` covers (its pixels at least
-## half selected, or any selected where none is), reachable from the
+## `tolerance` of the range of colors `selection` covers (its pixels wholly
+## selected, or any selected where none is), reachable from the
 ## selection through such pixels when `contiguous`. Only the cells the
 ## selection touches are read for the range; every cell for the matches.
 pub func grow(found: Cells*, selection: const Cells*, reader: Reader, tolerance: f64, contiguous: bool) -> !:
@@ -286,7 +286,11 @@ func range_item(context: void*?, item: usize):
                 let bits = (usize)((u16)halves[at + channel * 2] | ((u16)halves[at + channel * 2 + 1] << 8))
                 color[channel] = job.table[bits + (65536 if channel == 3 else 0)]
             for level in 0..<(usize)2:
-                if level == 0 and coverage < 128:
+                # The range is the selection's solid colors: an anti-aliased
+                # edge blends in the neighbours' colors and would let Grow
+                # spread into them. Partial coverage counts only when nothing
+                # is wholly selected.
+                if level == 0 and coverage < 255:
                     continue
                 any[level] = true
                 for channel in 0..<(usize)4:

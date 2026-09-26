@@ -244,3 +244,27 @@ test "select and mask previews in the view's box, keeps one step, and cancels ba
     assert(canvas.selected_at(295, 100) > 0)
     try canvas.end_refine(false)
     assert(canvas.selected_at(295, 100) == 0 and canvas.selected_at(303, 100) == 255)
+
+test "grow takes its colors from the selection's solid pixels, not its anti-aliased rim":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(400, 300)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    # A pink ground, a red disc on it with a soft (anti-aliased) edge whose
+    # blends run from the red to the pink.
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.35, 0.35, false)
+    try canvas.select_all()
+    try canvas.fill(layer, false)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.select_ellipse(100, 50, 200, 200, 0)
+    try canvas.fill(layer, false)
+    # The disc selected with its soft rim, then grown: the pink stays out.
+    try canvas.select_ellipse(100, 50, 200, 200, 0)
+    try canvas.grow_selection(layer, 48.0, true)
+    assert(canvas.selected_at(200, 150) == 255 and canvas.selected_at(20, 20) == 0 and canvas.selected_at(380, 280) == 0)
