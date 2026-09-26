@@ -99,6 +99,9 @@ struct Bands:
         let last = min_usize(self.strips.length, first + self.strips_per_part)
         let part_left = (u32)first * strip_width
         let part_width = min_u32(canvas.extent_x - part_left, (u32)(last - first) * strip_width)
+        # The layer tiles this part needs, brought back together (decoded across
+        # the processors) rather than one by one as each cell is composited.
+        try composer.gather(document, part_left // tile_size, row, (part_left + part_width + tile_size - 1) // tile_size, row + 1, 0)
         let batch = &self.reads[turn]
         let base = (try batch.reserve((usize)part_width * (usize)rows * 4)) else error(invalid, "a band's part must fit a read batch")
         let over: f32 = 1.0 if self.matte[0] >= 0.0 else 0.0
