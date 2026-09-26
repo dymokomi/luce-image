@@ -170,3 +170,7 @@ test "past the RAM budget six layers move to the scratch file, and undo and expo
         let a = try expected.value().getpixel(probe, y)
         let b = try exported.value().getpixel(probe, y)
         assert(a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a)
+
+test "the scratch folder can be chosen before the first spill":
+    try Canvas.set_scratch_folder("build")
+    try Canvas.set_scratch_folder("")
