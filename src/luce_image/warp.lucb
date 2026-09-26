@@ -1,7 +1,9 @@
 ## Smudge and Liquify's push, as Compositor's (Document/SmudgeLiquify.swift):
 ## both work dab by dab on a premultiplied working copy of the layer on the
 ## CPU, and the tiles a dab reaches are uploaded as the stroke goes, so the
-## canvas shows it live. The tip falls off as a smoothstep from the hardness
+## canvas shows it live. The working copy is kept a cell at a time, each read
+## back from the layer as it was when the stroke began the first time a dab
+## comes near it: a stroke costs the cells it passes, not the document. The tip falls off as a smoothstep from the hardness
 ## to the rim.
 ## - Smudge picks up the pixels under the first dab and carries them: each
 ##   dab lays them down by the tip, and keeps `strength` of what it carried
@@ -16,11 +18,18 @@ from raster_errors import invalid
 pub let warp_smudge: i64 = 0
 pub let warp_push: i64 = 1
 
+## One cell of the working copy: 256 rows of 256 premultiplied RGBA f32 samples.
+struct WarpCell:
+    var pixels: f32[]
+
 pub struct WarpStroke:
     var width: usize
     var height: usize
-    ## The layer as the stroke has it, premultiplied RGBA f32.
-    var pixels: f32[]
+    var columns: usize
+    ## The layer as the stroke began (sharing its tiles), where cells are read from.
+    var source: Tiles
+    ## The working copy's cells, each none until a dab first comes near it.
+    var cells: WarpCell*?[]
     var mode: i64
     var radius: f64
     var hardness: f64
@@ -46,24 +55,24 @@ pub struct WarpStroke:
             error(invalid, "a warp stroke needs a finite point and a diameter of 1..5000")
         let width = (usize)tiles.width()
         let height = (usize)tiles.height()
-        let pixels = try alloc f32[width * height * 4] in memory.heap
-        errdefer free(pixels) in memory.heap
-        try tiles.read(pixels)
-        for at in 0..<width * height:
-            let alpha = pixels[at * 4 + 3]
-            for channel in 0..<(usize)3:
-                pixels[at * 4 + channel] *= alpha
+        var source = try tiles.clone()
+        errdefer source.destroy()
+        let count = (usize)tiles.columns() * (usize)tiles.rows()
+        let cells = try alloc WarpCell*?[count] in memory.heap
+        errdefer free(cells) in memory.heap
+        for index in 0..<count:
+            cells[index] = none
         let radius = math.max(1.0, diameter * 0.5)
         let side = (usize)(math.ceil(radius) * 2.0 + 1.0)
         let carried = try alloc f32[side * side * 4] in memory.heap
         errdefer free(carried) in memory.heap
         var no_scratch: f32[]
-        var stroke = WarpStroke(width = width, height = height, pixels = pixels, mode = mode, radius = radius,
+        var stroke = WarpStroke(width = width, height = height, columns = (usize)tiles.columns(), source = source, cells = cells, mode = mode, radius = radius,
                                 hardness = math.clamp(hardness, 0.0, 0.98), strength = math.clamp(strength, 0.01, 1.0),
                                 carried = carried, scratch = no_scratch, last_x = x, last_y = y, debt = 0.0,
                                 dirty_left = 1, dirty_top = 1, dirty_right = 0, dirty_bottom = 0)
         if mode == warp_smudge:
-            stroke.pick_up(x, y)
+            try stroke.pick_up(x, y)
         return stroke
 
     ## Continue to (`x`, `y`), a dab every spacing along the way.
@@ -82,7 +91,7 @@ pub struct WarpStroke:
             let to_x = self.last_x + dx * t
             let to_y = self.last_y + dy * t
             if self.mode == warp_smudge:
-                self.smudge(to_x, to_y)
+                try self.smudge(to_x, to_y)
             else:
                 try self.push(from_x, from_y, to_x, to_y)
             from_x = to_x
@@ -100,14 +109,21 @@ pub struct WarpStroke:
         while row <= self.dirty_bottom:
             var column = self.dirty_left
             while column <= self.dirty_right:
-                try tiles.write_cell_premultiplied((u32)column, (u32)row, self.pixels)
+                # A cell no dab came near is as it was.
+                if let cell = self.cells[(usize)row * self.columns + (usize)column]:
+                    try tiles.write_cell_premultiplied((u32)column, (u32)row, cell.pixels)
                 column += 1
             row += 1
         self.dirty_left = 1
         self.dirty_right = 0
 
     pub mutating func destroy():
-        free(self.pixels) in memory.heap
+        for index in 0..<self.cells.length:
+            if let cell = self.cells[index]:
+                free(cell.pixels) in memory.heap
+                free(cell) in memory.heap
+        free(self.cells) in memory.heap
+        self.source.destroy()
         free(self.carried) in memory.heap
         if self.scratch.length > 0:
             free(self.scratch) in memory.heap
@@ -126,22 +142,24 @@ pub struct WarpStroke:
         return t * t * (3.0 - 2.0 * t)
 
     ## Smudge: the square under the first dab, carried.
-    mutating func pick_up(x: f64, y: f64):
+    mutating func pick_up(x: f64, y: f64) -> !:
         let reach = (i64)math.ceil(self.radius)
         let side = reach * 2 + 1
         let cx = (i64)math.round(x)
         let cy = (i64)math.round(y)
+        try self.load(cx - reach, cy - reach, cx + reach, cy + reach)
         for j in 0..<side:
             for i in 0..<side:
                 let at = ((usize)j * (usize)side + (usize)i) * 4
                 for channel in 0..<(usize)4:
                     self.carried[at + channel] = self.pixel(cx - reach + i, cy - reach + j, channel)
 
-    mutating func smudge(x: f64, y: f64):
+    mutating func smudge(x: f64, y: f64) -> !:
         let reach = (i64)math.ceil(self.radius)
         let side = reach * 2 + 1
         let cx = (i64)math.round(x)
         let cy = (i64)math.round(y)
+        try self.load(cx - reach, cy - reach, cx + reach, cy + reach)
         for j in 0..<side:
             for i in 0..<side:
                 let px = cx - reach + i
@@ -150,12 +168,13 @@ pub struct WarpStroke:
                     continue
                 let w = self.weight(math.hypot((f64)(i - reach), (f64)(j - reach)))
                 let k = ((usize)j * (usize)side + (usize)i) * 4
-                let at = ((usize)py * self.width + (usize)px) * 4
+                let pixels = self.cell_pixels(px, py)
+                let at = offset_in_cell(px, py)
                 for channel in 0..<(usize)4:
-                    let under = (f64)self.pixels[at + channel]
+                    let under = (f64)pixels[at + channel]
                     let carried = (f64)self.carried[k + channel]
                     let painted = under + (carried - under) * w
-                    self.pixels[at + channel] = (f32)painted
+                    pixels[at + channel] = (f32)painted
                     self.carried[k + channel] = (f32)(painted + (carried - painted) * self.strength)
         self.touch(cx - reach, cy - reach, cx + reach, cy + reach)
 
@@ -172,6 +191,7 @@ pub struct WarpStroke:
         let left = cx - margin
         let top = cy - margin
         let side = (usize)(margin * 2 + 1)
+        try self.load(left, top, cx + margin, cy + margin)
         if self.scratch.length < side * side * 4:
             if self.scratch.length > 0:
                 free(self.scratch) in memory.heap
@@ -191,16 +211,48 @@ pub struct WarpStroke:
                     continue
                 let sx = (f64)(px - left) - move_x * w
                 let sy = (f64)(py - top) - move_y * w
-                let at = ((usize)py * self.width + (usize)px) * 4
+                let pixels = self.cell_pixels(px, py)
+                let at = offset_in_cell(px, py)
                 for channel in 0..<(usize)4:
-                    self.pixels[at + channel] = (f32)bilinear(self.scratch, side, sx, sy, channel)
+                    pixels[at + channel] = (f32)bilinear(self.scratch, side, sx, sy, channel)
         self.touch(cx - reach, cy - reach, cx + reach, cy + reach)
 
-    ## A sample of the working copy; transparent past its edges.
+    ## A sample of the working copy (its cell loaded); transparent past its edges.
     func pixel(x: i64, y: i64, channel: usize) -> f32:
         if x < 0 or y < 0 or x >= (i64)self.width or y >= (i64)self.height:
             return 0.0
-        return self.pixels[((usize)y * self.width + (usize)x) * 4 + channel]
+        return self.cell_pixels(x, y)[offset_in_cell(x, y) + channel]
+
+    ## The loaded cell holding document pixel (`x`, `y`), on the document.
+    func cell_pixels(x: i64, y: i64) -> f32[]:
+        let index = (usize)(y // (i64)tile_size) * self.columns + (usize)(x // (i64)tile_size)
+        let cell = self.cells[index] else trap("a warp dab reached a cell it did not load")
+        return cell.pixels
+
+    ## Read in, premultiplied, every cell over document pixels `left`..`right`,
+    ## `top`..`bottom` that is not yet in the working copy.
+    mutating func load(left: i64, top: i64, right: i64, bottom: i64) -> !:
+        let rows = (i64)self.cells.length // (i64)self.columns
+        let first_column = math.imax(0, left // (i64)tile_size)
+        let first_row = math.imax(0, top // (i64)tile_size)
+        let last_column = math.imin((i64)self.columns - 1, right // (i64)tile_size)
+        let last_row = math.imin(rows - 1, bottom // (i64)tile_size)
+        var row = first_row
+        while row <= last_row:
+            var column = first_column
+            while column <= last_column:
+                let index = (usize)row * self.columns + (usize)column
+                if self.cells[index] == none:
+                    let pixels = try alloc f32[(usize)tile_size * (usize)tile_size * 4] in memory.heap
+                    errdefer free(pixels) in memory.heap
+                    try self.source.read_cell((u32)column, (u32)row, pixels)
+                    for at in 0..<pixels.length // 4:
+                        let alpha = pixels[at * 4 + 3]
+                        for channel in 0..<(usize)3:
+                            pixels[at * 4 + channel] *= alpha
+                    self.cells[index] = try new WarpCell(pixels = pixels) in memory.heap
+                column += 1
+            row += 1
 
     ## Mark the cells a dab over document pixels `left`..`right`, `top`..`bottom` reached.
     mutating func touch(left: i64, top: i64, right: i64, bottom: i64):
@@ -239,3 +291,7 @@ func texel(samples: const f32[], side: usize, x: i64, y: i64, channel: usize) ->
     if x < 0 or y < 0 or x >= (i64)side or y >= (i64)side:
         return 0.0
     return (f64)samples[((usize)y * side + (usize)x) * 4 + channel]
+
+## Where document pixel (`x`, `y`)'s samples start within its cell.
+func offset_in_cell(x: i64, y: i64) -> usize:
+    return ((usize)(y % (i64)tile_size) * (usize)tile_size + (usize)(x % (i64)tile_size)) * 4
