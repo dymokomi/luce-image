@@ -11,6 +11,7 @@ transforming.lucb
 filter_previews.lucb
 type_layers.lucb
 shape_layers.lucb
+shape_render.lucb
 path_layers.lucb
 ranging.lucb
 selecting.lucb
@@ -22,3 +23,4 @@ preview_tests.lucb
 warp_tests.lucb
 liquify_tests.lucb
 path_tests.lucb
+shape_render_tests.lucb

@@ -1,0 +1,257 @@
+#==============================================================================================
+#
+#   canvas/shape_render - A shape layer drawn a window of cells at a time
+#
+#   DESCRIPTION:
+#       luce-svg draws a shape layer into windows of the canvas's grid, a few 256-pixel cells
+#       across, and only over the cells the shape can reach: a shape costs its own area,
+#       never the document's (drawing into one canvas-sized buffer took 5.7 GB at 360 MP).
+#       Each window is the same SVG with its viewBox moved onto the window, which luce-svg
+#       covers exactly as it would the whole canvas. The main thread parses a wave of
+#       windows, the processors draw them and turn their cells into half floats, and the
+#       main thread uploads the cells (the GPU is its), sharing one tile among cells that
+#       are one color throughout, as the inside of a large filled shape is.
+#
+#==============================================================================================
+
+## Cells a window spans across: its buffer is this many cells' pixels.
+let window_cells: u32 = 4
+
+## One window of a wave: its first cell and its size in pixels, the drawing moved onto
+## it, and what its worker made of it — each of its cells as half floats, whether the
+## cell holds anything, and whether it is one pixel throughout.
+struct ShapeWindow:
+    var column: u32
+    var row: u32
+    var width: u32
+    var height: u32
+    var drawing: svg.Drawing*?
+    var pixels: f32[]
+    var cells: u8[]
+    var painted: bool[4]
+    var uniform: bool[4]
+    var failed: bool
+
+## The cells a shape can reach, `left..<right` by `top..<bottom`.
+struct ShapeReach:
+    var left: u32
+    var top: u32
+    var right: u32
+    var bottom: u32
+
+## A tile already made for a cell of one pixel throughout, by that pixel's half floats.
+struct SharedTile:
+    var pixel: u64
+    var column: u32
+    var row: u32
+
+## The layer's pixels for `spec`, drawn window by window over the cells it reaches.
+func rendered_shape(canvas: Canvas*, spec: ShapeSpec) -> Tiles!:
+    let device = canvas.device else error(invalid, "draw the document once before drawing a shape")
+    var tiles = try Tiles.create(device, canvas.extent_x, canvas.extent_y)
+    errdefer tiles.destroy()
+    let reach = shape_reach(spec, canvas.extent_x, canvas.extent_y) else return tiles
+    let workers = (usize)math.imin(16, math.imax(1, (i64)os.cpus()))
+    let per_tile = (usize)tile_size * (usize)tile_size * 8
+    let span = (usize)window_cells * (usize)tile_size
+    let windows = try alloc ShapeWindow[workers] in memory.heap
+    defer free(windows) in memory.heap
+    var made: usize = 0
+    defer release_windows(windows[..<made])
+    for index in 0..<workers:
+        let pixels = try alloc f32[span * (usize)tile_size * 4] in memory.heap
+        let cells = alloc u8[(usize)window_cells * per_tile] in memory.heap catch failure:
+            free(pixels) in memory.heap
+            error(failure.code, failure.message)
+        windows[index] = ShapeWindow(column = 0, row = 0, width = 0, height = 0, drawing = none, pixels = pixels, cells = cells,
+                                     painted = [false, false, false, false], uniform = [false, false, false, false], failed = false)
+        made += 1
+    var shared: SharedTile[16] = ---
+    var shared_count: usize = 0
+    var row = reach.top
+    var column = reach.left
+    while row < reach.bottom:
+        # A wave: as many windows as there are workers, in reading order.
+        var wave: usize = 0
+        var parsed: interop.Reference[svg.Drawing][16] = ---
+        defer release_drawings(parsed[..<16], &wave)
+        while wave < workers and row < reach.bottom:
+            let across = math.imin((i64)window_cells, (i64)(reach.right - column))
+            let left = column * tile_size
+            let top = row * tile_size
+            let width = min_u32((u32)across * tile_size, canvas.extent_x - left)
+            let height = min_u32(tile_size, canvas.extent_y - top)
+            var text = try strings.Builder.create()
+            defer text.destroy()
+            try shape_svg(&text, spec, left, top, width, height)
+            parsed[wave] = try svg.parse(text.view())
+            windows[wave].column = column
+            windows[wave].row = row
+            windows[wave].width = width
+            windows[wave].height = height
+            windows[wave].drawing = parsed[wave].value()
+            windows[wave].failed = false
+            wave += 1
+            column += (u32)across
+            if column >= reach.right:
+                column = reach.left
+                row += 1
+        try draw_windows(windows[..<wave])
+        for index in 0..<wave:
+            if windows[index].failed:
+                error(invalid, "a shape window could not be drawn")
+            try upload_window(device, &tiles, &windows[index], shared[..<16], &shared_count)
+    return tiles
+
+## The processors draw `windows`, this thread taking the first.
+func draw_windows(windows: ShapeWindow[]) -> !:
+    var handles: thread.Handle[16]
+    var started: usize = 0
+    for index in 1..<windows.length:
+        handles[started] = thread.spawn(window_entry, (void*)&windows[index], name = "shape-window") catch failure:
+            for other in index..<windows.length:
+                draw_window(&windows[other])
+            break
+        started += 1
+    if windows.length > 0:
+        draw_window(&windows[0])
+    for index in 0..<started:
+        try handles[index].join()
+
+func window_entry(context: void*?):
+    draw_window((ShapeWindow*)(context else return))
+
+## Draw `window`'s drawing and turn each of its cells into half floats, as
+## `Tiles.write` does: straight alpha, clear past the document's edge.
+func draw_window(window: ShapeWindow*):
+    let width = (usize)window.width
+    let height = (usize)window.height
+    let pixels = window.pixels[..<width * height * 4]
+    let drawing = window.drawing else return
+    svg.rasterize_rgba(drawing, window.width, window.height, pixels, svg.Color(r = 0.0, g = 0.0, b = 0.0)) catch _:
+        window.failed = true
+        return
+    let per_tile = (usize)tile_size * (usize)tile_size * 8
+    let side = (usize)tile_size
+    let count = (width + side - 1) // side
+    # Inside a shape one value repeats pixel after pixel: each channel keeps its last
+    # conversion, and a value like it skips `to_half`.
+    var last_value: f32[4] = [0.0, 0.0, 0.0, 0.0]
+    var last_half: u16[4] = [0, 0, 0, 0]
+    for cell in 0..<count:
+        let bytes = window.cells[cell * per_tile..<(cell + 1) * per_tile]
+        let across = min_usize(side, width - cell * side)
+        var painted = false
+        for y in 0..<side:
+            for x in 0..<side:
+                let destination = (y * side + x) * 8
+                if y >= height or x >= across:
+                    for index in 0..<(usize)8:
+                        bytes[destination + index] = 0
+                    continue
+                let source = (y * width + cell * side + x) * 4
+                for channel in 0..<(usize)4:
+                    let value = pixels[source + channel]
+                    if value != last_value[channel]:
+                        last_value[channel] = value
+                        last_half[channel] = to_half(value)
+                    let half = last_half[channel]
+                    bytes[destination + channel * 2] = (u8)(half & 0xff)
+                    bytes[destination + channel * 2 + 1] = (u8)(half >> 8)
+                if pixels[source + 3] != 0.0:
+                    painted = true
+        window.painted[cell] = painted
+        window.uniform[cell] = painted and one_pixel(bytes)
+    for cell in count..<(usize)window_cells:
+        window.painted[cell] = false
+        window.uniform[cell] = false
+
+## Whether a cell's half floats are one pixel throughout.
+func one_pixel(bytes: const u8[]) -> bool:
+    for index in 8..<bytes.length:
+        if bytes[index] != bytes[index % 8]:
+            return false
+    return true
+
+## The first pixel of a cell's half floats as one number.
+func pixel_key(bytes: const u8[]) -> u64:
+    var key: u64 = 0
+    for index in 0..<(usize)8:
+        key = key | ((u64)bytes[index] << ((u64)index * 8))
+    return key
+
+## Put `window`'s painted cells into `tiles`: a cell one pixel throughout shares
+## the tile already made for that pixel, when there is one.
+func upload_window(device: gpu.Device, tiles: Tiles*, window: const ShapeWindow*, shared: SharedTile[], shared_count: usize*) -> !:
+    let per_tile = (usize)tile_size * (usize)tile_size * 8
+    for cell in 0..<(usize)window_cells:
+        if not window.painted[cell]:
+            continue
+        let column = window.column + (u32)cell
+        let bytes = window.cells[cell * per_tile..<(cell + 1) * per_tile]
+        if window.uniform[cell]:
+            let key = pixel_key(bytes)
+            var found = false
+            for index in 0..<*shared_count:
+                if shared[index].pixel == key:
+                    try tiles.share(column, window.row, shared[index].column, shared[index].row)
+                    found = true
+                    break
+            if found:
+                continue
+            if *shared_count < shared.length:
+                shared[*shared_count] = SharedTile(pixel = key, column = column, row = window.row)
+                *shared_count += 1
+        var texture = try gpu.Texture.create(device, tile_size, tile_size, gpu.Format.rgba16_float)
+        errdefer texture.destroy()
+        try texture.upload(bytes)
+        try tiles.set(column, window.row, texture)
+
+## Let go of the first `count` drawings of a wave.
+func release_drawings(parsed: interop.Reference[svg.Drawing][], count: usize*):
+    for index in 0..<*count:
+        parsed[index].release()
+
+func release_windows(windows: ShapeWindow[]):
+    for index in 0..<windows.length:
+        free(windows[index].pixels) in memory.heap
+        free(windows[index].cells) in memory.heap
+
+## The cells `spec` can reach on a `width` by `height` canvas: its box (a path's anchors
+## and their handles) through its matrix, grown by twice its stroke (a miter reaches
+## four half widths out) and two pixels of antialiasing. None when it misses the canvas.
+func shape_reach(spec: ShapeSpec, width: u32, height: u32) -> ShapeReach?:
+    var low_x = math.infinity
+    var low_y = math.infinity
+    var high_x = -math.infinity
+    var high_y = -math.infinity
+    let m = spec.matrix
+    var corners: f64[8] = [spec.x, spec.y, spec.x + spec.width, spec.y, spec.x, spec.y + spec.height, spec.x + spec.width, spec.y + spec.height]
+    if spec.kind == 4:
+        for at in 0..<spec.path.length // 2:
+            let px = spec.path[at * 2]
+            let py = spec.path[at * 2 + 1]
+            low_x = math.min(low_x, m[0] * px + m[2] * py + m[4])
+            high_x = math.max(high_x, m[0] * px + m[2] * py + m[4])
+            low_y = math.min(low_y, m[1] * px + m[3] * py + m[5])
+            high_y = math.max(high_y, m[1] * px + m[3] * py + m[5])
+    else:
+        for at in 0..<(usize)4:
+            let px = corners[at * 2]
+            let py = corners[at * 2 + 1]
+            low_x = math.min(low_x, m[0] * px + m[2] * py + m[4])
+            high_x = math.max(high_x, m[0] * px + m[2] * py + m[4])
+            low_y = math.min(low_y, m[1] * px + m[3] * py + m[5])
+            high_y = math.max(high_y, m[1] * px + m[3] * py + m[5])
+    if not math.is_finite(low_x) or not math.is_finite(high_x) or not math.is_finite(low_y) or not math.is_finite(high_y):
+        return none
+    let stroked = spec.stroked or spec.kind == 2
+    let grow = (spec.stroke_width * 2.0 if stroked else 0.0) + 2.0
+    let size = (f64)tile_size
+    let left = math.max(0.0, math.floor((low_x - grow) / size))
+    let top = math.max(0.0, math.floor((low_y - grow) / size))
+    let right = math.min((f64)tile_columns(width), math.ceil((high_x + grow) / size))
+    let bottom = math.min((f64)tile_columns(height), math.ceil((high_y + grow) / size))
+    if right <= left or bottom <= top:
+        return none
+    return ShapeReach(left = (u32)left, top = (u32)top, right = (u32)right, bottom = (u32)bottom)
