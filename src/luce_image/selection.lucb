@@ -5,6 +5,8 @@
 import gpu
 import math
 import memory
+import os
+import thread
 from tiles import Tiles, tile_size, box, unbox
 from half import to_half
 from luce_image.projective import Warp
@@ -70,6 +72,15 @@ pub struct Selection:
         self.coverage = coverage
         self.holders = holders
 
+    ## A coverage of this selection's own set wholly to `value`: what a change
+    ## that overwrites every pixel starts from, with nothing copied if shared.
+    mutating func own_filled(value: u8):
+        if self.holders.count > 1:
+            let fresh = alloc u8[self.coverage.length] in memory.heap catch failure:
+                trap("out of memory replacing the selection")
+            self.adopt(fresh)
+        memory.set(self.coverage, value)
+
     ## Take `coverage` (fresh, held by nobody else) in place of this selection's.
     mutating func adopt(coverage: u8[]):
         self.release_coverage()
@@ -104,16 +115,23 @@ pub struct Selection:
         return self.coverage[(usize)y * (usize)self.extent_x + (usize)x]
 
     pub mutating func clear():
-        self.own()
-        for index in 0..<self.coverage.length:
-            self.coverage[index] = 0
-        self.finish()
+        self.own_filled(0)
+        # Known without a scan.
+        self.empty = true
+        self.left = (i64)self.extent_x
+        self.top = (i64)self.extent_y
+        self.right = 0
+        self.bottom = 0
+        self.uploaded = false
 
     pub mutating func select_all():
-        self.own()
-        for index in 0..<self.coverage.length:
-            self.coverage[index] = 255
-        self.finish()
+        self.own_filled(255)
+        self.empty = false
+        self.left = 0
+        self.top = 0
+        self.right = (i64)self.extent_x
+        self.bottom = (i64)self.extent_y
+        self.uploaded = false
 
     pub mutating func invert():
         self.own()
@@ -178,15 +196,23 @@ pub struct Selection:
         self.shape(x, y, width, height, mode, true)
 
     mutating func shape(x: i64, y: i64, width: i64, height: i64, mode: Mode, round: bool):
-        self.own()
         if mode == Mode.replace:
-            for index in 0..<self.coverage.length:
-                self.coverage[index] = 0
+            self.own_filled(0)
+        else:
+            self.own()
         let left = math.imax(0, x)
         let top = math.imax(0, y)
         let right = math.imin((i64)self.extent_x, x + width)
         let bottom = math.imin((i64)self.extent_y, y + height)
-        if right > left and bottom > top:
+        if right > left and bottom > top and not round:
+            # A rectangle is whole rows of one value in every mode: filled for
+            # replace and add, cleared for subtract, kept for intersect.
+            if mode != Mode.intersect:
+                let value: u8 = 0 if mode == Mode.subtract else 255
+                for row in top..<bottom:
+                    let start = (usize)row * (usize)self.extent_x
+                    memory.set(self.coverage[start + (usize)left..<start + (usize)right], value)
+        elif right > left and bottom > top:
             let cx = (f64)x + (f64)width * 0.5
             let cy = (f64)y + (f64)height * 0.5
             let rx = math.max(0.5, (f64)width * 0.5)
@@ -473,26 +499,54 @@ pub struct Selection:
 
     ## Intersecting clears everything outside the shape's rectangle.
     mutating func outside(left: i64, top: i64, right: i64, bottom: i64):
+        let width = (usize)self.extent_x
         for row in 0..<(i64)self.extent_y:
-            for column in 0..<(i64)self.extent_x:
-                if row < top or row >= bottom or column < left or column >= right:
-                    self.coverage[(usize)row * (usize)self.extent_x + (usize)column] = 0
+            let start = (usize)row * width
+            if row < top or row >= bottom or right <= left:
+                memory.set(self.coverage[start..<start + width], 0)
+                continue
+            if left > 0:
+                memory.set(self.coverage[start..<start + (usize)math.imin(left, (i64)width)], 0)
+            if right < (i64)width:
+                memory.set(self.coverage[start + (usize)math.imax(right, 0)..<start + width], 0)
 
     ## Recompute emptiness and bounds; the GPU mirror is stale until `gpu_tiles`.
     mutating func finish():
+        # Bands of rows on every processor, each finding its own box.
+        var job = BoundsJob(coverage = self.coverage, width = (usize)self.extent_x, first = 0, last = (usize)self.extent_y)
+        let rows = (usize)self.extent_y
+        let workers = math.imin(16, math.imax(1, (i64)os.cpus())) if self.coverage.length >= 1048576 else 1
+        var bands: BoundsJob[16] = ---
+        var handles: thread.Handle[16]
+        var started: usize = 0
+        let per = (rows + (usize)workers - 1) // (usize)workers
+        for band in 0..<(usize)workers:
+            bands[band] = job
+            bands[band].first = (rows if band * per > rows else band * per)
+            bands[band].last = (rows if band * per + per > rows else band * per + per)
+        for band in 1..<(usize)workers:
+            handles[started] = thread.spawn(bounds_entry, (void*)&bands[band], name = "selection-bounds") catch failure:
+                for other in band..<(usize)workers:
+                    bounds_rows(&bands[other])
+                break
+            started += 1
+        bounds_rows(&bands[0])
+        for index in 0..<started:
+            handles[index].join() catch failure:
+                trap("a selection-bounds thread failed to join")
         self.empty = true
         self.left = (i64)self.extent_x
         self.top = (i64)self.extent_y
         self.right = 0
         self.bottom = 0
-        for row in 0..<(i64)self.extent_y:
-            for column in 0..<(i64)self.extent_x:
-                if self.coverage[(usize)row * (usize)self.extent_x + (usize)column] > 0:
-                    self.empty = false
-                    self.left = math.imin(self.left, column)
-                    self.top = math.imin(self.top, row)
-                    self.right = math.imax(self.right, column + 1)
-                    self.bottom = math.imax(self.bottom, row + 1)
+        for band in 0..<(usize)workers:
+            if not bands[band].found:
+                continue
+            self.empty = false
+            self.left = math.imin(self.left, bands[band].left)
+            self.top = math.imin(self.top, bands[band].top)
+            self.right = math.imax(self.right, bands[band].right)
+            self.bottom = math.imax(self.bottom, bands[band].bottom)
         self.uploaded = false
 
     ## The selection as GPU tiles (coverage in red, alpha one), refreshed after
@@ -654,3 +708,56 @@ test "a copy shares the coverage until one of them changes, and each keeps what 
     first.destroy()
     second.destroy()
     third.destroy()
+
+## One band of rows for `Selection.finish`: the box of every nonzero byte.
+struct BoundsJob:
+    var coverage: const u8[]
+    var width: usize
+    var first: usize
+    var last: usize
+    var found: bool = false
+    var left: i64 = 0
+    var top: i64 = 0
+    var right: i64 = 0
+    var bottom: i64 = 0
+
+func bounds_entry(context: void*?):
+    bounds_rows((BoundsJob*)(context else return))
+
+## Each row's first and last nonzero byte, scanned in from both ends.
+func bounds_rows(job: BoundsJob*):
+    for row in job.first..<job.last:
+        let start = row * job.width
+        var low: usize = 0
+        while low < job.width and job.coverage[start + low] == 0:
+            low += 1
+        if low == job.width:
+            continue
+        var high = job.width
+        while job.coverage[start + high - 1] == 0:
+            high -= 1
+        if not job.found:
+            job.found = true
+            job.left = (i64)low
+            job.top = (i64)row
+            job.right = (i64)high
+        job.left = math.imin(job.left, (i64)low)
+        job.right = math.imax(job.right, (i64)high)
+        job.bottom = (i64)row + 1
+
+test "rectangles fill whole rows in every mode, and a big selection finds its box in bands":
+    # Over a million pixels, so the bounds are found on several threads.
+    var selection = try Selection.create(2000, 1000)
+    defer selection.destroy()
+    selection.rectangle(100, 200, 500, 300, Mode.replace)
+    assert(selection.at(100, 200) == 255 and selection.at(599, 499) == 255 and selection.at(600, 499) == 0 and selection.at(99, 200) == 0)
+    assert(selection.left == 100 and selection.top == 200 and selection.right == 600 and selection.bottom == 500)
+    selection.rectangle(1500, 900, 1000, 1000, Mode.add)
+    assert(selection.at(1999, 999) == 255 and selection.right == 2000 and selection.bottom == 1000)
+    selection.rectangle(0, 0, 2000, 400, Mode.subtract)
+    assert(selection.at(300, 300) == 0 and selection.at(300, 450) == 255 and selection.top == 400)
+    selection.rectangle(200, 400, 200, 50, Mode.intersect)
+    assert(selection.at(250, 420) == 255 and selection.at(150, 420) == 0 and selection.at(1600, 950) == 0)
+    assert(selection.left == 200 and selection.top == 400 and selection.right == 400 and selection.bottom == 450)
+    selection.rectangle(5000, 5000, 10, 10, Mode.intersect)
+    assert(selection.is_empty())

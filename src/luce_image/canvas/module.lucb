@@ -29,6 +29,7 @@ import c as c_api
 import clipboard
 import files
 import jpeg
+import png
 import raw
 import gpu
 import interop

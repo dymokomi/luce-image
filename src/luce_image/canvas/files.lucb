@@ -11,6 +11,9 @@ func save_flattened(canvas: Canvas*, path: str, quality: i64, matte_red: f64, ma
     if matte_red >= 0.0 and (strings.ends_with(lower, ".jpg") or strings.ends_with(lower, ".jpeg")):
         try save_jpeg_streamed(canvas, path, quality, matte_red, matte_green, matte_blue)
         return
+    if strings.ends_with(lower, ".png"):
+        try save_png_streamed(canvas, path, matte_red, matte_green, matte_blue)
+        return
     let pixels = try flattened_pixels(canvas)
     defer free(pixels) in memory.heap
     # Under a matte (linear light; a negative red means none) the picture comes out
@@ -36,45 +39,86 @@ func save_flattened(canvas: Canvas*, path: str, quality: i64, matte_red: f64, ma
 ## time: each row of composited tiles becomes sRGB bytes and goes straight to the
 ## encoder, so no buffer the size of the document is ever held.
 func save_jpeg_streamed(canvas: Canvas*, path: str, quality: i64, matte_red: f64, matte_green: f64, matte_blue: f64) -> !:
-    try canvas.require_open()
-    let document = canvas.document else error(invalid, "draw the document once before saving it")
-    let composer = canvas.composer else error(invalid, "draw the document once before saving it")
-    let width = (usize)canvas.extent_x
-    # Linear light to 8-bit sRGB, 4096 steps across 0..1.
-    var encode_table: u8[4097]
-    for step in 0..<(usize)4097:
-        encode_table[step] = (u8)(srgb_byte((f64)step / 4096.0))
-    let matte: f64[3] = [matte_red, matte_green, matte_blue]
+    var bands = try Bands.begin(canvas, [matte_red, matte_green, matte_blue])
+    defer bands.close()
     var encoded = Buffer(maximum = (usize)1 << 40)
     defer encoded.close()
-    var encoder = try jpeg.Encoder.begin(width, (usize)canvas.extent_y, jpeg.Input.rgba, &encoded, jpeg.EncodeOptions(quality = quality))
+    var encoder = try jpeg.Encoder.begin((usize)canvas.extent_x, (usize)canvas.extent_y, jpeg.Input.rgba, &encoded, jpeg.EncodeOptions(quality = quality))
     defer encoder.close()
-    let band = try alloc u8[width * (usize)tile_size * 4] in memory.heap
-    defer free(band) in memory.heap
-    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
-    defer free(bytes) in memory.heap
     for row in 0..<tile_columns(canvas.extent_y):
+        let rows = try bands.fill(canvas, row)
+        try encoder.write_rows(bands.band[..<(usize)canvas.extent_x * rows * 4], rows)
+    try encoder.finish()
+    try write_file(path, encoded.view())
+
+## A PNG of the flattened document, straight alpha kept (or over the matte when
+## one is given), streamed a row of cells at a time as the JPEG is.
+func save_png_streamed(canvas: Canvas*, path: str, matte_red: f64, matte_green: f64, matte_blue: f64) -> !:
+    var bands = try Bands.begin(canvas, [matte_red, matte_green, matte_blue])
+    defer bands.close()
+    var encoded = Buffer(maximum = (usize)1 << 40)
+    defer encoded.close()
+    var encoder = try png.Encoder.begin((usize)canvas.extent_x, (usize)canvas.extent_y, png.Format.rgba8, &encoded)
+    defer encoder.close()
+    for row in 0..<tile_columns(canvas.extent_y):
+        let rows = try bands.fill(canvas, row)
+        try encoder.write_rows(bands.band[..<(usize)canvas.extent_x * rows * 4], rows)
+    try encoder.finish()
+    try write_file(path, encoded.view())
+
+func write_file(path: str, bytes: const u8[]) -> !:
+    let destination = try strings.copy(path)
+    defer strings.release(destination)
+    try files.write_atomic((c_api.str)destination, bytes)
+
+## A row of cells of the flattened document as 8-bit sRGB RGBA, one at a time:
+## over `matte` (linear light) when its red is not negative, else alpha kept.
+struct Bands:
+    var band: u8[]
+    var bytes: u8[]
+    var table: u8[]
+    var matte: f64[3]
+
+    static func begin(canvas: Canvas*, matte: f64[3]) -> Bands!:
+        try canvas.require_open()
+        let band = try alloc u8[(usize)canvas.extent_x * (usize)tile_size * 4] in memory.heap
+        errdefer free(band) in memory.heap
+        let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+        errdefer free(bytes) in memory.heap
+        # Linear light to 8-bit sRGB, 4096 steps across 0..1.
+        let table = try alloc u8[4097] in memory.heap
+        for step in 0..<(usize)4097:
+            table[step] = srgb_byte((f64)step / 4096.0)
+        return Bands(band = band, bytes = bytes, table = table, matte = matte)
+
+    ## Row `row` of cells into `band`; how many pixel rows it holds.
+    mutating func fill(canvas: Canvas*, row: u32) -> usize!:
+        let document = canvas.document else error(invalid, "draw the document once before saving it")
+        let composer = canvas.composer else error(invalid, "draw the document once before saving it")
+        let width = (usize)canvas.extent_x
         let rows = (usize)min_u32(tile_size, canvas.extent_y - row * tile_size)
+        let over = self.matte[0] >= 0.0
         for column in 0..<tile_columns(canvas.extent_x):
             let texture = try composer.tile(document, column, row, 0)
             let columns = (usize)min_u32(tile_size, canvas.extent_x - column * tile_size)
-            try texture.read(bytes[..<columns * rows * 8], gpu.Region(0, 0, (u32)columns, (u32)rows))
+            try texture.read(self.bytes[..<columns * rows * 8], gpu.Region(0, 0, (u32)columns, (u32)rows))
             for y in 0..<rows:
                 for x in 0..<columns:
                     let source = (y * columns + x) * 8
-                    let alpha = (f64)from_half((u16)bytes[source + 6] | ((u16)bytes[source + 7] << 8))
-                    let clamped = alpha if alpha < 1.0 else 1.0
+                    let alpha = math.clamp((f64)from_half((u16)self.bytes[source + 6] | ((u16)self.bytes[source + 7] << 8)), 0.0, 1.0)
                     let destination = (y * width + (usize)column * (usize)tile_size + x) * 4
                     for channel in 0..<(usize)3:
-                        let value = (f64)from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8))
-                        let over = value * clamped + matte[channel] * (1.0 - clamped)
-                        band[destination + channel] = encode_table[(usize)(math.clamp(over, 0.0, 1.0) * 4096.0 + 0.5)]
-                    band[destination + 3] = 255
-        try encoder.write_rows(band[..<width * rows * 4], rows)
-    try encoder.finish()
-    let destination = try strings.copy(path)
-    defer strings.release(destination)
-    try files.write_atomic((c_api.str)destination, encoded.view())
+                        var value = (f64)from_half((u16)self.bytes[source + channel * 2] | ((u16)self.bytes[source + channel * 2 + 1] << 8))
+                        if over:
+                            value = value * alpha + self.matte[channel] * (1.0 - alpha)
+                        self.band[destination + channel] = self.table[(usize)(math.clamp(value, 0.0, 1.0) * 4096.0 + 0.5)]
+                    self.band[destination + 3] = 255 if over else (u8)(alpha * 255.0 + 0.5)
+        return rows
+
+    mutating func close():
+        free(self.band) in memory.heap
+        free(self.bytes) in memory.heap
+        free(self.table) in memory.heap
 
 ## A linear component as an 8-bit sRGB value.
 func srgb_byte(linear: f64) -> u8:

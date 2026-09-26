@@ -56,11 +56,11 @@ func copy_to_clipboard(canvas: Canvas*, id: i64, merged: bool, cut: bool) -> !:
             cropped[target + 3] = pixels[source + 3] * cover
     let picture = try Image.from_linear_rgba(width, height, cropped)
     defer picture.release()
-    let png = try picture.value().encode("png")
-    defer free(png) in memory.heap
+    let encoded_png = try picture.value().encode("png")
+    defer free(encoded_png) in memory.heap
     let rgba = try picture.value().rgba8()
     defer free(rgba) in memory.heap
-    try clipboard.write_image(png, (u32)width, (u32)height, rgba)
+    try clipboard.write_image(encoded_png, (u32)width, (u32)height, rgba)
     copied_left = left
     copied_top = top
     copied_width = (u32)width
