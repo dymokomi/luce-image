@@ -28,11 +28,23 @@ func set_memory_usage(canvas: Canvas*, fraction: f64) -> !:
     if let device = canvas.device:
         try configure_memory(device)
 
-## Begin a frame's epoch and, when the tiers hold too much, mark what every
-## layer and mask of the document shows and move the least wanted tiles to
-## RAM. Cheap when within budget: one comparison.
+## A draw into frame `serial`: whether it is the first into a new frame, which
+## begins the frame's epoch. That draw settles the tiers once it has drawn
+## (`settle_tiers`), so what it drew with (a new layer's tiles, making its
+## levels) stays on the GPU for it; later draws into the same frame (the
+## Navigator after the view) keep what the first pinned.
+func begin_frame(serial: u64) -> bool:
+    return residency_frame(serial)
+
+## Begin an epoch outside any frame and settle: headless steps and tests.
 func settle_memory(canvas: Canvas*) -> !:
     residency_advance()
+    try settle_tiers(canvas)
+
+## When the tiers hold too much, mark what every layer and mask of the
+## document shows and move the least wanted tiles down a tier. Cheap within
+## budget: one comparison.
+func settle_tiers(canvas: Canvas*) -> !:
     if not residency_over_budget():
         return
     let device = canvas.device else return

@@ -74,3 +74,99 @@ test "under a tiny memory budget the document draws, strokes, undoes and exports
         let a = try expected.value().getpixel(probe, y)
         let b = try exported.value().getpixel(probe, y)
         assert(a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a)
+
+## One window frame as luced-2d draws it: the view, the Navigator's thumbnail
+## and a popup's backdrop, three draws into one frame, read back.
+func window_frame(canvas: Canvas*, target: gpu.Texture*, into: u8[]) -> !:
+    try canvas.wait_idle()
+    let frame = try target.frame()
+    defer frame.release()
+    let root = try frame.value().target()
+    defer root.release()
+    try canvas.draw(root, gpu.Rect(width = 256.0, height = 192.0), 1.0, -600.0, -500.0)
+    try canvas.draw(root, gpu.Rect(x = 192.0, width = 64.0, height = 48.0), 64.0 / 1500.0, 0.0, 0.0)
+    try canvas.draw(root, gpu.Rect(x = 0.0, y = 128.0, width = 96.0, height = 64.0), 96.0 / 1500.0, 0.0, 0.0)
+    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    try target.read(into)
+
+test "a frame drawn three times under a budget one draw alone exceeds completes, the same, without growing":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(1500, 1100)
+    defer canvas.close()
+    defer residency_budgets(0, 0)
+    var target = try gpu.Texture.create(device, 256, 192, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    var reference: u8[196608]
+    var seen: u8[196608]
+    try window_frame(&canvas, &target, reference)
+    for index in 0..<(usize)4:
+        let layer = try canvas.add_layer("Layer")
+        let f = (f64)index / 4.0
+        try canvas.fill_gradient(layer, 0.0, f * 300.0, 1500.0, 1100.0 - f * 200.0, 0.2 + f * 0.5, 0.9 - f * 0.4, 0.3, 1.0 if index == 0 else 0.4,
+                                 0.9 - f * 0.3, 0.2 + f * 0.6, 0.8, 1.0 if index == 0 else 0.3)
+    try window_frame(&canvas, &target, reference)
+    # One tile of GPU: every frame's first draw pins more than that.
+    try canvas.set_memory_budgets(524288, 0)
+    try window_frame(&canvas, &target, seen)
+    assert(same_bytes(seen, reference))
+    try window_frame(&canvas, &target, seen)
+    let derived = canvas.memory_derived_bytes()
+    let uploads = canvas.memory_transient_uploads()
+    for round in 0..<(usize)10:
+        try window_frame(&canvas, &target, seen)
+        assert(same_bytes(seen, reference))
+    # The same frames again cost the same: nothing grows, nothing is made twice over.
+    assert(canvas.memory_derived_bytes() <= derived + 1048576)
+    assert(canvas.memory_transient_uploads() - uploads <= 10 * 4 * 30)
+
+test "past the RAM budget six layers move to the scratch file, and undo and export read them back":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(1500, 1100)
+    defer canvas.close()
+    defer residency_budgets(0, 0)
+    var target = try gpu.Texture.create(device, 256, 192, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    var reference: u8[196608]
+    var seen: u8[196608]
+    try frame_pixels(&canvas, &target, 1.0, -600.0, -500.0, reference)
+    # Four tiles of GPU and eight of RAM against six layers of thirty tiles each.
+    try canvas.set_memory_budgets(4 * 524288, 8 * 524288)
+    var layers: i64[6]
+    for index in 0..<(usize)6:
+        layers[index] = try canvas.add_layer("Layer")
+        let f = (f64)index / 6.0
+        try canvas.fill_gradient(layers[index], f * 100.0, 0.0, 1500.0 - f * 100.0, 1100.0, 0.1 + f * 0.6, 0.8 - f * 0.5, 0.4, 1.0 if index == 0 else 0.35,
+                                 0.8 - f * 0.2, 0.3 + f * 0.5, 0.7, 1.0 if index == 0 else 0.25)
+        try frame_pixels(&canvas, &target, 1.0, -600.0, -500.0, seen)
+        try canvas.settle_memory()
+        assert(canvas.memory_ram_bytes() <= 8 * 524288)
+    assert(canvas.memory_disk_bytes() > 0 and canvas.memory_spills() > 0)
+    try frame_pixels(&canvas, &target, 1.0, -600.0, -500.0, reference)
+    try canvas.save("build/memory-disk-reference.png")
+    # A stroke and its undo, then an export: every tile read back from wherever it is.
+    try canvas.set_brush(120.0, 0.8, 1.0, 1.0, 0.0, 0.0, 0.0, false)
+    try canvas.begin_stroke(layers[3], 600.0, 500.0)
+    try canvas.extend_stroke(1200.0, 900.0)
+    try canvas.end_stroke()
+    try canvas.settle_memory()
+    try canvas.undo()
+    try frame_pixels(&canvas, &target, 1.0, -600.0, -500.0, seen)
+    assert(same_bytes(seen, reference))
+    try canvas.settle_memory()
+    assert(canvas.memory_ram_bytes() <= 8 * 524288)
+    try canvas.save("build/memory-disk.png")
+    let expected = try Image.open("build/memory-disk-reference.png")
+    defer expected.release()
+    let exported = try Image.open("build/memory-disk.png")
+    defer exported.release()
+    for probe in [(usize)0, 377, 749, 1100, 1499]:
+        let y = probe * 1099 // 1499
+        let a = try expected.value().getpixel(probe, y)
+        let b = try exported.value().getpixel(probe, y)
+        assert(a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a)

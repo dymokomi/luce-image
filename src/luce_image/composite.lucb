@@ -14,7 +14,7 @@
 import gpu
 import memory
 from tiles import Tiles, Tile, tile_size, min_u32, tile_texture, transient_mark, release_transients
-from pyramid import Pyramid, covered_at, tile_bytes
+from pyramid import Pyramid, covered_at, tile_bytes, precious_level
 from tile_cache import TileCache
 from luce_image.document import Document, Layer, fnv_start, fnv_mix
 from luce_image.style import Styler
@@ -168,7 +168,9 @@ pub struct Composer:
         defer release_transients(mark)
         let texture = try self.flatten(document, column, row)
         self.renders += 1
-        try self.cache.put(digest | 1, texture, tile_bytes)
+        # A zoomed-out composite is made from every layer's levels below it:
+        # precious, so the view at fit keeps it while finer tiles come and go.
+        try self.cache.put(digest | 1, texture, tile_bytes, precious = precious_level(document.width(), document.height(), level))
         return texture
 
     ## Cell (`column`, `row`) of any store at `level`, for drawing outside a

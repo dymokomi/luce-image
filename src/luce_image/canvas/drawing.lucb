@@ -17,8 +17,10 @@ func draw_canvas(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectan
     # A standalone frame has no device; it records nothing.
     let document = canvas.document else return
     let composer = canvas.composer else return
-    # A new frame: what the last one pinned may move, within the memory budget.
-    try settle_memory(canvas)
+    # A new frame: what the last one pinned may move, within the memory budget,
+    # once this draw is done with it. Later draws into the same frame keep what
+    # this one pins.
+    let settles = begin_frame(checked.frame_serial())
     let clipped = try checked.clipped(rectangle)
     defer clipped.release()
     let area = clipped.value()
@@ -47,6 +49,8 @@ func draw_canvas(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectan
             let destination = gpu.Rect(left, top, (f64)covered_x * (f64)span * zoom, (f64)covered_y * (f64)span * zoom)
             try gpu.draw_image(area, texture, destination, gpu.Region(0, 0, covered_x, covered_y), 1.0,
                                gpu.Filter.nearest if zoom >= 1.0 else gpu.Filter.linear)
+    if settles:
+        try settle_tiers(canvas)
 
 ## `Canvas.draw_layer`: one layer's own pixels, or its mask, scaled into `rectangle`.
 func draw_one_layer(canvas: Canvas*, target: interop.View[gpu.RenderTarget], index: i64, rectangle: gpu.Rect, mask: bool) -> !:
