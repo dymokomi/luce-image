@@ -8,7 +8,11 @@
 #       tiles are read back in batches (`read_cells`), filtered and deflated across the
 #       processors a batch at a time, and written in order; the memory tiers settle between
 #       batches, so a save holds about one batch of tiles beyond the budget, not the
-#       document. A tile shared by several cells (or layers) goes out once.
+#       document (and keeps no RAM copies of what it read: `warm = false`). A tile shared by
+#       several cells (or layers) goes out once. Once the file is whole, every tile written
+#       is backed by it (luce-canvas tiles/backing), so the governor can let those tiles go
+#       without writing them anywhere; a save over the file the tiles were backed by first
+#       brings the few tiles only history holds into RAM, so the old file can close.
 #
 #==============================================================================================
 
@@ -38,12 +42,15 @@ struct PackageWriter:
     var slot_rows: usize[]
     var staged: usize
     var failed: @bool
+    ## Where each tile written came from, to be backed by the file once it is whole.
+    var homes: Home[]
+    var home_count: usize
 
     static func begin(path: str) -> PackageWriter!:
         var file = try files.File.open((c_api.str)path, files.OpenMode.replace)
         errdefer file.destroy()
         let slot = (usize)tile_size * tile_row_bytes
-        var writer = PackageWriter(file = file, offset = 0, blob_count = 0, cell_count = 0, stamp_count = 0, staged = 0)
+        var writer = PackageWriter(file = file, offset = 0, blob_count = 0, cell_count = 0, stamp_count = 0, staged = 0, home_count = 0)
         writer.failed.store(false, .release)
         writer.blobs = try alloc PackageBlob[256] in memory.heap
         writer.cells = try alloc PackageCell[256] in memory.heap
@@ -57,6 +64,7 @@ struct PackageWriter:
         writer.packed_length = try alloc usize[package_batch] in memory.heap
         writer.slot_blob = try alloc u32[package_batch] in memory.heap
         writer.slot_rows = try alloc usize[package_batch] in memory.heap
+        writer.homes = try alloc Home[256] in memory.heap
         var header: u8[16]
         memory.copy(u8[](&header[0], 8), package_magic.bytes, 8)
         put_u32(u8[](&header[0], 16), 8, package_version)
@@ -87,6 +95,16 @@ struct PackageWriter:
             self.cells = grown
         self.cells[self.cell_count] = PackageCell(layer = layer, plane = plane, column = (i32)column, row = (i32)row, blob = blob)
         self.cell_count += 1
+
+    ## Remember that `blob` holds the tile at cell (`column`, `row`) of `tiles`.
+    mutating func home(tiles: const Tiles*, column: u32, row: u32, blob: u32) -> !:
+        if self.home_count == self.homes.length:
+            let grown = try alloc Home[self.homes.length * 2] in memory.heap
+            memory.copy(grown, self.homes, self.home_count)
+            free(self.homes) in memory.heap
+            self.homes = grown
+        self.homes[self.home_count] = Home(tiles = tiles, column = column, row = row, blob = blob)
+        self.home_count += 1
 
     ## The blob already holding the tile of `stamp`, if one does.
     func stamped(stamp: u64) -> u32?:
@@ -165,6 +183,8 @@ struct PackageWriter:
             free(self.packed_length) in memory.heap
             free(self.slot_blob) in memory.heap
             free(self.slot_rows) in memory.heap
+        if self.homes.length > 0:
+            free(self.homes) in memory.heap
 
 ## On a worker: filter and deflate staged slot `slot`.
 func compress_slot(context: void*?, slot: usize):
@@ -191,19 +211,19 @@ func save_canvas_package(canvas: Canvas*, path: str) -> !:
     let temporary = try strings.join([path, ".saving"], "")
     defer strings.release(temporary)
     # A save that fails takes its unfinished file with it; the old one stays.
-    write_package(canvas, document, manifest, temporary) catch failure:
+    # A Luce string need not end in NUL; the file calls get a copy that does.
+    let native = try strings.copy(path)
+    defer strings.release(native)
+    write_package(canvas, document, manifest, temporary, native) catch failure:
         files.remove_file((c_api.str)temporary) catch removal:
             discard(removal)
         error(failure.code, failure.message)
     # An older document folder of this name gives way; then the new file takes its place.
-    # A Luce string need not end in NUL; the file calls get a copy that does.
-    let native = try strings.copy(path)
-    defer strings.release(native)
     try clear_old_package(native)
     try files.rename((c_api.str)temporary, (c_api.str)native, replace = true)
 
 ## Write the whole file to `temporary`.
-func write_package(canvas: Canvas*, document: Document*, manifest: interop.Reference[prism.Document], temporary: str) -> !:
+func write_package(canvas: Canvas*, document: Document*, manifest: interop.Reference[prism.Document], temporary: str, path: str) -> !:
     var writer = try PackageWriter.begin(temporary)
     defer writer.destroy()
     for index in 0..<canvas.count:
@@ -242,6 +262,7 @@ func write_package(canvas: Canvas*, document: Document*, manifest: interop.Refer
     try writer.write(end)
     try writer.file.sync()
     try writer.file.close()
+    try rehome_tiles(canvas, &writer, temporary, path)
     # The last tiles read and the preview's composite may leave RAM over its budget.
     try settle_job(canvas)
 
@@ -267,6 +288,7 @@ func write_tiles(canvas: Canvas*, writer: PackageWriter*, layer: u32, tiles: con
             let blob = try writer.new_blob(rows)
             try writer.remember(stamp, blob)
             try writer.add_cell(layer, base, (i64)column, (i64)row, blob)
+            try writer.home(tiles, column, row, blob)
             wanted[count] = Cell(column = column, row = row)
             blobs[count] = blob
             count += 1
@@ -275,11 +297,35 @@ func write_tiles(canvas: Canvas*, writer: PackageWriter*, layer: u32, tiles: con
     while first < count:
         let last = min_usize(count, first + package_read_chunk)
         sink.next = first
-        try read_cells(tiles, wanted[first..<last], (void*)&sink, sink_cell)
+        # One pass: what it reads back is not kept warm in RAM.
+        try read_cells(tiles, wanted[first..<last], (void*)&sink, sink_cell, warm = false)
         # What the reads brought back to RAM may leave before the next chunk's.
         try settle_job(canvas)
         first = last
     try write_beyond(writer, layer, tiles, base + 1)
+
+## A tile written, by its cell: backed by the file once the file is whole.
+struct Home:
+    var tiles: const Tiles*
+    var column: u32
+    var row: u32
+    var blob: u32
+
+## The file at `temporary` is whole: back every tile written by it (known by
+## `path`, the name it is about to take). The file the tiles were backed by
+## before, when it is `path` (a save over it), first lets go of the tiles only
+## it still backs (history's), bringing them into RAM, so it can close before
+## the new file takes its name.
+func rehome_tiles(canvas: Canvas*, writer: const PackageWriter*, temporary: str, path: str) -> !:
+    let source = try open_tile_source(temporary, none, decode_record, name = path)
+    for home in writer.homes[..<writer.home_count]:
+        let blob = writer.blobs[(usize)home.blob]
+        try back_cell(home.tiles, home.column, home.row, source, blob.offset, blob.length, (u32)blob.rows)
+    if let previous = canvas.backing:
+        if tile_source_is(previous, path):
+            try detach_tile_source(previous)
+        release_tile_source(previous)
+    canvas.backing = source
 
 ## Where `read_cells` hands a layer's cells: each to its blob, in order.
 struct TileSink:
@@ -382,6 +428,7 @@ func package_manifest(canvas: Canvas*) -> interop.Reference[prism.Document]!:
     try manifest.value().add("/document", "document")
     try set_integer(manifest.value(), "/document", "width", (i64)canvas.extent_x)
     try set_integer(manifest.value(), "/document", "height", (i64)canvas.extent_y)
+    try set_integer(manifest.value(), "/document", "selected", canvas.selected_layer_index)
     let resolution = try prism.Value.number(canvas.dpi)
     defer resolution.release()
     try manifest.value().set("/document", "resolution", resolution)

@@ -105,36 +105,56 @@ func get_u64(bytes: const u8[], at: usize) -> u64:
 
 ## Filter a tile's `rows` texel rows from `texels` into `filtered` (as many
 ## bytes): each sample's difference from the one to its left, low bytes first.
+## The lengths are checked once; the loops then run on pointers with wrapping
+## arithmetic (checked indexing per byte made this the save's hottest loop).
 func filter_tile(texels: const u8[], rows: usize, filtered: u8[]):
-    let count = rows * tile_row_bytes // 2
-    for row in 0..<rows:
-        let line = row * tile_row_bytes
-        for sample in 0..<tile_row_bytes // 2:
-            let at = line + sample * 2
-            let value = (u16)texels[at] | ((u16)texels[at + 1] << 8)
-            var left: u16 = 0
-            if sample >= 4:
-                left = (u16)texels[at - 8] | ((u16)texels[at - 7] << 8)
-            let delta = value -% left
-            let place = row * (tile_row_bytes // 2) + sample
-            filtered[place] = (u8)(delta & 0xff)
-            filtered[count + place] = (u8)(delta >> 8)
+    let per_row = tile_row_bytes // 2
+    let count = rows * per_row
+    if texels.length < count * 2 or filtered.length < count * 2:
+        trap("a tile filter was given too few bytes")
+    let source = (const u16*)texels.data
+    let low = filtered.data
+    let high = filtered.data + count
+    var row: usize = 0
+    while row < rows:
+        let base = row *% per_row
+        var sample: usize = 0
+        while sample < 4:
+            let value = source[base +% sample]
+            low[base +% sample] = (u8)(value & 0xff)
+            high[base +% sample] = (u8)(value >> 8)
+            sample = sample +% 1
+        while sample < per_row:
+            let at = base +% sample
+            let delta = source[at] -% source[at -% 4]
+            low[at] = (u8)(delta & 0xff)
+            high[at] = (u8)(delta >> 8)
+            sample = sample +% 1
+        row = row +% 1
 
 ## Undo `filter_tile`: `filtered` back into `texels`, `rows` rows of them.
 func unfilter_tile(filtered: const u8[], rows: usize, texels: u8[]):
-    let count = rows * tile_row_bytes // 2
-    for row in 0..<rows:
-        let line = row * tile_row_bytes
-        for sample in 0..<tile_row_bytes // 2:
-            let place = row * (tile_row_bytes // 2) + sample
-            let delta = (u16)filtered[place] | ((u16)filtered[count + place] << 8)
-            let at = line + sample * 2
-            var left: u16 = 0
-            if sample >= 4:
-                left = (u16)texels[at - 8] | ((u16)texels[at - 7] << 8)
-            let value = delta +% left
-            texels[at] = (u8)(value & 0xff)
-            texels[at + 1] = (u8)(value >> 8)
+    let per_row = tile_row_bytes // 2
+    let count = rows * per_row
+    if texels.length < count * 2 or filtered.length < count * 2:
+        trap("a tile unfilter was given too few bytes")
+    let target = (u16*)texels.data
+    let low = filtered.data
+    let high = filtered.data + count
+    var row: usize = 0
+    while row < rows:
+        let base = row *% per_row
+        var sample: usize = 0
+        while sample < 4:
+            let at = base +% sample
+            target[at] = (u16)low[at] | ((u16)high[at] << 8)
+            sample = sample +% 1
+        while sample < per_row:
+            let at = base +% sample
+            let delta = (u16)low[at] | ((u16)high[at] << 8)
+            target[at] = delta +% target[at -% 4]
+            sample = sample +% 1
+        row = row +% 1
 
 # -- Work spread over the processors.
 

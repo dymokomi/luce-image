@@ -163,7 +163,83 @@ test "a document past its memory budget saves and opens within it, pixels unchan
     try frame_pixels(&canvas, &target, 0.25, 0.0, 0.0, reference)
     try canvas.save_package("build/package-budget.l2d")
     assert(canvas.memory_ram_bytes() <= 8 * 524288)
+    let written = canvas.memory_disk_bytes()
     let opened = try Canvas.open("build/package-budget.l2d")
     defer opened.release()
     try frame_pixels(opened.value(), &target, 0.25, 0.0, 0.0, seen)
     assert(same_bytes(seen, reference))
+    # The opened tiles are backed by the file: past the budget they leave without
+    # being written to the scratch file, and the GPU keeps within the budget (and
+    # a batch of slack) once the load settles.
+    try opened.value().settle_memory()
+    assert(opened.value().memory_disk_bytes() <= written)
+    assert(opened.value().memory_gpu_bytes() <= 4 * 524288 + 32 * 524288)
+    # Panning over tiles that left comes back exact, read from the file.
+    try frame_pixels(opened.value(), &target, 1.0, -600.0, -500.0, seen)
+    try frame_pixels(&canvas, &target, 1.0, -600.0, -500.0, reference)
+    assert(same_bytes(seen, reference))
+
+test "the selected layer is saved with the document and comes back":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(300, 200)
+    defer canvas.close()
+    discard(try canvas.add_layer("Background"))
+    discard(try canvas.add_layer("Top"))
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    assert(canvas.selected_layer() == -1)
+    canvas.set_selected_layer(1)
+    try canvas.save_package("build/package-selected.l2d")
+    let opened = try Canvas.open("build/package-selected.l2d")
+    defer opened.release()
+    assert(opened.value().selected_layer() == 1)
+
+test "a document saved over the file it came from keeps every pixel, and undo still reaches before the save":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    defer residency_budgets(0, 0)
+    var target = try gpu.Texture.create(device, 256, 192, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    var first: u8[196608]
+    var second: u8[196608]
+    var seen: u8[196608]
+    # A document on disk, then opened from it: its tiles are backed by that file.
+    var canvas = try Canvas(1200, 900)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.fill_gradient(layer, 0.0, 0.0, 1200.0, 900.0, 0.2, 0.6, 0.3, 1.0, 0.9, 0.1, 0.7, 1.0)
+    try canvas.save_package("build/package-over.l2d")
+    let opened = try Canvas.open("build/package-over.l2d")
+    defer opened.release()
+    let document = opened.value()
+    try document.set_memory_budgets(4 * 524288, 4 * 524288)
+    try frame_pixels(document, &target, 0.25, 0.0, 0.0, first)
+    # An edit, then the document saved over its own file.
+    try document.select_rectangle(100, 100, 600, 500)
+    try document.set_brush(40.0, 1.0, 1.0, 1.0, 0.1, 0.2, 0.9, false)
+    try document.fill(try document.layer_id(0), false)
+    try document.deselect()
+    try frame_pixels(document, &target, 0.25, 0.0, 0.0, second)
+    try document.save_package("build/package-over.l2d")
+    try document.settle_memory()
+    # What the document shows now, read back through the new file.
+    try frame_pixels(document, &target, 0.25, 0.0, 0.0, seen)
+    assert(same_bytes(seen, second))
+    let again = try Canvas.open("build/package-over.l2d")
+    defer again.release()
+    try frame_pixels(again.value(), &target, 0.25, 0.0, 0.0, seen)
+    assert(same_bytes(seen, second))
+    # Undo (deselect, fill, select) reaches the pixels from before, which only
+    # history held: they left the old file before it was replaced.
+    try document.undo()
+    try document.undo()
+    try document.undo()
+    try frame_pixels(document, &target, 0.25, 0.0, 0.0, seen)
+    assert(same_bytes(seen, first))

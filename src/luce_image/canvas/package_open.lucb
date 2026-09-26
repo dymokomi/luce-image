@@ -9,7 +9,10 @@
 #       inflated and unfiltered across the processors, uploaded in one submission, and the
 #       memory tiers settle between batches, so a document larger than the GPU (or RAM)
 #       opens within its budget and nothing the size of the document is ever made. A tile
-#       stored once for several cells of a layer is uploaded once and shared.
+#       stored once for several cells of a layer is uploaded once and shared. Every tile
+#       loaded stays backed by the file (luce-canvas tiles/backing): past the budgets the
+#       governor drops it rather than writing it to the scratch file, and reads it back from
+#       the document when it is wanted again.
 #
 #==============================================================================================
 
@@ -121,6 +124,10 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
     let native = try new Canvas(width, height) in memory.heap
     errdefer native.close()
     try native.set_resolution(try get_number(doc, "/document", "resolution"))
+    # The layer the application had selected; a file without it selects none.
+    native.selected_layer_index = get_integer(doc, "/document", "selected") catch failure:
+        discard(failure)
+        recover -1
     let profile_value = try doc.get("/document", "profile")
     defer profile_value.release()
     native.set_profile(try profile_value.value().text_at())
@@ -193,6 +200,11 @@ func load_package(canvas: Canvas*) -> !:
     let document = canvas.document else trap("loading an unbound document")
     var file = try files.File.open((c_api.str)source.path)
     defer file.destroy()
+    # The file backs the tiles loaded from it; the canvas keeps a hold on it.
+    let backing = try open_tile_source(source.path, none, decode_record)
+    if let previous = canvas.backing:
+        release_tile_source(previous)
+    canvas.backing = backing
     for index in 0..<canvas.count:
         let stored = canvas.records[index].stored
         if stored < 0:
@@ -200,12 +212,12 @@ func load_package(canvas: Canvas*) -> !:
         canvas.records[index].stored = -1
         let id = canvas.records[index].id
         if not canvas.records[index].group and canvas.records[index].adjustment < 0:
-            if let tiles = try load_tiles(canvas, source, &file, (u32)stored, plane_pixels):
+            if let tiles = try load_tiles(canvas, source, &file, backing, (u32)stored, plane_pixels):
                 try document.set_tiles(id, tiles)
                 let layer = document.find(id) else trap("a loaded layer is gone")
                 try build_levels(canvas, layer.tiles() else trap("a loaded layer has no pixels"), false)
         if canvas.records[index].masked:
-            if let mask = try load_tiles(canvas, source, &file, (u32)stored, plane_mask):
+            if let mask = try load_tiles(canvas, source, &file, backing, (u32)stored, plane_mask):
                 var old = try document.take_mask(id, mask)
                 old.destroy()
                 let layer = document.find(id) else trap("a loaded layer is gone")
@@ -239,7 +251,7 @@ func inflate_slot(context: void*?, slot: usize):
 
 ## Layer `layer`'s tiles of `base` (pixels or mask, with the plane past the
 ## canvas after it) as a new store; none when the file holds no cell of them.
-func load_tiles(canvas: Canvas*, source: PackageSource*, file: files.File*, layer: u32, base: u32) -> Tiles?!:
+func load_tiles(canvas: Canvas*, source: PackageSource*, file: files.File*, backing: TileSource*, layer: u32, base: u32) -> Tiles?!:
     var any = false
     var outside = CellRange(left = 0, top = 0, right = 0, bottom = 0)
     var beyond = false
@@ -290,6 +302,12 @@ func load_tiles(canvas: Canvas*, source: PackageSource*, file: files.File*, laye
     defer free(shares) in memory.heap
     var share_count: usize = 0
     var staged: usize = 0
+    # Loading goes a row of cells at a time (the file holds a layer's cells in rows): once
+    # a row is in, the cells sharing its tiles are placed and the levels above the rows
+    # finished so far are made, while those rows' tiles are still on the GPU. Past the
+    # budgets they may then leave (the file backs them) without ever being read again.
+    var building = LevelBuild(canvas = canvas, tiles = &tiles, mask = base == plane_mask, top = top_level(canvas), done = 0)
+    var current: i64 = -1
     for cell in source.cells:
         if cell.layer != layer or (cell.plane != base and cell.plane != base + 1):
             continue
@@ -297,6 +315,14 @@ func load_tiles(canvas: Canvas*, source: PackageSource*, file: files.File*, laye
         if cell.plane == base:
             if (u32)cell.column >= tiles.columns() or (u32)cell.row >= tiles.rows() or cell.column < 0 or cell.row < 0:
                 error(invalid, "a stored cell lies off the canvas grid")
+            if (i64)cell.row != current:
+                try place_batch(canvas, &tiles, &batch, places, staged, base, source, backing)
+                staged = 0
+                try place_shares(&tiles, first, shares[..<share_count])
+                share_count = 0
+                if current >= 0:
+                    try building.rows_through((u32)current)
+                current = (i64)cell.row
             # A tile this layer already has: shared, not read again.
             if first[(usize)cell.blob] >= 0:
                 shares[share_count] = cell
@@ -311,17 +337,64 @@ func load_tiles(canvas: Canvas*, source: PackageSource*, file: files.File*, laye
         places[staged] = cell
         staged += 1
         if staged == load_batch:
-            try place_batch(canvas, &tiles, &batch, places, staged, base)
+            try place_batch(canvas, &tiles, &batch, places, staged, base, source, backing)
             staged = 0
-    try place_batch(canvas, &tiles, &batch, places, staged, base)
-    for cell in shares[..<share_count]:
+    try place_batch(canvas, &tiles, &batch, places, staged, base, source, backing)
+    try place_shares(&tiles, first, shares[..<share_count])
+    if current >= 0:
+        try building.rows_through(tiles.rows() - 1)
+    return tiles
+
+## Place the cells of `shares` sharing a tile already loaded (`first` says
+## where it went on the canvas grid).
+func place_shares(tiles: Tiles*, first: const i64[], shares: const PackageCell[]) -> !:
+    for cell in shares:
         let seen = first[(usize)cell.blob]
         try tiles.share((u32)cell.column, (u32)cell.row, (u32)(seen % 65536), (u32)(seen // 65536))
-    return tiles
+
+## The level at which the document fits one cell: the view at fit reads it.
+func top_level(canvas: const Canvas*) -> u32:
+    var level: u32 = 0
+    while level_size(canvas.extent_x, level) > tile_size or level_size(canvas.extent_y, level) > tile_size:
+        level += 1
+    return level
+
+## A layer's pyramid made as its rows of cells load: the levels above every
+## row finished so far, each level from the one below it while that is fresh.
+struct LevelBuild:
+    var canvas: Canvas*
+    var tiles: const Tiles*
+    var mask: bool
+    var top: u32
+    ## Rows of cells finished at level 0.
+    var done: u32
+
+    ## Rows 0..`row` of level 0 are in: make every level's rows they complete.
+    mutating func rows_through(row: u32) -> !:
+        if self.top == 0 or row + 1 <= self.done:
+            return
+        let composer = self.canvas.composer else return
+        # A request of its own: what earlier rows made may leave the cache now, as
+        # the load is not inside one frame's request (which would keep all of it).
+        composer.levels().hold()
+        let finished = row + 1
+        let rows = self.tiles.rows()
+        let mark = transient_mark()
+        defer release_transients(mark)
+        for level in 1..<self.top + 1:
+            # The rows of this level whose children, rows at level 0, are all in now.
+            let span = 1u32 << level
+            let before = self.done // span if self.done < rows else (rows + span - 1) // span
+            let after = finished // span if finished < rows else (rows + span - 1) // span
+            let columns = (self.tiles.columns() + span - 1) // span
+            for level_row in before..<after:
+                for column in 0..<columns:
+                    discard(try composer.levels().texture(self.tiles, column, level_row, level, self.mask))
+        self.done = finished
 
 ## Inflate the batch's `count` records across the processors, upload them in
 ## one submission into their cells, and let the tiers settle.
-func place_batch(canvas: Canvas*, tiles: Tiles*, batch: LoadBatch*, places: const PackageCell[], count: usize, base: u32) -> !:
+func place_batch(canvas: Canvas*, tiles: Tiles*, batch: LoadBatch*, places: const PackageCell[], count: usize, base: u32, source: const PackageSource*, backing: TileSource*) -> !:
     if count == 0:
         return
     # A batch of its own each time: its staging goes once the copies are done.
@@ -342,8 +415,16 @@ func place_batch(canvas: Canvas*, tiles: Tiles*, batch: LoadBatch*, places: cons
         else:
             try tiles.place((i64)cell.column, (i64)cell.row, texture, false, true)
     try upload.submit()
-    # What came in may push older tiles to RAM before the next batch.
-    try settle_job(canvas)
+    # Each tile keeps its record in the file, so leaving the GPU or RAM costs nothing.
+    for slot in 0..<count:
+        let cell = places[slot]
+        if cell.plane != base:
+            continue
+        let blob = source.blobs[(usize)cell.blob]
+        try back_cell(tiles, (u32)cell.column, (u32)cell.row, backing, blob.offset, blob.length, (u32)blob.rows)
+    # What came in may push older tiles down a tier before the next batch; the layer
+    # loading counts as shown, not as history's.
+    try settle_loading(canvas, tiles)
 
 ## Build `tiles`' pyramid up to the level where the document fits one cell,
 ## while the layer's newest tiles are still on the GPU: the first view of the
@@ -360,3 +441,18 @@ func build_levels(canvas: Canvas*, tiles: const Tiles*, mask: bool) -> !:
     defer release_transients(mark)
     discard(try composer.levels().texture(tiles, 0, 0, level, mask))
     try settle_job(canvas)
+
+## luce-canvas's decode of this format's records (tiles/backing): inflate the
+## record, then undo its filter into `into`'s first `rows` texel rows. Runs on
+## worker threads too.
+func decode_record(context: void*?, packed: const u8[], rows: u32, into: u8[]) -> !:
+    discard(context)
+    let bytes = (usize)rows * tile_row_bytes
+    if bytes > into.length:
+        error(invalid, "a stored tile of the .l2d document is damaged")
+    let filtered = try alloc u8[bytes] in memory.heap
+    defer free(filtered) in memory.heap
+    let used = try flate.inflate_raw(packed, filtered)
+    if used != packed.length:
+        error(invalid, "a stored tile of the .l2d document is damaged")
+    unfilter_tile(filtered, (usize)rows, into[..<bytes])

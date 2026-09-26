@@ -16,15 +16,32 @@
 ## Memory usage, one setting for every open document.
 var memory_usage: f64 = 0.6
 
-## Budget the governor for `device` at the current memory usage.
+## Budgets set in bytes (`Canvas.set_memory_budgets`), which a later bind
+## keeps rather than replacing with the memory usage's; zero for none set.
+var forced_gpu: usize = 0
+var forced_ram: usize = 0
+var forced: bool = false
+
+## Budget the governor for `device` at the current memory usage, or at the
+## budgets set in bytes.
 func configure_memory(device: gpu.Device) -> !:
     try residency_configure(device, memory_usage)
+    if forced:
+        residency_budgets(forced_gpu, forced_ram)
+
+## `Canvas.set_memory_budgets`: bytes, kept across binds.
+func force_memory_budgets(gpu_bytes: usize, ram_bytes: usize):
+    forced = true
+    forced_gpu = gpu_bytes
+    forced_ram = ram_bytes
+    residency_budgets(gpu_bytes, ram_bytes)
 
 ## `Canvas.set_memory_usage`: a new share, applied at once when bound.
 func set_memory_usage(canvas: Canvas*, fraction: f64) -> !:
     if not (fraction >= 0.1 and fraction <= 0.95):
         error(invalid, "memory usage must be 0.1..0.95 of what the machine has")
     memory_usage = fraction
+    forced = false
     if let device = canvas.device:
         try configure_memory(device)
 
@@ -50,6 +67,21 @@ func settle_job(canvas: Canvas*) -> !:
         return
     residency_advance()
     try settle_tiers(canvas)
+
+## `settle_job` while `loading` (a layer's tiles coming from a file, not yet
+## in the document) is filled: it counts as shown, so its tiles do not leave
+## first as history's would.
+func settle_loading(canvas: Canvas*, loading: const Tiles*) -> !:
+    if not residency_over_budget():
+        return
+    let device = canvas.device else return
+    let document = canvas.document else return
+    residency_advance()
+    residency_begin_marking()
+    for layer in document.layers():
+        mark_layer(layer)
+    residency_mark_live(loading)
+    try residency_settle(device)
 
 ## When the tiers hold too much, mark what every layer and mask of the
 ## document shows and move the least wanted tiles down a tier. Cheap within
