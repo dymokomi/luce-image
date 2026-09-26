@@ -181,3 +181,42 @@ func release_records(records: Record[], count: usize):
         strings.release(records[index].name)
         release_type(&records[index])
     free(records) in memory.heap
+
+## The user steps of a history stack, `count` entries of `entries`: on the undo
+## stack (`future` false) a step is an entry not joined with those joined above
+## it, oldest first; on the redo stack it is the top entry with those joined
+## below it, next first. How many there are; with `index`, the entry that
+## names step `index` (the one Undo's menu would name) goes into `named`.
+func step_starts(entries: const Snapshot[], count: usize, future: bool, index: i64?, named: usize*? = none) -> usize:
+    var steps: usize = 0
+    if not future:
+        var at: usize = 0
+        while at < count:
+            # The step runs up through every joined entry above its first.
+            var top = at
+            while top + 1 < count and entries[top + 1].joined:
+                top += 1
+            if let wanted = index:
+                if wanted == (i64)steps:
+                    if let out = named: *out = top
+            steps += 1
+            at = top + 1
+        return steps
+    var at = count
+    while at > 0:
+        # From the next redo down through the joined entries below it.
+        var bottom = at - 1
+        while bottom > 0 and entries[bottom - 1].joined:
+            bottom -= 1
+        if let wanted = index:
+            if wanted == (i64)steps:
+                if let out = named: *out = bottom
+        steps += 1
+        at = bottom
+    return steps
+
+## The name of step `index` of a history stack, "" past its end.
+func step_name(entries: const Snapshot[], count: usize, future: bool, index: i64) -> str:
+    var named = count
+    discard(step_starts(entries, count, future, index, &named))
+    return entries[named].name if named < count else ""
