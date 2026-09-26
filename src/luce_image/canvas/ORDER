@@ -6,6 +6,7 @@ clipboard.lucb
 layer_clip.lucb
 retouch.lucb
 retouch_effects.lucb
+liquifying.lucb
 transforming.lucb
 filter_previews.lucb
 type_layers.lucb
@@ -18,3 +19,4 @@ support.lucb
 tests.lucb
 preview_tests.lucb
 warp_tests.lucb
+liquify_tests.lucb

@@ -1,0 +1,108 @@
+#==============================================================================================
+#
+#   canvas/liquifying - Liquify's push on a canvas: shown live, kept once
+#
+#   DESCRIPTION:
+#       A push stroke only moves its grid as the pointer goes (liquify.lucb). Once a frame,
+#       when the grid moved, the layer is shown through a new generation of a stand-in that
+#       makes the pushed cells the view draws, at its level; the layer keeps its pixels
+#       meanwhile. Ending the stroke makes the cells the grid moved once at full size, puts
+#       them in the layer as one undo step (remembered when the stroke began), and keeps
+#       them within the selection as every retouching stroke is.
+#
+#==============================================================================================
+
+## A push under way on layer `layer`: the stroke, and the layer's pixels as it
+## began with their pieces, which every made cell reads.
+struct Liquifying:
+    var stroke: LiquifyStroke
+    var layer: u64
+    var original: Tiles
+    var parts: Pieces
+    var liquifier: Liquifier
+    var generation: u64
+
+## `Canvas.begin_stroke` with the push tool: a push on layer `id`'s `tiles`
+## begun at (`x`, `y`), its pixels remembered for undo.
+func begin_liquify(canvas: Canvas*, id: u64, tiles: const Tiles*, x: f64, y: f64) -> !:
+    let device = canvas.device else error(invalid, "draw the document once before retouching")
+    if canvas.liquifier == none:
+        canvas.liquifier = try Liquifier.create(device)
+    let liquifier = canvas.liquifier else trap("made")
+    var stroke = try LiquifyStroke.begin(tiles.width(), tiles.height(), x, y, canvas.brush.diameter, canvas.brush.hardness, canvas.brush.opacity)
+    errdefer stroke.destroy()
+    var original = try tiles.clone()
+    errdefer original.destroy()
+    var parts = try pieces(&original)
+    errdefer parts.destroy()
+    try canvas.remember(id, try tiles.clone(), name = "Liquify")
+    canvas.liquify = try new Liquifying(stroke = stroke, layer = id, original = original, parts = parts, liquifier = liquifier, generation = 0) in memory.heap
+
+## Continue a push to (`x`, `y`): its grid moves; the next frame shows it.
+func extend_liquify(shown: Liquifying*, x: f64, y: f64) -> !:
+    try shown.stroke.extend(x, y)
+
+## Once a frame: when the grid moved, show the layer through a new generation
+## of the stand-in, so the view makes the cells it draws again.
+func settle_liquify(canvas: Canvas*, shown: Liquifying*) -> !:
+    if not shown.stroke.changed:
+        return
+    shown.stroke.changed = false
+    let composer = canvas.composer else return
+    shown.generation = next_generation()
+    try composer.stand_in(StandIn(layer = shown.layer, mask = false, generation = shown.generation, context = (void*)shown, make = liquify_cell))
+
+## A stand-in's cell (`column`, `row`) of `level`: the pushed layer there.
+func liquify_cell(context: void*?, layer_levels: Pyramid*, layer: u64, mask: bool, column: u32, row: u32, level: u32) -> Made!:
+    let shown = (Liquifying*)(context else return made_original())
+    var original = false
+    let made = try shown.liquifier.cell(&shown.stroke.grid, &shown.original, &shown.parts, layer_levels, column, row, level, &original)
+    if original:
+        return made_original()
+    let texture = made else return made_nothing()
+    return made_texture(texture)
+
+## End a push: the cells its grid moved made at full size into the layer, kept
+## within the selection. One undo step, remembered when it began.
+func finish_liquify(canvas: Canvas*, shown: Liquifying*) -> !:
+    canvas.liquify = none
+    defer drop_liquifying(shown)
+    let document = canvas.document else trap("stroke without a document")
+    let composer = canvas.composer else trap("stroke without a compositor")
+    composer.drop_stand_ins()
+    let layer = document.find(shown.layer) else error(invalid, "the pushed layer is gone")
+    let tiles = layer.tiles() else error(invalid, "the pushed layer has no pixels")
+    let moved = shown.stroke.grid.moved
+    if not moved.any:
+        return
+    let span = (f64)tile_size
+    let first_column = (u32)math.max(0.0, math.floor(moved.left / span))
+    let first_row = (u32)math.max(0.0, math.floor(moved.top / span))
+    let last_column = (u32)math.min((f64)tiles.columns() - 1.0, math.floor(moved.right / span))
+    let last_row = (u32)math.min((f64)tiles.rows() - 1.0, math.floor(moved.bottom / span))
+    for row in first_row..<last_row + 1:
+        for column in first_column..<last_column + 1:
+            var original = false
+            let made = try shown.liquifier.cell(&shown.stroke.grid, &shown.original, &shown.parts, composer.levels(), column, row, 0, &original)
+            if original:
+                continue
+            if let texture = made:
+                try tiles.set(column, row, texture)
+            else:
+                try tiles.clear(column, row)
+    layer.revision += 1
+    try canvas.restrict_to_selection(shown.layer, &canvas.history[canvas.history_count - 1].tiles)
+
+## Let a push go without keeping it (the canvas closing mid-stroke).
+func drop_liquify(canvas: Canvas*):
+    let shown = canvas.liquify else return
+    canvas.liquify = none
+    if let composer = canvas.composer:
+        composer.drop_stand_ins()
+    drop_liquifying(shown)
+
+func drop_liquifying(shown: Liquifying*):
+    shown.stroke.destroy()
+    shown.original.destroy()
+    shown.parts.destroy()
+    free(shown) in memory.heap

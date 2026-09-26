@@ -1,20 +1,20 @@
-## Smudge and Liquify's push, as Compositor's (Document/SmudgeLiquify.swift):
-## both work dab by dab on a premultiplied working copy of the layer on the
-## CPU, and the tiles a dab reaches are uploaded as the stroke goes, so the
-## canvas shows it live. The working copy is kept a cell at a time, each read
-## back from the layer as it was when the stroke began the first time a dab
-## comes near it: a stroke costs the cells it passes, not the document. The
-## tip falls off as a smoothstep from the hardness to the rim.
+## Smudge, as Compositor's (Document/SmudgeLiquify.swift): dab by dab on a
+## premultiplied working copy of the layer on the CPU, and the tiles a dab
+## reaches are uploaded as the stroke goes, so the canvas shows it live. The
+## working copy is kept a cell at a time, each read back from the layer as it
+## was when the stroke began the first time a dab comes near it: a stroke
+## costs the cells it passes, not the document. The tip falls off as a
+## smoothstep from the hardness to the rim. (Liquify's push moves a
+## displacement grid instead: liquify.lucb.)
+##
+## Smudge picks up the pixels under the first dab and carries them: each dab
+## lays them down by the tip, and keeps `strength` of what it carried (1
+## carries forever, less picks up more of what it passes).
 ##
 ## A stroke can walk its path on a worker thread (`start_async`): the main
 ## thread only records points, reading in the cells each segment's dabs can
 ## reach first (the GPU is the main thread's), and uploads what changed once a
 ## frame. Ending the path returns at once; the worker finishes it.
-## - Smudge picks up the pixels under the first dab and carries them: each
-##   dab lays them down by the tip, and keeps `strength` of what it carried
-##   (1 carries forever, less picks up more of what it passes).
-## - Push moves the pixels under the tip along the stroke by `strength` of
-##   each step, sampled back from behind the brush (bilinear).
 import math
 import memory
 import os
@@ -26,9 +26,6 @@ from luce_image.warp_queue import WarpQueue
 from luce_image.warp_upload import PackCell, pack_cells
 import gpu
 
-pub let warp_smudge: i64 = 0
-pub let warp_push: i64 = 1
-
 ## Smudge's dab spacing by default, a fraction of the diameter: nearly twice
 ## the 0.08 it was, halving the dabs. Wider shows each dab: the carried
 ## pixels jump a whole step between dabs, and from about 0.2 their edges repeat
@@ -36,9 +33,6 @@ pub let warp_push: i64 = 1
 pub let default_smudge_spacing: f64 = 0.15
 ## How many changed cells are converted together before they go up.
 let upload_batch: usize = 64
-
-## Push steps finely whatever the setting: each step moves pixels by its length.
-let push_spacing: f64 = 0.025
 
 ## One cell of the working copy: 256 rows of 256 premultiplied RGBA f32 samples.
 struct WarpCell:
@@ -52,15 +46,13 @@ pub struct WarpStroke:
     var source: Tiles
     ## The working copy's cells, each none until a dab first comes near it.
     var cells: WarpCell*?[]
-    var mode: i64
     ## Smudge's dab spacing, a fraction of the diameter.
     var spacing: f64
     var radius: f64
     var hardness: f64
     var strength: f64
-    ## Smudge's carried square, (2r+1)² RGBA; push's scratch copy of a dab's area.
+    ## The carried square, (2r+1)² RGBA.
     var carried: f32[]
-    var scratch: f32[]
     var last_x: f64
     var last_y: f64
     var debt: f64
@@ -82,9 +74,7 @@ pub struct WarpStroke:
     ## Begin on `tiles` (straight alpha) at (`x`, `y`): `diameter`, `hardness`
     ## (at most 0.98), `strength` (0.01..1) and smudge's `spacing` (a fraction
     ## of the diameter).
-    pub static func begin(tiles: const Tiles*, mode: i64, x: f64, y: f64, diameter: f64, hardness: f64, strength: f64, spacing: f64 = default_smudge_spacing) -> WarpStroke!:
-        if mode != warp_smudge and mode != warp_push:
-            error(invalid, "a warp stroke smudges or pushes")
+    pub static func begin(tiles: const Tiles*, x: f64, y: f64, diameter: f64, hardness: f64, strength: f64, spacing: f64 = default_smudge_spacing) -> WarpStroke!:
         if not math.is_finite(x) or not math.is_finite(y) or not (diameter >= 1.0 and diameter <= 5000.0):
             error(invalid, "a warp stroke needs a finite point and a diameter of 1..5000")
         if not (spacing >= 0.01 and spacing <= 5.0):
@@ -104,17 +94,15 @@ pub struct WarpStroke:
         errdefer free(carried) in memory.heap
         let weights = try alloc f32[side * side] in memory.heap
         errdefer free(weights) in memory.heap
-        var no_scratch: f32[]
-        var stroke = WarpStroke(width = width, height = height, columns = (usize)tiles.columns(), source = source, cells = cells, mode = mode, spacing = spacing, radius = radius,
+        var stroke = WarpStroke(width = width, height = height, columns = (usize)tiles.columns(), source = source, cells = cells, spacing = spacing, radius = radius,
                                 hardness = math.clamp(hardness, 0.0, 0.98), strength = math.clamp(strength, 0.01, 1.0),
-                                carried = carried, scratch = no_scratch, weights = weights, last_x = x, last_y = y, debt = 0.0,
+                                carried = carried, weights = weights, last_x = x, last_y = y, debt = 0.0,
                                 dirty_left = 1, dirty_top = 1, dirty_right = 0, dirty_bottom = 0, queue = none, worker = none, queued_x = x, queued_y = y)
         let reach = (i64)math.ceil(radius)
         for j in 0..<(i64)side:
             for i in 0..<(i64)side:
                 weights[(usize)j * side + (usize)i] = (f32)stroke.weight(math.hypot((f64)(i - reach), (f64)(j - reach)))
-        if mode == warp_smudge:
-            try stroke.pick_up(x, y)
+        try stroke.pick_up(x, y)
         return stroke
 
     ## Continue to (`x`, `y`) here and now, a dab every spacing along the way.
@@ -126,14 +114,12 @@ pub struct WarpStroke:
 
     ## How far apart the dabs fall, in pixels.
     func step() -> f64:
-        return math.max(1.0, self.radius * 2.0 * (self.spacing if self.mode == warp_smudge else push_spacing))
+        return math.max(1.0, self.radius * 2.0 * self.spacing)
 
     ## Read in every cell a dab on the segment from (`x0`, `y0`) to (`x1`,
-    ## `y1`) can reach: the tip's reach, and for push the area it samples back from.
+    ## `y1`) can reach.
     mutating func load_segment(x0: f64, y0: f64, x1: f64, y1: f64) -> !:
-        var margin = (i64)math.ceil(self.radius) + 2
-        if self.mode == warp_push:
-            margin += (i64)math.ceil(self.step() * 2.0) + 2
+        let margin = (i64)math.ceil(self.radius) + 2
         try self.load((i64)math.floor(math.min(x0, x1)) - margin, (i64)math.floor(math.min(y0, y1)) - margin,
                       (i64)math.ceil(math.max(x0, x1)) + margin, (i64)math.ceil(math.max(y0, y1)) + margin)
 
@@ -145,18 +131,9 @@ pub struct WarpStroke:
         let length = math.sqrt(dx * dx + dy * dy)
         let step = self.step()
         var along = step - self.debt
-        var from_x = self.last_x
-        var from_y = self.last_y
         while along <= length:
             let t = along / length
-            let to_x = self.last_x + dx * t
-            let to_y = self.last_y + dy * t
-            if self.mode == warp_smudge:
-                try self.smudge(to_x, to_y)
-            else:
-                try self.push(from_x, from_y, to_x, to_y)
-            from_x = to_x
-            from_y = to_y
+            try self.smudge(self.last_x + dx * t, self.last_y + dy * t)
             along += step
         self.debt = length - (along - step)
         self.last_x = x
@@ -243,7 +220,7 @@ pub struct WarpStroke:
         queue.wait()
         try self.join()
         if queue.failure():
-            error(invalid, "a smudge or push dab could not be made")
+            error(invalid, "a smudge dab could not be made")
 
     func join() -> !:
         if let handle = self.worker:
@@ -267,8 +244,6 @@ pub struct WarpStroke:
         self.source.destroy()
         free(self.carried) in memory.heap
         free(self.weights) in memory.heap
-        if self.scratch.length > 0:
-            free(self.scratch) in memory.heap
 
     # -- The dabs.
 
@@ -305,44 +280,6 @@ pub struct WarpStroke:
         # the rows go to the processors.
         var job = SmudgeJob(stroke = &self, cx = cx, cy = cy, reach = reach, first = 0, last = side)
         try smudge_bands(&job)
-        self.touch(cx - reach, cy - reach, cx + reach, cy + reach)
-
-    ## Push: each pixel under the tip takes what was behind it along the
-    ## step, by the tip's weight there.
-    mutating func push(from_x: f64, from_y: f64, to_x: f64, to_y: f64) -> !:
-        let move_x = (to_x - from_x) * self.strength
-        let move_y = (to_y - from_y) * self.strength
-        let reach = (i64)math.ceil(self.radius)
-        let margin = reach + (i64)math.ceil(math.abs(move_x) + math.abs(move_y)) + 2
-        let cx = (i64)math.round(to_x)
-        let cy = (i64)math.round(to_y)
-        # The area as it was before this dab, so the dab reads nothing it wrote.
-        let left = cx - margin
-        let top = cy - margin
-        let side = (usize)(margin * 2 + 1)
-        if self.scratch.length < side * side * 4:
-            if self.scratch.length > 0:
-                free(self.scratch) in memory.heap
-            self.scratch = try alloc f32[side * side * 4] in memory.heap
-        for j in 0..<side:
-            for i in 0..<side:
-                for channel in 0..<(usize)4:
-                    self.scratch[(j * side + i) * 4 + channel] = self.pixel(left + (i64)i, top + (i64)j, channel)
-        for j in -reach..<(reach + 1):
-            for i in -reach..<(reach + 1):
-                let px = cx + i
-                let py = cy + j
-                if px < 0 or py < 0 or px >= (i64)self.width or py >= (i64)self.height:
-                    continue
-                let w = self.weight(math.hypot((f64)px - to_x, (f64)py - to_y))
-                if w <= 0.0:
-                    continue
-                let sx = (f64)(px - left) - move_x * w
-                let sy = (f64)(py - top) - move_y * w
-                let pixels = self.cell_pixels(px, py)
-                let at = offset_in_cell(px, py)
-                for channel in 0..<(usize)4:
-                    pixels[at + channel] = (f32)bilinear(self.scratch, side, sx, sy, channel)
         self.touch(cx - reach, cy - reach, cx + reach, cy + reach)
 
     ## A sample of the working copy (its cell loaded); transparent past its edges.
@@ -406,23 +343,6 @@ pub struct WarpStroke:
         self.dirty_top = math.imin(self.dirty_top, first_row)
         self.dirty_right = math.imax(self.dirty_right, last_column)
         self.dirty_bottom = math.imax(self.dirty_bottom, last_row)
-
-## A bilinear sample of a `side`-wide square of RGBA samples; transparent past it.
-func bilinear(samples: const f32[], side: usize, x: f64, y: f64, channel: usize) -> f64:
-    let x0 = math.floor(x)
-    let y0 = math.floor(y)
-    let fx = x - x0
-    let fy = y - y0
-    let a = texel(samples, side, (i64)x0, (i64)y0, channel)
-    let b = texel(samples, side, (i64)x0 + 1, (i64)y0, channel)
-    let c = texel(samples, side, (i64)x0, (i64)y0 + 1, channel)
-    let d = texel(samples, side, (i64)x0 + 1, (i64)y0 + 1, channel)
-    return (a + (b - a) * fx) + ((c + (d - c) * fx) - (a + (b - a) * fx)) * fy
-
-func texel(samples: const f32[], side: usize, x: i64, y: i64, channel: usize) -> f64:
-    if x < 0 or y < 0 or x >= (i64)side or y >= (i64)side:
-        return 0.0
-    return (f64)samples[((usize)y * side + (usize)x) * 4 + channel]
 
 ## Where document pixel (`x`, `y`)'s samples start within its cell.
 func offset_in_cell(x: i64, y: i64) -> usize:

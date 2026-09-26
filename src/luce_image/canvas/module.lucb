@@ -47,7 +47,8 @@ from tiles import Tiles, Bounds, tile_size, tile_columns, min_u32, max_u32, flat
 from pyramid import covered_at
 from luce_image.heal import heal
 from luce_image.color_range import RangeSample, range_sample, range_coverage, range_labs
-from luce_image.warp import WarpStroke, warp_smudge, warp_push, default_smudge_spacing
+from luce_image.warp import WarpStroke, default_smudge_spacing
+from luce_image.liquify import Liquifier, LiquifyStroke
 from luce_image.document import Style, Document, Layer, TreeState, release_snapshot, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
 from luce_image.composite import Composer, box_composer, unbox_composer
 from luce_image.brush import Brush, Painter, Stroke, EffectSource, begin_boxed, finish_boxed, fill_selection, fill_gradient, simulate_fill_failure
@@ -148,6 +149,8 @@ pub struct Canvas:
     var range_session: RangeSession*?
     var ants_shader: gpu.Shader?
     var ants: gpu.Pipeline?
+    ## Liquify's push pipeline, made for the first push.
+    var liquifier: Liquifier?
     var history: Snapshot[]
     var history_count: usize
     var future: Snapshot[]
@@ -170,7 +173,7 @@ pub struct Canvas:
     ## The parameters the next adjustment takes (`set_adjustment`).
     var adjustment: f64[23]
     ## The retouching tool strokes use (`set_retouch`), the clone stamp's
-    ## source and offset (whole pixels) and options, a smudge or push under
+    ## source and offset (whole pixels) and options, a smudge under
     ## way and its layer, and a spot healing stroke's opacity.
     var retouch: i64
     var clone_x: f64
@@ -188,13 +191,15 @@ pub struct Canvas:
     var preview_bytes: u8[]
     var warp: WarpStroke*?
     var warped: u64
-    ## The smudge or push stroke has ended and its worker walks the rest of
+    ## The smudge stroke has ended and its worker walks the rest of
     ## its path; the next frame after it is done keeps it (`settle_warp`).
     var warp_finishing: bool
-    ## Whether smudge and push walk on a worker (the default), and smudge's
+    ## Whether smudge walks on a worker (the default), and smudge's
     ## dab spacing as a fraction of the diameter.
     var warp_async: bool
     var smudge_spacing: f64
+    ## A Liquify push under way (canvas/liquifying.lucb).
+    var liquify: Liquifying*?
     var heal_opacity: f64
     ## Inside `begin_edit`: changes record nothing more, the edit's first snapshot covers them.
     var edit_depth: i64
@@ -258,6 +263,7 @@ pub struct Canvas:
         self.range_count = 0
         self.range_session = none
         self.ants_shader = none
+        self.liquifier = none
         self.ants = none
         var no_history: Snapshot[]
         self.history = no_history
@@ -290,6 +296,7 @@ pub struct Canvas:
         self.warped = 0
         self.warp_finishing = false
         self.warp_async = true
+        self.liquify = none
         self.smudge_spacing = default_smudge_spacing
         self.transform_session = none
         self.filter_stand_in = none
@@ -357,7 +364,7 @@ pub struct Canvas:
     ## smudge still finishing on its worker is waited for.
     mutating func require_idle() -> !:
         try self.wait_idle()
-        if self.stroke != none or self.warp != none:
+        if self.stroke != none or self.warp != none or self.liquify != none:
             error(invalid, "finish the stroke first")
         if self.transform_session != none:
             error(invalid, "finish the transform first")
@@ -482,6 +489,7 @@ pub struct Canvas:
             self.warp_finishing = false
             warp.destroy()
             free(warp) in memory.heap
+        drop_liquify(&self)
         drop_filter_preview(&self)
         if let composer = self.composer:
             composer.drop_stand_ins()
@@ -507,6 +515,10 @@ pub struct Canvas:
             var owned = shader
             owned.destroy()
             self.ants_shader = none
+        if let liquifier = self.liquifier:
+            var owned = liquifier
+            owned.destroy()
+            self.liquifier = none
         end_range(&self)
         self.selection.destroy()
         if self.polygon.length > 0:
@@ -1518,7 +1530,7 @@ pub struct Canvas:
     pub mutating func begin_stroke(layer: i64, x: f64, y: f64, pressure: f64 = 1.0) -> !:
         try self.require_open()
         try self.wait_idle()
-        if self.stroke != none or self.warp != none:
+        if self.stroke != none or self.warp != none or self.liquify != none:
             error(invalid, "a stroke is already in progress")
         if self.preview != none:
             error(invalid, "finish the preview first")
@@ -1542,6 +1554,9 @@ pub struct Canvas:
         if let warp = self.warp:
             try extend_warp(&self, warp, x, y)
             return
+        if let shown = self.liquify:
+            try extend_liquify(shown, x, y)
+            return
         let stroke = self.stroke else error(invalid, "no stroke is in progress")
         let document = self.document else trap("stroke without a document")
         var painter = self.painter else trap("stroke without a painter")
@@ -1555,6 +1570,9 @@ pub struct Canvas:
         if let warp = self.warp:
             try finish_warp(&self, warp)
             return
+        if let shown = self.liquify:
+            try finish_liquify(&self, shown)
+            return
         try self.settle_stroke()
         let stroke = self.stroke else error(invalid, "no stroke is in progress")
         self.stroke = none
@@ -1564,14 +1582,14 @@ pub struct Canvas:
 
     ## Whether a stroke takes points: one ended and still finishing does not.
     pub func painting() -> bool:
-        return self.stroke != none or (self.warp != none and not self.warp_finishing)
+        return self.stroke != none or self.liquify != none or (self.warp != none and not self.warp_finishing)
 
     ## Whether work goes on between frames (a smudge finishing on its worker):
     ## the view keeps drawing until it is kept.
     pub func busy() -> bool:
         return self.warp != none
 
-    ## Wait for a smudge or push still finishing and keep it. Everything that
+    ## Wait for a smudge still finishing and keep it. Everything that
     ## changes or reads the whole document calls this first.
     pub mutating func wait_idle() -> !:
         if not self.warp_finishing:
@@ -1579,7 +1597,7 @@ pub struct Canvas:
         let warp = self.warp else return
         try keep_warp(&self, warp)
 
-    ## Whether smudge and push walk on a worker: on by default; off, each move
+    ## Whether smudge walks on a worker: on by default; off, each move
     ## is walked before `extend_stroke` returns (scripts that time strokes).
     pub mutating func set_async_warp(on: bool) -> !:
         try self.wait_idle()
@@ -1597,6 +1615,9 @@ pub struct Canvas:
     mutating func settle_stroke() -> !:
         if let warp = self.warp:
             try settle_warp(&self, warp)
+            return
+        if let shown = self.liquify:
+            try settle_liquify(&self, shown)
             return
         let stroke = self.stroke else return
         let document = self.document else return

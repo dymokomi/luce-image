@@ -86,6 +86,8 @@ pub func level_for(box: Footprint) -> u32:
 ## the layer has nothing (a mask's white). Level 0 takes the layer's pieces,
 ## past the canvas too; coarser levels the canvas's pyramid.
 pub func gather(device: gpu.Device, tiles: const Tiles*, parts: const Pieces*, pyramid: Pyramid*, box: Footprint, level: u32, mask: bool, empty: gpu.Color) -> Window!:
+    if level == 0:
+        return try gather_pieces(device, parts, box, empty)
     let scale = (f64)(1u32 << level)
     let left = (i64)math.floor(box.left / scale)
     let top = (i64)math.floor(box.top / scale)
@@ -99,24 +101,40 @@ pub func gather(device: gpu.Device, tiles: const Tiles*, parts: const Pieces*, p
     defer frame.release()
     let whole = try frame.value().target()
     defer whole.release()
-    if level == 0:
-        for index in 0..<parts.count:
-            let piece = parts.at(index)
-            if piece.x >= right or piece.y >= bottom or piece.x + (i64)piece.source.width <= left or piece.y + (i64)piece.source.height <= top:
+    let span = (i64)tile_size
+    for row in max_i64(0, top // span)..<(bottom + span - 1) // span:
+        for column in max_i64(0, left // span)..<(right + span - 1) // span:
+            if not cell_exists(tiles, (u32)column, (u32)row, level):
                 continue
-            try gpu.copy_image(whole.value(), piece.texture, gpu.Rect((f64)(piece.x - left), (f64)(piece.y - top), (f64)piece.source.width, (f64)piece.source.height), piece.source)
-    else:
-        let span = (i64)tile_size
-        for row in max_i64(0, top // span)..<(bottom + span - 1) // span:
-            for column in max_i64(0, left // span)..<(right + span - 1) // span:
-                if not cell_exists(tiles, (u32)column, (u32)row, level):
-                    continue
-                let cell = (try pyramid.texture(tiles, (u32)column, (u32)row, level, mask)) else continue
-                let width = covered_at(tiles.width(), (u32)column, level)
-                let height = covered_at(tiles.height(), (u32)row, level)
-                try gpu.copy_image(whole.value(), cell, gpu.Rect((f64)(column * span - left), (f64)(row * span - top), (f64)width, (f64)height), gpu.Region(0, 0, width, height))
+            let cell = (try pyramid.texture(tiles, (u32)column, (u32)row, level, mask)) else continue
+            let width = covered_at(tiles.width(), (u32)column, level)
+            let height = covered_at(tiles.height(), (u32)row, level)
+            try gpu.copy_image(whole.value(), cell, gpu.Rect((f64)(column * span - left), (f64)(row * span - top), (f64)width, (f64)height), gpu.Region(0, 0, width, height))
     discard(try frame.value().present(empty))
     return Window(texture = texture, left = left, top = top, level = level)
+
+## `box` of a layer's `parts` (past the canvas too) gathered at full size into
+## a window texture, `empty` where the layer has nothing.
+pub func gather_pieces(device: gpu.Device, parts: const Pieces*, box: Footprint, empty: gpu.Color) -> Window!:
+    let left = (i64)math.floor(box.left)
+    let top = (i64)math.floor(box.top)
+    let right = (i64)math.ceil(box.right)
+    let bottom = (i64)math.ceil(box.bottom)
+    if right - left > 16384 or bottom - top > 16384:
+        error(invalid, "a transform window cannot exceed 16384 texels")
+    var texture = try gpu.Texture.create(device, (u32)(right - left), (u32)(bottom - top), gpu.Format.rgba16_float)
+    errdefer texture.destroy()
+    let frame = try texture.frame()
+    defer frame.release()
+    let whole = try frame.value().target()
+    defer whole.release()
+    for index in 0..<parts.count:
+        let piece = parts.at(index)
+        if piece.x >= right or piece.y >= bottom or piece.x + (i64)piece.source.width <= left or piece.y + (i64)piece.source.height <= top:
+            continue
+        try gpu.copy_image(whole.value(), piece.texture, gpu.Rect((f64)(piece.x - left), (f64)(piece.y - top), (f64)piece.source.width, (f64)piece.source.height), piece.source)
+    discard(try frame.value().present(empty))
+    return Window(texture = texture, left = left, top = top, level = 0)
 
 ## `warp` read into `window`'s texels: document pixels scaled to its level and
 ## moved to its corner.

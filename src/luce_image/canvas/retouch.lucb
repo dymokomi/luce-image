@@ -8,8 +8,8 @@
 #       color: the picture shifted by the clone offset, a blurred copy, a lightened (dodge)
 #       or darkened (burn) copy, the healed spot (worked out when the stroke ends; a dark
 #       wash marks it meanwhile). retouch_effects.lucb makes those images, only where
-#       the stroke reaches. Smudge and push
-#       (Liquify) work on the CPU dab by dab (warp.lucb). Each stroke is one undo step.
+#       the stroke reaches. Smudge works on the CPU dab by dab (warp.lucb); Liquify's
+#       push moves a displacement grid (canvas/liquifying.lucb). Each stroke is one undo step.
 #
 #==============================================================================================
 
@@ -34,13 +34,15 @@ func begin_retouch(canvas: Canvas*, id: u64, x: f64, y: f64, pressure: f64) -> !
     let layer = document.find(id) else error(invalid, "no such layer")
     let tiles = layer.tiles() else error(invalid, "this layer has no pixels to retouch")
     let kind = canvas.retouch
-    if kind == retouch_smudge or kind == retouch_push:
-        var warp = try WarpStroke.begin(tiles, warp_smudge if kind == retouch_smudge else warp_push, x, y, canvas.brush.diameter, canvas.brush.hardness,
-                                        canvas.brush.opacity, spacing = canvas.smudge_spacing)
+    if kind == retouch_push:
+        try begin_liquify(canvas, id, tiles, x, y)
+        return
+    if kind == retouch_smudge:
+        var warp = try WarpStroke.begin(tiles, x, y, canvas.brush.diameter, canvas.brush.hardness, canvas.brush.opacity, spacing = canvas.smudge_spacing)
         errdefer warp.destroy()
         let boxed = try new WarpStroke in memory.heap
         *boxed = warp
-        try canvas.remember(id, try tiles.clone(), name = "Smudge" if kind == retouch_smudge else "Liquify")
+        try canvas.remember(id, try tiles.clone(), name = "Smudge")
         canvas.warp = boxed
         canvas.warped = id
         # The worker holds the boxed stroke's address, so it starts there; a
@@ -83,7 +85,7 @@ func begin_retouch(canvas: Canvas*, id: u64, x: f64, y: f64, pressure: f64) -> !
     try canvas.remember(id, try stroke.original().clone(), name = retouch_name(kind))
     canvas.stroke = stroke
 
-## Continue a smudge or push to (`x`, `y`): recorded for the worker, or
+## Continue a smudge to (`x`, `y`): recorded for the worker, or
 ## walked here without one. The next frame shows it.
 func extend_warp(canvas: Canvas*, warp: WarpStroke*, x: f64, y: f64) -> !:
     if warp.walks_async():
@@ -91,7 +93,7 @@ func extend_warp(canvas: Canvas*, warp: WarpStroke*, x: f64, y: f64) -> !:
     else:
         try warp.extend(x, y)
 
-## Upload what a smudge or push changed since the last frame, once a frame
+## Upload what a smudge changed since the last frame, once a frame
 ## however many pointer moves came in; a stroke finishing whose worker is done
 ## is kept.
 func settle_warp(canvas: Canvas*, warp: WarpStroke*) -> !:
@@ -107,7 +109,7 @@ func upload_warp(canvas: Canvas*, warp: WarpStroke*) -> !:
     if try warp.flush(tiles):
         layer.revision += 1
 
-## End a smudge or push. Walked on a worker, it returns at once and the
+## End a smudge. Walked on a worker, it returns at once and the
 ## worker finishes the path; the stroke is kept once it is done.
 func finish_warp(canvas: Canvas*, warp: WarpStroke*) -> !:
     if warp.walks_async():
@@ -116,7 +118,7 @@ func finish_warp(canvas: Canvas*, warp: WarpStroke*) -> !:
         return
     try keep_warp(canvas, warp)
 
-## Keep a smudge or push whose path is walked (waiting for its worker if it
+## Keep a smudge whose path is walked (waiting for its worker if it
 ## is not yet): its last cells go up, and it stays where the selection allows.
 func keep_warp(canvas: Canvas*, warp: WarpStroke*) -> !:
     canvas.warp = none
