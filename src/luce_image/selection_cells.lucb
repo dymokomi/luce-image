@@ -1,0 +1,330 @@
+## A selection's coverage kept in cells of the canvas's 256-pixel grid. A cell
+## is either one value throughout (nothing selected, or all of it), which costs
+## no memory, or a block of coverage bytes. Blocks are counted and shared with
+## every copy of the selection (an undo step's) until one of them writes to
+## one, so a copy costs a pointer a cell and a change costs only the cells it
+## touches: a marquee across a 360-megapixel canvas holds its edge cells alone.
+import math
+import memory
+import os
+import thread
+from tiles import tile_size
+
+## Bytes in one cell's block: 256 rows of 256, whatever the cell's size.
+pub let block_bytes: usize = 65536
+
+## How a new shape combines with the selection so far.
+pub enum Mode as u8:
+    replace = 0
+    add = 1
+    subtract = 2
+    intersect = 3
+
+## One cell's coverage, rows of 256 bytes. Past the document's edge (in the
+## last column and row of cells) the bytes are never read.
+pub struct Block:
+    pub var references: usize
+    ## The content's name for the GPU mirror, unique for all time; 0 while
+    ## written and not yet settled.
+    var version: u64
+    ## Whether the fields below describe the bytes: what `settle` found.
+    var scanned: bool
+    ## 0 all clear, 255 all selected, 1 a mix.
+    var kind: u8
+    ## The box of nonzero bytes in the cell, when the kind is not 0.
+    var left: i64
+    var top: i64
+    var right: i64
+    var bottom: i64
+    pub var bytes: u8[]
+
+## The box of every selected pixel, and whether there is one.
+pub struct Covered:
+    pub var found: bool = false
+    pub var left: i64 = 0
+    pub var top: i64 = 0
+    pub var right: i64 = 0
+    pub var bottom: i64 = 0
+
+    mutating func take(left: i64, top: i64, right: i64, bottom: i64):
+        if not self.found:
+            self = Covered(found = true, left = left, top = top, right = right, bottom = bottom)
+            return
+        self.left = math.imin(self.left, left)
+        self.top = math.imin(self.top, top)
+        self.right = math.imax(self.right, right)
+        self.bottom = math.imax(self.bottom, bottom)
+
+## Versions for the GPU mirror; 0 is unsettled and 1 and 2 name the uniform
+## selected cells (`Cells.shows`). Settled on the main thread only.
+var last_version: u64 = 2
+
+pub struct Cells:
+    pub var extent_x: u32
+    pub var extent_y: u32
+    var cell_columns: u32
+    var cell_rows: u32
+    ## A cell's block, or `none` where it is `values`' one value throughout.
+    var blocks: Block*?[]
+    var values: u8[]
+
+    ## `width` by `height` pixels, nothing selected.
+    pub static func create(width: u32, height: u32) -> Cells!:
+        let columns = (width + tile_size - 1) // tile_size
+        let rows = (height + tile_size - 1) // tile_size
+        let count = (usize)columns * (usize)rows
+        let blocks = try alloc Block*?[count] in memory.heap
+        errdefer free(blocks) in memory.heap
+        let values = try alloc u8[count] in memory.heap
+        for index in 0..<count:
+            blocks[index] = none
+        memory.set(values, 0)
+        return Cells(extent_x = width, extent_y = height, cell_columns = columns, cell_rows = rows, blocks = blocks, values = values)
+
+    ## A second holder of the same cells: every block shared until written.
+    pub func copy() -> Cells!:
+        var copy = try Cells.create(self.extent_x, self.extent_y)
+        for index in 0..<self.blocks.length:
+            copy.values[index] = self.values[index]
+            if let block = self.blocks[index]:
+                block.references += 1
+                copy.blocks[index] = block
+        return copy
+
+    pub mutating func destroy():
+        for index in 0..<self.blocks.length:
+            self.release(index)
+        if self.blocks.length > 0:
+            free(self.blocks) in memory.heap
+            free(self.values) in memory.heap
+        var no_blocks: Block*?[]
+        var no_values: u8[]
+        self.blocks = no_blocks
+        self.values = no_values
+
+    pub func count() -> usize:
+        return self.blocks.length
+
+    pub func columns() -> u32:
+        return self.cell_columns
+
+    pub func rows() -> u32:
+        return self.cell_rows
+
+    ## The document pixels cell `index` covers: its corner and size.
+    pub func origin_x(index: usize) -> i64:
+        return (i64)(index % (usize)self.cell_columns) * (i64)tile_size
+
+    pub func origin_y(index: usize) -> i64:
+        return (i64)(index // (usize)self.cell_columns) * (i64)tile_size
+
+    pub func cell_width(index: usize) -> i64:
+        return math.imin((i64)tile_size, (i64)self.extent_x - self.origin_x(index))
+
+    pub func cell_height(index: usize) -> i64:
+        return math.imin((i64)tile_size, (i64)self.extent_y - self.origin_y(index))
+
+    ## Whether the cell is a whole 256 by 256 (not cut by the document's edge).
+    pub func whole(index: usize) -> bool:
+        return self.cell_width(index) == (i64)tile_size and self.cell_height(index) == (i64)tile_size
+
+    ## The coverage at a document pixel, which must be inside.
+    pub func at(x: i64, y: i64) -> u8:
+        let index = (usize)(y // (i64)tile_size) * (usize)self.cell_columns + (usize)(x // (i64)tile_size)
+        let block = self.blocks[index] else return self.values[index]
+        return block.bytes[(usize)(y % (i64)tile_size) * (usize)tile_size + (usize)(x % (i64)tile_size)]
+
+    ## The cell's one value, or -1 when it holds a block.
+    pub func uniform(index: usize) -> i64:
+        if self.blocks[index] != none:
+            return -1
+        return (i64)self.values[index]
+
+    ## The cell's block, borrowed, or `none` when it is one value.
+    pub func block(index: usize) -> Block*?:
+        return self.blocks[index]
+
+    ## Make cell `index` `value` throughout, letting its block go.
+    pub mutating func fill(index: usize, value: u8):
+        self.release(index)
+        self.values[index] = value
+
+    ## Every cell `value` throughout.
+    pub mutating func fill_all(value: u8):
+        for index in 0..<self.blocks.length:
+            self.fill(index, value)
+
+    ## Put `other`'s cell `source` here at `index`, shared.
+    pub mutating func share(index: usize, other: const Cells*, source: usize):
+        self.release(index)
+        self.values[index] = other.values[source]
+        if let block = other.blocks[source]:
+            block.references += 1
+            self.blocks[index] = block
+
+    ## The bytes of cell `index`, held here alone and ready to write: a block
+    ## made from the cell's one value, or copied when shared. Safe from several
+    ## threads on different cells: a block shared with another selection is
+    ## only ever read there while this one changes.
+    pub mutating func writable(index: usize) -> u8[]:
+        if let block = self.blocks[index]:
+            if block.references == 1:
+                block.scanned = false
+                block.version = 0
+                return block.bytes
+            let copied = self.fresh_block()
+            memory.copy(copied.bytes, block.bytes, block_bytes)
+            block.references -= 1
+            self.blocks[index] = copied
+            return copied.bytes
+        let made = self.fresh_block()
+        memory.set(made.bytes, self.values[index])
+        self.blocks[index] = made
+        return made.bytes
+
+    func fresh_block() -> Block*:
+        let bytes = alloc u8[block_bytes] in memory.heap catch failure:
+            trap("out of memory for a selection cell")
+        let block = new Block(references = 1, version = 0, scanned = false, kind = 1, left = 0, top = 0, right = 0, bottom = 0, bytes = bytes) in memory.heap catch failure:
+            trap("out of memory for a selection cell")
+        return block
+
+    mutating func release(index: usize):
+        let block = self.blocks[index] else return
+        self.blocks[index] = none
+        block.references -= 1
+        if block.references == 0:
+            free(block.bytes) in memory.heap
+            free(block) in memory.heap
+
+    ## What the GPU mirror shows for cell `index`: 0 nothing, 1 the tile every
+    ## whole selected cell shares, 2 a selected cell cut by the document's edge
+    ## (its own tile, clear past the edge), else its block's version.
+    pub func shows(index: usize) -> u64:
+        if let block = self.blocks[index]:
+            return block.version
+        if self.values[index] == 0:
+            return 0
+        return 1 if self.whole(index) and self.values[index] == 255 else 2
+
+    ## After a change: the blocks written since are scanned (on every
+    ## processor), those one value throughout become that value again, each
+    ## other gets a new version; the box of every selected pixel is returned.
+    pub mutating func settle() -> Covered!:
+        var pending: usize = 0
+        for block in self.blocks:
+            if let written = block:
+                if not written.scanned:
+                    pending += 1
+        if pending > 0:
+            let items = try alloc usize[pending] in memory.heap
+            defer free(items) in memory.heap
+            var at: usize = 0
+            for index in 0..<self.blocks.length:
+                if let written = self.blocks[index]:
+                    if not written.scanned:
+                        items[at] = index
+                        at += 1
+            var job = ScanJob(cells = &self, items = items)
+            each(pending, (void*)&job, scan_item)
+            for item in items:
+                let block = self.blocks[item] else continue
+                if block.kind != 1:
+                    self.fill(item, block.kind)
+                elif block.version == 0:
+                    last_version += 1
+                    block.version = last_version
+        var covered = Covered()
+        for index in 0..<self.blocks.length:
+            let x = self.origin_x(index)
+            let y = self.origin_y(index)
+            if let block = self.blocks[index]:
+                covered.take(x + block.left, y + block.top, x + block.right, y + block.bottom)
+            elif self.values[index] != 0:
+                covered.take(x, y, x + self.cell_width(index), y + self.cell_height(index))
+        return covered
+
+## The blocks `settle` scans, an item each.
+struct ScanJob:
+    var cells: Cells*
+    var items: const usize[]
+
+## Scan one block: its kind and the box of its nonzero bytes, within the cell.
+func scan_item(context: void*?, item: usize):
+    let job = (ScanJob*)(context else return)
+    let index = job.items[item]
+    let block = job.cells.blocks[index] else return
+    let width = (usize)job.cells.cell_width(index)
+    let height = (usize)job.cells.cell_height(index)
+    var found = false
+    var full = true
+    var left = width
+    var right: usize = 0
+    var top: usize = 0
+    var bottom: usize = 0
+    for y in 0..<height:
+        let line = block.bytes[y * (usize)tile_size..<y * (usize)tile_size + width]
+        var low: usize = 0
+        while low < width and line[low] == 0:
+            low += 1
+        if low > 0:
+            full = false
+        if low == width:
+            continue
+        var high = width
+        while line[high - 1] == 0:
+            high -= 1
+        if full:
+            if high < width:
+                full = false
+            else:
+                for x in low..<high:
+                    if line[x] != 255:
+                        full = false
+                        break
+        if not found:
+            found = true
+            top = y
+        left = left if left < low else low
+        right = right if right > high else high
+        bottom = y + 1
+    block.scanned = true
+    block.kind = 255 if found and full else (1 if found else 0)
+    block.left = (i64)left
+    block.top = (i64)top
+    block.right = (i64)right
+    block.bottom = (i64)bottom
+
+## Work dealt out over the processors an item at a time.
+struct Dealer:
+    var context: void*?
+    var work: func(void*?, usize) -> unit
+    var count: usize
+    var next: @usize
+
+func deal(raw: void*?):
+    let dealer = (Dealer*)(raw else return)
+    while true:
+        let item = dealer.next.add(1, .relaxed)
+        if item >= dealer.count:
+            return
+        dealer.work(dealer.context, item)
+
+## `work(context, item)` for every item in 0..<`count`, on up to 16
+## processors; the items go to whichever thread is free next.
+pub func each(count: usize, context: void*?, work: func(void*?, usize) -> unit):
+    if count == 0:
+        return
+    var dealer = Dealer(context = context, work = work, count = count)
+    let workers = math.imin(math.imin(16, math.imax(1, (i64)os.cpus())), (i64)count)
+    var handles: thread.Handle[16]
+    var started: usize = 0
+    for worker in 1..<(usize)workers:
+        # A thread that cannot start leaves its share to the others.
+        handles[started] = thread.spawn(deal, (void*)&dealer, name = "selection") catch failure:
+            break
+        started += 1
+    deal((void*)&dealer)
+    for index in 0..<started:
+        handles[index].join() catch failure:
+            trap("a selection thread failed to join")

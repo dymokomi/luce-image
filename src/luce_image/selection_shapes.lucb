@@ -1,0 +1,335 @@
+## Shapes drawn into a selection's cells (selection_cells.lucb), a cell at a
+## time and on every processor: rectangles, ellipses, polygons, and coverage
+## from elsewhere (another selection, a byte a pixel, a layer's samples).
+## A cell the shape covers wholly or misses wholly is combined as one value,
+## so only the cells along a shape's edge ever hold bytes.
+##
+## Modes here are add, subtract and intersect; replace is add onto cells
+## cleared first, which the callers do.
+import math
+import memory
+from tiles import tile_size
+from luce_image.selection_cells import Cells, Mode, block_bytes, each
+
+## One pixel's coverage `current` combined with a shape's `value` by `mode`.
+pub func mix(current: u8, value: u8, mode: Mode) -> u8:
+    if mode == Mode.subtract:
+        return current - (value if value < current else current)
+    if mode == Mode.intersect:
+        return value if value < current else current
+    return value if value > current else current
+
+## A shape `value` throughout cell `index`, combined by `mode`.
+pub func combine_value(cells: Cells*, index: usize, value: u8, mode: Mode):
+    let current = cells.uniform(index)
+    if current >= 0:
+        cells.fill(index, mix((u8)current, value, mode))
+        return
+    # Nothing changes: adding nothing, taking nothing away, or keeping all.
+    if (value == 0 and mode != Mode.intersect) or (value == 255 and mode == Mode.intersect):
+        return
+    if (value == 255 and mode == Mode.add) or (value == 255 and mode == Mode.subtract) or (value == 0 and mode == Mode.intersect):
+        cells.fill(index, 255 if mode == Mode.add else 0)
+        return
+    let bytes = cells.writable(index)
+    let width = (usize)cells.cell_width(index)
+    for y in 0..<(usize)cells.cell_height(index):
+        for x in 0..<width:
+            let at = y * (usize)tile_size + x
+            bytes[at] = mix(bytes[at], value, mode)
+
+## A cell's worth of shape coverage (`shape`, rows of 256) combined into cell
+## `index` by `mode`.
+pub func combine_cell(cells: Cells*, index: usize, shape: const u8[], mode: Mode):
+    let width = (usize)cells.cell_width(index)
+    let height = (usize)cells.cell_height(index)
+    # One value throughout is combined as one.
+    let first = shape[0]
+    var same = true
+    for y in 0..<height:
+        let line = y * (usize)tile_size
+        for x in 0..<width:
+            if shape[line + x] != first:
+                same = false
+                break
+        if not same:
+            break
+    if same:
+        combine_value(cells, index, first, mode)
+        return
+    let current = cells.uniform(index)
+    if (current == 0 and mode != Mode.add) or (current == 255 and mode == Mode.add):
+        return
+    let bytes = cells.writable(index)
+    if current == 0 or (current == 255 and mode == Mode.intersect):
+        # Onto nothing, or cut from everything: the shape itself.
+        memory.copy(bytes, shape, block_bytes)
+        return
+    for y in 0..<height:
+        let line = y * (usize)tile_size
+        for x in 0..<width:
+            bytes[line + x] = mix(bytes[line + x], shape[line + x], mode)
+
+## The cells a box of document pixels reaches: first and last-plus-one column and row.
+struct Reach:
+    var left: usize
+    var top: usize
+    var right: usize
+    var bottom: usize
+
+func reach(cells: const Cells*, left: i64, top: i64, right: i64, bottom: i64) -> Reach:
+    let span = (i64)tile_size
+    return Reach(left = (usize)(left // span), top = (usize)(top // span), right = (usize)((right + span - 1) // span), bottom = (usize)((bottom + span - 1) // span))
+
+## A rectangle of document pixels (inside the document, not empty), combined by `mode`.
+pub func rectangle(cells: Cells*, left: i64, top: i64, right: i64, bottom: i64, mode: Mode):
+    if mode == Mode.intersect:
+        # All of the rectangle is selected: intersecting keeps what is inside.
+        outside(cells, left, top, right, bottom)
+        return
+    let cover = reach(cells, left, top, right, bottom)
+    let value: u8 = 0 if mode == Mode.subtract else 255
+    for row in cover.top..<cover.bottom:
+        for column in cover.left..<cover.right:
+            let index = row * (usize)cells.columns() + column
+            let x = cells.origin_x(index)
+            let y = cells.origin_y(index)
+            let x0 = math.imax(left, x) - x
+            let y0 = math.imax(top, y) - y
+            let x1 = math.imin(right, x + cells.cell_width(index)) - x
+            let y1 = math.imin(bottom, y + cells.cell_height(index)) - y
+            if x0 == 0 and y0 == 0 and x1 == cells.cell_width(index) and y1 == cells.cell_height(index):
+                cells.fill(index, value)
+                continue
+            if cells.uniform(index) == (i64)value:
+                continue
+            let bytes = cells.writable(index)
+            for line in y0..<y1:
+                let start = (usize)line * (usize)tile_size
+                memory.set(bytes[start + (usize)x0..<start + (usize)x1], value)
+
+## Clear everything outside a box of document pixels (intersecting with a shape inside it).
+pub func outside(cells: Cells*, left: i64, top: i64, right: i64, bottom: i64):
+    for index in 0..<cells.count():
+        let x = cells.origin_x(index)
+        let y = cells.origin_y(index)
+        let width = cells.cell_width(index)
+        let height = cells.cell_height(index)
+        let x0 = math.imax(left, x) - x
+        let y0 = math.imax(top, y) - y
+        let x1 = math.imin(right, x + width) - x
+        let y1 = math.imin(bottom, y + height) - y
+        if x1 <= x0 or y1 <= y0:
+            cells.fill(index, 0)
+            continue
+        if (x0 == 0 and y0 == 0 and x1 == width and y1 == height) or cells.uniform(index) == 0:
+            continue
+        let bytes = cells.writable(index)
+        for line in 0..<height:
+            let start = (usize)line * (usize)tile_size
+            if line < y0 or line >= y1:
+                memory.set(bytes[start..<start + (usize)width], 0)
+                continue
+            if x0 > 0:
+                memory.set(bytes[start..<start + (usize)x0], 0)
+            if x1 < width:
+                memory.set(bytes[start + (usize)x1..<start + (usize)width], 0)
+
+# mark: Ellipses ==============================================================================
+
+## An ellipse inscribed in the box `x`, `y`, `width`, `height`, antialiased over a pixel.
+pub struct Ellipse:
+    var cx: f64
+    var cy: f64
+    var rx: f64
+    var ry: f64
+    var edge: f64
+
+    pub static func inscribed(x: i64, y: i64, width: i64, height: i64) -> Ellipse:
+        let rx = math.max(0.5, (f64)width * 0.5)
+        let ry = math.max(0.5, (f64)height * 0.5)
+        return Ellipse(cx = (f64)x + (f64)width * 0.5, cy = (f64)y + (f64)height * 0.5, rx = rx, ry = ry, edge = math.min(rx, ry))
+
+    ## Coverage at the pixel whose centre is (`px`, `py`).
+    pub func value(px: f64, py: f64) -> u8:
+        let dx = (px - self.cx) / self.rx
+        let dy = (py - self.cy) / self.ry
+        let d = math.sqrt(dx * dx + dy * dy)
+        let coverage = math.clamp((1.0 - d) * self.edge + 0.5, 0.0, 1.0)
+        return (u8)(coverage * 255.0 + 0.5)
+
+struct EllipseJob:
+    var cells: Cells*
+    var shape: Ellipse
+    var cover: Reach
+    var mode: Mode
+
+## The ellipse into the cells of the box `left`..`bottom` (inside the document) by `mode`.
+pub func ellipse(cells: Cells*, shape: Ellipse, left: i64, top: i64, right: i64, bottom: i64, mode: Mode):
+    var job = EllipseJob(cells = cells, shape = shape, cover = reach(cells, left, top, right, bottom), mode = mode)
+    let count = (job.cover.right - job.cover.left) * (job.cover.bottom - job.cover.top)
+    each(count, (void*)&job, ellipse_item)
+    if mode == Mode.intersect:
+        outside(cells, left, top, right, bottom)
+
+## One cell of the ellipse. Its coverage only falls away from the centre, so a
+## cell whose nearest pixel is outside is wholly outside, and one whose four
+## corner pixels are inside is wholly inside (an ellipse is convex).
+func ellipse_item(context: void*?, item: usize):
+    let job = (EllipseJob*)(context else return)
+    let across = job.cover.right - job.cover.left
+    let index = (job.cover.top + item // across) * (usize)job.cells.columns() + job.cover.left + item % across
+    let x = (f64)job.cells.origin_x(index)
+    let y = (f64)job.cells.origin_y(index)
+    let width = job.cells.cell_width(index)
+    let height = job.cells.cell_height(index)
+    let last_x = x + (f64)width - 0.5
+    let last_y = y + (f64)height - 0.5
+    let near_x = math.clamp(job.shape.cx, x + 0.5, last_x)
+    let near_y = math.clamp(job.shape.cy, y + 0.5, last_y)
+    if job.shape.value(near_x, near_y) == 0:
+        combine_value(job.cells, index, 0, job.mode)
+        return
+    if job.shape.value(x + 0.5, y + 0.5) == 255 and job.shape.value(last_x, y + 0.5) == 255 and job.shape.value(x + 0.5, last_y) == 255 and job.shape.value(last_x, last_y) == 255:
+        combine_value(job.cells, index, 255, job.mode)
+        return
+    let shape = alloc u8[block_bytes] in memory.heap catch failure:
+        trap("out of memory drawing a selection")
+    defer free(shape) in memory.heap
+    memory.set(shape, 0)
+    for row in 0..<(usize)height:
+        for column in 0..<(usize)width:
+            shape[row * (usize)tile_size + column] = job.shape.value(x + (f64)column + 0.5, y + (f64)row + 0.5)
+    combine_cell(job.cells, index, shape, job.mode)
+
+# mark: Polygons ==============================================================================
+
+struct PolygonJob:
+    var cells: Cells*
+    var points: const f64[]
+    var cover: Reach
+    var mode: Mode
+
+## The polygon of `points` (x, y pairs), even-odd filled, into the cells of its
+## box `left`..`bottom` (inside the document) by `mode`: a row of cells a thread.
+pub func polygon(cells: Cells*, points: const f64[], left: i64, top: i64, right: i64, bottom: i64, mode: Mode):
+    var job = PolygonJob(cells = cells, points = points, cover = reach(cells, left, top, right, bottom), mode = mode)
+    each(job.cover.bottom - job.cover.top, (void*)&job, polygon_row)
+    if mode == Mode.intersect:
+        outside(cells, left, top, right, bottom)
+
+## One row of cells of the polygon: each pixel row's coverage from scanline
+## crossings at four heights (a little antialiasing along near-horizontal
+## edges), spans summed through a running difference, into a strip of cells.
+func polygon_row(context: void*?, item: usize):
+    let job = (PolygonJob*)(context else return)
+    let cells = job.cells
+    let row = job.cover.top + item
+    let across = job.cover.right - job.cover.left
+    let first_index = row * (usize)cells.columns() + job.cover.left
+    let xa = cells.origin_x(first_index)
+    let xb = math.imin((i64)cells.extent_x, (i64)(job.cover.right * (usize)tile_size))
+    let span = (usize)(xb - xa)
+    let count = job.points.length // 2
+    let strip = alloc u8[across * block_bytes] in memory.heap catch failure:
+        trap("out of memory drawing a selection")
+    defer free(strip) in memory.heap
+    let delta = alloc i32[span + 1] in memory.heap catch failure:
+        trap("out of memory drawing a selection")
+    defer free(delta) in memory.heap
+    let crossings = alloc f64[count] in memory.heap catch failure:
+        trap("out of memory drawing a selection")
+    defer free(crossings) in memory.heap
+    memory.set(strip, 0)
+    let y0 = cells.origin_y(first_index)
+    for line in 0..<(usize)cells.cell_height(first_index):
+        for x in 0..<delta.length:
+            delta[x] = 0
+        var touched = false
+        for sample in 0..<(usize)4:
+            let y = (f64)y0 + (f64)line + ((f64)sample + 0.5) * 0.25
+            var found: usize = 0
+            for edge in 0..<count:
+                let ax = job.points[edge * 2]
+                let ay = job.points[edge * 2 + 1]
+                let bx = job.points[((edge + 1) % count) * 2]
+                let by = job.points[((edge + 1) % count) * 2 + 1]
+                if (ay <= y and by > y) or (by <= y and ay > y):
+                    crossings[found] = ax + (y - ay) * (bx - ax) / (by - ay)
+                    found += 1
+            # Sorted, the crossings pair up into the spans inside.
+            for i in 1..<found:
+                let value = crossings[i]
+                var at = i
+                while at > 0 and crossings[at - 1] > value:
+                    crossings[at] = crossings[at - 1]
+                    at -= 1
+                crossings[at] = value
+            var pair: usize = 0
+            while pair + 1 < found:
+                let start = math.imin(math.imax((i64)math.floor(crossings[pair] + 0.5), xa), xb)
+                let stop = math.imin(math.imax((i64)math.floor(crossings[pair + 1] + 0.5), xa), xb)
+                if stop > start:
+                    delta[(usize)(start - xa)] += 64
+                    delta[(usize)(stop - xa)] -= 64
+                    touched = true
+                pair += 2
+        if not touched:
+            continue
+        var running: i32 = 0
+        for x in 0..<span:
+            running += delta[x]
+            if running > 0:
+                let value: u8 = 255 if running >= 256 else (u8)running
+                strip[(x // (usize)tile_size) * block_bytes + line * (usize)tile_size + x % (usize)tile_size] = value
+    for column in 0..<across:
+        combine_cell(cells, first_index + column, strip[column * block_bytes..<(column + 1) * block_bytes], job.mode)
+
+# mark: Coverage from elsewhere =================================================================
+
+## Where `from_source` takes its coverage: another selection's cells, a byte
+## a document pixel (times `scale`), or one channel of RGBA f32 samples.
+pub struct Source:
+    pub var other: const Cells*? = none
+    pub var bytes: const u8[]
+    pub var scale: u8 = 1
+    pub var samples: const f32[]
+    pub var channel: usize = 0
+
+struct SourceJob:
+    var cells: Cells*
+    var source: Source
+    var mode: Mode
+
+## Every cell combined with `source` by `mode`.
+pub func from_source(cells: Cells*, source: Source, mode: Mode):
+    var job = SourceJob(cells = cells, source = source, mode = mode)
+    each(cells.count(), (void*)&job, source_item)
+
+func source_item(context: void*?, index: usize):
+    let job = (SourceJob*)(context else return)
+    if let other = job.source.other:
+        let value = other.uniform(index)
+        if value >= 0:
+            combine_value(job.cells, index, (u8)value, job.mode)
+        elif let block = other.block(index):
+            combine_cell(job.cells, index, block.bytes, job.mode)
+        return
+    let shape = alloc u8[block_bytes] in memory.heap catch failure:
+        trap("out of memory reading a selection")
+    defer free(shape) in memory.heap
+    memory.set(shape, 0)
+    let width = (usize)job.cells.cell_width(index)
+    let stride = (usize)job.cells.extent_x
+    let x = (usize)job.cells.origin_x(index)
+    let y = (usize)job.cells.origin_y(index)
+    for row in 0..<(usize)job.cells.cell_height(index):
+        let line = (y + row) * stride + x
+        for column in 0..<width:
+            var value: u8 = 0
+            if job.source.samples.length > 0:
+                value = (u8)(math.clamp((f64)job.source.samples[(line + column) * 4 + job.source.channel], 0.0, 1.0) * 255.0 + 0.5)
+            else:
+                value = job.source.bytes[line + column] * job.source.scale
+            shape[row * (usize)tile_size + column] = value
+    combine_cell(job.cells, index, shape, job.mode)

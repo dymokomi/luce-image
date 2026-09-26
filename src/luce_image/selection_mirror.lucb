@@ -1,0 +1,129 @@
+## A selection's GPU tiles (coverage in red, green and blue, alpha one), for
+## the shaders that clip strokes and fills and draw the ants. Kept in step with
+## the cells a cell at a time: only the cells whose content changed since the
+## last look are uploaded again, nothing is kept for unselected cells, and
+## every wholly selected cell shares one tile.
+import gpu
+import memory
+from tiles import Tiles, tile_size, box, unbox
+from half import to_half
+from luce_image.selection_cells import Cells, each
+
+## Cells converted to half floats together before they are uploaded.
+let batch: usize = 32
+
+## Bytes of one tile of RGBA half floats.
+let tile_bytes: usize = 524288
+
+pub struct Mirror:
+    var tiles: Tiles*?
+    ## What each cell's tile shows, as `Cells.shows` names it.
+    var shown: u64[]
+
+    pub static func create() -> Mirror:
+        var nothing: u64[]
+        return Mirror(tiles = none, shown = nothing)
+
+    pub mutating func destroy():
+        if let tiles = self.tiles:
+            unbox(tiles)
+            self.tiles = none
+        if self.shown.length > 0:
+            free(self.shown) in memory.heap
+        var nothing: u64[]
+        self.shown = nothing
+
+    ## The tiles showing `cells` (settled), their changed cells uploaded.
+    pub mutating func update(device: gpu.Device, cells: const Cells*) -> Tiles*!:
+        if self.tiles == none:
+            var fresh = try Tiles.create(device, cells.extent_x, cells.extent_y)
+            errdefer fresh.destroy()
+            let shown = try alloc u64[cells.count()] in memory.heap
+            errdefer free(shown) in memory.heap
+            memory.set(u8[]((u8*)shown.data, shown.length * 8), 0)
+            self.tiles = try box(fresh)
+            self.shown = shown
+        let tiles = self.tiles else trap("made above")
+        # A cell already showing the shared selected tile, to share it from.
+        var full: usize = cells.count()
+        for index in 0..<cells.count():
+            if self.shown[index] == 1 and cells.shows(index) == 1:
+                full = index
+                break
+        let pending = try alloc usize[batch] in memory.heap
+        defer free(pending) in memory.heap
+        var waiting: usize = 0
+        for index in 0..<cells.count():
+            let wanted = cells.shows(index)
+            if wanted == self.shown[index]:
+                continue
+            let column = (u32)(index % (usize)cells.columns())
+            let row = (u32)(index // (usize)cells.columns())
+            if wanted == 0:
+                try tiles.clear(column, row)
+            elif wanted == 1 and full < cells.count():
+                try tiles.share(column, row, (u32)(full % (usize)cells.columns()), (u32)(full // (usize)cells.columns()))
+            elif wanted == 1:
+                # The first selected cell gets the tile the others will share.
+                var single: usize[1] = [index]
+                try upload(tiles, cells, single)
+                full = index
+            else:
+                pending[waiting] = index
+                waiting += 1
+                if waiting == batch:
+                    try upload(tiles, cells, pending[..<waiting])
+                    waiting = 0
+            self.shown[index] = wanted
+        if waiting > 0:
+            try upload(tiles, cells, pending[..<waiting])
+        return tiles
+
+## Convert `items` (cell indices) to half floats on every processor, then
+## upload them and set them in `tiles`.
+func upload(tiles: Tiles*, cells: const Cells*, items: const usize[]) -> !:
+    let staging = try alloc u8[items.length * tile_bytes] in memory.heap
+    defer free(staging) in memory.heap
+    var job = ConvertJob(cells = cells, items = items, staging = staging)
+    for value in 0..<(usize)256:
+        job.halves[value] = to_half((f32)value / 255.0)
+    each(items.length, (void*)&job, convert_item)
+    for item in 0..<items.length:
+        let index = items[item]
+        var texture = try gpu.Texture.create(tiles.device(), tile_size, tile_size, gpu.Format.rgba16_float)
+        errdefer texture.destroy()
+        try texture.upload(staging[item * tile_bytes..<(item + 1) * tile_bytes])
+        try tiles.set((u32)(index % (usize)cells.columns()), (u32)(index // (usize)cells.columns()), texture)
+
+struct ConvertJob:
+    var cells: const Cells*
+    var items: const usize[]
+    var staging: u8[]
+    var halves: u16[256]
+
+## One cell as RGBA half floats: its coverage in the color channels, alpha one,
+## clear past the document's edge.
+func convert_item(context: void*?, item: usize):
+    let job = (ConvertJob*)(context else return)
+    let index = job.items[item]
+    let bytes = job.staging[item * tile_bytes..<(item + 1) * tile_bytes]
+    memory.set(bytes, 0)
+    let width = (usize)job.cells.cell_width(index)
+    let height = (usize)job.cells.cell_height(index)
+    let one = to_half(1.0)
+    let block = job.cells.block(index)
+    let value = job.cells.uniform(index)
+    for y in 0..<height:
+        for x in 0..<width:
+            var coverage: u8 = 0
+            if let cell = block:
+                coverage = cell.bytes[y * (usize)tile_size + x]
+            else:
+                coverage = (u8)value
+            let half = job.halves[(usize)coverage]
+            let at = (y * (usize)tile_size + x) * 8
+            for channel in 0..<(usize)3:
+                bytes[at + channel * 2] = (u8)(half & 0xff)
+                bytes[at + channel * 2 + 1] = (u8)(half >> 8)
+            bytes[at + 6] = (u8)(one & 0xff)
+            bytes[at + 7] = (u8)(one >> 8)

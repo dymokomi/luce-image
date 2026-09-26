@@ -1,39 +1,25 @@
-## A per-pixel selection: one coverage byte per document pixel on the CPU,
-## where the shapes are drawn and the morphology runs, mirrored into GPU tiles
-## (red channel) on demand for the shaders that clip strokes and fills. Shapes
-## combine in Photoshop's modes: replace, add, subtract, intersect.
+## A per-pixel selection: one coverage byte per document pixel, kept in the
+## canvas's 256-pixel cells (selection_cells.lucb) where the shapes are drawn
+## and the morphology runs, mirrored into GPU tiles (selection_mirror.lucb) on
+## demand for the shaders that clip strokes and fills. Cells wholly selected
+## or wholly clear cost no memory and copies share the rest, so a selection
+## of a huge canvas, and every undo step's copy of it, costs its edges.
+## Shapes combine in Photoshop's modes: replace, add, subtract, intersect.
 import gpu
 import math
 import memory
-import os
-import thread
-from tiles import Tiles, tile_size, box, unbox
-from half import to_half
+from tiles import Tiles, tile_size
 from luce_image.projective import Warp
+from luce_image.selection_cells import Cells, Mode, block_bytes, each
+from luce_image.selection_mirror import Mirror
+import luce_image.selection_shapes as shapes
 from raster_errors import invalid
-
-## How many selections share one coverage buffer: a copy (an undo step's) shares
-## it until either changes, so each structural step costs no copy of a document-
-## sized buffer.
-struct Holders:
-    var count: usize
-
-## How a new shape combines with the selection so far.
-pub enum Mode as u8:
-    replace = 0
-    add = 1
-    subtract = 2
-    intersect = 3
 
 pub struct Selection:
     var extent_x: u32
     var extent_y: u32
-    var coverage: u8[]
-    ## Shared with copies until one of them changes (`own`).
-    var holders: Holders*
-    var tiles: Tiles*?
-    var owner: gpu.Device?
-    var uploaded: bool
+    var cells: Cells
+    var mirror: Mirror
     var empty: bool
     ## The bounding box of the selected pixels, valid when not empty.
     pub var left: i64
@@ -44,58 +30,16 @@ pub struct Selection:
     pub static func create(width: u32, height: u32) -> Selection!:
         if width == 0 or height == 0 or width > 65536 or height > 65536:
             error(invalid, "selection dimensions must be in 1..65536")
-        let coverage = try alloc u8[(usize)width * (usize)height] in memory.heap
-        errdefer free(coverage) in memory.heap
-        for index in 0..<coverage.length:
-            coverage[index] = 0
-        let holders = try new Holders(count = 1) in memory.heap
-        return Selection(extent_x = width, extent_y = height, coverage = coverage, holders = holders, tiles = none, owner = none, uploaded = false, empty = true)
+        let cells = try Cells.create(width, height)
+        return Selection(extent_x = width, extent_y = height, cells = cells, mirror = Mirror.create(), empty = true,
+                         left = (i64)width, top = (i64)height, right = 0, bottom = 0)
 
-    ## A copy of the selection, sharing its coverage until either changes (its
-    ## GPU tiles are made again when wanted).
+    ## A copy of the selection sharing its cells until either changes. Its GPU
+    ## tiles are made again when wanted: an undo step's copy holds none.
     pub func copy() -> Selection!:
-        self.holders.count += 1
-        return Selection(extent_x = self.extent_x, extent_y = self.extent_y, coverage = self.coverage, holders = self.holders, tiles = none, owner = none,
-                         uploaded = false, empty = self.empty, left = self.left, top = self.top, right = self.right, bottom = self.bottom)
-
-    ## The coverage this selection alone holds, copied first if shared: every
-    ## change starts here.
-    mutating func own():
-        if self.holders.count == 1:
-            return
-        let coverage = alloc u8[self.coverage.length] in memory.heap catch failure:
-            trap("out of memory copying the selection")
-        memory.copy(coverage, self.coverage, self.coverage.length)
-        let holders = new Holders(count = 1) in memory.heap catch failure:
-            trap("out of memory copying the selection")
-        self.holders.count -= 1
-        self.coverage = coverage
-        self.holders = holders
-
-    ## A coverage of this selection's own set wholly to `value`: what a change
-    ## that overwrites every pixel starts from, with nothing copied if shared.
-    mutating func own_filled(value: u8):
-        if self.holders.count > 1:
-            let fresh = alloc u8[self.coverage.length] in memory.heap catch failure:
-                trap("out of memory replacing the selection")
-            self.adopt(fresh)
-        memory.set(self.coverage, value)
-
-    ## Take `coverage` (fresh, held by nobody else) in place of this selection's.
-    mutating func adopt(coverage: u8[]):
-        self.release_coverage()
-        self.coverage = coverage
-        self.holders = new Holders(count = 1) in memory.heap catch failure:
-            trap("out of memory replacing the selection")
-
-    ## Let go of the coverage, freeing it with its last holder.
-    mutating func release_coverage():
-        if self.coverage.length == 0:
-            return
-        self.holders.count -= 1
-        if self.holders.count == 0:
-            free(self.coverage) in memory.heap
-            free(self.holders) in memory.heap
+        let cells = try self.cells.copy()
+        return Selection(extent_x = self.extent_x, extent_y = self.extent_y, cells = cells, mirror = Mirror.create(),
+                         empty = self.empty, left = self.left, top = self.top, right = self.right, bottom = self.bottom)
 
     pub func is_empty() -> bool:
         return self.empty
@@ -110,48 +54,35 @@ pub struct Selection:
     pub func at(x: i64, y: i64) -> u8:
         if self.empty:
             return 255
+        return self.sample(x, y)
+
+    ## Coverage at a pixel, nothing past the document.
+    func sample(x: i64, y: i64) -> u8:
         if x < 0 or y < 0 or x >= (i64)self.extent_x or y >= (i64)self.extent_y:
             return 0
-        return self.coverage[(usize)y * (usize)self.extent_x + (usize)x]
+        return self.cells.at(x, y)
 
     pub mutating func clear():
-        self.own_filled(0)
-        # Known without a scan.
-        self.empty = true
-        self.left = (i64)self.extent_x
-        self.top = (i64)self.extent_y
-        self.right = 0
-        self.bottom = 0
-        self.uploaded = false
+        self.cells.fill_all(0)
+        self.finish()
 
     pub mutating func select_all():
-        self.own_filled(255)
-        self.empty = false
-        self.left = 0
-        self.top = 0
-        self.right = (i64)self.extent_x
-        self.bottom = (i64)self.extent_y
-        self.uploaded = false
+        self.cells.fill_all(255)
+        self.finish()
 
     pub mutating func invert():
-        self.own()
-        for index in 0..<self.coverage.length:
-            self.coverage[index] = 255 - self.coverage[index]
+        each(self.cells.count(), (void*)&self.cells, invert_item)
         self.finish()
 
     ## Move the selection by (`dx`, `dy`) pixels; what leaves the document is dropped.
     pub mutating func translate(dx: i64, dy: i64) -> !:
         if (dx == 0 and dy == 0) or self.empty:
             return
-        let width = (i64)self.extent_x
-        let height = (i64)self.extent_y
-        let moved = try alloc u8[self.coverage.length] in memory.heap
-        for index in 0..<moved.length:
-            moved[index] = 0
-        for row in math.imax(0, dy)..<math.imin(height, height + dy):
-            for column in math.imax(0, dx)..<math.imin(width, width + dx):
-                moved[(usize)(row * width + column)] = self.coverage[(usize)((row - dy) * width + column - dx)]
-        self.adopt(moved)
+        var moved = try Cells.create(self.extent_x, self.extent_y)
+        var job = MoveJob(source = &self.cells, target = &moved, dx = dx, dy = dy)
+        each(moved.count(), (void*)&job, move_item)
+        self.cells.destroy()
+        self.cells = moved
         self.finish()
 
     ## Take the selection through `warp` (a backwards map, as free transform
@@ -159,124 +90,79 @@ pub struct Selection:
     pub mutating func warp(warp: Warp) -> !:
         if self.empty:
             return
-        let width = (i64)self.extent_x
-        let height = (i64)self.extent_y
-        let moved = try alloc u8[self.coverage.length] in memory.heap
-        for row in 0..<height:
-            for column in 0..<width:
-                var x = 0.0
-                var y = 0.0
-                var value = 0.0
-                if warp.map((f64)column + 0.5, (f64)row + 0.5, &x, &y):
-                    let sx = x - 0.5
-                    let sy = y - 0.5
-                    let x0 = (i64)math.floor(sx)
-                    let y0 = (i64)math.floor(sy)
-                    let fx = sx - (f64)x0
-                    let fy = sy - (f64)y0
-                    let top = (f64)self.sample(x0, y0) * (1.0 - fx) + (f64)self.sample(x0 + 1, y0) * fx
-                    let bottom = (f64)self.sample(x0, y0 + 1) * (1.0 - fx) + (f64)self.sample(x0 + 1, y0 + 1) * fx
-                    value = top * (1.0 - fy) + bottom * fy
-                moved[(usize)(row * width + column)] = (u8)math.clamp(math.round(value), 0.0, 255.0)
-        self.adopt(moved)
+        var moved = try Cells.create(self.extent_x, self.extent_y)
+        var job = WarpJob(selection = &self, target = &moved, warp = warp)
+        each(moved.count(), (void*)&job, warp_item)
+        self.cells.destroy()
+        self.cells = moved
         self.finish()
-
-    ## Coverage at a pixel, nothing past the document.
-    func sample(x: i64, y: i64) -> u8:
-        if x < 0 or y < 0 or x >= (i64)self.extent_x or y >= (i64)self.extent_y:
-            return 0
-        return self.coverage[(usize)y * (usize)self.extent_x + (usize)x]
 
     ## A rectangle, combined by `mode`.
     pub mutating func rectangle(x: i64, y: i64, width: i64, height: i64, mode: Mode):
-        self.shape(x, y, width, height, mode, false)
-
-    ## An ellipse inscribed in a rectangle, combined by `mode`, antialiased.
-    pub mutating func ellipse(x: i64, y: i64, width: i64, height: i64, mode: Mode):
-        self.shape(x, y, width, height, mode, true)
-
-    mutating func shape(x: i64, y: i64, width: i64, height: i64, mode: Mode, round: bool):
-        if mode == Mode.replace:
-            self.own_filled(0)
-        else:
-            self.own()
+        let adding = self.prepare(mode)
         let left = math.imax(0, x)
         let top = math.imax(0, y)
         let right = math.imin((i64)self.extent_x, x + width)
         let bottom = math.imin((i64)self.extent_y, y + height)
-        if right > left and bottom > top and not round:
-            # A rectangle is whole rows of one value in every mode: filled for
-            # replace and add, cleared for subtract, kept for intersect.
-            if mode != Mode.intersect:
-                let value: u8 = 0 if mode == Mode.subtract else 255
-                for row in top..<bottom:
-                    let start = (usize)row * (usize)self.extent_x
-                    memory.set(self.coverage[start + (usize)left..<start + (usize)right], value)
-        elif right > left and bottom > top:
-            let cx = (f64)x + (f64)width * 0.5
-            let cy = (f64)y + (f64)height * 0.5
-            let rx = math.max(0.5, (f64)width * 0.5)
-            let ry = math.max(0.5, (f64)height * 0.5)
-            for row in top..<bottom:
-                for column in left..<right:
-                    var value: u8 = 255
-                    if round:
-                        # Distance to the ellipse edge in its own units, antialiased over one pixel.
-                        let dx = ((f64)column + 0.5 - cx) / rx
-                        let dy = ((f64)row + 0.5 - cy) / ry
-                        let d = math.sqrt(dx * dx + dy * dy)
-                        let edge = math.min(rx, ry)
-                        let coverage = math.clamp((1.0 - d) * edge + 0.5, 0.0, 1.0)
-                        value = (u8)(coverage * 255.0 + 0.5)
-                    self.combine((usize)row * (usize)self.extent_x + (usize)column, value, mode)
-        if mode == Mode.intersect:
-            self.outside(left, top, right, bottom)
+        if right > left and bottom > top:
+            shapes.rectangle(&self.cells, left, top, right, bottom, adding)
+        elif mode == Mode.intersect:
+            self.cells.fill_all(0)
         self.finish()
+
+    ## An ellipse inscribed in a rectangle, combined by `mode`, antialiased.
+    pub mutating func ellipse(x: i64, y: i64, width: i64, height: i64, mode: Mode):
+        let adding = self.prepare(mode)
+        let left = math.imax(0, x)
+        let top = math.imax(0, y)
+        let right = math.imin((i64)self.extent_x, x + width)
+        let bottom = math.imin((i64)self.extent_y, y + height)
+        if right > left and bottom > top:
+            shapes.ellipse(&self.cells, shapes.Ellipse.inscribed(x, y, width, height), left, top, right, bottom, adding)
+        elif mode == Mode.intersect:
+            self.cells.fill_all(0)
+        self.finish()
+
+    ## Replace starts from nothing and adds; the other modes are as they are.
+    mutating func prepare(mode: Mode) -> Mode:
+        if mode != Mode.replace:
+            return mode
+        self.cells.fill_all(0)
+        return Mode.add
 
     ## Coverage from channel `channel` (0 red .. 3 alpha) of straight RGBA
     ## samples covering the document, 0..1, combined by `mode`: a layer's
     ## transparency, or its mask, loaded as a selection.
     pub mutating func from_samples(samples: const f32[], channel: usize, mode: Mode) -> !:
-        self.own()
-        if samples.length != self.coverage.length * 4 or channel > 3:
+        if samples.length != (usize)self.extent_x * (usize)self.extent_y * 4 or channel > 3:
             error(invalid, "samples must be RGBA for every document pixel")
-        if mode == Mode.replace:
-            for index in 0..<self.coverage.length:
-                self.coverage[index] = 0
-        for index in 0..<self.coverage.length:
-            let value = (u8)(math.clamp((f64)samples[index * 4 + channel], 0.0, 1.0) * 255.0 + 0.5)
-            self.combine(index, value, mode)
+        var nothing: u8[]
+        let adding = self.prepare(mode)
+        shapes.from_source(&self.cells, shapes.Source(bytes = nothing, samples = samples, channel = channel), adding)
         self.finish()
 
     ## Coverage bytes, one for every document pixel, combined by `mode`: a
     ## color range (color_range.lucb).
     pub mutating func from_coverage(values: const u8[], mode: Mode) -> !:
-        self.own()
-        if values.length != self.coverage.length:
+        if values.length != (usize)self.extent_x * (usize)self.extent_y:
             error(invalid, "coverage must have a byte for every document pixel")
-        if mode == Mode.replace:
-            for index in 0..<self.coverage.length:
-                self.coverage[index] = 0
-        for index in 0..<self.coverage.length:
-            self.combine(index, values[index], mode)
+        var nothing: f32[]
+        let adding = self.prepare(mode)
+        shapes.from_source(&self.cells, shapes.Source(bytes = values, samples = nothing), adding)
         self.finish()
 
     ## A polygon from `points` (x, y pairs in document pixels), even-odd filled,
     ## combined by `mode`.
     pub mutating func polygon(points: const f64[], mode: Mode) -> !:
-        self.own()
         if points.length < 6 or points.length % 2 != 0:
             error(invalid, "a polygon needs at least three points")
         for value in points:
             if not math.is_finite(value):
                 error(invalid, "polygon points must be finite")
-        if mode == Mode.replace:
-            for index in 0..<self.coverage.length:
-                self.coverage[index] = 0
-        var min_y = points[1]
-        var max_y = points[1]
         var min_x = points[0]
         var max_x = points[0]
+        var min_y = points[1]
+        var max_y = points[1]
         var index: usize = 0
         while index < points.length:
             min_x = math.min(min_x, points[index])
@@ -284,50 +170,15 @@ pub struct Selection:
             min_y = math.min(min_y, points[index + 1])
             max_y = math.max(max_y, points[index + 1])
             index += 2
+        let adding = self.prepare(mode)
+        let left = math.imax(0, (i64)math.floor(min_x))
         let top = math.imax(0, (i64)math.floor(min_y))
+        let right = math.imin((i64)self.extent_x, (i64)math.ceil(max_x) + 1)
         let bottom = math.imin((i64)self.extent_y, (i64)math.ceil(max_y))
-        let count = points.length // 2
-        # Scanline crossings at each row's centre, four subsamples per row for
-        # a little antialiasing along near-horizontal edges.
-        let crossings = try alloc f64[count] in memory.heap
-        defer free(crossings) in memory.heap
-        let accumulate = try alloc u16[(usize)self.extent_x] in memory.heap
-        defer free(accumulate) in memory.heap
-        for row in top..<bottom:
-            for column in 0..<(usize)self.extent_x:
-                accumulate[column] = 0
-            for sample in 0..<(usize)4:
-                let y = (f64)row + ((f64)sample + 0.5) * 0.25
-                var found: usize = 0
-                for edge in 0..<count:
-                    let ax = points[edge * 2]
-                    let ay = points[edge * 2 + 1]
-                    let bx = points[((edge + 1) % count) * 2]
-                    let by = points[((edge + 1) % count) * 2 + 1]
-                    if (ay <= y and by > y) or (by <= y and ay > y):
-                        crossings[found] = ax + (y - ay) * (bx - ax) / (by - ay)
-                        found += 1
-                # Sort the crossings and fill between pairs.
-                for i in 1..<found:
-                    let value = crossings[i]
-                    var at = i
-                    while at > 0 and crossings[at - 1] > value:
-                        crossings[at] = crossings[at - 1]
-                        at -= 1
-                    crossings[at] = value
-                var pair: usize = 0
-                while pair + 1 < found:
-                    let start = math.imax(0, (i64)math.floor(crossings[pair] + 0.5))
-                    let stop = math.imin((i64)self.extent_x, (i64)math.floor(crossings[pair + 1] + 0.5))
-                    for column in start..<stop:
-                        accumulate[(usize)column] += 64
-                    pair += 2
-            for column in 0..<(usize)self.extent_x:
-                if accumulate[column] > 0:
-                    let value = (u8)(math.imin(255, (i64)accumulate[column] - 1) if accumulate[column] == 256 else (i64)accumulate[column])
-                    self.combine((usize)row * (usize)self.extent_x + column, value, mode)
-        if mode == Mode.intersect:
-            self.outside(math.imax(0, (i64)math.floor(min_x)), top, math.imin((i64)self.extent_x, (i64)math.ceil(max_x)), bottom)
+        if right > left and bottom > top:
+            shapes.polygon(&self.cells, points, left, top, right, bottom, adding)
+        elif mode == Mode.intersect:
+            self.cells.fill_all(0)
         self.finish()
 
     ## The magic wand: every pixel of `pixels` (RGBA straight-alpha linear
@@ -335,7 +186,6 @@ pub struct Selection:
     ## (0..255, in sRGB, alpha included) of the one at (`x`, `y`), reachable
     ## through such pixels when `contiguous`, combined by `mode`.
     pub mutating func wand(pixels: const f32[], x: i64, y: i64, tolerance: f64, contiguous: bool, mode: Mode) -> !:
-        self.own()
         let width = (usize)self.extent_x
         let height = (usize)self.extent_y
         if pixels.length != width * height * 4:
@@ -344,9 +194,6 @@ pub struct Selection:
             error(invalid, "the wand point lies outside the document")
         if not math.is_finite(tolerance) or tolerance < 0.0 or tolerance > 255.0:
             error(invalid, "wand tolerance is 0..255")
-        if mode == Mode.replace:
-            for index in 0..<self.coverage.length:
-                self.coverage[index] = 0
         # Colors compared as 8-bit sRGB, the way the tolerance is stated.
         let bytes = try alloc u8[width * height * 4] in memory.heap
         defer free(bytes) in memory.heap
@@ -358,12 +205,7 @@ pub struct Selection:
         let limit = (i64)math.floor(tolerance + 0.5)
         let matched = try alloc u8[width * height] in memory.heap
         defer free(matched) in memory.heap
-        for index in 0..<(width * height):
-            matched[index] = 0
-        var left = (i64)width
-        var top = (i64)height
-        var right: i64 = 0
-        var bottom: i64 = 0
+        memory.set(matched, 0)
         if contiguous:
             let queue = try alloc u32[width * height] in memory.heap
             defer free(queue) in memory.heap
@@ -377,10 +219,6 @@ pub struct Selection:
                 head += 1
                 let column = (i64)(index % width)
                 let row = (i64)(index // width)
-                left = math.imin(left, column)
-                right = math.imax(right, column + 1)
-                top = math.imin(top, row)
-                bottom = math.imax(bottom, row + 1)
                 for step in 0..<(usize)4:
                     let nx = column + (1 if step == 0 else (-1 if step == 1 else 0))
                     let ny = row + (1 if step == 2 else (-1 if step == 3 else 0))
@@ -395,237 +233,238 @@ pub struct Selection:
             for index in 0..<(width * height):
                 if within(bytes, seed, index, limit):
                     matched[index] = 1
-                    let column = (i64)(index % width)
-                    let row = (i64)(index // width)
-                    left = math.imin(left, column)
-                    right = math.imax(right, column + 1)
-                    top = math.imin(top, row)
-                    bottom = math.imax(bottom, row + 1)
-        for index in 0..<(width * height):
-            if matched[index] != 0:
-                self.combine(index, 255, mode)
-        if mode == Mode.intersect:
-            self.outside(left, top, right, bottom)
+        var nothing: f32[]
+        let adding = self.prepare(mode)
+        shapes.from_source(&self.cells, shapes.Source(bytes = matched, scale = 255, samples = nothing), adding)
         self.finish()
 
     ## Grow (positive) or shrink (negative) the selection by `pixels` with a
     ## square structuring element, then soften its edge over `feather` pixels.
+    ## Done on the whole document's bytes at once, put back into cells after.
     pub mutating func adjust(pixels: i64, feather: i64) -> !:
-        self.own()
         if pixels < -512 or pixels > 512 or feather < 0 or feather > 512:
             error(invalid, "expand and contract are limited to 512 pixels, feather to 0..512")
+        if pixels == 0 and feather == 0:
+            return
+        let count = (usize)self.extent_x * (usize)self.extent_y
+        let coverage = try alloc u8[count] in memory.heap
+        defer free(coverage) in memory.heap
+        let scratch = try alloc u8[count] in memory.heap
+        defer free(scratch) in memory.heap
+        for y in 0..<(i64)self.extent_y:
+            for x in 0..<(i64)self.extent_x:
+                coverage[(usize)y * (usize)self.extent_x + (usize)x] = self.cells.at(x, y)
+        let w = (usize)self.extent_x
+        let h = (usize)self.extent_y
         if pixels != 0:
-            let scratch = try alloc u8[self.coverage.length] in memory.heap
-            defer free(scratch) in memory.heap
             let grow = pixels > 0
             let radius = (usize)math.iabs(pixels)
-            try self.morph(scratch, radius, grow, true)
-            try self.morph(scratch, radius, grow, false)
+            morph(coverage, scratch, w, h, radius, grow, true)
+            morph(coverage, scratch, w, h, radius, grow, false)
         if feather > 0:
-            let scratch = try alloc u8[self.coverage.length] in memory.heap
-            defer free(scratch) in memory.heap
-            try self.soften(scratch, (usize)feather, true)
-            try self.soften(scratch, (usize)feather, false)
+            soften(coverage, scratch, w, h, (usize)feather, true)
+            soften(coverage, scratch, w, h, (usize)feather, false)
+        var nothing: f32[]
+        self.cells.fill_all(0)
+        shapes.from_source(&self.cells, shapes.Source(bytes = coverage, samples = nothing), Mode.add)
         self.finish()
-
-    ## One separable pass of a max (grow) or min (shrink) filter.
-    mutating func morph(scratch: u8[], radius: usize, grow: bool, horizontal: bool) -> !:
-        let w = (usize)self.extent_x
-        let h = (usize)self.extent_y
-        for y in 0..<h:
-            for x in 0..<w:
-                var value: u8 = 0 if grow else 255
-                let span = (i64)radius
-                for offset in -span..<(span + 1):
-                    let sx = (i64)x + (offset if horizontal else 0)
-                    let sy = (i64)y + (0 if horizontal else offset)
-                    var sample: u8 = 0
-                    if sx >= 0 and sy >= 0 and sx < (i64)w and sy < (i64)h:
-                        sample = self.coverage[(usize)sy * w + (usize)sx]
-                    if grow:
-                        if sample > value:
-                            value = sample
-                    elif sample < value:
-                        value = sample
-                scratch[y * w + x] = value
-        memory.copy(self.coverage, scratch, self.coverage.length)
-
-    ## One separable pass of a box blur of `radius`.
-    mutating func soften(scratch: u8[], radius: usize, horizontal: bool) -> !:
-        let w = (usize)self.extent_x
-        let h = (usize)self.extent_y
-        let span = (i64)radius
-        for y in 0..<h:
-            for x in 0..<w:
-                var total: i64 = 0
-                var count: i64 = 0
-                for offset in -span..<(span + 1):
-                    let sx = (i64)x + (offset if horizontal else 0)
-                    let sy = (i64)y + (0 if horizontal else offset)
-                    if sx >= 0 and sy >= 0 and sx < (i64)w and sy < (i64)h:
-                        total += (i64)self.coverage[(usize)sy * w + (usize)sx]
-                    count += 1
-                scratch[y * w + x] = (u8)(total // count)
-        memory.copy(self.coverage, scratch, self.coverage.length)
-
-    mutating func combine(index: usize, value: u8, mode: Mode):
-        let current = self.coverage[index]
-        if mode == Mode.replace or mode == Mode.add:
-            self.coverage[index] = value if value > current else current
-        elif mode == Mode.subtract:
-            self.coverage[index] = current - (value if value < current else current)
-        else:
-            self.coverage[index] = value if value < current else current
 
     ## Every pixel of `other` (a shape made alone) combined in by `mode`, as
     ## a shape drawn here would be.
     pub mutating func merge(other: const Selection*, mode: Mode) -> !:
-        self.own()
-        if other.coverage.length != self.coverage.length:
+        if other.extent_x != self.extent_x or other.extent_y != self.extent_y:
             error(invalid, "selections must be the same size to merge")
         if mode == Mode.replace:
-            for index in 0..<self.coverage.length:
-                self.coverage[index] = 0
-        for index in 0..<self.coverage.length:
-            self.combine(index, other.coverage[index], mode)
+            # The other's cells themselves, shared.
+            var cells = try other.cells.copy()
+            self.cells.destroy()
+            self.cells = cells
+        else:
+            var nothing_bytes: u8[]
+            var nothing_samples: f32[]
+            shapes.from_source(&self.cells, shapes.Source(other = &other.cells, bytes = nothing_bytes, samples = nothing_samples), mode)
         self.finish()
 
     ## Hard edges: each pixel wholly in or out, at half coverage (anti-alias off).
     pub mutating func harden():
-        self.own()
-        for index in 0..<self.coverage.length:
-            self.coverage[index] = 255 if self.coverage[index] >= 128 else 0
+        each(self.cells.count(), (void*)&self.cells, harden_item)
         self.finish()
 
-    ## Intersecting clears everything outside the shape's rectangle.
-    mutating func outside(left: i64, top: i64, right: i64, bottom: i64):
-        let width = (usize)self.extent_x
-        for row in 0..<(i64)self.extent_y:
-            let start = (usize)row * width
-            if row < top or row >= bottom or right <= left:
-                memory.set(self.coverage[start..<start + width], 0)
-                continue
-            if left > 0:
-                memory.set(self.coverage[start..<start + (usize)math.imin(left, (i64)width)], 0)
-            if right < (i64)width:
-                memory.set(self.coverage[start + (usize)math.imax(right, 0)..<start + width], 0)
-
-    ## Recompute emptiness and bounds; the GPU mirror is stale until `gpu_tiles`.
+    ## Settle the cells after a change and take their emptiness and bounds;
+    ## the GPU mirror catches up in `gpu_tiles`.
     mutating func finish():
-        # Bands of rows on every processor, each finding its own box.
-        var job = BoundsJob(coverage = self.coverage, width = (usize)self.extent_x, first = 0, last = (usize)self.extent_y)
-        let rows = (usize)self.extent_y
-        let workers = math.imin(16, math.imax(1, (i64)os.cpus())) if self.coverage.length >= 1048576 else 1
-        var bands: BoundsJob[16] = ---
-        var handles: thread.Handle[16]
-        var started: usize = 0
-        let per = (rows + (usize)workers - 1) // (usize)workers
-        for band in 0..<(usize)workers:
-            bands[band] = job
-            bands[band].first = (rows if band * per > rows else band * per)
-            bands[band].last = (rows if band * per + per > rows else band * per + per)
-        for band in 1..<(usize)workers:
-            handles[started] = thread.spawn(bounds_entry, (void*)&bands[band], name = "selection-bounds") catch failure:
-                for other in band..<(usize)workers:
-                    bounds_rows(&bands[other])
-                break
-            started += 1
-        bounds_rows(&bands[0])
-        for index in 0..<started:
-            handles[index].join() catch failure:
-                trap("a selection-bounds thread failed to join")
-        self.empty = true
-        self.left = (i64)self.extent_x
-        self.top = (i64)self.extent_y
-        self.right = 0
-        self.bottom = 0
-        for band in 0..<(usize)workers:
-            if not bands[band].found:
-                continue
-            self.empty = false
-            self.left = math.imin(self.left, bands[band].left)
-            self.top = math.imin(self.top, bands[band].top)
-            self.right = math.imax(self.right, bands[band].right)
-            self.bottom = math.imax(self.bottom, bands[band].bottom)
-        self.uploaded = false
+        let covered = self.cells.settle() catch failure:
+            trap("out of memory settling the selection")
+        self.empty = not covered.found
+        if self.empty:
+            self.left = (i64)self.extent_x
+            self.top = (i64)self.extent_y
+            self.right = 0
+            self.bottom = 0
+            return
+        self.left = covered.left
+        self.top = covered.top
+        self.right = covered.right
+        self.bottom = covered.bottom
 
-    ## The selection as GPU tiles (coverage in red, alpha one), refreshed after
-    ## every change; `none` when nothing is selected.
+    ## The selection as GPU tiles (coverage in red, alpha one), brought up to
+    ## date with the cells that changed; `none` when nothing is selected.
     pub mutating func gpu_tiles(device: gpu.Device) -> Tiles*?!:
         if self.empty:
             return none
-        if self.owner == none:
-            self.owner = device
-        if not self.uploaded or self.tiles == none:
-            var fresh = try Tiles.create(device, self.extent_x, self.extent_y)
-            errdefer fresh.destroy()
-            try self.fill_tiles(&fresh)
-            let boxed = try box(fresh)
-            if let previous = self.tiles:
-                unbox(previous)
-            self.tiles = boxed
-            self.uploaded = true
-        return self.tiles
+        return try self.mirror.update(device, &self.cells)
 
-    ## Every cell of `tiles` from the coverage, converted a tile at a time straight to
-    ## half floats (a byte's 256 values looked up), with no document-sized buffer.
-    ## Unselected cells get no tile (users read a missing cell as unselected) and
-    ## fully selected ones share one, so a big selection costs its edges.
-    func fill_tiles(tiles: Tiles*) -> !:
-        var halves: u16[256]
-        for value in 0..<(usize)256:
-            halves[value] = to_half((f32)value / 255.0)
-        let one = to_half(1.0)
-        let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
-        defer free(bytes) in memory.heap
-        var full_column: u32 = 0
-        var full_row: u32 = 0
-        var have_full = false
-        for row in 0..<tiles.rows():
-            for column in 0..<tiles.columns():
-                let area = tiles.region(column, row)
-                # What the cell holds: nothing, everything, or some.
-                var any = false
-                var all = area.width == tile_size and area.height == tile_size
-                for y in 0..<(usize)area.height:
-                    let line = ((usize)row * (usize)tile_size + y) * (usize)self.extent_x + (usize)column * (usize)tile_size
-                    for x in 0..<(usize)area.width:
-                        let value = self.coverage[line + x]
-                        any = any or value != 0
-                        all = all and value == 255
-                if not any:
-                    continue
-                if all and have_full:
-                    try tiles.share(column, row, full_column, full_row)
-                    continue
-                for index in 0..<bytes.length:
-                    bytes[index] = 0
-                for y in 0..<(usize)area.height:
-                    let line = ((usize)row * (usize)tile_size + y) * (usize)self.extent_x + (usize)column * (usize)tile_size
-                    for x in 0..<(usize)area.width:
-                        let half = halves[(usize)self.coverage[line + x]]
-                        let at = (y * (usize)tile_size + x) * 8
-                        for channel in 0..<(usize)3:
-                            bytes[at + channel * 2] = (u8)(half & 0xff)
-                            bytes[at + channel * 2 + 1] = (u8)(half >> 8)
-                        bytes[at + 6] = (u8)(one & 0xff)
-                        bytes[at + 7] = (u8)(one >> 8)
-                var texture = try gpu.Texture.create(tiles.device(), tile_size, tile_size, gpu.Format.rgba16_float)
-                errdefer texture.destroy()
-                try texture.upload(bytes)
-                try tiles.set(column, row, texture)
-                if all:
-                    full_column = column
-                    full_row = row
-                    have_full = true
+    ## Let the GPU tiles go (a selection put away in history); they are made
+    ## again when wanted.
+    pub mutating func drop_gpu_tiles():
+        self.mirror.destroy()
 
     pub mutating func destroy():
-        if let tiles = self.tiles:
-            unbox(tiles)
-            self.tiles = none
-        self.release_coverage()
-        var empty: u8[]
-        self.coverage = empty
+        self.mirror.destroy()
+        self.cells.destroy()
+
+# mark: Per-cell work ===========================================================================
+
+## Invert one cell.
+func invert_item(context: void*?, index: usize):
+    let cells = (Cells*)(context else return)
+    let value = cells.uniform(index)
+    if value >= 0:
+        cells.fill(index, 255 - (u8)value)
+        return
+    let bytes = cells.writable(index)
+    for at in 0..<bytes.length:
+        bytes[at] = 255 - bytes[at]
+
+## Harden one cell at half coverage.
+func harden_item(context: void*?, index: usize):
+    let cells = (Cells*)(context else return)
+    let value = cells.uniform(index)
+    if value >= 0:
+        cells.fill(index, 255 if value >= 128 else 0)
+        return
+    let bytes = cells.writable(index)
+    for at in 0..<bytes.length:
+        bytes[at] = 255 if bytes[at] >= 128 else 0
+
+struct MoveJob:
+    var source: const Cells*
+    var target: Cells*
+    var dx: i64
+    var dy: i64
+
+## One cell of a moved selection: one value when every cell it comes from is
+## that value, the source block itself when the move is by whole cells, else
+## its pixels copied one by one.
+func move_item(context: void*?, index: usize):
+    let job = (MoveJob*)(context else return)
+    let source = job.source
+    let x = job.target.origin_x(index) - job.dx
+    let y = job.target.origin_y(index) - job.dy
+    let width = job.target.cell_width(index)
+    let height = job.target.cell_height(index)
+    let left = math.imax(0, x)
+    let top = math.imax(0, y)
+    let right = math.imin((i64)source.extent_x, x + width)
+    let bottom = math.imin((i64)source.extent_y, y + height)
+    if right <= left or bottom <= top:
+        return
+    let span = (i64)tile_size
+    let inside = left == x and top == y and right == x + width and bottom == y + height
+    if inside and x % span == 0 and y % span == 0:
+        job.target.share(index, source, (usize)(y // span) * (usize)source.columns() + (usize)(x // span))
+        return
+    # Past the document is nothing; otherwise one value if every cell agrees.
+    var value: i64 = -2 if inside else 0
+    for row in (top // span)..<((bottom + span - 1) // span):
+        for column in (left // span)..<((right + span - 1) // span):
+            let found = source.uniform((usize)row * (usize)source.columns() + (usize)column)
+            if found < 0 or (value != -2 and found != value):
+                value = -1
+            elif value == -2:
+                value = found
+    if value >= 0:
+        job.target.fill(index, (u8)value)
+        return
+    let bytes = job.target.writable(index)
+    for row in 0..<height:
+        for column in 0..<width:
+            let sx = x + column
+            let sy = y + row
+            var coverage: u8 = 0
+            if sx >= 0 and sy >= 0 and sx < (i64)source.extent_x and sy < (i64)source.extent_y:
+                coverage = source.at(sx, sy)
+            bytes[(usize)row * (usize)tile_size + (usize)column] = coverage
+
+struct WarpJob:
+    var selection: const Selection*
+    var target: Cells*
+    var warp: Warp
+
+## One cell of a warped selection, each pixel sampled bilinearly back through the warp.
+func warp_item(context: void*?, index: usize):
+    let job = (WarpJob*)(context else return)
+    let shape = alloc u8[block_bytes] in memory.heap catch failure:
+        trap("out of memory warping the selection")
+    defer free(shape) in memory.heap
+    memory.set(shape, 0)
+    let origin_x = job.target.origin_x(index)
+    let origin_y = job.target.origin_y(index)
+    for row in 0..<job.target.cell_height(index):
+        for column in 0..<job.target.cell_width(index):
+            var x = 0.0
+            var y = 0.0
+            var value = 0.0
+            if job.warp.map((f64)(origin_x + column) + 0.5, (f64)(origin_y + row) + 0.5, &x, &y):
+                let sx = x - 0.5
+                let sy = y - 0.5
+                let x0 = (i64)math.floor(sx)
+                let y0 = (i64)math.floor(sy)
+                let fx = sx - (f64)x0
+                let fy = sy - (f64)y0
+                let upper = (f64)job.selection.sample(x0, y0) * (1.0 - fx) + (f64)job.selection.sample(x0 + 1, y0) * fx
+                let lower = (f64)job.selection.sample(x0, y0 + 1) * (1.0 - fx) + (f64)job.selection.sample(x0 + 1, y0 + 1) * fx
+                value = upper * (1.0 - fy) + lower * fy
+            shape[(usize)row * (usize)tile_size + (usize)column] = (u8)math.clamp(math.round(value), 0.0, 255.0)
+    shapes.combine_cell(job.target, index, shape, Mode.add)
+
+# mark: Whole-document passes ===================================================================
+
+## One separable pass of a max (grow) or min (shrink) filter over `coverage`.
+func morph(coverage: u8[], scratch: u8[], w: usize, h: usize, radius: usize, grow: bool, horizontal: bool):
+    for y in 0..<h:
+        for x in 0..<w:
+            var value: u8 = 0 if grow else 255
+            let span = (i64)radius
+            for offset in -span..<(span + 1):
+                let sx = (i64)x + (offset if horizontal else 0)
+                let sy = (i64)y + (0 if horizontal else offset)
+                var sample: u8 = 0
+                if sx >= 0 and sy >= 0 and sx < (i64)w and sy < (i64)h:
+                    sample = coverage[(usize)sy * w + (usize)sx]
+                if grow:
+                    if sample > value:
+                        value = sample
+                elif sample < value:
+                    value = sample
+            scratch[y * w + x] = value
+    memory.copy(coverage, scratch, coverage.length)
+
+## One separable pass of a box blur of `radius` over `coverage`.
+func soften(coverage: u8[], scratch: u8[], w: usize, h: usize, radius: usize, horizontal: bool):
+    let span = (i64)radius
+    for y in 0..<h:
+        for x in 0..<w:
+            var total: i64 = 0
+            var count: i64 = 0
+            for offset in -span..<(span + 1):
+                let sx = (i64)x + (offset if horizontal else 0)
+                let sy = (i64)y + (0 if horizontal else offset)
+                if sx >= 0 and sy >= 0 and sx < (i64)w and sy < (i64)h:
+                    total += (i64)coverage[(usize)sy * w + (usize)sx]
+                count += 1
+            scratch[y * w + x] = (u8)(total // count)
+    memory.copy(coverage, scratch, coverage.length)
 
 ## A linear-light sample as an 8-bit sRGB value.
 func srgb_byte(value: f32) -> u8:
@@ -640,6 +479,8 @@ func within(bytes: const u8[], a: usize, b: usize, limit: i64) -> bool:
         if difference > limit or -difference > limit:
             return false
     return true
+
+
 
 
 test "selection shapes combine, invert, grow and feather":
@@ -694,56 +535,70 @@ test "the wand selects like colors, contiguously or not":
         rejected = true
     assert(rejected)
 
-test "a copy shares the coverage until one of them changes, and each keeps what it had":
-    var first = try Selection.create(64, 64)
-    first.rectangle(0, 0, 32, 32, Mode.replace)
+test "a copy shares its cells until one of them changes, and each keeps what it had":
+    var first = try Selection.create(600, 600)
+    first.rectangle(0, 0, 300, 300, Mode.replace)
     var second = try first.copy()
-    assert(first.holders == second.holders and first.holders.count == 2)
+    # The whole cell is one value; the cut one is a block both hold.
+    assert(first.cells.uniform(0) == 255 and first.cells.block(1) == second.cells.block(1))
+    assert((first.cells.block(1) else trap("a block")).references == 2)
     # Changing the first leaves the copy as it was.
-    first.rectangle(32, 32, 32, 32, Mode.add)
-    assert(first.holders != second.holders and first.at(40, 40) == 255 and second.at(40, 40) == 0 and second.at(10, 10) == 255)
+    first.rectangle(260, 0, 100, 100, Mode.add)
+    assert(first.cells.block(1) != second.cells.block(1) and first.at(320, 50) == 255 and second.at(320, 50) == 0 and second.at(10, 10) == 255)
     var third = try second.copy()
     third.invert()
-    assert(second.at(10, 10) == 255 and third.at(10, 10) == 0)
+    assert(second.at(10, 10) == 255 and third.at(10, 10) == 0 and third.at(400, 400) == 255)
     first.destroy()
     second.destroy()
     third.destroy()
 
-## One band of rows for `Selection.finish`: the box of every nonzero byte.
-struct BoundsJob:
-    var coverage: const u8[]
-    var width: usize
-    var first: usize
-    var last: usize
-    var found: bool = false
-    var left: i64 = 0
-    var top: i64 = 0
-    var right: i64 = 0
-    var bottom: i64 = 0
+test "cells one value throughout hold no bytes, and settle back to one value":
+    var selection = try Selection.create(512, 512)
+    defer selection.destroy()
+    selection.rectangle(0, 0, 100, 256, Mode.replace)
+    assert(selection.cells.uniform(0) == -1)
+    selection.rectangle(100, 0, 156, 256, Mode.add)
+    assert(selection.cells.uniform(0) == 255 and selection.cells.uniform(1) == 0)
+    selection.rectangle(0, 0, 256, 256, Mode.subtract)
+    assert(selection.is_empty() and selection.cells.uniform(0) == 0)
+    # A polygon covering a cell wholly leaves it one value too.
+    try selection.polygon([-10.0, -10.0, 300.0, -10.0, 300.0, 300.0, -10.0, 300.0], Mode.replace)
+    assert(selection.cells.uniform(0) == 255 and selection.cells.uniform(1) == -1)
 
-func bounds_entry(context: void*?):
-    bounds_rows((BoundsJob*)(context else return))
+test "a rectangle holds bytes only in the cells along its edge":
+    var selection = try Selection.create(2000, 1000)
+    defer selection.destroy()
+    selection.rectangle(100, 200, 1500, 600, Mode.replace)
+    var blocks = 0
+    var full = 0
+    for index in 0..<selection.cells.count():
+        if selection.cells.uniform(index) == -1:
+            blocks += 1
+        elif selection.cells.uniform(index) == 255:
+            full += 1
+    assert(blocks == 18 and full == 10)
+    assert(selection.left == 100 and selection.top == 200 and selection.right == 1600 and selection.bottom == 800)
+    # An ellipse's middle is one value too.
+    selection.ellipse(0, 0, 2000, 1000, Mode.replace)
+    assert(selection.cells.uniform(1 * 8 + 3) == 255 and selection.at(1000, 500) == 255 and selection.at(2, 2) == 0)
 
-## Each row's first and last nonzero byte, scanned in from both ends.
-func bounds_rows(job: BoundsJob*):
-    for row in job.first..<job.last:
-        let start = row * job.width
-        var low: usize = 0
-        while low < job.width and job.coverage[start + low] == 0:
-            low += 1
-        if low == job.width:
-            continue
-        var high = job.width
-        while job.coverage[start + high - 1] == 0:
-            high -= 1
-        if not job.found:
-            job.found = true
-            job.left = (i64)low
-            job.top = (i64)row
-            job.right = (i64)high
-        job.left = math.imin(job.left, (i64)low)
-        job.right = math.imax(job.right, (i64)high)
-        job.bottom = (i64)row + 1
+test "inverting cells of one value flips the value and makes no bytes":
+    var selection = try Selection.create(700, 600)
+    defer selection.destroy()
+    selection.select_all()
+    selection.invert()
+    assert(selection.is_empty())
+    for index in 0..<selection.cells.count():
+        assert(selection.cells.uniform(index) == 0)
+    selection.rectangle(256, 256, 256, 256, Mode.replace)
+    selection.invert()
+    assert(selection.cells.uniform(4) == 0 and selection.cells.uniform(0) == 255 and selection.cells.uniform(8) == 255)
+    assert(selection.at(300, 300) == 0 and selection.at(10, 10) == 255 and selection.at(699, 599) == 255)
+    # Moving by whole cells shares the cells; by less copies the edge.
+    try selection.translate(256, 0)
+    assert(selection.at(300, 300) == 255 and selection.at(600, 300) == 0 and selection.at(10, 10) == 0)
+    try selection.translate(-10, 5)
+    assert(selection.at(590, 305) == 0 and selection.at(500, 305) == 255 and selection.at(250, 4) == 0 and selection.at(250, 5) == 255)
 
 test "rectangles fill whole rows in every mode, and a big selection finds its box in bands":
     # Over a million pixels, so the bounds are found on several threads.
@@ -761,3 +616,27 @@ test "rectangles fill whole rows in every mode, and a big selection finds its bo
     assert(selection.left == 200 and selection.top == 400 and selection.right == 400 and selection.bottom == 450)
     selection.rectangle(5000, 5000, 10, 10, Mode.intersect)
     assert(selection.is_empty())
+
+test "the GPU tiles follow the cells, uploading only the cells that changed":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var selection = try Selection.create(600, 300)
+    defer selection.destroy()
+    selection.rectangle(0, 0, 300, 300, Mode.replace)
+    let first = (try selection.gpu_tiles(device)) else trap("something is selected")
+    let whole = first.stamp(0, 0)
+    let edge = first.stamp(1, 0)
+    assert(whole != 0 and edge != 0 and first.stamp(2, 0) == 0 and first.stamp(0, 1) != 0)
+    selection.rectangle(520, 0, 50, 50, Mode.add)
+    let second = (try selection.gpu_tiles(device)) else trap("something is selected")
+    assert(second == first and second.stamp(0, 0) == whole and second.stamp(1, 0) == edge and second.stamp(2, 0) != 0)
+    let pixels = try alloc f32[600 * 300 * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    try second.read(pixels)
+    for probe in [(i64)(100 * 600 + 100), 10 * 600 + 310, 10 * 600 + 530, 299 * 600 + 290, 299 * 600 + 5, 60 * 600 + 530]:
+        let expected: f32 = 0.0 if probe == 10 * 600 + 310 or probe == 60 * 600 + 530 else 1.0
+        assert(pixels[(usize)probe * 4] == expected)
+    selection.clear()
+    assert((try selection.gpu_tiles(device)) == none)
