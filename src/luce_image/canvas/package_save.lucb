@@ -1,0 +1,445 @@
+#==============================================================================================
+#
+#   canvas/package_save - Writing an .l2d document (package_format.lucb)
+#
+#   DESCRIPTION:
+#       The file is written to `<path>.saving` beside the target and renamed over it only
+#       once whole, so a save that fails leaves the old document as it was. Each layer's
+#       tiles are read back in batches (`read_cells`), filtered and deflated across the
+#       processors a batch at a time, and written in order; the memory tiers settle between
+#       batches, so a save holds about one batch of tiles beyond the budget, not the
+#       document. A tile shared by several cells (or layers) goes out once.
+#
+#==============================================================================================
+
+## Tiles staged, compressed and written together.
+let package_batch: usize = 32
+## Cells read back per `read_cells` call; the tiers settle between calls.
+let package_read_chunk: usize = 256
+
+## The file being written, its tables so far and one batch of staged tiles.
+struct PackageWriter:
+    var file: files.File
+    var offset: u64
+    var blobs: PackageBlob[]
+    var blob_count: usize
+    var cells: PackageCell[]
+    var cell_count: usize
+    ## Tile stamps written so far, and their blobs (open addressing, 0 is empty).
+    var stamp_keys: u64[]
+    var stamp_blobs: u32[]
+    var stamp_count: usize
+    ## The batch: raw texels, their filtered bytes and the deflated result per slot.
+    var texels: u8[]
+    var filtered: u8[]
+    var packed: u8[]
+    var packed_length: usize[]
+    var slot_blob: u32[]
+    var slot_rows: usize[]
+    var staged: usize
+    var failed: @bool
+
+    static func begin(path: str) -> PackageWriter!:
+        var file = try files.File.open((c_api.str)path, files.OpenMode.replace)
+        errdefer file.destroy()
+        let slot = (usize)tile_size * tile_row_bytes
+        var writer = PackageWriter(file = file, offset = 0, blob_count = 0, cell_count = 0, stamp_count = 0, staged = 0)
+        writer.failed.store(false, .release)
+        writer.blobs = try alloc PackageBlob[256] in memory.heap
+        writer.cells = try alloc PackageCell[256] in memory.heap
+        writer.stamp_keys = try alloc u64[1024] in memory.heap
+        writer.stamp_blobs = try alloc u32[1024] in memory.heap
+        for index in 0..<writer.stamp_keys.length:
+            writer.stamp_keys[index] = 0
+        writer.texels = try alloc u8[package_batch * slot] in memory.heap
+        writer.filtered = try alloc u8[package_batch * slot] in memory.heap
+        writer.packed = try alloc u8[package_batch * flate.deflate_bound(slot)] in memory.heap
+        writer.packed_length = try alloc usize[package_batch] in memory.heap
+        writer.slot_blob = try alloc u32[package_batch] in memory.heap
+        writer.slot_rows = try alloc usize[package_batch] in memory.heap
+        var header: u8[16]
+        memory.copy(u8[](&header[0], 8), package_magic.bytes, 8)
+        put_u32(u8[](&header[0], 16), 8, package_version)
+        put_u32(u8[](&header[0], 16), 12, 0)
+        try writer.write(u8[](&header[0], 16))
+        return writer
+
+    mutating func write(bytes: const u8[]) -> !:
+        try write_all(&self.file, bytes)
+        self.offset += (u64)bytes.length
+
+    ## A new blob of `rows` texel rows, its place filled in when it is written.
+    mutating func new_blob(rows: usize) -> u32!:
+        if self.blob_count == self.blobs.length:
+            let grown = try alloc PackageBlob[self.blobs.length * 2] in memory.heap
+            memory.copy(grown, self.blobs, self.blob_count)
+            free(self.blobs) in memory.heap
+            self.blobs = grown
+        self.blobs[self.blob_count] = PackageBlob(offset = 0, length = 0, rows = (u16)rows, filter = tile_filter_sub)
+        self.blob_count += 1
+        return (u32)(self.blob_count - 1)
+
+    mutating func add_cell(layer: u32, plane: u32, column: i64, row: i64, blob: u32) -> !:
+        if self.cell_count == self.cells.length:
+            let grown = try alloc PackageCell[self.cells.length * 2] in memory.heap
+            memory.copy(grown, self.cells, self.cell_count)
+            free(self.cells) in memory.heap
+            self.cells = grown
+        self.cells[self.cell_count] = PackageCell(layer = layer, plane = plane, column = (i32)column, row = (i32)row, blob = blob)
+        self.cell_count += 1
+
+    ## The blob already holding the tile of `stamp`, if one does.
+    func stamped(stamp: u64) -> u32?:
+        if stamp == 0:
+            return none
+        var at = (usize)(stamp *% 0x9e3779b97f4a7c15 >> 20) % self.stamp_keys.length
+        while self.stamp_keys[at] != 0:
+            if self.stamp_keys[at] == stamp:
+                return self.stamp_blobs[at]
+            at = (at + 1) % self.stamp_keys.length
+        return none
+
+    mutating func remember(stamp: u64, blob: u32) -> !:
+        if stamp == 0:
+            return
+        if (self.stamp_count + 1) * 2 > self.stamp_keys.length:
+            let keys = self.stamp_keys
+            let blobs = self.stamp_blobs
+            self.stamp_keys = try alloc u64[keys.length * 2] in memory.heap
+            self.stamp_blobs = try alloc u32[keys.length * 2] in memory.heap
+            for index in 0..<self.stamp_keys.length:
+                self.stamp_keys[index] = 0
+            self.stamp_count = 0
+            for index in 0..<keys.length:
+                if keys[index] != 0:
+                    try self.remember(keys[index], blobs[index])
+            free(keys) in memory.heap
+            free(blobs) in memory.heap
+        var at = (usize)(stamp *% 0x9e3779b97f4a7c15 >> 20) % self.stamp_keys.length
+        while self.stamp_keys[at] != 0:
+            at = (at + 1) % self.stamp_keys.length
+        self.stamp_keys[at] = stamp
+        self.stamp_blobs[at] = blob
+        self.stamp_count += 1
+
+    ## Stage `rows` texel rows of a tile for `blob`; a full batch goes out.
+    mutating func stage(texels: const u8[], rows: usize, blob: u32) -> !:
+        let slot = (usize)tile_size * tile_row_bytes
+        let bytes = rows * tile_row_bytes
+        memory.copy(self.texels[self.staged * slot..], texels, bytes)
+        self.slot_blob[self.staged] = blob
+        self.slot_rows[self.staged] = rows
+        self.staged += 1
+        if self.staged == package_batch:
+            try self.flush()
+
+    ## Compress the staged tiles across the processors, then write them in order.
+    mutating func flush() -> !:
+        if self.staged == 0:
+            return
+        try spread(self.staged, (void*)&self, compress_slot)
+        if self.failed.load(.acquire):
+            error(invalid, "a tile could not be compressed")
+        let bound = flate.deflate_bound((usize)tile_size * tile_row_bytes)
+        for slot in 0..<self.staged:
+            let blob = self.slot_blob[slot]
+            self.blobs[(usize)blob].offset = self.offset
+            self.blobs[(usize)blob].length = (u32)self.packed_length[slot]
+            try self.write(self.packed[slot * bound..<slot * bound + self.packed_length[slot]])
+        self.staged = 0
+
+    mutating func destroy():
+        self.file.destroy()
+        if self.texels.length > 0:
+            free(self.texels) in memory.heap
+            free(self.filtered) in memory.heap
+            free(self.packed) in memory.heap
+        if self.blobs.length > 0:
+            free(self.blobs) in memory.heap
+        if self.cells.length > 0:
+            free(self.cells) in memory.heap
+        if self.stamp_keys.length > 0:
+            free(self.stamp_keys) in memory.heap
+            free(self.stamp_blobs) in memory.heap
+        if self.packed_length.length > 0:
+            free(self.packed_length) in memory.heap
+            free(self.slot_blob) in memory.heap
+            free(self.slot_rows) in memory.heap
+
+## On a worker: filter and deflate staged slot `slot`.
+func compress_slot(context: void*?, slot: usize):
+    let writer = (PackageWriter*)(context else return)
+    let size = (usize)tile_size * tile_row_bytes
+    let bytes = writer.slot_rows[slot] * tile_row_bytes
+    let filtered = writer.filtered[slot * size..<slot * size + bytes]
+    filter_tile(writer.texels[slot * size..<slot * size + bytes], writer.slot_rows[slot], filtered)
+    let bound = flate.deflate_bound(size)
+    let used = flate.deflate_raw(filtered, tile_deflate_level, writer.packed[slot * bound..<(slot + 1) * bound], true) catch failure:
+        discard(failure)
+        writer.failed.store(true, .release)
+        return
+    writer.packed_length[slot] = used
+
+## `Canvas.save_package`: the document as one `.l2d` file (package_format.lucb).
+func save_canvas_package(canvas: Canvas*, path: str) -> !:
+    try canvas.require_open()
+    if not ends_with(path, ".l2d"):
+        error(invalid, "a document is saved as *.l2d")
+    let document = canvas.document else error(invalid, "draw the document once before saving")
+    let manifest = try package_manifest(canvas)
+    defer manifest.release()
+    let temporary = try strings.join([path, ".saving"], "")
+    defer strings.release(temporary)
+    # A save that fails takes its unfinished file with it; the old one stays.
+    write_package(canvas, document, manifest, temporary) catch failure:
+        files.remove_file((c_api.str)temporary) catch removal:
+            discard(removal)
+        error(failure.code, failure.message)
+    # An older document folder of this name gives way; then the new file takes its place.
+    # A Luce string need not end in NUL; the file calls get a copy that does.
+    let native = try strings.copy(path)
+    defer strings.release(native)
+    try clear_old_package(native)
+    try files.rename((c_api.str)temporary, (c_api.str)native, replace = true)
+
+## Write the whole file to `temporary`.
+func write_package(canvas: Canvas*, document: Document*, manifest: interop.Reference[prism.Document], temporary: str) -> !:
+    var writer = try PackageWriter.begin(temporary)
+    defer writer.destroy()
+    for index in 0..<canvas.count:
+        let record = canvas.records[index]
+        let layer = document.find(record.id) else error(invalid, "a layer is missing")
+        if not record.group and record.adjustment < 0:
+            let tiles = layer.tiles() else error(invalid, "a layer has no pixels")
+            try write_tiles(canvas, &writer, (u32)index, tiles, plane_pixels)
+        if let mask = layer.mask_tiles():
+            try write_tiles(canvas, &writer, (u32)index, mask, plane_mask)
+    try writer.flush()
+    # The preview, the manifest and the index, then the trailer that finds them.
+    var trailer = PackageTrailer(manifest_offset = 0, manifest_length = 0, preview_offset = 0, preview_length = 0, index_offset = 0, index_length = 0)
+    var preview = Buffer(maximum = (usize)1 << 30)
+    defer preview.close()
+    try package_preview(canvas, &preview)
+    trailer.preview_offset = writer.offset
+    trailer.preview_length = (u64)preview.view().length
+    try writer.write(preview.view())
+    let text = try manifest.value().encode(prism.Encoding.text)
+    defer text.release()
+    trailer.manifest_offset = writer.offset
+    trailer.manifest_length = (u64)text.value().bytes().length
+    try writer.write(text.value().bytes())
+    let index = try package_index(&writer)
+    defer free(index) in memory.heap
+    trailer.index_offset = writer.offset
+    trailer.index_length = (u64)index.length
+    try writer.write(index)
+    var tail: u8[64]
+    let end = u8[](&tail[0], 64)
+    memory.copy(end, package_trailer_magic.bytes, 8)
+    let places = [trailer.manifest_offset, trailer.manifest_length, trailer.preview_offset, trailer.preview_length, trailer.index_offset, trailer.index_length, 0]
+    for at in 0..<(usize)7:
+        put_u64(end, 8 + at * 8, places[at])
+    try writer.write(end)
+    try writer.file.sync()
+    try writer.file.close()
+    # The last tiles read and the preview's composite may leave RAM over its budget.
+    try settle_job(canvas)
+
+## The tiles of one layer's pixels or mask (`base` plane): the canvas grid's
+## painted cells, a shared tile once, then any cells past the canvas.
+func write_tiles(canvas: Canvas*, writer: PackageWriter*, layer: u32, tiles: const Tiles*, base: u32) -> !:
+    let cap = (usize)tiles.columns() * (usize)tiles.rows()
+    let wanted = try alloc Cell[cap if cap > 0 else 1] in memory.heap
+    defer free(wanted) in memory.heap
+    let blobs = try alloc u32[cap if cap > 0 else 1] in memory.heap
+    defer free(blobs) in memory.heap
+    var count: usize = 0
+    for row in 0..<tiles.rows():
+        for column in 0..<tiles.columns():
+            if not tiles.painted(column, row):
+                continue
+            let rows = (usize)tiles.region(column, row).height
+            let stamp = tiles.stamp(column, row)
+            if let known = writer.stamped(stamp):
+                if (usize)writer.blobs[(usize)known].rows >= rows:
+                    try writer.add_cell(layer, base, (i64)column, (i64)row, known)
+                    continue
+            let blob = try writer.new_blob(rows)
+            try writer.remember(stamp, blob)
+            try writer.add_cell(layer, base, (i64)column, (i64)row, blob)
+            wanted[count] = Cell(column = column, row = row)
+            blobs[count] = blob
+            count += 1
+    var sink = TileSink(writer = writer, blobs = blobs, next = 0)
+    var first: usize = 0
+    while first < count:
+        let last = min_usize(count, first + package_read_chunk)
+        sink.next = first
+        try read_cells(tiles, wanted[first..<last], (void*)&sink, sink_cell)
+        # What the reads brought back to RAM may leave before the next chunk's.
+        try settle_job(canvas)
+        first = last
+    try write_beyond(writer, layer, tiles, base + 1)
+
+## Where `read_cells` hands a layer's cells: each to its blob, in order.
+struct TileSink:
+    var writer: PackageWriter*
+    var blobs: u32[]
+    var next: usize
+
+func sink_cell(context: void*?, cell: Cell, bytes: const u8[]) -> !:
+    let sink = (TileSink*)(context else return)
+    let blob = sink.blobs[sink.next]
+    sink.next += 1
+    let rows = (usize)sink.writer.blobs[(usize)blob].rows
+    if bytes.length < rows * tile_row_bytes:
+        error(invalid, "a tile read back short")
+    try sink.writer.stage(bytes, rows, blob)
+
+## The cells past the canvas (`plane`), read one by one: few layers have any.
+func write_beyond(writer: PackageWriter*, layer: u32, tiles: const Tiles*, plane: u32) -> !:
+    let range = tiles.outside_range() else return
+    let bytes = try alloc u8[(usize)tile_size * tile_row_bytes] in memory.heap
+    defer free(bytes) in memory.heap
+    for row in range.top..<range.bottom:
+        for column in range.left..<range.right:
+            let texture = (try tiles.outside_texture(column, row)) else continue
+            try texture.read(bytes)
+            let blob = try writer.new_blob((usize)tile_size)
+            try writer.add_cell(layer, plane, column, row, blob)
+            try writer.stage(bytes, (usize)tile_size, blob)
+
+## The blob and cell tables as the index's bytes (heap, the caller frees).
+func package_index(writer: const PackageWriter*) -> u8[]!:
+    let size = 4 + writer.blob_count * package_blob_bytes + 4 + writer.cell_count * package_cell_bytes
+    let index = try alloc u8[size] in memory.heap
+    put_u32(index, 0, (u32)writer.blob_count)
+    var at: usize = 4
+    for blob in writer.blobs[..<writer.blob_count]:
+        put_u64(index, at, blob.offset)
+        put_u32(index, at + 8, blob.length)
+        put_u16(index, at + 12, blob.rows)
+        index[at + 14] = blob.filter
+        index[at + 15] = 0
+        at += package_blob_bytes
+    put_u32(index, at, (u32)writer.cell_count)
+    at += 4
+    for cell in writer.cells[..<writer.cell_count]:
+        put_u32(index, at, cell.layer)
+        put_u32(index, at + 4, cell.plane)
+        put_u32(index, at + 8, (u32)cell.column)
+        put_u32(index, at + 12, (u32)cell.row)
+        put_u32(index, at + 16, cell.blob)
+        at += package_cell_bytes
+    return index
+
+## A folder left by the older format at `path` (NUL-terminated; it holds
+## document.prisma) is removed so the file can take its name; anything else
+## there is left alone.
+func clear_old_package(path: str) -> !:
+    let found = files.metadata((c_api.str)path) catch failure:
+        discard(failure)
+        return
+    if found.kind != files.FileKind.directory:
+        return
+    let manifest = try paths.join(path, "document.prisma")
+    discard(files.metadata((c_api.str)manifest) catch failure:
+        error(invalid, "a folder that is not a document is in the way of the saved file"))
+    try files.delete_path(path, recursive = true)
+
+## A small flattened PNG of the document into `out`: the composite at the
+## first pyramid level that fits in 256 pixels.
+func package_preview(canvas: Canvas*, out: Buffer*) -> !:
+    let document = canvas.document else error(invalid, "draw the document once before saving")
+    let composer = canvas.composer else error(invalid, "draw the document once before saving")
+    var level: u32 = 0
+    while level_size(canvas.extent_x, level) > tile_size or level_size(canvas.extent_y, level) > tile_size:
+        level += 1
+    let width = level_size(canvas.extent_x, level)
+    let height = level_size(canvas.extent_y, level)
+    let texture = try composer.tile(document, 0, 0, level)
+    let halves = try alloc u8[(usize)width * (usize)height * 8] in memory.heap
+    defer free(halves) in memory.heap
+    try texture.read(halves, gpu.Region(0, 0, width, height))
+    let pixels = try alloc u8[(usize)width * (usize)height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    for at in 0..<(usize)width * (usize)height:
+        let alpha = math.clamp((f64)from_half(get_u16(halves, at * 8 + 6)), 0.0, 1.0)
+        for channel in 0..<(usize)3:
+            pixels[at * 4 + channel] = srgb_byte((f64)from_half(get_u16(halves, at * 8 + channel * 2)))
+        pixels[at * 4 + 3] = (u8)(alpha * 255.0 + 0.5)
+    var encoder = try png.Encoder.begin((usize)width, (usize)height, png.Format.rgba8, out)
+    defer encoder.close()
+    try encoder.write_rows(pixels, (usize)height)
+    try encoder.finish()
+
+## The document's manifest: its size, resolution and profile, every layer's
+## settings (with the text, shape or path it keeps), and the guides.
+func package_manifest(canvas: Canvas*) -> interop.Reference[prism.Document]!:
+    let native = try new prism.Document() in memory.heap
+    let manifest = try interop.Reference[prism.Document].adopt(native, prism.document_type, memory.heap)
+    errdefer manifest.release()
+    try manifest.value().add("/document", "document")
+    try set_integer(manifest.value(), "/document", "width", (i64)canvas.extent_x)
+    try set_integer(manifest.value(), "/document", "height", (i64)canvas.extent_y)
+    let resolution = try prism.Value.number(canvas.dpi)
+    defer resolution.release()
+    try manifest.value().set("/document", "resolution", resolution)
+    let profile = try prism.Value.text((str)canvas.profile_name[..<canvas.profile_length])
+    defer profile.release()
+    try manifest.value().set("/document", "profile", profile)
+    try manifest.value().add("/layers", "layers")
+    for index in 0..<canvas.count:
+        let record = canvas.records[index]
+        var name_buffer: u8[64]
+        let element = try format_path(name_buffer, "/layers/layer", index)
+        try manifest.value().add(element, "layer")
+        let text = try prism.Value.text(record.name)
+        defer text.release()
+        try manifest.value().set(element, "name", text)
+        try set_integer(manifest.value(), element, "visible", 1 if record.visible else 0)
+        let opacity = try prism.Value.number(record.opacity)
+        defer opacity.release()
+        try manifest.value().set(element, "opacity", opacity)
+        try set_integer(manifest.value(), element, "blend", record.blend)
+        try set_integer(manifest.value(), element, "clipped", 1 if record.clipped else 0)
+        try set_integer(manifest.value(), element, "mask", 1 if record.masked else 0)
+        try set_integer(manifest.value(), element, "mask_enabled", 1 if record.mask_enabled else 0)
+        try set_integer(manifest.value(), element, "mask_linked", 1 if record.mask_linked else 0)
+        # A group holds no pixels; its layers name it by its place in the file, from 1.
+        try set_integer(manifest.value(), element, "group", 1 if record.group else 0)
+        var parent: i64 = 0
+        if record.parent != 0:
+            parent = (i64)(try canvas.index(record.parent)) + 1
+        try set_integer(manifest.value(), element, "parent", parent)
+        # An adjustment layer is its kind and parameters, no pixels.
+        try set_integer(manifest.value(), element, "adjustment", record.adjustment)
+        if record.adjustment >= 0:
+            for parameter in 0..<parameter_count:
+                var key_buffer: u8[32]
+                let number = try prism.Value.number(record.adjustment_values[parameter])
+                defer number.release()
+                try manifest.value().set(element, try format_file(key_buffer, "a", parameter, ""), number)
+            if record.adjustment == (i64)curves:
+                try write_curves(manifest.value(), element, record.curves)
+        if record.typed:
+            try write_type(manifest.value(), element, record.typeset)
+        if record.shaped:
+            try write_shape(manifest.value(), element, record.shape)
+        if record.style.any():
+            let names = style_field_names()
+            for field in 0..<style_field_count:
+                let number = try prism.Value.number(record.style.field(field) else trap("style field"))
+                defer number.release()
+                try manifest.value().set(element, names[(usize)field], number)
+    # The guides, each vertical or not and where.
+    try manifest.value().add("/guides", "guides")
+    for index in 0..<canvas.guides.count:
+        var guide_buffer: u8[64]
+        let element = try format_path(guide_buffer, "/guides/guide", index)
+        try manifest.value().add(element, "guide")
+        try set_integer(manifest.value(), element, "vertical", 1 if canvas.guides.vertical[index] else 0)
+        let place = try prism.Value.number(canvas.guides.positions[index])
+        defer place.release()
+        try manifest.value().set(element, "position", place)
+    return manifest

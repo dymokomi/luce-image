@@ -1122,7 +1122,7 @@ test "guides are added, moved, removed and cleared undoably, and saved with the 
     try canvas.remove_guide(across)
     assert(canvas.guide_count() == 1 and (try canvas.guide_vertical(0)))
     try canvas.save_package("build/canvas-guides.l2d")
-    let reopened = try Canvas.open("build/canvas-guides.l2d/document.prisma")
+    let reopened = try Canvas.open("build/canvas-guides.l2d")
     defer reopened.release()
     assert(reopened.value().guide_count() == 1 and (try reopened.value().guide_position(0)) == 30.5)
     try canvas.clear_guides()

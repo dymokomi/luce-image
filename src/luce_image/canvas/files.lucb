@@ -1,6 +1,6 @@
 #==============================================================================================
 #
-#   canvas/files - Opening and saving pictures, Photoshop files and .l2d packages
+#   canvas/files - Opening and saving pictures and Photoshop files (.l2d: package_*.lucb)
 #
 #==============================================================================================
 
@@ -167,102 +167,6 @@ func measure_trim_bounds(canvas: Canvas*, based_on: i64) -> bool!:
     canvas.content = bounds if found else Bounds(left = 0, top = 0, right = 0, bottom = 0)
     return found
 
-## `Canvas.save_package`: an `.l2d` package, a directory of the manifest and each layer's pictures.
-func save_canvas_package(canvas: Canvas*, path: str) -> !:
-    try canvas.require_open()
-    if not ends_with(path, ".l2d"):
-        error(invalid, "a document package is a directory named *.l2d")
-    let document = canvas.document else error(invalid, "draw the document once before saving")
-    try files.ensure_directory(path)
-    let layers_dir = try paths.join(path, "layers")
-    try files.ensure_directory(layers_dir)
-    let native = try new prism.Document() in memory.heap
-    let manifest = try interop.Reference[prism.Document].adopt(native, prism.document_type, memory.heap)
-    defer manifest.release()
-    try manifest.value().add("/document", "document")
-    try set_integer(manifest.value(), "/document", "width", (i64)canvas.extent_x)
-    try set_integer(manifest.value(), "/document", "height", (i64)canvas.extent_y)
-    let resolution = try prism.Value.number(canvas.dpi)
-    defer resolution.release()
-    try manifest.value().set("/document", "resolution", resolution)
-    let profile = try prism.Value.text((str)canvas.profile_name[..<canvas.profile_length])
-    defer profile.release()
-    try manifest.value().set("/document", "profile", profile)
-    try manifest.value().add("/layers", "layers")
-    for index in 0..<canvas.count:
-        let record = canvas.records[index]
-        var name_buffer: u8[64]
-        let element = try format_path(name_buffer, "/layers/layer", index)
-        try manifest.value().add(element, "layer")
-        let text = try prism.Value.text(record.name)
-        defer text.release()
-        try manifest.value().set(element, "name", text)
-        try set_integer(manifest.value(), element, "visible", 1 if record.visible else 0)
-        let opacity = try prism.Value.number(record.opacity)
-        defer opacity.release()
-        try manifest.value().set(element, "opacity", opacity)
-        try set_integer(manifest.value(), element, "blend", record.blend)
-        try set_integer(manifest.value(), element, "clipped", 1 if record.clipped else 0)
-        try set_integer(manifest.value(), element, "mask", 1 if record.masked else 0)
-        try set_integer(manifest.value(), element, "mask_enabled", 1 if record.mask_enabled else 0)
-        try set_integer(manifest.value(), element, "mask_linked", 1 if record.mask_linked else 0)
-        # A group holds no pixels; its layers name it by its place in the file, from 1.
-        try set_integer(manifest.value(), element, "group", 1 if record.group else 0)
-        var parent: i64 = 0
-        if record.parent != 0:
-            parent = (i64)(try canvas.index(record.parent)) + 1
-        try set_integer(manifest.value(), element, "parent", parent)
-        # An adjustment layer is its kind and parameters, no picture.
-        try set_integer(manifest.value(), element, "adjustment", record.adjustment)
-        if record.adjustment >= 0:
-            for parameter in 0..<parameter_count:
-                var key_buffer: u8[32]
-                let number = try prism.Value.number(record.adjustment_values[parameter])
-                defer number.release()
-                try manifest.value().set(element, try format_file(key_buffer, "a", parameter, ""), number)
-            if record.adjustment == (i64)curves:
-                try write_curves(manifest.value(), element, record.curves)
-        if record.typed:
-            try write_type(manifest.value(), element, record.typeset)
-        if record.shaped:
-            try write_shape(manifest.value(), element, record.shape)
-        if record.style.any():
-            let names = style_field_names()
-            for field in 0..<style_field_count:
-                let number = try prism.Value.number(record.style.field(field) else trap("style field"))
-                defer number.release()
-                try manifest.value().set(element, names[(usize)field], number)
-        let layer = document.find(record.id) else error(invalid, "a layer is missing")
-        if record.group or record.adjustment >= 0:
-            # No picture; an adjustment layer's mask still has one.
-            try note_mask(manifest.value(), element, try write_mask(canvas, layer, layers_dir, index))
-            continue
-        var file_buffer: u8[64]
-        let tiles = layer.tiles() else error(invalid, "a layer has no pixels")
-        let origin = try write_layer_picture(canvas, tiles, layers_dir, try format_file(file_buffer, "layer", index, ".png"), false)
-        if origin.left != 0 or origin.top != 0:
-            try set_integer(manifest.value(), element, "x", origin.left)
-            try set_integer(manifest.value(), element, "y", origin.top)
-        try note_mask(manifest.value(), element, try write_mask(canvas, layer, layers_dir, index))
-    # The guides, each vertical or not and where.
-    try manifest.value().add("/guides", "guides")
-    for index in 0..<canvas.guides.count:
-        var guide_buffer: u8[64]
-        let element = try format_path(guide_buffer, "/guides/guide", index)
-        try manifest.value().add(element, "guide")
-        try set_integer(manifest.value(), element, "vertical", 1 if canvas.guides.vertical[index] else 0)
-        let place = try prism.Value.number(canvas.guides.positions[index])
-        defer place.release()
-        try manifest.value().set(element, "position", place)
-    try manifest.value().save(try paths.join(path, "document.prisma"), prism.Encoding.text)
-
-## Layer `index`'s mask, if it has one, as `layerN.mask.png` in `layers_dir`
-## (with its origin in the manifest when it reaches past the canvas).
-func write_mask(canvas: Canvas*, layer: Layer*, layers_dir: str, index: usize) -> Bounds?!:
-    let mask = layer.mask_tiles() else return none
-    var file_buffer: u8[64]
-    return try write_layer_picture(canvas, mask, layers_dir, try format_file(file_buffer, "layer", index, ".mask.png"), true)
-
 ## A text layer's words and setting, in its manifest element.
 func write_type(manifest: prism.Document*, element: str, spec: TypeSpec) -> !:
     for (key, value) in [("text", spec.text), ("family", spec.family), ("font_style", spec.style)]:
@@ -375,51 +279,6 @@ func read_shape(doc: prism.Document*, element: str, canvas: Canvas*, id: i64) ->
 func type_value_names() -> str[10]:
     return ["type_size", "type_red", "type_green", "type_blue", "type_x", "type_y", "box_width", "alignment", "tracking", "leading"]
 
-## Where a mask's picture starts, when it reaches past the canvas.
-func note_mask(manifest: prism.Document*, element: str, origin: Bounds?) -> !:
-    let box = origin else return
-    if box.left != 0 or box.top != 0:
-        try set_integer(manifest, element, "mask_x", box.left)
-        try set_integer(manifest, element, "mask_y", box.top)
-
-## Layer pixels (or a `mask`) as the picture `name` in `directory`: the
-## canvas and whatever lies past it, over the box both cover; its top-left
-## document pixel is returned. A mask's unpainted cells are written white.
-func write_layer_picture(canvas: Canvas*, tiles: const Tiles*, directory: str, name: str, mask: bool) -> Bounds!:
-    var box = Bounds(left = 0, top = 0, right = (i64)canvas.extent_x, bottom = (i64)canvas.extent_y)
-    if tiles.has_outside():
-        if let found = try full_bounds(tiles):
-            box.left = math.imin(box.left, found.left)
-            box.top = math.imin(box.top, found.top)
-            box.right = math.imax(box.right, found.right)
-            box.bottom = math.imax(box.bottom, found.bottom)
-    let width = (u32)(box.right - box.left)
-    let height = (u32)(box.bottom - box.top)
-    let device = canvas.device else trap("saving without a device")
-    var whole = try Tiles.create(device, width, height)
-    defer whole.destroy()
-    let empty = 1.0 if mask else 0.0
-    try relocate(tiles, &whole, 1.0, 1.0, (f64)-box.left, (f64)-box.top, false, gpu.Color(empty, empty, empty, empty))
-    let pixels = try alloc f32[(usize)width * (usize)height * 4] in memory.heap
-    defer free(pixels) in memory.heap
-    try whole.read(pixels)
-    # What the read brought back to RAM may leave before the next layer's.
-    try settle_job(canvas)
-    if mask:
-        # A cell never painted reveals everything: white.
-        for row in 0..<whole.rows():
-            for column in 0..<whole.columns():
-                if whole.painted(column, row):
-                    continue
-                let area = whole.region(column, row)
-                for y in 0..<(usize)area.height:
-                    for x in 0..<(usize)area.width:
-                        let at = (((usize)row * (usize)tile_size + y) * (usize)width + (usize)column * (usize)tile_size + x) * 4
-                        for channel in 0..<(usize)4:
-                            pixels[at + channel] = 1.0
-    try write_picture(directory, name, width, height, pixels)
-    return box
-
 ## `Canvas.place_layer`: the picture at `path` on layer `id`, centred on a document point.
 func place_picture(canvas: Canvas*, id: i64, path: str, center_x: i64, center_y: i64) -> !:
     let picture = try Image.open(path)
@@ -467,13 +326,6 @@ func place_image_at(canvas: Canvas*, id: i64, picture: interop.Reference[Image],
 func open_canvas(path: str) -> interop.Reference[Canvas]!:
     if ends_with(path, ".l2d"):
         return try open_package(path)
-    # A package's manifest names the package: Windows' file dialog opens the
-    # .l2d folder rather than choosing it, so this is how it is picked there.
-    let manifest = "document.prisma"
-    if ends_with(path, manifest) and path.length > manifest.length + 5:
-        let folder = (str)path.bytes[..<(path.length - manifest.length - 1)]
-        if ends_with(folder, ".l2d"):
-            return try open_package(folder)
     if ends_with(path, ".psd") or ends_with(path, ".PSD") or ends_with(path, ".psb") or ends_with(path, ".PSB"):
         return try open_psd(path)
     let picture = try Image.open(path)
@@ -546,117 +398,6 @@ func format_file(buffer: u8[], prefix: str, index: usize, suffix: str) -> str!:
     memory.copy(buffer[end..], suffix.bytes, suffix.length)
     end += suffix.length
     return (str)buffer[..<end]
-
-## Write linear float pixels to `directory`/`name` as a package picture.
-func write_picture(directory: str, name: str, width: u32, height: u32, pixels: const f32[]) -> !:
-    let picture = try Image.from_linear_rgba((usize)width, (usize)height, pixels)
-    defer picture.release()
-    let target = try paths.join(directory, name)
-    try picture.value().save(target)
-
-## A canvas from an `.l2d` package: the manifest's layers, their pictures
-## waiting to be bound.
-func open_package(path: str) -> interop.Reference[Canvas]!:
-    let manifest_path = try paths.join(path, "document.prisma")
-    let text = try files.read_text(manifest_path)
-    defer text.release()
-    let manifest = try prism.Document.decode(text.value.bytes)
-    defer manifest.release()
-    let doc = manifest.value()
-    let width = try get_integer(doc, "/document", "width")
-    let height = try get_integer(doc, "/document", "height")
-    var reservation = try interop.Reservation[Canvas](canvas_type)
-    errdefer reservation.cancel()
-    let native = try new Canvas(width, height) in memory.heap
-    errdefer native.close()
-    # Packages from before resolution and profile keep the defaults.
-    let resolution = get_number(doc, "/document", "resolution") catch _:
-        recover 72.0
-    try native.set_resolution(resolution)
-    let profile_value = doc.get("/document", "profile") catch _:
-        recover try prism.Value.text("sRGB")
-    defer profile_value.release()
-    native.set_profile(try profile_value.value().text_at())
-    let layers_dir = try paths.join(path, "layers")
-    let total = doc.child_count("/layers")
-    # The ids the file's layers get, for groups named by their place in it.
-    let ids = try alloc i64[total if total > 0 else 1] in memory.heap
-    defer free(ids) in memory.heap
-    for index in 0..<total:
-        let element = doc.child_at("/layers", index) else error(invalid, "a layer element is missing")
-        let name_value = try doc.get(element, "name")
-        defer name_value.release()
-        let group = (get_integer(doc, element, "group") catch _:
-            recover 0) != 0
-        let adjustment = get_integer(doc, element, "adjustment") catch _:
-            recover -1
-        var id: i64 = 0
-        if adjustment >= 0:
-            for parameter in 0..<parameter_count:
-                var key_buffer: u8[32]
-                try native.set_adjustment((i64)parameter, try get_number(doc, element, try format_file(key_buffer, "a", parameter, "")))
-            if adjustment == (i64)curves:
-                try read_curves(doc, element, native)
-            id = try native.add_adjustment_layer(try name_value.value().text_at(), adjustment)
-            native.clear_adjustments()
-        elif group:
-            id = try native.add_group(try name_value.value().text_at())
-        else:
-            id = try native.add_layer(try name_value.value().text_at())
-        ids[index] = id
-        let visible = (try get_integer(doc, element, "visible")) != 0
-        let opacity = try get_number(doc, element, "opacity")
-        let blend = try get_integer(doc, element, "blend")
-        try native.set_layer(id, visible, opacity, blend)
-        try native.set_clipped(id, (try get_integer(doc, element, "clipped")) != 0)
-        # Older documents have no style fields; a missing first one means none.
-        let styled = get_number(doc, element, "shadow") catch failure:
-            discard(failure)
-            recover -1.0
-        if styled >= 0.0:
-            let names = style_field_names()
-            for field in 0..<style_field_count:
-                # A field a document does not have keeps its default.
-                let value = get_number(doc, element, names[(usize)field]) catch _:
-                    continue
-                try native.set_style_value(id, field, value)
-        var file_buffer: u8[64]
-        if not group and adjustment < 0:
-            let picture = try Image.open(try paths.join(layers_dir, try format_file(file_buffer, "layer", index, ".png")))
-            # A picture reaching past the canvas says where its top-left goes.
-            let x = get_integer(doc, element, "x") catch _:
-                recover 0
-            let y = get_integer(doc, element, "y") catch _:
-                recover 0
-            try native.place((u64)id, picture, x, y)
-            try read_type(doc, element, native, id)
-            try read_shape(doc, element, native, id)
-        if (try get_integer(doc, element, "mask")) != 0:
-            try native.set_mask(id, true)
-            let mask = try Image.open(try paths.join(layers_dir, try format_file(file_buffer, "layer", index, ".mask.png")))
-            let slot = try native.index((u64)id)
-            native.records[slot].mask_picture = mask
-            native.records[slot].mask_x = get_integer(doc, element, "mask_x") catch _:
-                recover 0
-            native.records[slot].mask_linked = (get_integer(doc, element, "mask_linked") catch _: recover 1) != 0
-            native.records[slot].mask_y = get_integer(doc, element, "mask_y") catch _:
-                recover 0
-            let enabled = get_integer(doc, element, "mask_enabled") catch _:
-                recover 1
-            native.records[slot].mask_enabled = enabled != 0
-    # The guides.
-    let guide_total = doc.child_count("/guides")
-    for index in 0..<guide_total:
-        let element = doc.child_at("/guides", index) else break
-        discard(try native.add_guide((try get_integer(doc, element, "vertical")) != 0, try get_number(doc, element, "position")))
-    # Groups come after their layers in the file, so layers go into them once all are read.
-    for index in 0..<total:
-        let element = doc.child_at("/layers", index) else error(invalid, "a layer element is missing")
-        let parent = get_integer(doc, element, "parent") catch _:
-            recover 0
-        if parent > 0 and parent <= (i64)total:
-            try native.move_into(ids[index], ids[(usize)parent - 1], -1)
-    return reservation.publish(native, memory.heap)
 
 ## A Photoshop document (PSD or PSB): its layers bottom-most first, with
 ## their names, visibility, opacity, blend mode, clipping and masks, in their

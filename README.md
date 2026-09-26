@@ -72,9 +72,10 @@ Luce-facing `Canvas` object:
   previewable live on the layer's original pixels before it is kept.
 - Layer styles — drop shadow, outer glow, stroke — rendered under the layer by
   the compositor, non-destructively.
-- Documents open from any picture, from `.l2d` packages (`document.prisma` and
-  one PNG per layer and mask) and from Photoshop `.psd` files (through the luce-psd package); they save as
-  `.l2d` or flatten to a picture.
+- Documents open from any picture, from `.l2d` documents (one file of the
+  layers' half-float tiles, a manifest and a preview; see
+  [the .l2d format](docs/FORMATS.md#the-l2d-document)) and from Photoshop `.psd`
+  files (through the luce-psd package); they save as `.l2d` or flatten to a picture.
 
 ## Cryptomatte
 

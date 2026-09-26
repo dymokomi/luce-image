@@ -1,0 +1,362 @@
+#==============================================================================================
+#
+#   canvas/package_open - Reading an .l2d document (package_format.lucb)
+#
+#   DESCRIPTION:
+#       Opening reads the trailer, the manifest and the index, and builds the layers from the
+#       manifest; no pixels yet, since a document gets its GPU only when it is bound. At the
+#       bind each layer's tiles come back a batch at a time: read in order from the file,
+#       inflated and unfiltered across the processors, uploaded in one submission, and the
+#       memory tiers settle between batches, so a document larger than the GPU (or RAM)
+#       opens within its budget and nothing the size of the document is ever made. A tile
+#       stored once for several cells of a layer is uploaded once and shared.
+#
+#==============================================================================================
+
+## An opened file's tables, kept from the open until the document is bound.
+struct PackageSource:
+    var path: str
+    var blobs: PackageBlob[]
+    var cells: PackageCell[]
+
+    mutating func destroy():
+        strings.release(self.path)
+        if self.blobs.length > 0:
+            free(self.blobs) in memory.heap
+        if self.cells.length > 0:
+            free(self.cells) in memory.heap
+
+## Tiles read, inflated and uploaded together.
+let load_batch: usize = 32
+
+## Read the trailer and index of the document at `path`; the manifest's bytes
+## go to `manifest` (heap, the caller frees).
+func read_package(path: str, manifest: u8[]*) -> PackageSource!:
+    # A Luce string need not end in NUL; the file call gets a copy that does.
+    let native = try strings.copy(path)
+    defer strings.release(native)
+    var file = try files.File.open((c_api.str)native)
+    defer file.destroy()
+    let size = (u64)(try file.seek(0, files.SeekOrigin.end))
+    if size < (u64)(package_header_bytes + package_trailer_bytes):
+        error(invalid, "not an .l2d document: the file is too short")
+    var head: u8[16]
+    try read_at(&file, 0, u8[](&head[0], 16))
+    if (str)u8[](&head[0], 8) != package_magic:
+        error(invalid, "not an .l2d document")
+    if get_u32(u8[](&head[0], 16), 8) != package_version:
+        error(invalid, "an .l2d document of a version this build does not read")
+    var tail: u8[64]
+    let end = u8[](&tail[0], 64)
+    try read_at(&file, size - (u64)package_trailer_bytes, end)
+    if (str)end[..<8] != package_trailer_magic:
+        error(invalid, "the .l2d document is cut short or damaged")
+    let trailer = PackageTrailer(manifest_offset = get_u64(end, 8), manifest_length = get_u64(end, 16), preview_offset = get_u64(end, 24),
+                                 preview_length = get_u64(end, 32), index_offset = get_u64(end, 40), index_length = get_u64(end, 48))
+    let body = size - (u64)package_trailer_bytes
+    for (offset, length) in [(trailer.manifest_offset, trailer.manifest_length), (trailer.index_offset, trailer.index_length)]:
+        if offset > body or length > body - offset or length > ((u64)1 << 31):
+            error(invalid, "the .l2d document's tables are damaged")
+    let text = try alloc u8[(usize)trailer.manifest_length] in memory.heap
+    errdefer free(text) in memory.heap
+    try read_at(&file, trailer.manifest_offset, text)
+    let index = try alloc u8[(usize)trailer.index_length] in memory.heap
+    defer free(index) in memory.heap
+    try read_at(&file, trailer.index_offset, index)
+    var source = try parse_index(index, body)
+    errdefer source.destroy()
+    source.path = try strings.copy(path)
+    *manifest = text
+    return source
+
+## The blob and cell tables from the index's bytes, every offset checked
+## against `body` (where the tiles may be) and every cell against the blobs.
+func parse_index(index: const u8[], body: u64) -> PackageSource!:
+    if index.length < 8:
+        error(invalid, "the .l2d document's index is damaged")
+    let blob_count = (usize)get_u32(index, 0)
+    if blob_count > (index.length - 8) // package_blob_bytes:
+        error(invalid, "the .l2d document's index is damaged")
+    let at_cells = 4 + blob_count * package_blob_bytes
+    let cell_count = (usize)get_u32(index, at_cells)
+    if at_cells + 4 + cell_count * package_cell_bytes > index.length:
+        error(invalid, "the .l2d document's index is damaged")
+    var source = PackageSource(path = "")
+    source.blobs = try alloc PackageBlob[blob_count if blob_count > 0 else 1] in memory.heap
+    source.cells = try alloc PackageCell[cell_count if cell_count > 0 else 1] in memory.heap
+    let most = (u64)flate.deflate_bound((usize)tile_size * tile_row_bytes)
+    for blob in 0..<blob_count:
+        let at = 4 + blob * package_blob_bytes
+        let found = PackageBlob(offset = get_u64(index, at), length = get_u32(index, at + 8), rows = get_u16(index, at + 12), filter = index[at + 14])
+        if found.rows == 0 or (u32)found.rows > tile_size or found.filter != tile_filter_sub or (u64)found.length > most or found.offset > body or (u64)found.length > body - found.offset:
+            source.destroy()
+            error(invalid, "the .l2d document's tile table is damaged")
+        source.blobs[blob] = found
+    for cell in 0..<cell_count:
+        let at = at_cells + 4 + cell * package_cell_bytes
+        let found = PackageCell(layer = get_u32(index, at), plane = get_u32(index, at + 4), column = (i32)get_u32(index, at + 8),
+                                row = (i32)get_u32(index, at + 12), blob = get_u32(index, at + 16))
+        if found.plane > plane_mask_beyond or (usize)found.blob >= blob_count:
+            source.destroy()
+            error(invalid, "the .l2d document's cell table is damaged")
+        source.cells[cell] = found
+    source.blobs = source.blobs[..<blob_count]
+    source.cells = source.cells[..<cell_count]
+    return source
+
+## `Canvas.open` of an `.l2d`: the manifest's layers, their tiles waiting in
+## the file until the document is bound.
+func open_package(path: str) -> interop.Reference[Canvas]!:
+    var text: u8[]
+    var source = try read_package(path, &text)
+    errdefer source.destroy()
+    defer free(text) in memory.heap
+    let manifest = try prism.Document.decode(text)
+    defer manifest.release()
+    let doc = manifest.value()
+    let width = try get_integer(doc, "/document", "width")
+    let height = try get_integer(doc, "/document", "height")
+    var reservation = try interop.Reservation[Canvas](canvas_type)
+    errdefer reservation.cancel()
+    let native = try new Canvas(width, height) in memory.heap
+    errdefer native.close()
+    try native.set_resolution(try get_number(doc, "/document", "resolution"))
+    let profile_value = try doc.get("/document", "profile")
+    defer profile_value.release()
+    native.set_profile(try profile_value.value().text_at())
+    let total = doc.child_count("/layers")
+    # The ids the file's layers get, for groups named by their place in it.
+    let ids = try alloc i64[total if total > 0 else 1] in memory.heap
+    defer free(ids) in memory.heap
+    for index in 0..<total:
+        let element = doc.child_at("/layers", index) else error(invalid, "a layer element is missing")
+        let name_value = try doc.get(element, "name")
+        defer name_value.release()
+        let group = (try get_integer(doc, element, "group")) != 0
+        let adjustment = try get_integer(doc, element, "adjustment")
+        var id: i64 = 0
+        if adjustment >= 0:
+            for parameter in 0..<parameter_count:
+                var key_buffer: u8[32]
+                try native.set_adjustment((i64)parameter, try get_number(doc, element, try format_file(key_buffer, "a", parameter, "")))
+            if adjustment == (i64)curves:
+                try read_curves(doc, element, native)
+            id = try native.add_adjustment_layer(try name_value.value().text_at(), adjustment)
+            native.clear_adjustments()
+        elif group:
+            id = try native.add_group(try name_value.value().text_at())
+        else:
+            id = try native.add_layer(try name_value.value().text_at())
+        ids[index] = id
+        try native.set_layer(id, (try get_integer(doc, element, "visible")) != 0, try get_number(doc, element, "opacity"), try get_integer(doc, element, "blend"))
+        try native.set_clipped(id, (try get_integer(doc, element, "clipped")) != 0)
+        # A layer without styles has no style fields.
+        let styled = get_number(doc, element, "shadow") catch failure:
+            discard(failure)
+            recover -1.0
+        if styled >= 0.0:
+            let names = style_field_names()
+            for field in 0..<style_field_count:
+                try native.set_style_value(id, field, try get_number(doc, element, names[(usize)field]))
+        let slot = try native.index((u64)id)
+        # Its tiles come from the file when the document is bound.
+        native.records[slot].stored = (i64)index
+        if not group and adjustment < 0:
+            try read_type(doc, element, native, id)
+            try read_shape(doc, element, native, id)
+        if (try get_integer(doc, element, "mask")) != 0:
+            try native.set_mask(id, true)
+            native.records[slot].mask_linked = (try get_integer(doc, element, "mask_linked")) != 0
+            native.records[slot].mask_enabled = (try get_integer(doc, element, "mask_enabled")) != 0
+    # The guides.
+    for index in 0..<doc.child_count("/guides"):
+        let element = doc.child_at("/guides", index) else break
+        discard(try native.add_guide((try get_integer(doc, element, "vertical")) != 0, try get_number(doc, element, "position")))
+    # Groups come after their layers in the file, so layers go into them once all are read.
+    for index in 0..<total:
+        let element = doc.child_at("/layers", index) else error(invalid, "a layer element is missing")
+        let parent = try get_integer(doc, element, "parent")
+        if parent > 0 and parent <= (i64)total:
+            try native.move_into(ids[index], ids[(usize)parent - 1], -1)
+    let kept = try new PackageSource in memory.heap
+    *kept = source
+    native.package = kept
+    return reservation.publish(native, memory.heap)
+
+## At the bind: every stored layer's tiles from the file, then the file's
+## tables go.
+func load_package(canvas: Canvas*) -> !:
+    let source = canvas.package else return
+    canvas.package = none
+    defer free(source) in memory.heap
+    defer source.destroy()
+    let document = canvas.document else trap("loading an unbound document")
+    var file = try files.File.open((c_api.str)source.path)
+    defer file.destroy()
+    for index in 0..<canvas.count:
+        let stored = canvas.records[index].stored
+        if stored < 0:
+            continue
+        canvas.records[index].stored = -1
+        let id = canvas.records[index].id
+        if not canvas.records[index].group and canvas.records[index].adjustment < 0:
+            if let tiles = try load_tiles(canvas, source, &file, (u32)stored, plane_pixels):
+                try document.set_tiles(id, tiles)
+                let layer = document.find(id) else trap("a loaded layer is gone")
+                try build_levels(canvas, layer.tiles() else trap("a loaded layer has no pixels"), false)
+        if canvas.records[index].masked:
+            if let mask = try load_tiles(canvas, source, &file, (u32)stored, plane_mask):
+                var old = try document.take_mask(id, mask)
+                old.destroy()
+                let layer = document.find(id) else trap("a loaded layer is gone")
+                try build_levels(canvas, layer.mask_tiles() else trap("a loaded mask is gone"), true)
+
+## The staged records of one load batch and what they become.
+struct LoadBatch:
+    var packed: u8[]
+    var filtered: u8[]
+    var texels: u8[]
+    var lengths: usize[]
+    var rows: usize[]
+    var failed: @bool
+
+## On a worker: inflate and unfilter slot `slot` of a load batch.
+func inflate_slot(context: void*?, slot: usize):
+    let batch = (LoadBatch*)(context else return)
+    let size = (usize)tile_size * tile_row_bytes
+    let bound = flate.deflate_bound(size)
+    let bytes = batch.rows[slot] * tile_row_bytes
+    let filtered = batch.filtered[slot * size..<slot * size + bytes]
+    # It fills `filtered` exactly and answers how much of the record it read.
+    let used = flate.inflate_raw(batch.packed[slot * bound..<slot * bound + batch.lengths[slot]], filtered) catch failure:
+        discard(failure)
+        batch.failed.store(true, .release)
+        return
+    if used != batch.lengths[slot]:
+        batch.failed.store(true, .release)
+        return
+    unfilter_tile(filtered, batch.rows[slot], batch.texels[slot * size..<slot * size + bytes])
+
+## Layer `layer`'s tiles of `base` (pixels or mask, with the plane past the
+## canvas after it) as a new store; none when the file holds no cell of them.
+func load_tiles(canvas: Canvas*, source: PackageSource*, file: files.File*, layer: u32, base: u32) -> Tiles?!:
+    var any = false
+    var outside = CellRange(left = 0, top = 0, right = 0, bottom = 0)
+    var beyond = false
+    for cell in source.cells:
+        if cell.layer != layer or (cell.plane != base and cell.plane != base + 1):
+            continue
+        any = true
+        if cell.plane == base + 1:
+            let column = (i64)cell.column
+            let row = (i64)cell.row
+            if not beyond:
+                outside = CellRange(left = column, top = row, right = column + 1, bottom = row + 1)
+                beyond = true
+            outside.left = math.imin(outside.left, column)
+            outside.top = math.imin(outside.top, row)
+            outside.right = math.imax(outside.right, column + 1)
+            outside.bottom = math.imax(outside.bottom, row + 1)
+    if not any:
+        return none
+    let device = canvas.device else trap("loading without a device")
+    var tiles = try Tiles.create(device, canvas.extent_x, canvas.extent_y)
+    errdefer tiles.destroy()
+    if beyond:
+        try tiles.cover(outside)
+    # Where each blob went first on the canvas grid, for cells that share it.
+    let first = try alloc i64[source.blobs.length if source.blobs.length > 0 else 1] in memory.heap
+    defer free(first) in memory.heap
+    for at in 0..<first.length:
+        first[at] = -1
+    let size = (usize)tile_size * tile_row_bytes
+    let bound = flate.deflate_bound(size)
+    var batch = LoadBatch()
+    batch.failed.store(false, .release)
+    batch.packed = try alloc u8[load_batch * bound] in memory.heap
+    defer free(batch.packed) in memory.heap
+    batch.filtered = try alloc u8[load_batch * size] in memory.heap
+    defer free(batch.filtered) in memory.heap
+    batch.texels = try alloc u8[load_batch * size] in memory.heap
+    defer free(batch.texels) in memory.heap
+    batch.lengths = try alloc usize[load_batch] in memory.heap
+    defer free(batch.lengths) in memory.heap
+    batch.rows = try alloc usize[load_batch] in memory.heap
+    defer free(batch.rows) in memory.heap
+    let places = try alloc PackageCell[load_batch] in memory.heap
+    defer free(places) in memory.heap
+    # Cells showing a tile loaded for an earlier cell; shared once it is placed.
+    let shares = try alloc PackageCell[source.cells.length if source.cells.length > 0 else 1] in memory.heap
+    defer free(shares) in memory.heap
+    var share_count: usize = 0
+    var staged: usize = 0
+    for cell in source.cells:
+        if cell.layer != layer or (cell.plane != base and cell.plane != base + 1):
+            continue
+        let blob = source.blobs[(usize)cell.blob]
+        if cell.plane == base:
+            if (u32)cell.column >= tiles.columns() or (u32)cell.row >= tiles.rows() or cell.column < 0 or cell.row < 0:
+                error(invalid, "a stored cell lies off the canvas grid")
+            # A tile this layer already has: shared, not read again.
+            if first[(usize)cell.blob] >= 0:
+                shares[share_count] = cell
+                share_count += 1
+                continue
+            if (u32)blob.rows < tiles.region((u32)cell.column, (u32)cell.row).height:
+                error(invalid, "a stored tile is shorter than its cell")
+            first[(usize)cell.blob] = (i64)cell.row * 65536 + (i64)cell.column
+        try read_at(file, blob.offset, batch.packed[staged * bound..<staged * bound + (usize)blob.length])
+        batch.lengths[staged] = (usize)blob.length
+        batch.rows[staged] = (usize)blob.rows
+        places[staged] = cell
+        staged += 1
+        if staged == load_batch:
+            try place_batch(canvas, &tiles, &batch, places, staged, base)
+            staged = 0
+    try place_batch(canvas, &tiles, &batch, places, staged, base)
+    for cell in shares[..<share_count]:
+        let seen = first[(usize)cell.blob]
+        try tiles.share((u32)cell.column, (u32)cell.row, (u32)(seen % 65536), (u32)(seen // 65536))
+    return tiles
+
+## Inflate the batch's `count` records across the processors, upload them in
+## one submission into their cells, and let the tiers settle.
+func place_batch(canvas: Canvas*, tiles: Tiles*, batch: LoadBatch*, places: const PackageCell[], count: usize, base: u32) -> !:
+    if count == 0:
+        return
+    # A batch of its own each time: its staging goes once the copies are done.
+    var upload = try gpu.UploadBatch.begin(canvas.device else trap("loading without a device"))
+    defer upload.finish()
+    try spread(count, (void*)batch, inflate_slot)
+    if batch.failed.load(.acquire):
+        error(invalid, "a stored tile of the .l2d document is damaged")
+    let device = canvas.device else trap("loading without a device")
+    let size = (usize)tile_size * tile_row_bytes
+    for slot in 0..<count:
+        let cell = places[slot]
+        var texture = try tile_texture(device)
+        errdefer texture.destroy()
+        try upload.add(texture, batch.texels[slot * size..<slot * size + batch.rows[slot] * tile_row_bytes], gpu.Region(0, 0, tile_size, (u32)batch.rows[slot]))
+        if cell.plane == base:
+            try tiles.set((u32)cell.column, (u32)cell.row, texture)
+        else:
+            try tiles.place((i64)cell.column, (i64)cell.row, texture, false, true)
+    try upload.submit()
+    # What came in may push older tiles to RAM before the next batch.
+    try settle_job(canvas)
+
+## Build `tiles`' pyramid up to the level where the document fits one cell,
+## while the layer's newest tiles are still on the GPU: the first view of the
+## document then reads levels already made, rather than bringing every tile
+## that moved to RAM or disk back for one frame.
+func build_levels(canvas: Canvas*, tiles: const Tiles*, mask: bool) -> !:
+    let composer = canvas.composer else return
+    var level: u32 = 0
+    while level_size(canvas.extent_x, level) > tile_size or level_size(canvas.extent_y, level) > tile_size:
+        level += 1
+    if level == 0:
+        return
+    let mark = transient_mark()
+    defer release_transients(mark)
+    discard(try composer.levels().texture(tiles, 0, 0, level, mask))
+    try settle_job(canvas)

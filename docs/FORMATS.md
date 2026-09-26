@@ -52,3 +52,50 @@ bigtiff=false)` infers the format from the extension unless explicitly supplied.
 
 Saving a selected TIFF page or EXR part writes that image only. It does not
 preserve other pages/parts from the source container.
+
+## The .l2d document
+
+`Canvas.save_package` writes a document as one `.l2d` file and `Canvas.open`
+reads it back. It keeps everything the editor does: every layer's pixels and
+mask as the canvas holds them (16-bit half floats, so nothing is lost to 8-bit),
+cells past the canvas, groups, adjustment layers, text, shapes and paths, styles,
+guides, resolution and profile. Nothing the size of the document is made in either
+direction: tiles are read back, compressed and written a batch at a time, and
+come back the same way, within the memory budget.
+
+Layout, all numbers little-endian:
+
+| Part | Content |
+|---|---|
+| header | 16 bytes: `LUCED2D1`, the format version (u32, now 1), reserved (u32) |
+| tiles | one record per stored tile, back to back |
+| preview | a PNG of the flattened document, at most 256 pixels a side |
+| manifest | the document as Prism text: size, resolution, profile, layers (name, visibility, opacity, blend, clipping, mask flags, group and parent, adjustment and its parameters or curves, text, shape and path values, style fields), guides |
+| index | the blob table, then the cell table |
+| trailer | 64 bytes: `L2DINDEX`, then offset and length (u64 each) of the manifest, the preview and the index, then 8 reserved bytes |
+
+The index:
+
+- `u32` blob count, then per blob: `u64` offset, `u32` length, `u16` rows,
+  `u8` filter (1), `u8` 0.
+- `u32` cell count, then per cell: `u32` layer (its place in the manifest), `u32`
+  plane (0 pixels on the canvas grid, 1 pixels past the canvas, 2 and 3 the
+  mask's), `i32` column, `i32` row, `u32` blob.
+
+A tile record is a 256-texel-wide cell of rgba16f texels, `rows` rows (the
+canvas's last row of cells may be shorter). Each 16-bit sample is replaced by its
+difference from the same channel of the texel to its left, the result split into
+a plane of low bytes then one of high bytes, then deflated as raw DEFLATE at level
+1. Unpainted cells have no entry (a mask's are white). A tile shared by several
+cells, or layers, is stored once: cells refer to its blob, and a layer's cells that
+share a blob come back sharing one tile.
+
+Saving writes `<name>.l2d.saving` beside the target and renames it over the target
+only when complete, so a failed save leaves the previous file as it was. Opening
+reads the trailer, manifest and index, builds the layers, and loads their tiles
+when the document is first bound to a GPU, building each layer's coarser levels
+as it goes.
+
+There is no reader for earlier layouts (the `.l2d` folders of PNGs): saving over
+one replaces the folder with the file.
+

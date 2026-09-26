@@ -1,0 +1,169 @@
+#==============================================================================================
+#
+#   canvas/package_tests - The .l2d file: exact tiles, shared tiles, safe saves, budgets
+#
+#==============================================================================================
+
+## Whether cell (`column`, `row`) holds the same half floats in both stores.
+func same_cell(a: const Tiles*, b: const Tiles*, column: u32, row: u32) -> bool!:
+    let first = try alloc f32[(usize)tile_size * (usize)tile_size * 4] in memory.heap
+    defer free(first) in memory.heap
+    let second = try alloc f32[(usize)tile_size * (usize)tile_size * 4] in memory.heap
+    defer free(second) in memory.heap
+    try a.read_cell(column, row, first)
+    try b.read_cell(column, row, second)
+    let rows = (usize)a.region(column, row).height
+    let columns = (usize)a.region(column, row).width
+    for y in 0..<rows:
+        for x in 0..<columns:
+            for channel in 0..<(usize)4:
+                let at = (y * (usize)tile_size + x) * 4 + channel
+                if first[at] != second[at]:
+                    return false
+    return true
+
+## Whether every canvas cell of two stores holds the same half floats and
+## the same cells are painted.
+func same_tiles(a: const Tiles*, b: const Tiles*) -> bool!:
+    for row in 0..<a.rows():
+        for column in 0..<a.columns():
+            if a.painted(column, row) != b.painted(column, row):
+                return false
+            if a.painted(column, row) and not (try same_cell(a, b, column, row)):
+                return false
+    return true
+
+test "an .l2d keeps every layer's exact half floats, its mask, groups, adjustments and pixels past the canvas":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    # Partial cells at the right and bottom edges.
+    var canvas = try Canvas(700, 500)
+    defer canvas.close()
+    let paint = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.fill_gradient(paint, 0.0, 0.0, 700.0, 500.0, 0.1, 0.7, 0.3, 1.0, 0.9, 0.2, 0.6, 0.4)
+    # A second layer moved partly past the canvas.
+    let moved = try canvas.add_layer("Moved")
+    try canvas.fill_gradient(moved, 0.0, 0.0, 700.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0)
+    try canvas.move_layer(moved, 450, 120)
+    # A mask painted half black, a group and an adjustment layer.
+    try canvas.set_mask(paint, true)
+    canvas.edit_mask(true)
+    try canvas.select_rectangle(0, 0, 350, 500)
+    try canvas.set_brush(40.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, false)
+    try canvas.fill(paint, false)
+    try canvas.deselect()
+    canvas.edit_mask(false)
+    discard(try canvas.add_group("Group"))
+    discard(try canvas.add_adjustment_layer("Levels", 1))
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.save_package("build/package-exact.l2d")
+    let opened = try Canvas.open("build/package-exact.l2d")
+    defer opened.release()
+    var restored = opened.value()
+    discard(try shown_at(restored, &target, 0, 0))
+    assert(restored.layer_count() == 4 and (try restored.layer_name(2)) == "Group")
+    let before = canvas.document else trap("bound")
+    let after = restored.document else trap("bound")
+    for id in [paint, moved]:
+        let was = (before.find((u64)id) else trap("layer")).tiles() else trap("pixels")
+        let now = (after.find((u64)id) else trap("layer")).tiles() else trap("pixels")
+        assert(try same_tiles(was, now))
+    # The moved layer still reaches past the canvas, to the same box.
+    assert(try canvas.measure_content(moved))
+    let box = canvas.content
+    assert(try restored.measure_content(moved))
+    assert(restored.content.left == box.left and restored.content.right == box.right and restored.content.right > 700)
+    # The mask, exactly.
+    let mask_was = (before.find((u64)paint) else trap("layer")).mask_tiles() else trap("mask")
+    let mask_now = (after.find((u64)paint) else trap("layer")).mask_tiles() else trap("mask")
+    assert(try same_tiles(mask_was, mask_now))
+
+test "a tile shared by many cells is stored once and comes back shared":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(1024, 1024)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Fill")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(40.0, 1.0, 1.0, 1.0, 0.2, 0.4, 0.6, false)
+    try canvas.fill(layer, false)
+    try canvas.save_package("build/package-shared.l2d")
+    var text: u8[]
+    var source = try read_package("build/package-shared.l2d", &text)
+    defer source.destroy()
+    defer free(text) in memory.heap
+    assert(source.cells.length == 16 and source.blobs.length == 1)
+    let opened = try Canvas.open("build/package-shared.l2d")
+    defer opened.release()
+    discard(try shown_at(opened.value(), &target, 0, 0))
+    let tiles = ((opened.value().document else trap("bound")).find((u64)layer) else trap("layer")).tiles() else trap("pixels")
+    assert(tiles.stamp(0, 0) != 0 and tiles.stamp(0, 0) == tiles.stamp(3, 3))
+
+test "a save that cannot finish leaves the document already on disk as it was":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(300, 200)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.fill_gradient(layer, 0.0, 0.0, 300.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0)
+    files.delete_path("build/package-keep.l2d.saving", recursive = true) catch failure:
+        discard(failure)
+    try canvas.save_package("build/package-keep.l2d")
+    let kept = try files.read((c_api.str)"build/package-keep.l2d")
+    defer free(kept)
+    # Something in the way of the file being written: the save fails.
+    try files.make_directory("build/package-keep.l2d.saving")
+    try canvas.fill_gradient(layer, 0.0, 0.0, 300.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    var failed = false
+    canvas.save_package("build/package-keep.l2d") catch failure:
+        discard(failure)
+        failed = true
+    assert(failed)
+    let after = try files.read((c_api.str)"build/package-keep.l2d")
+    defer free(after)
+    assert(after.length == kept.length and (str)after == (str)kept)
+    try files.delete_path("build/package-keep.l2d.saving", recursive = true)
+
+test "a document past its memory budget saves and opens within it, pixels unchanged":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(1500, 1100)
+    defer canvas.close()
+    defer residency_budgets(0, 0)
+    var target = try gpu.Texture.create(device, 256, 192, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    var reference: u8[196608]
+    var seen: u8[196608]
+    try frame_pixels(&canvas, &target, 1.0, -600.0, -500.0, reference)
+    # Four tiles of GPU and eight of RAM against four layers of thirty tiles each.
+    try canvas.set_memory_budgets(4 * 524288, 8 * 524288)
+    for index in 0..<(usize)4:
+        let layer = try canvas.add_layer("Layer")
+        let f = (f64)index / 4.0
+        try canvas.fill_gradient(layer, f * 100.0, 0.0, 1500.0 - f * 100.0, 1100.0, 0.1 + f * 0.6, 0.8 - f * 0.5, 0.4, 1.0 if index == 0 else 0.35,
+                                 0.8 - f * 0.2, 0.3 + f * 0.5, 0.7, 1.0 if index == 0 else 0.25)
+        try frame_pixels(&canvas, &target, 1.0, -600.0, -500.0, seen)
+        try canvas.settle_memory()
+    try frame_pixels(&canvas, &target, 0.25, 0.0, 0.0, reference)
+    try canvas.save_package("build/package-budget.l2d")
+    assert(canvas.memory_ram_bytes() <= 8 * 524288)
+    let opened = try Canvas.open("build/package-budget.l2d")
+    defer opened.release()
+    try frame_pixels(opened.value(), &target, 0.25, 0.0, 0.0, seen)
+    assert(same_bytes(seen, reference))

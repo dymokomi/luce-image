@@ -1,6 +1,9 @@
 module.lucb
 drawing.lucb
 files.lucb
+package_format.lucb
+package_save.lucb
+package_open.lucb
 bands.lucb
 clipboard.lucb
 layer_clip.lucb
@@ -28,3 +31,4 @@ liquify_tests.lucb
 path_tests.lucb
 memory_tests.lucb
 shape_render_tests.lucb
+package_tests.lucb

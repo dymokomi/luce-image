@@ -1,0 +1,195 @@
+#==============================================================================================
+#
+#   canvas/package_format - The .l2d file: its layout and its tile codec
+#
+#   DESCRIPTION:
+#       An .l2d document is one file, written front to back in a single pass:
+#
+#           header    16 bytes: "LUCED2D1", format version (u32), reserved (u32)
+#           tiles     one record per stored tile, back to back (see below)
+#           preview   a small flattened PNG of the document, for quick looks
+#           manifest  the document as Prism text: size, resolution, profile, every
+#                     layer's settings, text, shape and path, styles, guides
+#           index     where every tile is and which cells use it
+#           trailer   64 bytes: "L2DINDEX", then the offset and length (u64 each) of
+#                     the manifest, the preview and the index, then 8 reserved bytes
+#
+#       All numbers are little-endian. The index is a blob table, then a cell table:
+#
+#           u32 blob count, then per blob:  u64 offset, u32 length, u16 rows, u8 filter, u8 0
+#           u32 cell count, then per cell:  u32 layer, u32 plane, i32 column, i32 row, u32 blob
+#
+#       `layer` is the layer's place in the manifest; `plane` is 0 for its pixels on the
+#       canvas grid, 1 for its pixels past the canvas, 2 and 3 likewise for its mask. A cell
+#       with nothing painted has no entry (a mask's unpainted cells are white), and one
+#       tile shared by several cells is stored once. A tile record is the cell's rgba16f
+#       texels, 256 to a row and `rows` rows, each 16-bit sample replaced by its difference
+#       from the same channel of the texel to its left, split into a plane of low bytes then
+#       one of high bytes, and deflated (raw DEFLATE). Nothing is ever the size of the
+#       document: tiles go out and come back one batch at a time.
+#
+#==============================================================================================
+
+## Where a document's parts sit in its file, from the trailer.
+struct PackageTrailer:
+    var manifest_offset: u64
+    var manifest_length: u64
+    var preview_offset: u64
+    var preview_length: u64
+    var index_offset: u64
+    var index_length: u64
+
+## One stored tile: where its record is and how to read it back.
+struct PackageBlob:
+    var offset: u64
+    var length: u32
+    var rows: u16
+    var filter: u8
+
+## One cell that shows a stored tile.
+struct PackageCell:
+    var layer: u32
+    var plane: u32
+    var column: i32
+    var row: i32
+    var blob: u32
+
+let package_magic: str = "LUCED2D1"
+let package_trailer_magic: str = "L2DINDEX"
+let package_version: u32 = 1
+let package_header_bytes: usize = 16
+let package_trailer_bytes: usize = 64
+let package_blob_bytes: usize = 16
+let package_cell_bytes: usize = 20
+## The planes of a layer: pixels on the canvas and past it, then its mask's.
+let plane_pixels: u32 = 0
+let plane_pixels_beyond: u32 = 1
+let plane_mask: u32 = 2
+let plane_mask_beyond: u32 = 3
+## Tile records: the sub filter with byte planes, deflated at this level.
+let tile_filter_sub: u8 = 1
+let tile_deflate_level: i32 = 1
+## Bytes one texel row of a tile takes (256 texels of four half floats).
+let tile_row_bytes: usize = 2048
+
+# -- Little-endian numbers into and out of byte arrays.
+
+func put_u16(bytes: u8[], at: usize, value: u16):
+    bytes[at] = (u8)(value & 0xff)
+    bytes[at + 1] = (u8)(value >> 8)
+
+func put_u32(bytes: u8[], at: usize, value: u32):
+    for index in 0..<(usize)4:
+        bytes[at + index] = (u8)((value >> (u32)(index * 8)) & 0xff)
+
+func put_u64(bytes: u8[], at: usize, value: u64):
+    for index in 0..<(usize)8:
+        bytes[at + index] = (u8)((value >> (u64)(index * 8)) & 0xff)
+
+func get_u16(bytes: const u8[], at: usize) -> u16:
+    return (u16)bytes[at] | ((u16)bytes[at + 1] << 8)
+
+func get_u32(bytes: const u8[], at: usize) -> u32:
+    var value: u32 = 0
+    for index in 0..<(usize)4:
+        value |= (u32)bytes[at + index] << (u32)(index * 8)
+    return value
+
+func get_u64(bytes: const u8[], at: usize) -> u64:
+    var value: u64 = 0
+    for index in 0..<(usize)8:
+        value |= (u64)bytes[at + index] << (u64)(index * 8)
+    return value
+
+# -- The tile codec.
+
+## Filter a tile's `rows` texel rows from `texels` into `filtered` (as many
+## bytes): each sample's difference from the one to its left, low bytes first.
+func filter_tile(texels: const u8[], rows: usize, filtered: u8[]):
+    let count = rows * tile_row_bytes // 2
+    for row in 0..<rows:
+        let line = row * tile_row_bytes
+        for sample in 0..<tile_row_bytes // 2:
+            let at = line + sample * 2
+            let value = (u16)texels[at] | ((u16)texels[at + 1] << 8)
+            var left: u16 = 0
+            if sample >= 4:
+                left = (u16)texels[at - 8] | ((u16)texels[at - 7] << 8)
+            let delta = value -% left
+            let place = row * (tile_row_bytes // 2) + sample
+            filtered[place] = (u8)(delta & 0xff)
+            filtered[count + place] = (u8)(delta >> 8)
+
+## Undo `filter_tile`: `filtered` back into `texels`, `rows` rows of them.
+func unfilter_tile(filtered: const u8[], rows: usize, texels: u8[]):
+    let count = rows * tile_row_bytes // 2
+    for row in 0..<rows:
+        let line = row * tile_row_bytes
+        for sample in 0..<tile_row_bytes // 2:
+            let place = row * (tile_row_bytes // 2) + sample
+            let delta = (u16)filtered[place] | ((u16)filtered[count + place] << 8)
+            let at = line + sample * 2
+            var left: u16 = 0
+            if sample >= 4:
+                left = (u16)texels[at - 8] | ((u16)texels[at - 7] << 8)
+            let value = delta +% left
+            texels[at] = (u8)(value & 0xff)
+            texels[at + 1] = (u8)(value >> 8)
+
+# -- Work spread over the processors.
+
+## Tasks `0..<count` of `task(context, index)`, taken in turn by up to one
+## thread a processor (the caller's among them).
+struct SpreadWork:
+    var next: @usize
+    var count: usize
+    var context: void*?
+    var task: func(void*?, usize) -> unit
+
+func spread_entry(context: void*?):
+    spread_drain((SpreadWork*)(context else return))
+
+func spread_drain(work: SpreadWork*):
+    while true:
+        let index = work.next.add(1, .relaxed)
+        if index >= work.count:
+            return
+        work.task(work.context, index)
+
+func spread(count: usize, context: void*?, task: func(void*?, usize) -> unit) -> !:
+    var work = SpreadWork(count = count, context = context, task = task)
+    let workers = (usize)math.imin(16, math.imax(1, (i64)os.cpus()))
+    if workers <= 1 or count <= 1:
+        spread_drain(&work)
+        return
+    var handles: thread.Handle[16]
+    var started: usize = 0
+    for share in 1..<(workers if workers < count else count):
+        handles[started] = thread.spawn(spread_entry, (void*)&work, name = "l2d-tiles") catch failure:
+            discard(failure)
+            break
+        started += 1
+    spread_drain(&work)
+    for index in 0..<started:
+        try handles[index].join()
+
+# -- A file written and read in whole pieces.
+
+## Write all of `bytes` to `file`.
+func write_all(file: files.File*, bytes: const u8[]) -> !:
+    var done: usize = 0
+    while done < bytes.length:
+        let wrote = try file.write(bytes[done..])
+        if wrote == 0:
+            error(invalid, "the document file stopped taking bytes")
+        done += wrote
+
+## Fill all of `buffer` from `file` at `offset`.
+func read_at(file: files.File*, offset: u64, buffer: u8[]) -> !:
+    discard(try file.seek((i64)offset))
+    var done: usize = 0
+    while done < buffer.length:
+        let got = try file.read(buffer[done..])
+        if got == 0:
+            error(invalid, "the document file ends too soon")
+        done += got
