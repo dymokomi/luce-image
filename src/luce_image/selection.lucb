@@ -13,7 +13,10 @@ from luce_image.projective import Warp
 from luce_image.selection_cells import Cells, Mode, block_bytes, each
 from luce_image.selection_mirror import Mirror
 import luce_image.selection_shapes as shapes
+import luce_image.selection_modify as modifying
+import luce_image.selection_sources as sources
 from raster_errors import invalid
+from half import to_half
 
 pub struct Selection:
     var extent_x: u32
@@ -130,15 +133,12 @@ pub struct Selection:
         self.cells.fill_all(0)
         return Mode.add
 
-    ## Coverage from channel `channel` (0 red .. 3 alpha) of straight RGBA
-    ## samples covering the document, 0..1, combined by `mode`: a layer's
-    ## transparency, or its mask, loaded as a selection.
-    pub mutating func from_samples(samples: const f32[], channel: usize, mode: Mode) -> !:
-        if samples.length != (usize)self.extent_x * (usize)self.extent_y * 4 or channel > 3:
-            error(invalid, "samples must be RGBA for every document pixel")
-        var nothing: u8[]
+    ## Channel `channel` of the pixels `reader` gives (a layer's alpha, or
+    ## its mask's) as coverage, a transparent cell `blank`, combined by
+    ## `mode`: Load Selection, a cell at a time (selection_sources.lucb).
+    pub mutating func load(reader: sources.Reader, channel: usize, blank: u8, mode: Mode) -> !:
         let adding = self.prepare(mode)
-        shapes.from_source(&self.cells, shapes.Source(bytes = nothing, samples = samples, channel = channel), adding)
+        try sources.load(&self.cells, reader, channel, blank, adding)
         self.finish()
 
     ## Coverage bytes, one for every document pixel, combined by `mode`: a
@@ -146,9 +146,8 @@ pub struct Selection:
     pub mutating func from_coverage(values: const u8[], mode: Mode) -> !:
         if values.length != (usize)self.extent_x * (usize)self.extent_y:
             error(invalid, "coverage must have a byte for every document pixel")
-        var nothing: f32[]
         let adding = self.prepare(mode)
-        shapes.from_source(&self.cells, shapes.Source(bytes = values, samples = nothing), adding)
+        shapes.from_source(&self.cells, shapes.Source(bytes = values), adding)
         self.finish()
 
     ## A polygon from `points` (x, y pairs in document pixels), even-odd filled,
@@ -181,92 +180,29 @@ pub struct Selection:
             self.cells.fill_all(0)
         self.finish()
 
-    ## The magic wand: every pixel of `pixels` (RGBA straight-alpha linear
-    ## samples, this selection's size) whose color is within `tolerance`
-    ## (0..255, in sRGB, alpha included) of the one at (`x`, `y`), reachable
-    ## through such pixels when `contiguous`, combined by `mode`.
-    pub mutating func wand(pixels: const f32[], x: i64, y: i64, tolerance: f64, contiguous: bool, mode: Mode) -> !:
-        let width = (usize)self.extent_x
-        let height = (usize)self.extent_y
-        if pixels.length != width * height * 4:
-            error(invalid, "pixel buffer must hold width * height RGBA samples")
-        if x < 0 or y < 0 or x >= (i64)width or y >= (i64)height:
-            error(invalid, "the wand point lies outside the document")
-        if not math.is_finite(tolerance) or tolerance < 0.0 or tolerance > 255.0:
-            error(invalid, "wand tolerance is 0..255")
-        # Colors compared as 8-bit sRGB, the way the tolerance is stated.
-        let bytes = try alloc u8[width * height * 4] in memory.heap
-        defer free(bytes) in memory.heap
-        for index in 0..<(width * height):
-            for channel in 0..<(usize)3:
-                bytes[index * 4 + channel] = srgb_byte(pixels[index * 4 + channel])
-            bytes[index * 4 + 3] = (u8)(math.clamp((f64)pixels[index * 4 + 3], 0.0, 1.0) * 255.0 + 0.5)
-        let seed = (usize)y * width + (usize)x
-        let limit = (i64)math.floor(tolerance + 0.5)
-        let matched = try alloc u8[width * height] in memory.heap
-        defer free(matched) in memory.heap
-        memory.set(matched, 0)
-        if contiguous:
-            let queue = try alloc u32[width * height] in memory.heap
-            defer free(queue) in memory.heap
-            var head: usize = 0
-            var tail: usize = 0
-            queue[tail] = (u32)seed
-            tail += 1
-            matched[seed] = 1
-            while head < tail:
-                let index = (usize)queue[head]
-                head += 1
-                let column = (i64)(index % width)
-                let row = (i64)(index // width)
-                for step in 0..<(usize)4:
-                    let nx = column + (1 if step == 0 else (-1 if step == 1 else 0))
-                    let ny = row + (1 if step == 2 else (-1 if step == 3 else 0))
-                    if nx < 0 or ny < 0 or nx >= (i64)width or ny >= (i64)height:
-                        continue
-                    let next = (usize)ny * width + (usize)nx
-                    if matched[next] == 0 and within(bytes, seed, next, limit):
-                        matched[next] = 1
-                        queue[tail] = (u32)next
-                        tail += 1
-        else:
-            for index in 0..<(width * height):
-                if within(bytes, seed, index, limit):
-                    matched[index] = 1
-        var nothing: f32[]
+    ## The magic wand: the pixels `reader` gives within `tolerance` (0..255,
+    ## 8-bit sRGB, alpha included) of the color at (`x`, `y`), averaged over a
+    ## `sample` by `sample` square (1, 3 or 5), reachable through such pixels
+    ## when `contiguous`, combined by `mode`; a cell at a time
+    ## (selection_sources.lucb).
+    pub mutating func wand(reader: sources.Reader, x: i64, y: i64, sample: i64, tolerance: f64, contiguous: bool, mode: Mode) -> !:
+        var found = try Cells.create(self.extent_x, self.extent_y)
+        defer found.destroy()
+        try sources.wand(&found, reader, x, y, sample, tolerance, contiguous)
+        var nothing_bytes: u8[]
         let adding = self.prepare(mode)
-        shapes.from_source(&self.cells, shapes.Source(bytes = matched, scale = 255, samples = nothing), adding)
+        shapes.from_source(&self.cells, shapes.Source(other = &found, bytes = nothing_bytes), adding)
         self.finish()
 
     ## Grow (positive) or shrink (negative) the selection by `pixels` with a
-    ## square structuring element, then soften its edge over `feather` pixels.
-    ## Done on the whole document's bytes at once, put back into cells after.
+    ## square structuring element, then soften its edge over `feather` pixels
+    ## (a box blur): cell by cell, only near the edge (selection_modify.lucb).
     pub mutating func adjust(pixels: i64, feather: i64) -> !:
         if pixels < -512 or pixels > 512 or feather < 0 or feather > 512:
             error(invalid, "expand and contract are limited to 512 pixels, feather to 0..512")
         if pixels == 0 and feather == 0:
             return
-        let count = (usize)self.extent_x * (usize)self.extent_y
-        let coverage = try alloc u8[count] in memory.heap
-        defer free(coverage) in memory.heap
-        let scratch = try alloc u8[count] in memory.heap
-        defer free(scratch) in memory.heap
-        for y in 0..<(i64)self.extent_y:
-            for x in 0..<(i64)self.extent_x:
-                coverage[(usize)y * (usize)self.extent_x + (usize)x] = self.cells.at(x, y)
-        let w = (usize)self.extent_x
-        let h = (usize)self.extent_y
-        if pixels != 0:
-            let grow = pixels > 0
-            let radius = (usize)math.iabs(pixels)
-            morph(coverage, scratch, w, h, radius, grow, true)
-            morph(coverage, scratch, w, h, radius, grow, false)
-        if feather > 0:
-            soften(coverage, scratch, w, h, (usize)feather, true)
-            soften(coverage, scratch, w, h, (usize)feather, false)
-        var nothing: f32[]
-        self.cells.fill_all(0)
-        shapes.from_source(&self.cells, shapes.Source(bytes = coverage, samples = nothing), Mode.add)
+        try modifying.modify(&self.cells, pixels, feather)
         self.finish()
 
     ## Every pixel of `other` (a shape made alone) combined in by `mode`, as
@@ -281,8 +217,7 @@ pub struct Selection:
             self.cells = cells
         else:
             var nothing_bytes: u8[]
-            var nothing_samples: f32[]
-            shapes.from_source(&self.cells, shapes.Source(other = &other.cells, bytes = nothing_bytes, samples = nothing_samples), mode)
+            shapes.from_source(&self.cells, shapes.Source(other = &other.cells, bytes = nothing_bytes), mode)
         self.finish()
 
     ## Hard edges: each pixel wholly in or out, at half coverage (anti-alias off).
@@ -428,61 +363,6 @@ func warp_item(context: void*?, index: usize):
             shape[(usize)row * (usize)tile_size + (usize)column] = (u8)math.clamp(math.round(value), 0.0, 255.0)
     shapes.combine_cell(job.target, index, shape, Mode.add)
 
-# mark: Whole-document passes ===================================================================
-
-## One separable pass of a max (grow) or min (shrink) filter over `coverage`.
-func morph(coverage: u8[], scratch: u8[], w: usize, h: usize, radius: usize, grow: bool, horizontal: bool):
-    for y in 0..<h:
-        for x in 0..<w:
-            var value: u8 = 0 if grow else 255
-            let span = (i64)radius
-            for offset in -span..<(span + 1):
-                let sx = (i64)x + (offset if horizontal else 0)
-                let sy = (i64)y + (0 if horizontal else offset)
-                var sample: u8 = 0
-                if sx >= 0 and sy >= 0 and sx < (i64)w and sy < (i64)h:
-                    sample = coverage[(usize)sy * w + (usize)sx]
-                if grow:
-                    if sample > value:
-                        value = sample
-                elif sample < value:
-                    value = sample
-            scratch[y * w + x] = value
-    memory.copy(coverage, scratch, coverage.length)
-
-## One separable pass of a box blur of `radius` over `coverage`.
-func soften(coverage: u8[], scratch: u8[], w: usize, h: usize, radius: usize, horizontal: bool):
-    let span = (i64)radius
-    for y in 0..<h:
-        for x in 0..<w:
-            var total: i64 = 0
-            var count: i64 = 0
-            for offset in -span..<(span + 1):
-                let sx = (i64)x + (offset if horizontal else 0)
-                let sy = (i64)y + (0 if horizontal else offset)
-                if sx >= 0 and sy >= 0 and sx < (i64)w and sy < (i64)h:
-                    total += (i64)coverage[(usize)sy * w + (usize)sx]
-                count += 1
-            scratch[y * w + x] = (u8)(total // count)
-    memory.copy(coverage, scratch, coverage.length)
-
-## A linear-light sample as an 8-bit sRGB value.
-func srgb_byte(value: f32) -> u8:
-    let c = math.clamp((f64)value, 0.0, 1.0)
-    let encoded = c * 12.92 if c <= 0.0031308 else 1.055 * math.pow(c, 1.0 / 2.4) - 0.055
-    return (u8)(encoded * 255.0 + 0.5)
-
-## Whether pixel `b` of `bytes` is within `limit` of pixel `a` on every channel.
-func within(bytes: const u8[], a: usize, b: usize, limit: i64) -> bool:
-    for channel in 0..<(usize)4:
-        let difference = (i64)bytes[a * 4 + channel] - (i64)bytes[b * 4 + channel]
-        if difference > limit or -difference > limit:
-            return false
-    return true
-
-
-
-
 test "selection shapes combine, invert, grow and feather":
     var selection = try Selection.create(64, 48)
     defer selection.destroy()
@@ -523,14 +403,16 @@ test "the wand selects like colors, contiguously or not":
             elif x < 4 or x > 5:
                 pixels[index] = 1.0 if x != 6 else 0.9
                 pixels[index + 3] = 1.0
-    try selection.wand(pixels, 1, 1, 10.0, true, Mode.replace)
+    var buffer = Buffer(pixels = pixels, width = 8, height = 4)
+    let reader = buffer.reader()
+    try selection.wand(reader, 1, 1, 1, 10.0, true, Mode.replace)
     assert(selection.at(0, 0) == 255 and selection.at(3, 3) == 255 and selection.at(4, 1) == 0 and selection.at(7, 1) == 0 and selection.at(5, 1) == 0)
-    try selection.wand(pixels, 1, 1, 10.0, false, Mode.replace)
+    try selection.wand(reader, 1, 1, 1, 10.0, false, Mode.replace)
     assert(selection.at(7, 1) == 255 and selection.at(6, 1) == 0)
-    try selection.wand(pixels, 1, 1, 40.0, false, Mode.replace)
+    try selection.wand(reader, 1, 1, 1, 40.0, false, Mode.replace)
     assert(selection.at(6, 1) == 255 and selection.at(4, 1) == 0)
     var rejected = false
-    selection.wand(pixels, 9, 0, 10.0, true, Mode.replace) catch failure:
+    selection.wand(reader, 9, 0, 1, 10.0, true, Mode.replace) catch failure:
         assert(failure.code == invalid)
         rejected = true
     assert(rejected)
@@ -640,3 +522,275 @@ test "the GPU tiles follow the cells, uploading only the cells that changed":
         assert(pixels[(usize)probe * 4] == expected)
     selection.clear()
     assert((try selection.gpu_tiles(device)) == none)
+
+# mark: Select › Modify against the whole-document passes ======================================
+
+## Tests' oracle: one separable pass of a max (grow) or min (shrink) filter
+## over a whole document's `coverage`, as Select › Modify once ran.
+func morph(coverage: u8[], scratch: u8[], w: usize, h: usize, radius: usize, grow: bool, horizontal: bool):
+    for y in 0..<h:
+        for x in 0..<w:
+            var value: u8 = 0 if grow else 255
+            let span = (i64)radius
+            for offset in -span..<(span + 1):
+                let sx = (i64)x + (offset if horizontal else 0)
+                let sy = (i64)y + (0 if horizontal else offset)
+                var sample: u8 = 0
+                if sx >= 0 and sy >= 0 and sx < (i64)w and sy < (i64)h:
+                    sample = coverage[(usize)sy * w + (usize)sx]
+                if grow:
+                    if sample > value:
+                        value = sample
+                elif sample < value:
+                    value = sample
+            scratch[y * w + x] = value
+    memory.copy(coverage, scratch, coverage.length)
+
+## Tests' oracle: one separable pass of a box blur of `radius`.
+func soften(coverage: u8[], scratch: u8[], w: usize, h: usize, radius: usize, horizontal: bool):
+    let span = (i64)radius
+    for y in 0..<h:
+        for x in 0..<w:
+            var total: i64 = 0
+            var count: i64 = 0
+            for offset in -span..<(span + 1):
+                let sx = (i64)x + (offset if horizontal else 0)
+                let sy = (i64)y + (0 if horizontal else offset)
+                if sx >= 0 and sy >= 0 and sx < (i64)w and sy < (i64)h:
+                    total += (i64)coverage[(usize)sy * w + (usize)sx]
+                count += 1
+            scratch[y * w + x] = (u8)(total // count)
+    memory.copy(coverage, scratch, coverage.length)
+
+## Tests' oracle: Select › Modify on a whole document's bytes.
+func dense_adjust(coverage: u8[], w: usize, h: usize, pixels: i64, feather: i64):
+    let scratch = alloc u8[coverage.length] in memory.heap catch failure:
+        trap("out of memory in a test")
+    defer free(scratch) in memory.heap
+    if pixels != 0:
+        morph(coverage, scratch, w, h, (usize)math.iabs(pixels), pixels > 0, true)
+        morph(coverage, scratch, w, h, (usize)math.iabs(pixels), pixels > 0, false)
+    if feather > 0:
+        soften(coverage, scratch, w, h, (usize)feather, true)
+        soften(coverage, scratch, w, h, (usize)feather, false)
+
+## A selection with edges everywhere: cells wholly selected against the
+## document's edges, curves across cells, a corner, a partial last cell.
+func busy_selection(width: u32, height: u32) -> Selection!:
+    var selection = try Selection.create(width, height)
+    selection.rectangle(0, 0, 260, (i64)height, Mode.replace)
+    selection.ellipse(300, 60, 250, 330, Mode.add)
+    selection.rectangle(40, 200, 90, 60, Mode.subtract)
+    try selection.polygon([400.0, 380.0, 590.0, 400.0, 470.0, 515.0, 330.0, 470.0], Mode.add)
+    selection.rectangle((i64)width - 20, (i64)height - 20, 20, 20, Mode.add)
+    return selection
+
+test "modify matches the whole-document passes, near edges and across cells":
+    let width: u32 = 600
+    let height: u32 = 520
+    let pixels: i64[11] = [1, 7, 40, 270, -1, -7, -40, -270, 0, 0, 12]
+    let feathers: i64[11] = [0, 0, 0, 0, 0, 0, 0, 0, 3, 90, 9]
+    let dense = try alloc u8[(usize)width * (usize)height] in memory.heap
+    defer free(dense) in memory.heap
+    for case in 0..<(usize)13:
+        var selection = try busy_selection(width, height)
+        defer selection.destroy()
+        var p = pixels[case] if case < 11 else -15
+        var f = feathers[case] if case < 11 else 6
+        if case == 12:
+            # Everything selected: only the document's edge moves in.
+            selection.select_all()
+            p = -5
+            f = 0
+        for y in 0..<(i64)height:
+            for x in 0..<(i64)width:
+                dense[(usize)y * (usize)width + (usize)x] = selection.sample(x, y)
+        try selection.adjust(p, f)
+        dense_adjust(dense, (usize)width, (usize)height, p, f)
+        for y in 0..<(i64)height:
+            for x in 0..<(i64)width:
+                if selection.sample(x, y) != dense[(usize)y * (usize)width + (usize)x]:
+                    trap(f"modify {p}, {f} differs at {x}, {y}: {selection.sample(x, y)} vs {dense[(usize)y * (usize)width + (usize)x]}")
+    # Contracting a selection of whole cells keeps the untouched middle one value.
+    var whole = try Selection.create(2048, 2048)
+    defer whole.destroy()
+    whole.select_all()
+    try whole.adjust(-5, 0)
+    assert(whole.cells.uniform(9) == 255 and whole.cells.uniform(0) == -1 and whole.at(4, 100) == 0 and whole.at(5, 100) == 255)
+
+# mark: Pixels a cell at a time against the whole-document wand ================================
+
+## Tests' pixels, straight-alpha linear RGBA, served a cell at a time as
+## half floats; a cell of nothing but zeros reads as transparent, as a layer's
+## unpainted cell does.
+struct Buffer:
+    var pixels: const f32[]
+    var width: usize
+    var height: usize
+
+    func reader() -> sources.Reader:
+        return sources.Reader(context = (void*)&self, read = read_buffer)
+
+func read_buffer(context: void*?, column: u32, row: u32, halves: u8[]) -> bool!:
+    let buffer = (Buffer*)(context else return false)
+    let left = (usize)column * (usize)tile_size
+    let top = (usize)row * (usize)tile_size
+    let width = math.imin((i64)tile_size, (i64)(buffer.width - left))
+    let height = math.imin((i64)tile_size, (i64)(buffer.height - top))
+    var painted = false
+    for y in 0..<(usize)height:
+        for x in 0..<(usize)width:
+            for channel in 0..<(usize)4:
+                let value = buffer.pixels[((top + y) * buffer.width + left + x) * 4 + channel]
+                if value != 0.0:
+                    painted = true
+                let bits = to_half(value)
+                let at = (y * (usize)tile_size + x) * 8 + channel * 2
+                halves[at] = (u8)(bits & 0xff)
+                halves[at + 1] = (u8)(bits >> 8)
+    return painted
+
+## Tests' oracle: a linear-light sample as an 8-bit sRGB value.
+func srgb_byte(value: f32) -> u8:
+    let c = math.clamp((f64)value, 0.0, 1.0)
+    let encoded = c * 12.92 if c <= 0.0031308 else 1.055 * math.pow(c, 1.0 / 2.4) - 0.055
+    return (u8)(encoded * 255.0 + 0.5)
+
+## Tests' oracle: whether pixel `b` of `bytes` is within `limit` of pixel `a`.
+func within(bytes: const u8[], a: usize, b: usize, limit: i64) -> bool:
+    for channel in 0..<(usize)4:
+        let difference = (i64)bytes[a * 4 + channel] - (i64)bytes[b * 4 + channel]
+        if difference > limit or -difference > limit:
+            return false
+    return true
+
+## Tests' oracle: the magic wand on a whole document's pixels as it once ran,
+## the seed pixel first averaged over its `reach`: 255 where matched.
+func dense_wand(source: const f32[], width: usize, height: usize, x: i64, y: i64, reach: i64, tolerance: f64, contiguous: bool, matched: u8[]):
+    let pixels = alloc f32[source.length] in memory.heap catch failure:
+        trap("out of memory in a test")
+    defer free(pixels) in memory.heap
+    memory.copy(pixels, source, source.length)
+    var sum: f64[4] = [0.0, 0.0, 0.0, 0.0]
+    var count = 0.0
+    for dy in -reach..<(reach + 1):
+        for dx in -reach..<(reach + 1):
+            let px = x + dx
+            let py = y + dy
+            if px < 0 or py < 0 or px >= (i64)width or py >= (i64)height:
+                continue
+            for channel in 0..<(usize)4:
+                sum[channel] += (f64)pixels[((usize)py * width + (usize)px) * 4 + channel]
+            count += 1.0
+    if reach > 0:
+        for channel in 0..<(usize)4:
+            pixels[((usize)y * width + (usize)x) * 4 + channel] = (f32)(sum[channel] / count)
+    let bytes = alloc u8[width * height * 4] in memory.heap catch failure:
+        trap("out of memory in a test")
+    defer free(bytes) in memory.heap
+    for index in 0..<(width * height):
+        for channel in 0..<(usize)3:
+            bytes[index * 4 + channel] = srgb_byte(pixels[index * 4 + channel])
+        bytes[index * 4 + 3] = (u8)(math.clamp((f64)pixels[index * 4 + 3], 0.0, 1.0) * 255.0 + 0.5)
+    let seed = (usize)y * width + (usize)x
+    let limit = (i64)math.floor(tolerance + 0.5)
+    memory.set(matched, 0)
+    if not contiguous:
+        for index in 0..<(width * height):
+            if within(bytes, seed, index, limit):
+                matched[index] = 255
+        return
+    let queue = alloc u32[width * height] in memory.heap catch failure:
+        trap("out of memory in a test")
+    defer free(queue) in memory.heap
+    var head: usize = 0
+    var tail: usize = 1
+    queue[0] = (u32)seed
+    matched[seed] = 255
+    while head < tail:
+        let index = (usize)queue[head]
+        head += 1
+        let column = (i64)(index % width)
+        let row = (i64)(index // width)
+        for step in 0..<(usize)4:
+            let nx = column + (1 if step == 0 else (-1 if step == 1 else 0))
+            let ny = row + (1 if step == 2 else (-1 if step == 3 else 0))
+            if nx < 0 or ny < 0 or nx >= (i64)width or ny >= (i64)height:
+                continue
+            let next = (usize)ny * width + (usize)nx
+            if matched[next] == 0 and within(bytes, seed, next, limit):
+                matched[next] = 255
+                queue[tail] = (u32)next
+                tail += 1
+
+## A test picture over several cells: bands of close colors that the wand
+## tells apart by tolerance, a transparent cell, a moat splitting a region,
+## and halves-exact values so the half floats read back unchanged.
+func wand_picture(width: usize, height: usize) -> f32[]!:
+    let pixels = try alloc f32[width * height * 4] in memory.heap
+    memory.set(u8[]((u8*)pixels.data, pixels.length * 4), 0)
+    for y in 0..<height:
+        for x in 0..<width:
+            let at = (y * width + x) * 4
+            # The top-right cell stays transparent.
+            if x >= 256 and x < 512 and y < 256:
+                continue
+            let band = (x // 37 + y // 53) % 5
+            pixels[at] = (f32)(band * 8 + 64) / 256.0
+            pixels[at + 1] = (f32)((x * 7 + y * 3) % 16 + 100) / 256.0
+            pixels[at + 2] = 0.5 if band != 3 else 0.25
+            pixels[at + 3] = 1.0 if (x + y) % 97 != 0 else 0.5
+            # A moat of pure blue down x = 300 below the first row of cells.
+            if x >= 300 and x < 303 and y >= 256:
+                pixels[at] = 0.0
+                pixels[at + 1] = 0.0
+                pixels[at + 2] = 1.0
+    return pixels
+
+test "the wand read a cell at a time matches the whole-document wand":
+    let width: usize = 600
+    let height: usize = 520
+    let pixels = try wand_picture(width, height)
+    defer free(pixels) in memory.heap
+    let matched = try alloc u8[width * height] in memory.heap
+    defer free(matched) in memory.heap
+    var buffer = Buffer(pixels = pixels, width = width, height = height)
+    let seeds: i64[10] = [10, 10, 255, 255, 256, 256, 599, 519, 400, 100]
+    let tolerances: f64[4] = [0.0, 6.0, 20.0, 255.0]
+    let samples: i64[3] = [1, 3, 5]
+    for seed in 0..<(usize)5:
+        for tolerance in tolerances:
+            for sample in samples:
+                for contiguous in 0..<(usize)2:
+                    let x = seeds[seed * 2]
+                    let y = seeds[seed * 2 + 1]
+                    var selection = try Selection.create((u32)width, (u32)height)
+                    defer selection.destroy()
+                    try selection.wand(buffer.reader(), x, y, sample, tolerance, contiguous == 1, Mode.replace)
+                    dense_wand(pixels, width, height, x, y, sample // 2, tolerance, contiguous == 1, matched)
+                    for py in 0..<(i64)height:
+                        for px in 0..<(i64)width:
+                            if selection.sample(px, py) != matched[(usize)py * width + (usize)px]:
+                                trap(f"wand at {x}, {y}, tolerance {tolerance}, sample {sample}, contiguous {contiguous}: differs at {px}, {py}")
+
+test "loading a channel a cell at a time matches the samples, transparent cells blank":
+    let width: usize = 600
+    let height: usize = 520
+    let pixels = try wand_picture(width, height)
+    defer free(pixels) in memory.heap
+    var buffer = Buffer(pixels = pixels, width = width, height = height)
+    for blank in 0..<(usize)2:
+        var selection = try Selection.create((u32)width, (u32)height)
+        defer selection.destroy()
+        selection.rectangle(0, 0, 50, 50, Mode.replace)
+        try selection.load(buffer.reader(), 3, 255 if blank == 1 else 0, Mode.add)
+        for py in 0..<(i64)height:
+            for px in 0..<(i64)width:
+                let transparent = px >= 256 and px < 512 and py < 256
+                var expected = (u8)(math.clamp((f64)pixels[((usize)py * width + (usize)px) * 4 + 3], 0.0, 1.0) * 255.0 + 0.5)
+                if transparent:
+                    expected = 255 if blank == 1 else 0
+                if px < 50 and py < 50:
+                    expected = 255
+                if selection.sample(px, py) != expected:
+                    trap(f"load differs at {px}, {py}")

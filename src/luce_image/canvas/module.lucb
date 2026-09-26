@@ -65,6 +65,7 @@ import fonts
 from luce_image.geometry import resize_canvas, resize_image
 from luce_image.selection import Selection
 from luce_image.selection_cells import Mode
+import luce_image.selection_sources as selection_sources
 from luce_image.shaders import ants_frag_words, ants_frag_msl
 from half import from_half, to_half
 from binary import Buffer
@@ -1020,21 +1021,10 @@ pub struct Canvas:
         let document = self.document else error(invalid, "draw the document once before selecting from a layer")
         let layer = document.find((u64)id) else error(invalid, "no such layer")
         let tiles = (layer.mask_tiles() else error(invalid, "the layer has no mask")) if mask else (layer.tiles() else error(invalid, "a group has no pixels to select"))
-        let count = (usize)self.extent_x * (usize)self.extent_y * 4
-        let pixels = try alloc f32[count] in memory.heap
-        defer free(pixels) in memory.heap
-        try tiles.read(pixels)
-        if mask:
-            # A mask cell never painted reveals everything.
-            for row in 0..<tiles.rows():
-                for column in 0..<tiles.columns():
-                    if tiles.texture(column, row) != none:
-                        continue
-                    let area = tiles.region(column, row)
-                    for y in 0..<(usize)area.height:
-                        for x in 0..<(usize)area.width:
-                            pixels[(((usize)row * (usize)tile_size + y) * (usize)self.extent_x + (usize)column * (usize)tile_size + x) * 4] = 1.0
-        try self.live().from_samples(pixels, 0 if mask else 3, try selection_mode(mode))
+        # A mask cell never painted reveals everything.
+        var source = TilesSource(tiles = tiles)
+        let reader = selection_sources.Reader(context = (void*)&source, read = read_tiles_cell)
+        try self.live().load(reader, 0 if mask else 3, 255 if mask else 0, try selection_mode(mode))
 
     ## Whether the layer at `index` is a group.
     pub func layer_is_group(index: i64) -> bool!:
@@ -1198,29 +1188,15 @@ pub struct Canvas:
     pub mutating func select_wand(id: i64, x: i64, y: i64, tolerance: f64, contiguous: bool, mode: i64 = 0, sample: i64 = 1, all_layers: bool = false) -> !:
         try self.require_open()
         try self.remember_state("Magic Wand")
-        if sample != 1 and sample != 3 and sample != 5:
-            error(invalid, "the wand samples 1, 3 or 5 pixels square")
-        var pixels: f32[]
+        let document = self.document else error(invalid, "draw the document once before using the wand")
         if all_layers:
-            pixels = try flattened_pixels(&self)
-        else:
-            let document = self.document else error(invalid, "draw the document once before using the wand")
-            let layer = document.find((u64)id) else error(invalid, "no such layer")
-            let tiles = layer.tiles() else error(invalid, "a group has no pixels to sample")
-            pixels = try alloc f32[(usize)self.extent_x * (usize)self.extent_y * 4] in memory.heap
-            tiles.read(pixels) catch failure:
-                free(pixels) in memory.heap
-                error(failure.code, failure.message)
-        defer free(pixels) in memory.heap
-        if sample > 1 and x >= 0 and y >= 0 and x < (i64)self.extent_x and y < (i64)self.extent_y:
-            average_around(pixels, (usize)self.extent_x, (usize)self.extent_y, x, y, sample // 2)
-        if not self.shaping():
-            try self.live().wand(pixels, x, y, tolerance, contiguous, try selection_mode(mode))
+            let composer = self.composer else error(invalid, "draw the document once before using the wand")
+            var picture = PictureSource(composer = composer, document = document, extent_y = self.extent_y)
+            try wand_from(&self, selection_sources.Reader(context = (void*)&picture, read = read_picture_cell), x, y, sample, tolerance, contiguous, mode)
             return
-        var shape = try Selection.create(self.extent_x, self.extent_y)
-        defer shape.destroy()
-        try shape.wand(pixels, x, y, tolerance, contiguous, Mode.replace)
-        try self.merge_shape(&shape, mode)
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        var source = TilesSource(tiles = layer.tiles() else error(invalid, "a group has no pixels to sample"))
+        try wand_from(&self, selection_sources.Reader(context = (void*)&source, read = read_tiles_cell), x, y, sample, tolerance, contiguous, mode)
 
     ## Forget Color Range's sampled colors.
     pub mutating func clear_range_samples():

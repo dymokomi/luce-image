@@ -182,6 +182,14 @@ pub struct Cells:
         self.blocks[index] = made
         return made.bytes
 
+    ## A block of its own for cell `index`, its bytes unset: for a change
+    ## that writes every byte.
+    pub mutating func fresh(index: usize) -> u8[]:
+        self.release(index)
+        let made = self.fresh_block()
+        self.blocks[index] = made
+        return made.bytes
+
     func fresh_block() -> Block*:
         let bytes = alloc u8[block_bytes] in memory.heap catch failure:
             trap("out of memory for a selection cell")
