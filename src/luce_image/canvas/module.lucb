@@ -58,7 +58,7 @@ from luce_image.puppet import Puppet
 from luce_image.document import Style, Document, Layer, TreeState, release_snapshot, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
 from luce_image.composite import Composer, box_composer, unbox_composer
 from luce_image.brush import Brush, Painter, Stroke, EffectSource, begin_boxed, finish_boxed, fill_selection, fill_gradient, gradient_tile, simulate_fill_failure
-from luce_image.adjust import Adjuster, adjustment_count, parameter_count, curves, levels
+from luce_image.adjust import Adjuster, adjustment_count, parameter_count, curves, levels, replace_color
 from luce_image.curves import Curves, lut_size
 from luce_image.filter import Filters
 import luce_image.filter as filtering
@@ -805,9 +805,10 @@ pub struct Canvas:
     ## clipped — the non-destructive twin of `adjust_layer`. A Curves layer
     ## takes the staged curves (`add_curve_point`).
     pub mutating func add_adjustment_layer(name: str, kind: i64) -> i64!:
-        try self.remember_state("New Adjustment Layer")
-        if kind < 0 or kind >= (i64)adjustment_count:
+        # Replace Color is destructive only, as Photoshop's: never a layer.
+        if kind < 0 or kind >= (i64)adjustment_count or kind == (i64)replace_color:
             error(invalid, "no such adjustment for a layer")
+        try self.remember_state("New Adjustment Layer")
         return try self.add_record(name, false, kind)
 
     ## Give adjustment layer `id` the staged parameters: editing it, live.
@@ -2346,7 +2347,8 @@ pub struct Canvas:
     ## staged parameters: 0 brightness/contrast, 1 hue/saturation/lightness,
     ## 2 invert, 3 levels, 4 desaturate, 5 threshold, 6 posterize, 7 curves
     ## (the curves set with `add_curve_point`), 8 exposure, 9 black & white,
-    ## 10 color balance, 11 gradient map. Undoable.
+    ## 10 color balance, 11 gradient map, 12 vignette, 13 grain, 14 noise,
+    ## 16 camera raw, 17 replace color (adjust.frag lists their parameters). Undoable.
     pub mutating func adjust_layer(id: i64, kind: i64) -> !:
         try self.require_open()
         try self.require_idle()

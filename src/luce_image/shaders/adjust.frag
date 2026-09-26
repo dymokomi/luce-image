@@ -40,6 +40,12 @@
 //     linear light), p2 exposure in stops; then on the encoded values p3
 //     contrast, p4 highlights, p5 shadows, p6 whites, p7 blacks, p8 vibrance
 //     (saturation mostly where there is little), p9 saturation (-1..1 each)
+//   17 replace color: p0 hue shift in turns, p1 saturation, p2 lightness
+//     (-1..1), applied as far as the pixel is within p3 fuzziness (0..200 ΔE
+//     in CIELAB) of the p4 samples (0..6) that follow, three linear-light
+//     values each, a subtracted one's red stored as -1 - red; the weight is
+//     Color Range's (color_range.lucb): nearest added sample, less nearest
+//     subtracted, whole within a quarter of the fuzziness
 // `place` is where the tile lies: its first pixel and the canvas's size, for
 // the kinds that depend on where a pixel is (vignette, grain, noise); a grain
 // hashed from the pixel's position lands the same on every tile and redraw.
@@ -80,6 +86,31 @@ float luminosity(vec3 c) { return dot(c, vec3(0.3, 0.59, 0.11)); }
 
 // Lightness moved by -1..1 as Photoshop's slider does: toward black below
 // zero, toward white above.
+// CIELAB of a linear-light sRGB color under D65, as luce-color's.
+vec3 lab_of(vec3 c) {
+    vec3 xyz = mat3(0.4124564, 0.2126729, 0.0193339, 0.3575761, 0.7151522, 0.1191920, 0.1804375, 0.0721750, 0.9503041) * max(c, vec3(0.0));
+    xyz /= vec3(0.95047, 1.0, 1.08883);
+    vec3 f = mix(xyz * (841.0 / 108.0) + 4.0 / 29.0, pow(max(xyz, vec3(0.0)), vec3(1.0 / 3.0)), step(216.0 / 24389.0, xyz));
+    return vec3(116.0 * f.y - 16.0, 500.0 * (f.x - f.y), 200.0 * (f.y - f.z));
+}
+float falloff(float distance, float fuzziness) {
+    if (fuzziness <= 0.0) return distance < 0.5 ? 1.0 : 0.0;
+    return clamp((fuzziness - distance) / (fuzziness * 0.75), 0.0, 1.0);
+}
+// How far a pixel is Replace Color's: within the fuzziness of the samples.
+float replace_weight(vec3 light) {
+    vec3 here = lab_of(light);
+    float keep = 0.0, away = 0.0;
+    int count = int(clamp(params.p[4], 0.0, 6.0) + 0.5);
+    for (int i = 0; i < count; i++) {
+        vec3 sample_color = vec3(params.p[5 + i * 3], params.p[6 + i * 3], params.p[7 + i * 3]);
+        bool subtract = sample_color.r < 0.0;
+        if (subtract) sample_color.r = -1.0 - sample_color.r;
+        float near = falloff(distance(here, lab_of(sample_color)), params.p[3]);
+        if (subtract) away = max(away, near); else keep = max(keep, near);
+    }
+    return keep * (1.0 - away);
+}
 float toward(float v, float amount) { return clamp(amount < 0.0 ? v * (1.0 + amount) : v + (1.0 - v) * amount, 0.0, 1.0); }
 
 // How much a hue (in turns) belongs to the range centred on `centre` turns:
@@ -250,6 +281,13 @@ void main() {
         vec3 h = rgb_to_hsl(clamp(c, 0.0, 1.0));
         h.y = clamp(h.y * (1.0 + params.p[9]) + params.p[8] * (1.0 - h.y) * h.y, 0.0, 1.0);
         c = hsl_to_rgb(h);
+    } else if (kind == 17) {
+        float weight = replace_weight(light);
+        vec3 h = rgb_to_hsl(c);
+        h.x = fract(h.x + params.p[0]);
+        h.y = clamp(h.y * (1.0 + clamp(params.p[1], -1.0, 1.0)), 0.0, 1.0);
+        h.z = toward(h.z, clamp(params.p[2], -1.0, 1.0));
+        c = mix(c, hsl_to_rgb(h), weight);
     } else if (kind == 11) {
         float t = dot(c, vec3(0.2126, 0.7152, 0.0722));
         if (params.p[0] > 0.5) t = 1.0 - t;
