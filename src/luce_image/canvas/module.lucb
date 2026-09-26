@@ -71,7 +71,7 @@ from luce_image.transform import translate, Transformer, Landed, landing, sampli
 from luce_image.projective import Warp, affine_warp, quad_warp, multiply
 import luce_image.live_wire as live_wire
 from luce_image.selection_refine import Refinement, CellBox, RefineWork, pending_cells, needed_cells
-from luce_image.background import Background, start_background, background_done, join_background
+from luce_image.background import Background, start_background, background_done, join_background, wake_frames
 from luce_image.extent import full_bounds, pieces, relocate, Pieces
 from luce_image.transform_window import Footprint
 from luce_image.transform_preview import warp_preview_cell, lifted_preview_cell

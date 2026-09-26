@@ -96,6 +96,7 @@ func opening_worker(context: void*?):
             opening.failed = true
         recover ()
     opening.finished.store(1, .release)
+    wake_frames()
 
 ## Encoded samples where the format gives them, else linear floats.
 func opening_decode(opening: Opening*) -> !:
@@ -135,6 +136,8 @@ func free_slot(opening: Opening*, first: usize) -> OpeningSlot*!:
 func band_packed(opening: Opening*, rows: usize):
     opening.rows.store(rows, .release)
     discard(opening.packed.add(1))
+    # Frames upload it; the window's loop may be asleep waiting for input.
+    wake_frames()
 
 ## Upload the bands packed since the last frame (for a frame's time at most),
 ## each followed by the pyramid levels it completes, and once the worker is
@@ -156,6 +159,8 @@ func collect_opening(canvas: Canvas*) -> !:
         opening.free_slots.release()
         try settle_job(canvas)
         if time.now() - started > opening_upload_budget_ns:
+            # The rest go in the next frame, which nothing else may ask for.
+            wake_frames()
             break
     if opening.finished.load(.acquire) == 0 or opening.uploaded < opening.packed.load(.acquire):
         return

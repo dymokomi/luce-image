@@ -5,6 +5,7 @@
 ## cancelling it through its own context.
 import memory
 import thread
+import window
 
 pub struct Background:
     var context: void*?
@@ -26,6 +27,14 @@ func background_entry(raw: void*?):
     let task = (Background*)(raw else return)
     task.work(task.context)
     task.over.store(true, .release)
+    wake_frames()
+
+## Ask the window's loop for a frame at once, from any thread: work done in
+## the background is taken in by a frame, and a window with no input waits for
+## one (up to a second on Windows) unless woken. Without a window, nothing.
+pub func wake_frames():
+    window.wake() catch failure:
+        discard(failure)
 
 ## Whether the work is done (`join_background` then returns at once).
 pub func background_done(task: const Background*) -> bool:
