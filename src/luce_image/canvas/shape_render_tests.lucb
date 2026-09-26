@@ -113,5 +113,5 @@ test "cells wholly inside a filled shape share one tile":
     defer tiles.destroy()
     # The four full cells are one tile; the partial cells at the edges hold their own.
     assert(tiles.stamp(0, 0) == tiles.stamp(1, 0) and tiles.stamp(0, 0) == tiles.stamp(0, 1) and tiles.stamp(0, 0) == tiles.stamp(1, 1))
-    assert(tiles.stamp(2, 0) != tiles.stamp(0, 0) and tiles.texture(2, 2) != none)
+    assert(tiles.stamp(2, 0) != tiles.stamp(0, 0) and tiles.painted(2, 2))
     try matches_whole(&canvas, spec)
