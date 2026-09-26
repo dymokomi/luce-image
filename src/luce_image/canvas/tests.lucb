@@ -344,6 +344,8 @@ test "a document keeps its resolution and color profile":
 
 ## The color at one pixel of the canvas drawn at 1:1 over black.
 func shown_at(canvas: Canvas*, target: gpu.Texture*, x: u32, y: u32) -> u8[4]!:
+    # A smudge still finishing on its worker is kept before it is looked at.
+    try canvas.wait_idle()
     let frame = try target.frame()
     defer frame.release()
     let root = try frame.value().target()

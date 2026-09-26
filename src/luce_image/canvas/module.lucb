@@ -47,7 +47,7 @@ from tiles import Tiles, Bounds, tile_size, tile_columns, min_u32, max_u32, flat
 from pyramid import covered_at
 from luce_image.heal import heal
 from luce_image.color_range import RangeSample, range_sample, range_coverage, range_labs
-from luce_image.warp import WarpStroke, warp_smudge, warp_push
+from luce_image.warp import WarpStroke, warp_smudge, warp_push, default_smudge_spacing
 from luce_image.document import Style, Document, Layer, TreeState, release_snapshot, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
 from luce_image.composite import Composer, box_composer, unbox_composer
 from luce_image.brush import Brush, Painter, Stroke, EffectSource, begin_boxed, finish_boxed, fill_selection, fill_gradient, simulate_fill_failure
@@ -187,6 +187,13 @@ pub struct Canvas:
     var preview_bytes: u8[]
     var warp: WarpStroke*?
     var warped: u64
+    ## The smudge or push stroke has ended and its worker walks the rest of
+    ## its path; the next frame after it is done keeps it (`settle_warp`).
+    var warp_finishing: bool
+    ## Whether smudge and push walk on a worker (the default), and smudge's
+    ## dab spacing as a fraction of the diameter.
+    var warp_async: bool
+    var smudge_spacing: f64
     var heal_opacity: f64
     ## Inside `begin_edit`: changes record nothing more, the edit's first snapshot covers them.
     var edit_depth: i64
@@ -280,6 +287,9 @@ pub struct Canvas:
         self.preview_bytes = no_bytes
         self.warp = none
         self.warped = 0
+        self.warp_finishing = false
+        self.warp_async = true
+        self.smudge_spacing = default_smudge_spacing
         self.transform_session = none
         self.filter_stand_in = none
         self.heal_opacity = 1.0
@@ -342,9 +352,11 @@ pub struct Canvas:
             return &document.selection
         return &self.selection
 
-    ## No stroke and no preview may be in progress for edits and history.
-    func require_idle() -> !:
-        if self.stroke != none:
+    ## No stroke and no preview may be in progress for edits and history; a
+    ## smudge still finishing on its worker is waited for.
+    mutating func require_idle() -> !:
+        try self.wait_idle()
+        if self.stroke != none or self.warp != none:
             error(invalid, "finish the stroke first")
         if self.transform_session != none:
             error(invalid, "finish the transform first")
@@ -463,6 +475,12 @@ pub struct Canvas:
         if self.closed:
             return
         self.closed = true
+        if let warp = self.warp:
+            # A worker still walking stops after its dab.
+            self.warp = none
+            self.warp_finishing = false
+            warp.destroy()
+            free(warp) in memory.heap
         drop_filter_preview(&self)
         if let composer = self.composer:
             composer.drop_stand_ins()
@@ -1496,6 +1514,7 @@ pub struct Canvas:
     ## the stroke go on the history.
     pub mutating func begin_stroke(layer: i64, x: f64, y: f64, pressure: f64 = 1.0) -> !:
         try self.require_open()
+        try self.wait_idle()
         if self.stroke != none or self.warp != none:
             error(invalid, "a stroke is already in progress")
         if self.preview != none:
@@ -1515,6 +1534,8 @@ pub struct Canvas:
     ## Continue the stroke to a document point.
     pub mutating func extend_stroke(x: f64, y: f64, pressure: f64 = 1.0) -> !:
         try self.require_open()
+        if self.warp_finishing:
+            error(invalid, "no stroke is in progress")
         if let warp = self.warp:
             try extend_warp(&self, warp, x, y)
             return
@@ -1526,6 +1547,8 @@ pub struct Canvas:
     ## End the stroke, keeping what it painted.
     pub mutating func end_stroke() -> !:
         try self.require_open()
+        if self.warp_finishing:
+            error(invalid, "no stroke is in progress")
         if let warp = self.warp:
             try finish_warp(&self, warp)
             return
@@ -1536,8 +1559,35 @@ pub struct Canvas:
         if self.retouch == retouch_heal:
             try finish_heal(&self, stroke)
 
+    ## Whether a stroke takes points: one ended and still finishing does not.
     pub func painting() -> bool:
-        return self.stroke != none or self.warp != none
+        return self.stroke != none or (self.warp != none and not self.warp_finishing)
+
+    ## Whether work goes on between frames (a smudge finishing on its worker):
+    ## the view keeps drawing until it is kept.
+    pub func busy() -> bool:
+        return self.warp != none
+
+    ## Wait for a smudge or push still finishing and keep it. Everything that
+    ## changes or reads the whole document calls this first.
+    pub mutating func wait_idle() -> !:
+        if not self.warp_finishing:
+            return
+        let warp = self.warp else return
+        try keep_warp(&self, warp)
+
+    ## Whether smudge and push walk on a worker: on by default; off, each move
+    ## is walked before `extend_stroke` returns (scripts that time strokes).
+    pub mutating func set_async_warp(on: bool) -> !:
+        try self.wait_idle()
+        self.warp_async = on
+
+    ## Smudge's dab spacing, a fraction of the diameter (0.15 by default;
+    ## from about 0.2 the dabs show as beads along a soft stroke).
+    pub mutating func set_smudge_spacing(spacing: f64) -> !:
+        if not (spacing >= 0.01 and spacing <= 5.0):
+            error(invalid, "smudge spacing is 0.01..5 of the diameter")
+        self.smudge_spacing = spacing
 
     ## Stamp the dabs the stroke queued since the last draw: pointer moves
     ## only queue them, so however many arrive, a frame stamps them once.
@@ -2643,12 +2693,14 @@ pub struct Canvas:
     ## package: `document.prisma` and one PNG per layer and mask. Needs the
     ## document drawn once.
     pub mutating func save_package(path: str) -> !:
+        try self.wait_idle()
         try save_canvas_package(&self, path)
         self.mark_saved()
 
     ## Write the flattened document to `path` as an 8-bit RGBA picture in the
     ## format its extension names. Needs the document drawn at least once.
     pub mutating func save(path: str, quality: i64 = 90, matte_red: f64 = -1.0, matte_green: f64 = 0.0, matte_blue: f64 = 0.0) -> !:
+        try self.wait_idle()
         try save_flattened(&self, path, quality, matte_red, matte_green, matte_blue)
 
     ## Draw the document onto `target`, clipped to `rectangle` (in the target's
