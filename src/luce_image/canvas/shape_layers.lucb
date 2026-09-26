@@ -134,30 +134,12 @@ func transformed_shape(spec: ShapeSpec, forward: Warp) -> ShapeSpec?:
     moved.stroke_width = spec.stroke_width * math.sqrt(math.abs(a * d - b * c))
     return moved
 
-## The layer's pixels for `spec`: the shape as SVG, drawn by luce-svg over the canvas.
-func rendered_shape(canvas: Canvas*, spec: ShapeSpec) -> Tiles!:
-    let device = canvas.device else error(invalid, "draw the document once before drawing a shape")
-    var text = try strings.Builder.create()
-    defer text.destroy()
-    try shape_svg(&text, spec, canvas.extent_x, canvas.extent_y)
-    let drawing = try svg.parse(text.view())
-    defer drawing.release()
-    let count = (usize)canvas.extent_x * (usize)canvas.extent_y
-    let pixels = try alloc f32[count * 4] in memory.heap
-    defer free(pixels) in memory.heap
-    for at in 0..<pixels.length:
-        pixels[at] = 0.0
-    try svg.rasterize_rgba(drawing.value(), canvas.extent_x, canvas.extent_y, pixels, svg.Color(r = 0.0, g = 0.0, b = 0.0))
-    var tiles = try Tiles.create(device, canvas.extent_x, canvas.extent_y)
-    errdefer tiles.destroy()
-    try tiles.write(pixels)
-    return tiles
-
-## `spec` as a one-element SVG document the canvas's size.
-func shape_svg(out: strings.Builder*, spec: ShapeSpec, width: u32, height: u32) -> !:
+## `spec` as a one-element SVG document whose viewBox is the `width` by `height`
+## window of the canvas from (`left`, `top`), a pixel a unit.
+func shape_svg(out: strings.Builder*, spec: ShapeSpec, left: u32, top: u32, width: u32, height: u32) -> !:
     var line: u8[512]
     let m = spec.matrix
-    try out.put(try format(line, f"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width} {height}\"><g transform=\"matrix({m[0]} {m[1]} {m[2]} {m[3]} {m[4]} {m[5]})\">"))
+    try out.put(try format(line, f"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{left} {top} {width} {height}\"><g transform=\"matrix({m[0]} {m[1]} {m[2]} {m[3]} {m[4]} {m[5]})\">"))
     var fill_text: u8[16]
     var stroke_text: u8[16]
     let fill = try hex_color(fill_text, spec.fill_red, spec.fill_green, spec.fill_blue) if spec.filled and spec.kind != 2 else "none"

@@ -99,7 +99,7 @@ def package "luce-image" {
 
     def dependency "luce-svg" {
         str owner = "dymokomi"
-        str version = "^0.4.2"
+        str version = "^0.4.3"
         str path = "../luce-svg"
     }
 

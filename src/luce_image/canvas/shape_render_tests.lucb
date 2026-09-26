@@ -1,0 +1,117 @@
+## Tests for drawing shape layers a window of cells at a time (shape_render.lucb),
+## against the whole-canvas drawing they replace, kept here as the oracle.
+
+## `spec` drawn over the whole `width` by `height` canvas at once, as shape layers
+## were before: straight RGBA f32, heap storage the caller frees.
+func whole_canvas_shape(spec: ShapeSpec, width: u32, height: u32) -> f32[]!:
+    var text = try strings.Builder.create()
+    defer text.destroy()
+    try shape_svg(&text, spec, 0, 0, width, height)
+    let drawing = try svg.parse(text.view())
+    defer drawing.release()
+    let pixels = try alloc f32[(usize)width * (usize)height * 4] in memory.heap
+    errdefer free(pixels) in memory.heap
+    try svg.rasterize_rgba(drawing.value(), width, height, pixels, svg.Color(r = 0.0, g = 0.0, b = 0.0))
+    return pixels
+
+## `spec` turned by `degrees` about the middle of its box.
+func turned(spec: ShapeSpec, degrees: f64) -> ShapeSpec:
+    let angle = degrees * math.pi / 180.0
+    let cx = spec.x + spec.width * 0.5
+    let cy = spec.y + spec.height * 0.5
+    let c = math.cos(angle)
+    let s = math.sin(angle)
+    var moved = spec
+    moved.matrix = [c, s, -s, c, cx - c * cx + s * cy, cy - s * cx - c * cy]
+    return moved
+
+## Whether `canvas` draws `spec` window by window as the whole canvas would, to within
+## a step of the half floats the tiles keep.
+func matches_whole(canvas: Canvas*, spec: ShapeSpec) -> !:
+    let width = canvas.extent_x
+    let height = canvas.extent_y
+    let expected = try whole_canvas_shape(spec, width, height)
+    defer free(expected) in memory.heap
+    var tiles = try rendered_shape(canvas, spec)
+    defer tiles.destroy()
+    let found = try alloc f32[expected.length] in memory.heap
+    defer free(found) in memory.heap
+    try tiles.read(found)
+    for index in 0..<expected.length:
+        let want = from_half(to_half(expected[index]))
+        assert(math.abs((f64)(want - found[index])) <= 1.5e-3)
+
+test "a shape layer drawn cell by cell matches it drawn over the whole canvas":
+    var canvas = try Canvas(700, 600)
+    defer canvas.close()
+    discard(try canvas.add_layer("Shape"))
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    var no_path: f64[]
+    let base = ShapeSpec(kind = 0, x = 100.0, y = 180.0, width = 500.0, height = 300.0, radius = 20.0, filled = true, fill_red = 0.8, fill_green = 0.1,
+                         fill_blue = 0.05, stroked = true, stroke_red = 0.0, stroke_green = 0.2, stroke_blue = 0.9, stroke_width = 9.0, path = no_path)
+    # A turned, rounded, stroked rectangle across many cell edges.
+    try matches_whole(&canvas, turned(base, 13.0))
+    # An ellipse touching almost every cell, stroked.
+    var ellipse = base
+    ellipse.kind = 1
+    ellipse.x = 20.0
+    ellipse.y = 30.0
+    ellipse.width = 660.0
+    ellipse.height = 540.0
+    ellipse.stroke_width = 5.0
+    try matches_whole(&canvas, ellipse)
+    # A nearly flat line, whose edges run across whole windows in a row.
+    var line = base
+    line.kind = 2
+    line.x = 5.0
+    line.y = 250.0
+    line.width = 690.0
+    line.height = 12.0
+    line.stroke_width = 3.0
+    try matches_whole(&canvas, line)
+    # A turned heptagon, filled only.
+    var polygon = base
+    polygon.kind = 3
+    polygon.sides = 7
+    polygon.x = 300.0
+    polygon.y = 100.0
+    polygon.width = 380.0
+    polygon.height = 420.0
+    polygon.stroked = false
+    try matches_whole(&canvas, turned(polygon, 21.0))
+    # A rectangle past the canvas's right and bottom edges.
+    var past = base
+    past.x = -100.0
+    past.y = 500.0
+    past.width = 900.0
+    past.height = 200.0
+    try matches_whole(&canvas, past)
+    # A closed pen path of three curved anchors.
+    var anchors: f64[18] = [60.0, 60.0, 20.0, 200.0, 200.0, -40.0,
+                            640.0, 120.0, 500.0, -50.0, 700.0, 300.0,
+                            330.0, 560.0, 600.0, 600.0, 90.0, 520.0]
+    var path = base
+    path.kind = 4
+    path.closed = true
+    path.stroke_width = 4.0
+    path.path = anchors[..<18]
+    try matches_whole(&canvas, path)
+
+test "cells wholly inside a filled shape share one tile":
+    var canvas = try Canvas(700, 600)
+    defer canvas.close()
+    discard(try canvas.add_layer("Shape"))
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    var no_path: f64[]
+    let spec = ShapeSpec(kind = 0, x = -10.0, y = -10.0, width = 720.0, height = 620.0, filled = true, fill_red = 0.2, fill_green = 0.4,
+                         fill_blue = 0.6, path = no_path)
+    var tiles = try rendered_shape(&canvas, spec)
+    defer tiles.destroy()
+    # The four full cells are one tile; the partial cells at the edges hold their own.
+    assert(tiles.stamp(0, 0) == tiles.stamp(1, 0) and tiles.stamp(0, 0) == tiles.stamp(0, 1) and tiles.stamp(0, 0) == tiles.stamp(1, 1))
+    assert(tiles.stamp(2, 0) != tiles.stamp(0, 0) and tiles.texture(2, 2) != none)
+    try matches_whole(&canvas, spec)
