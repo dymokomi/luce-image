@@ -43,14 +43,14 @@ import svg
 import os
 import thread
 from luce_image.image import Image, Pixel
-from tiles import Tiles, Bounds, tile_size, tile_columns, min_u32, max_u32, flatten
+from tiles import Tiles, Bounds, tile_size, tile_columns, min_u32, max_u32, flatten, tiles_alive
 from pyramid import covered_at
 from luce_image.heal import heal
 from luce_image.color_range import RangeSample, range_sample, range_coverage, range_labs
 from luce_image.warp import WarpStroke, warp_smudge, warp_push
 from luce_image.document import Style, Document, Layer, TreeState, release_snapshot, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
 from luce_image.composite import Composer, box_composer, unbox_composer
-from luce_image.brush import Brush, Painter, Stroke, EffectSource, begin_boxed, finish_boxed, fill_selection, fill_gradient
+from luce_image.brush import Brush, Painter, Stroke, EffectSource, begin_boxed, finish_boxed, fill_selection, fill_gradient, simulate_fill_failure
 from luce_image.adjust import Adjuster, adjustment_count, parameter_count, curves, levels
 from luce_image.curves import Curves, lut_size
 from luce_image.filter import Filters
@@ -146,6 +146,8 @@ pub struct Canvas:
     var history_count: usize
     var future: Snapshot[]
     var future_count: usize
+    ## Bytes of GPU tiles the history may hold beyond the document's own.
+    var history_budget: u64
     var closed: bool
     ## Pixels per inch, for print sizes and rulers in physical units.
     var dpi: f64
@@ -247,6 +249,7 @@ pub struct Canvas:
         self.history_count = 0
         self.future = no_history
         self.future_count = 0
+        self.history_budget = default_history_budget
         self.closed = false
         self.dpi = 72.0
         var no_name: u8[64]
@@ -2436,6 +2439,26 @@ pub struct Canvas:
 
     # mark: History ===============================================================================
 
+    ## How many bytes of GPU tiles the undo history may hold beyond what the
+    ## document shows (4 GiB by default): past it the oldest steps are dropped,
+    ## though the last step always stays. The next step applies it.
+    pub mutating func set_history_limit(bytes: i64) -> !:
+        if bytes < 0:
+            error(invalid, "a history budget cannot be negative")
+        self.history_budget = (u64)bytes
+
+    pub func history_limit() -> i64:
+        return (i64)self.history_budget
+
+    ## How many steps undo can take back.
+    pub func undo_steps() -> i64:
+        return (i64)self.history_count
+
+    ## Bytes of GPU memory in pixel tiles, across every open document with its
+    ## history and selection: a figure for a memory readout.
+    pub static func tile_memory() -> i64:
+        return (i64)tiles_alive() * (i64)tile_memory_bytes
+
     pub func can_undo() -> bool:
         return self.history_count > 0
 
@@ -2500,6 +2523,7 @@ pub struct Canvas:
         self.joining = false
         self.serial += 1
         try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = tiles, mask = mask, joined = join, name = name, serial = self.serial))
+        try trim_history(&self)
 
     ## Record the whole document before a change to what it is made of, as
     ## step `name`. The same change to the same layer again (`layer` non-zero)
@@ -2527,17 +2551,13 @@ pub struct Canvas:
         self.separating = false
         self.serial += 1
         try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = Tiles(), mask = false, joined = join, state = state, name = name, serial = self.serial))
+        try trim_history(&self)
 
     ## Drop the redo trail and, at the limit, the oldest step.
     mutating func make_room():
         clear_snapshots(&self.future, &self.future_count)
         if self.history_count == 64:
-            drop_snapshot(&self.history[0])
-            for index in 1..<self.history_count:
-                self.history[index - 1] = self.history[index]
-            self.history_count -= 1
-            # What was joined to the dropped entry now starts the oldest edit kept.
-            self.history[0].joined = false
+            drop_oldest(&self)
 
     ## Put `entry`'s pixels or document in place, returning a snapshot of what
     ## was there, for the other stack.

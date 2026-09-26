@@ -605,12 +605,20 @@ func jitter_color(color: gpu.Color, hue: f64, saturation: f64, brightness: f64) 
 ## Fill the selection on `layer`'s pixels (or its mask) with `brush`'s color at
 ## its opacity, or erase it when the brush erases; the whole layer when nothing
 ## is selected. Returns the tiles from before, for history.
+## For tests: fail the next fill after it has made this many tiles, as when
+## GPU memory runs out part way; -1 never.
+var fill_failure_at: i64 = -1
+
+pub func simulate_fill_failure(after: i64):
+    fill_failure_at = after
+
 pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brush: Brush, on_mask: bool = false) -> Tiles!:
     try brush.check()
     let target = document.find(layer) else error(invalid, "no such layer")
     let tiles = (target.mask_tiles() else error(invalid, "the layer has no mask")) if on_mask else (target.tiles() else error(invalid, "a group cannot be filled"))
     var before = try tiles.clone()
-    errdefer before.destroy()
+    # Failing part way (out of GPU memory), the layer gets its tiles back whole.
+    errdefer restore_layer(document, layer, on_mask, before)
     let selection = try document.selection_tiles()
     let fill = gpu.Color(1.0, 1.0, 1.0, 1.0) if on_mask else gpu.Color(0.0, 0.0, 0.0, 0.0)
     # A destroyed zero-value texture is a no-op, so the stand-in can always be dropped.
@@ -620,33 +628,44 @@ pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brus
     var coverage = try gpu.Texture.create(painter.owner, 1, 1, gpu.Format.r8)
     defer coverage.destroy()
     try coverage.upload([(u8)255])
-    # A cell's result depends only on its source tile and selection tile: cells
-    # with the same pair (an empty layer under no selection, or under the one tile
-    # every fully selected cell shares) share one result, so filling a huge
-    # empty layer costs one tile, not thousands.
-    var made_keys: u64[16]
-    var made_cells: u32[32]
+    # Where a cell is selected throughout (or nothing is selected) and the fill
+    # is opaque, what was there does not matter: every such cell shares the one
+    # tile the first of them made, so filling a huge area costs its edge cells.
+    let solid = brush.opacity >= 1.0 and not brush.erase
+    var solid_made = false
+    var solid_cell: u32[2] = [0, 0]
+    # Otherwise a cell's result depends only on its source tile and selection
+    # tile. Only wholly selected cells are remembered: an edge cell's selection
+    # tile is its own, so its result is never wanted again.
+    var made_keys: u64[64]
+    var made_cells: u32[128]
     var made_count: usize = 0
     for row in 0..<tiles.rows():
         for column in 0..<tiles.columns():
             var clip = painter.white
             var params: f32[16] = [(f32)brush.color.red, (f32)brush.color.green, (f32)brush.color.blue, 1.0, (f32)brush.opacity, 1.0 if brush.erase else 0.0, 1.0, 0.0,
                                    0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+            var full = true
             if let selected = selection:
                 # A selection cell with no tile selects nothing there.
                 clip = selected.texture(column, row) else continue
                 params[7] = 1.0
+                full = document.selection.cell_full(column, row)
+            if solid and full and solid_made:
+                try tiles.share(column, row, solid_cell[0], solid_cell[1])
+                continue
             let source_stamp = before.stamp(column, row)
             var clip_stamp: u64 = 1
             if let selected = selection:
                 clip_stamp = selected.stamp(column, row)
             let key = (source_stamp *% 1099511628211) ^ clip_stamp
             var shared = false
-            for at in 0..<made_count:
-                if made_keys[at] == key:
-                    try tiles.share(column, row, made_cells[at * 2], made_cells[at * 2 + 1])
-                    shared = true
-                    break
+            if full and not solid:
+                for at in 0..<made_count:
+                    if made_keys[at] == key:
+                        try tiles.share(column, row, made_cells[at * 2], made_cells[at * 2 + 1])
+                        shared = true
+                        break
             if shared:
                 continue
             var source = gpu.Texture()
@@ -661,6 +680,11 @@ pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brus
                         defer clear_frame.release()
                         discard(try clear_frame.value().present(fill))
                 source = empty
+            if fill_failure_at == 0:
+                fill_failure_at = -1
+                error(limit, "out of GPU memory (simulated)")
+            if fill_failure_at > 0:
+                fill_failure_at -= 1
             var fresh = try tiles.blank()
             errdefer fresh.destroy()
             let frame = try fresh.frame()
@@ -671,13 +695,31 @@ pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brus
                           [source, coverage, clip], gpu.Filter.nearest)
             discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
             try tiles.set(column, row, fresh)
-            if made_count < made_keys.length:
+            if solid and full:
+                solid_made = true
+                solid_cell = [column, row]
+            elif full and made_count < made_keys.length:
                 made_keys[made_count] = key
                 made_cells[made_count * 2] = column
                 made_cells[made_count * 2 + 1] = row
                 made_count += 1
     target.revision += 1
     return before
+
+## Put `before` back as `layer`'s pixels (or mask) after a fill failed part
+## way, dropping what the fill had made. Nothing here can fail but a tiny box.
+func restore_layer(document: Document*, layer: u64, on_mask: bool, before: Tiles):
+    var owned = before
+    if on_mask:
+        var made = document.take_mask(layer, owned) catch _:
+            owned.destroy()
+            return
+        made.destroy()
+    else:
+        var made = document.take_tiles(layer, owned) catch _:
+            owned.destroy()
+            return
+        made.destroy()
 
 ## Lay a linear gradient from `from_color` at (`x0`, `y0`) to `to_color` at
 ## (`x1`, `y1`) over `layer`, within the selection; the tiles from before.
@@ -688,7 +730,8 @@ pub func fill_gradient(painter: Painter*, document: Document*, layer: u64, x0: f
     let target = document.find(layer) else error(invalid, "no such layer")
     let tiles = (target.mask_tiles() else error(invalid, "the layer has no mask")) if on_mask else (target.tiles() else error(invalid, "a group cannot be filled"))
     var before = try tiles.clone()
-    errdefer before.destroy()
+    # Failing part way (out of GPU memory), the layer gets its tiles back whole.
+    errdefer restore_layer(document, layer, on_mask, before)
     let selection = try document.selection_tiles()
     var empty = gpu.Texture()
     var have_empty = false
