@@ -16,7 +16,7 @@ import raw
 import heic
 import luce_image.parallel as parallel
 from luce_image.svg_import import is_svg, render_svg
-from luce_image.streaming import LinearSink, stream_linear, decode_srgb
+from luce_image.streaming import LinearSink, EncodedSink, stream_linear, stream_encoded, decode_srgb
 from binary import Buffer
 from raster_errors import invalid, unsupported, limit
 
@@ -110,7 +110,7 @@ pub struct Image:
         errdefer raster.close()
         with memory.heap:
             raster.path = try strings.copy(path)
-            raster.encoded = try files.read_limit((c_api.str)raster.path, max_bytes)
+        raster.encoded = try read_whole((c_api.str)raster.path, max_bytes)
         try probe(&raster)
         return try Image.own(raster, threads)
 
@@ -521,6 +521,15 @@ pub struct Image:
             try sink(context, top, count, band[..<width * count * 4])
             top += count
 
+    ## A PNG or JPEG not yet decoded as its encoded 8 or 16-bit RGBA samples,
+    ## `rows` rows at a time, to `sink` (luce_image/streaming); false for any
+    ## other picture, which `linear_rgba_bands` gives instead.
+    pub mutating func encoded_rgba_bands(rows: usize, sink: EncodedSink, context: void*?) -> bool!:
+        try self.ensure_open()
+        if self.is_loaded():
+            return false
+        return try stream_encoded(&self.raster, rows, sink, context)
+
     ## An 8-bit RGBA image from straight-alpha linear-light RGBA f32 samples,
     ## sRGB-encoded and clamped. Base only.
     pub static func from_linear_rgba(width: usize, height: usize, pixels: const f32[]) -> interop.Reference[Image]!:
@@ -746,3 +755,23 @@ func encode_srgb(value: f64) -> f64:
     let clamped = math.clamp(value, 0.0, 1.0)
     let encoded = clamped * 12.92 if clamped <= 0.0031308 else 1.055 * math.pow(clamped, 1.0 / 2.4) - 0.055
     return math.floor(encoded * 255.0 + 0.5)
+
+## A file's bytes, heap storage of exactly its size (at most `most`): read
+## into one buffer rather than one grown by doubling, which for a picture of
+## hundreds of megabytes left as much again behind.
+func read_whole(path: c_api.str, most: usize) -> u8[]!:
+    var file = try files.File.open(path)
+    defer file.destroy()
+    let size = try file.seek(0, files.SeekOrigin.end)
+    discard(try file.seek(0))
+    if size < 0 or (u64)size > (u64)most:
+        error(limit, "the file exceeds the read limit")
+    let data = try alloc u8[(usize)size] in memory.heap
+    errdefer free(data) in memory.heap
+    var used: usize = 0
+    while used < data.length:
+        let count = try file.read(data[used..])
+        if count == 0:
+            error(invalid, "the file ended before its size")
+        used += count
+    return data

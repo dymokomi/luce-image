@@ -284,12 +284,43 @@ let picture_bytes: usize = (usize)1 << 40
 struct PictureBands:
     var canvas: Canvas*
     var tiles: Tiles*
+    ## For encoded samples: a band packed at a time, and each code's half float.
+    var band: u8[]
+    var painted: bool[]
+    var color: u16[]
+    var alpha: u16[]
+
+    mutating func close():
+        if self.band.length > 0:
+            free(self.band) in memory.heap
+        if self.painted.length > 0:
+            free(self.painted) in memory.heap
+        if self.color.length > 0:
+            free(self.color) in memory.heap
+            free(self.alpha) in memory.heap
 
 ## `linear_rgba_bands`' sink: a band of rows becomes a row of cells.
 func picture_band(context: void*?, first: usize, count: usize, pixels: f32[]) -> !:
     let banding = (PictureBands*)(context else return)
     discard(count)
     try banding.tiles.write_band((u32)(first // (usize)tile_size), pixels)
+    try settle_job(banding.canvas)
+
+## `encoded_rgba_bands`' sink: the samples through tables of their half
+## floats become a row of cells, no floats made on the way.
+func picture_coded_band(context: void*?, first: usize, count: usize, samples: const u8[], deep: bool) -> !:
+    let banding = (PictureBands*)(context else return)
+    discard(count)
+    if banding.band.length == 0:
+        let codes: usize = 65536 if deep else 256
+        banding.band = try alloc u8[packed_band_bytes(banding.tiles.width())] in memory.heap
+        banding.painted = try alloc bool[(usize)banding.tiles.columns()] in memory.heap
+        banding.color = try alloc u16[codes] in memory.heap
+        banding.alpha = try alloc u16[codes] in memory.heap
+        try encoded_tables(deep, banding.color, banding.alpha)
+    let row = (u32)(first // (usize)tile_size)
+    try pack_band_coded(banding.tiles.width(), banding.tiles.height(), row, samples, deep, banding.color, banding.alpha, banding.band, banding.painted)
+    try banding.tiles.write_packed(row, banding.band, banding.painted)
     try settle_job(banding.canvas)
 
 ## `Canvas.place_layer`: the picture at `path` on layer `id`, centred on a document point.
@@ -336,6 +367,8 @@ func open_canvas(path: str) -> interop.Reference[Canvas]!:
     let native = try new Canvas((i64)width, (i64)height) in memory.heap
     errdefer native.close()
     let id = try native.add_layer("Background")
+    # A window that draws progressively shows it filling in (canvas/opening).
+    native.open_in_background = not is_svg(path)
     try native.place((u64)id, picture)
     # An SVG keeps its elements too: the picture is what they draw, until one is edited.
     if is_svg(path):

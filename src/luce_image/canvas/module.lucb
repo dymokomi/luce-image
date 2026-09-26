@@ -13,6 +13,7 @@
 #       module.lucb    the Canvas and its per-layer Record
 #       drawing.lucb   drawing the document, a layer, a move and the selection onto a target
 #       files.lucb     opening and saving pictures, Photoshop files and .l2d packages
+#       opening.lucb   a picture opened as the document, loading while frames go on
 #       clipboard.lucb copy, cut and paste, and layers via copy
 #       history.lucb   the undo and redo snapshots
 #       support.lucb   device binding, blend and style names, small checks
@@ -44,9 +45,11 @@ import svg
 import os
 import time
 import thread
+import sync
 from luce_image.image import Image, Pixel
+from luce_image.streaming import encoded_tables
 from luce_image.svg_import import is_svg
-from tiles import Cell, CellRange, read_cells, transient_mark, release_transients, Tiles, Bounds, tile_size, tile_columns, min_u32, max_u32, flatten, tiles_alive, tile_texture, residency_configure, residency_budgets, residency_advance, residency_frame, residency_over_budget, residency_begin_marking, residency_mark_live, residency_settle, residency_report, set_scratch_directory, residency_codec, clear_residency_codec, Gathering, prefetch_collect, prefetch_pending, prefetch_had_failure, prefetch_wait, release_scratch, TileSource, open_tile_source, release_tile_source, back_cell, detach_tile_source, tile_source_is
+from tiles import pack_band, pack_band_coded, packed_band_bytes, Cell, CellRange, read_cells, transient_mark, release_transients, Tiles, Bounds, tile_size, tile_columns, min_u32, max_u32, flatten, tiles_alive, tile_texture, residency_configure, residency_budgets, residency_advance, residency_frame, residency_over_budget, residency_begin_marking, residency_mark_live, residency_settle, residency_report, set_scratch_directory, residency_codec, clear_residency_codec, Gathering, prefetch_collect, prefetch_pending, prefetch_had_failure, prefetch_wait, release_scratch, TileSource, open_tile_source, release_tile_source, back_cell, detach_tile_source, tile_source_is
 from pyramid import covered_at
 from luce_image.heal import heal
 from luce_image.color_range import RangeSample, range_sample, range_coverage, range_labs
@@ -282,6 +285,12 @@ pub struct Canvas:
     ## What `measure_histogram` counted: luminosity, red, green and blue, 256
     ## bins each of the encoded values.
     var histogram_counts: u64[1024]
+    ## A picture opened as the document loads in the background once bound
+    ## (canvas/opening), and while it does, `opening` is its load.
+    var open_in_background: bool = false
+    var opening: Opening*? = none
+    ## Why the load failed, kept for the error that reports it.
+    var open_failure: u8[256]
 
     # mark: Lifecycle and document settings =======================================================
 
@@ -440,6 +449,7 @@ pub struct Canvas:
     ## No stroke and no preview may be in progress for edits and history; a
     ## smudge still finishing on its worker is waited for.
     mutating func require_idle() -> !:
+        try require_loaded(&self)
         try self.wait_idle()
         if self.stroke != none or self.warp != none or self.liquify != none:
             error(invalid, "finish the stroke first")
@@ -667,6 +677,10 @@ pub struct Canvas:
         for index in 0..<self.count:
             if let picture = self.records[index].picture:
                 self.records[index].picture = none
+                if opens_in_background(&self, picture):
+                    # The document's own picture fills in while frames go on.
+                    try begin_opening(&self, index, picture)
+                    continue
                 self.load_picture(index, picture, self.records[index].picture_x, self.records[index].picture_y, false) catch failure:
                     if failed == none:
                         failed = failure.code
@@ -698,6 +712,7 @@ pub struct Canvas:
         if self.closed:
             return
         self.closed = true
+        cancel_opening(&self)
         if let warp = self.warp:
             # A worker still walking stops after its dab.
             self.warp = none
@@ -1005,7 +1020,9 @@ pub struct Canvas:
             whole = try Tiles.create(device, (u32)width, (u32)height)
             errdefer whole.destroy()
             var banding = PictureBands(canvas = &self, tiles = &whole)
-            try picture.value().linear_rgba_bands((usize)tile_size, picture_band, (void*)&banding)
+            defer banding.close()
+            if not (try picture.value().encoded_rgba_bands((usize)tile_size, picture_coded_band, (void*)&banding)):
+                try picture.value().linear_rgba_bands((usize)tile_size, picture_band, (void*)&banding)
         errdefer whole.destroy()
         if x == 0 and y == 0 and width == (usize)self.extent_x and height == (usize)self.extent_y:
             return whole
@@ -2067,6 +2084,7 @@ pub struct Canvas:
     ## the stroke go on the history.
     pub mutating func begin_stroke(layer: i64, x: f64, y: f64, pressure: f64 = 1.0) -> !:
         try self.require_open()
+        try require_loaded(&self)
         try self.wait_idle()
         if self.stroke != none or self.warp != none or self.liquify != none:
             error(invalid, "a stroke is already in progress")
@@ -2126,7 +2144,22 @@ pub struct Canvas:
     ## tiles coming back in the background while coarser ones stand in): the
     ## view keeps drawing until it is done.
     pub func busy() -> bool:
-        return self.warp != none or self.coarse_shown or prefetch_pending() or refine_busy(&self)
+        return self.warp != none or self.coarse_shown or prefetch_pending() or refine_busy(&self) or self.opening != none
+
+    ## Whether the picture the document was opened from is still loading
+    ## (canvas/opening): it draws as far as it has come; edits and saves wait.
+    pub func is_opening() -> bool:
+        return self.opening != none
+
+    ## How much of the picture has loaded, 0..100 (100 once it has).
+    pub func opening_percent() -> i64:
+        return opening_progress(&self)
+
+    ## Take in the bands decoded since the last call, as a draw does: for a
+    ## document not on screen, whose picture would otherwise wait for its next
+    ## frame. A failed load is reported here, once.
+    pub mutating func continue_opening() -> !:
+        try collect_opening(&self)
 
     ## Wait for a smudge still finishing and keep it. Everything that
     ## changes or reads the whole document calls this first.
@@ -3400,6 +3433,7 @@ pub struct Canvas:
     mutating func remember(layer: u64, tiles: Tiles, mask: bool = false, joined: bool = false, name: str = "Edit") -> !:
         var owned = tiles
         errdefer owned.destroy()
+        try require_loaded(&self)
         # Pixels of a text layer changed as pixels (a move only moves it): it is
         # no longer text. The step holds the whole document, with the pixels
         # from before put back while it is taken, so undo brings the text back.
@@ -3433,6 +3467,7 @@ pub struct Canvas:
     ## document is drawn once.
     mutating func remember_state(name: str, layer: u64 = 0) -> !:
         let document = self.document else return
+        try require_loaded(&self)
         if self.edit_depth > 0 and self.history_count > 0:
             return
         if self.edit_depth == 0 and layer != 0 and self.future_count == 0 and self.history_count > 0:
@@ -3543,6 +3578,7 @@ pub struct Canvas:
     ## their half-float tiles, a manifest and a preview (docs/FORMATS.md).
     ## Needs the document drawn once.
     pub mutating func save_package(path: str) -> !:
+        try require_loaded(&self)
         try self.wait_idle()
         try save_canvas_package(&self, path)
         self.mark_saved()
@@ -3550,6 +3586,7 @@ pub struct Canvas:
     ## Write the flattened document to `path` as an 8-bit RGBA picture in the
     ## format its extension names. Needs the document drawn at least once.
     pub mutating func save(path: str, quality: i64 = 90, matte_red: f64 = -1.0, matte_green: f64 = 0.0, matte_blue: f64 = 0.0) -> !:
+        try require_loaded(&self)
         try self.wait_idle()
         try save_flattened(&self, path, quality, matte_red, matte_green, matte_blue)
 

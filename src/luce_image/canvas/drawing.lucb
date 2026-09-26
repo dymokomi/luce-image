@@ -18,6 +18,8 @@ func draw_canvas(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectan
     # A standalone frame has no device; it records nothing.
     let document = canvas.document else return
     let composer = canvas.composer else return
+    # The bands of a picture still opening that are ready since the last frame.
+    try collect_opening(canvas)
     # A new frame: what the last one pinned may move, within the memory budget,
     # once this draw is done with it. Later draws into the same frame keep what
     # this one pins.

@@ -1,7 +1,7 @@
 #prisma 4.0
 def package "luce-image" {
     str owner = "dymokomi"
-    str version = "0.35.0"
+    str version = "0.36.0"
     str kind = "package"
     str language = "luce-base"
     str description = "JPEG, PNG, TIFF and OpenEXR image I/O for Luce, implemented in Luce Base, with a Pillow-inspired owning Image API and Cryptomatte 1.2 reading and authoring."
@@ -33,19 +33,19 @@ def package "luce-image" {
 
     def dependency "luce-compress" {
         str owner = "dymokomi"
-        str version = "^0.2.1"
+        str version = "^0.2.2"
         str path = "../luce-compress"
     }
 
     def dependency "luce-png" {
         str owner = "dymokomi"
-        str version = "^0.2.1"
+        str version = "^0.2.2"
         str path = "../luce-png"
     }
 
     def dependency "luce-jpeg" {
         str owner = "dymokomi"
-        str version = "^0.3.0"
+        str version = "^0.3.1"
         str path = "../luce-jpeg"
     }
 
@@ -105,7 +105,7 @@ def package "luce-image" {
 
     def dependency "luce-canvas" {
         str owner = "dymokomi"
-        str version = "^0.1.16"
+        str version = "^0.1.17"
         str path = "../luce-canvas"
     }
 

@@ -1,0 +1,241 @@
+#==============================================================================================
+#
+#   canvas/open_timing_tests - An 18000 by 12000 picture opened as the window opens it
+#
+#==============================================================================================
+
+## The view the timing tests draw into.
+let opening_view_width: u32 = 1600
+let opening_view_height: u32 = 1000
+
+## A `width` by `height` RGB PNG as other encoders write it: no `luPD` bands,
+## one zlib stream in sync-flushed segments over many IDAT chunks, so it takes
+## the general path, a tester's photograph's. Ramps with a texture over them.
+func write_plain_png(path: str, width: usize, height: usize) -> !:
+    var file = Buffer(maximum = (usize)1 << 40)
+    defer file.close()
+    let signature: u8[8] = [137, 80, 78, 71, 13, 10, 26, 10]
+    try file.put(signature)
+    var header: u8[13]
+    put_be32(header[0..], (u32)width)
+    put_be32(header[4..], (u32)height)
+    header[8] = 8
+    header[9] = 2
+    try png_chunk(&file, "IHDR", header)
+    let stride = width * 3 + 1
+    let group: usize = 64
+    let rows = try alloc u8[stride * group] in memory.heap
+    defer free(rows) in memory.heap
+    let packed = try alloc u8[stride * group + 65536] in memory.heap
+    defer free(packed) in memory.heap
+    let zlib: u8[2] = [0x78, 0x01]
+    try png_chunk(&file, "IDAT", zlib)
+    var adler: u32 = 1
+    var top: usize = 0
+    while top < height:
+        let count = group if top + group <= height else height - top
+        for y in 0..<count:
+            let line = rows[y * stride..<(y + 1) * stride]
+            line[0] = 0
+            for x in 0..<width:
+                let texture = (u8)((x * 7 + (top + y) * 3) % 23)
+                line[1 + x * 3] = (u8)(x * 200 // width) + texture
+                line[2 + x * 3] = (u8)((top + y) * 200 // height) + texture
+                line[3 + x * 3] = (u8)(((x + top + y) // 97) % 200) + texture
+        let scanlines = rows[..<count * stride]
+        adler = flate.adler32(scanlines, adler)
+        let used = try flate.deflate_raw(scanlines, 1, packed, top + count == height)
+        try png_chunk(&file, "IDAT", packed[..<used])
+        top += count
+    var trailer: u8[4]
+    put_be32(trailer[0..], adler)
+    try png_chunk(&file, "IDAT", trailer)
+    try png_chunk(&file, "IEND", trailer[..<0])
+    try write_file(path, file.view())
+
+func png_chunk(file: Buffer*, name: str, data: const u8[]) -> !:
+    var length: u8[4]
+    put_be32(length[0..], (u32)data.length)
+    try file.put(length)
+    try file.put(name.bytes)
+    try file.put(data)
+    var crc: u8[4]
+    put_be32(crc[0..], flate.crc32(data, flate.crc32(name.bytes)))
+    try file.put(crc)
+
+func put_be32(at: u8[], value: u32):
+    at[0] = (u8)(value >> 24)
+    at[1] = (u8)(value >> 16)
+    at[2] = (u8)(value >> 8)
+    at[3] = (u8)value
+
+## The same kind of picture as a baseline JPEG, encoded a band at a time.
+func write_big_jpeg(path: str, width: usize, height: usize) -> !:
+    var encoded = Buffer(maximum = (usize)1 << 40)
+    defer encoded.close()
+    var encoder = try jpeg.Encoder.begin(width, height, jpeg.Input.rgba, &encoded, jpeg.EncodeOptions(quality = 85))
+    defer encoder.close()
+    let group: usize = 256
+    let band = try alloc u8[width * group * 4] in memory.heap
+    defer free(band) in memory.heap
+    var top: usize = 0
+    while top < height:
+        let count = group if top + group <= height else height - top
+        for y in 0..<count:
+            for x in 0..<width:
+                let at = (y * width + x) * 4
+                band[at] = (u8)(x * 255 // width)
+                band[at + 1] = (u8)((top + y) * 255 // height)
+                band[at + 2] = (u8)(((x + top + y) // 97) % 256)
+                band[at + 3] = 255
+        try encoder.write_rows(band[..<width * count * 4], count)
+        top += count
+    try encoder.finish()
+    try write_file(path, encoded.view())
+
+## What opening `path` in a window took: to the first frame showing the top
+## rows, and to the whole picture, in milliseconds.
+struct OpenTimes:
+    var first: u64
+    var whole: u64
+
+## Open `path` as the window does and draw it fitted a frame at a time until
+## it is whole: meanwhile edits are refused and the progress only grows.
+func open_as_window(device: gpu.Device, path: str) -> OpenTimes!:
+    var target = try gpu.Texture.create(device, opening_view_width, opening_view_height, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    let started = time.now()
+    let opened = try Canvas.open(path)
+    defer opened.release()
+    var canvas = opened.value()
+    let width = (f64)canvas.width()
+    let height = (f64)canvas.height()
+    let zoom = math.min((f64)opening_view_width / width, (f64)opening_view_height / height)
+    let middle = (u32)(width * zoom / 2.0)
+    var times = OpenTimes(first = 0, whole = 0)
+    var progress: i64 = 0
+    var refused = false
+    while true:
+        try draw_opening_frame(canvas, &target, zoom)
+        if times.first == 0 and not dark(try opening_pixel(&target, middle, 1)):
+            times.first = since(started)
+        if not canvas.is_opening():
+            break
+        assert(canvas.opening_percent() >= progress)
+        progress = canvas.opening_percent()
+        if not refused:
+            canvas.add_layer("Too soon") catch failure:
+                refused = failure.code == invalid
+                recover 0
+            assert(refused and canvas.layer_count() == 1)
+        thread.sleep(8)
+    times.whole = since(started)
+    assert(canvas.opening_percent() == 100)
+    # The last frame has the bottom rows, and the document edits again.
+    assert(not dark(try opening_pixel(&target, middle, (u32)(height * zoom) - 2)))
+    discard(try canvas.add_layer("After"))
+    canvas.close()
+    return times
+
+func draw_opening_frame(canvas: Canvas*, target: gpu.Texture*, zoom: f64) -> !:
+    let frame = try target.frame()
+    defer frame.release()
+    let root = try frame.value().target()
+    defer root.release()
+    try canvas.draw(root, gpu.Rect(width = (f64)opening_view_width, height = (f64)opening_view_height), zoom, 0.0, 0.0)
+    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+
+func opening_pixel(target: gpu.Texture*, x: u32, y: u32) -> u8[4]!:
+    var read: u8[4]
+    try target.read(read, gpu.Region(x, y, 1, 1))
+    return read
+
+func dark(color: u8[4]) -> bool:
+    return color[0] == 0 and color[1] == 0 and color[2] == 0
+
+test "an 18000 by 12000 PNG and JPEG show their first rows at once and fill in while the window stays live":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    try write_plain_png("build/open-timing.png", 18000, 12000)
+    try write_big_jpeg("build/open-timing.jpg", 18000, 12000)
+    Canvas.set_progressive_loading(true)
+    defer Canvas.set_progressive_loading(false)
+    # On this Mac (2026-09-26) the PNG showed its top rows 0.33 s after the
+    # open began and was whole at 2.5 s; before, nothing showed until 4.1 s.
+    # The JPEG: 0.46 s and 0.8 s, from 2.3 s. Generous limits for slower machines.
+    for path in ["build/open-timing.png", "build/open-timing.jpg"]:
+        let times = try open_as_window(device, path)
+        assert(times.first < 2000 and times.whole < 30000)
+
+## Every texel of `canvas`'s first layer, straight RGBA f32 a cell after another.
+func first_layer_texels(canvas: Canvas*, into: f32[]) -> !:
+    let document = canvas.document else trap("bound")
+    let layer = document.find(canvas.records[0].id) else trap("a layer")
+    let tiles = layer.tiles() else trap("pixels")
+    let cell = (usize)tile_size * (usize)tile_size * 4
+    for row in 0..<tiles.rows():
+        for column in 0..<tiles.columns():
+            let at = ((usize)row * (usize)tiles.columns() + (usize)column) * cell
+            try tiles.read_cell(column, row, into[at..<at + cell])
+
+test "a picture loaded in the background makes the same tiles as one loaded at once":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    # 8-bit RGBA with soft alpha, 16-bit RGBA (encoded samples through tables),
+    # TIFF strips (linear floats) and JPEG, each over a partial last row and column.
+    let width: usize = 700
+    let height: usize = 600
+    let bytes = try alloc u8[width * height * 4] in memory.heap
+    defer free(bytes) in memory.heap
+    let words = try alloc u16[width * height * 4] in memory.heap
+    defer free(words) in memory.heap
+    for index in 0..<bytes.length:
+        bytes[index] = (u8)((index * 7 + index // 2801) % 256)
+        words[index] = (u16)((index * 2654435761) >> 9)
+    let picture = try Image.from_rgba8(width, height, bytes)
+    defer picture.release()
+    try picture.value().save("build/background-open.png")
+    try picture.value().save("build/background-open.tif")
+    let opaque = try picture.value().convert("RGB")
+    defer opaque.release()
+    try opaque.value().save("build/background-open.jpg", quality = 85)
+    var deep = Buffer(maximum = (usize)1 << 30)
+    defer deep.close()
+    var encoder = try png.Encoder.begin(width, height, png.Format.rgba16, &deep)
+    defer encoder.close()
+    try encoder.write_rows16(words, height)
+    try encoder.finish()
+    try write_file("build/background-open-16.png", deep.view())
+    let cells = (usize)tile_columns((u32)width) * (usize)tile_columns((u32)height) * (usize)tile_size * (usize)tile_size * 4
+    let at_once = try alloc f32[cells] in memory.heap
+    defer free(at_once) in memory.heap
+    let in_background = try alloc f32[cells] in memory.heap
+    defer free(in_background) in memory.heap
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    for path in ["build/background-open.png", "build/background-open-16.png", "build/background-open.tif", "build/background-open.jpg"]:
+        let whole = try Canvas.open(path)
+        defer whole.release()
+        var synchronous = whole.value()
+        # Drawn without progressive frames, the first draw loads it all.
+        try draw_opening_frame(synchronous, &target, 0.05)
+        assert(not synchronous.is_opening())
+        try first_layer_texels(synchronous, at_once)
+        let later = try Canvas.open(path)
+        defer later.release()
+        var loading = later.value()
+        Canvas.set_progressive_loading(true)
+        var frames = 0
+        while frames == 0 or loading.is_opening():
+            draw_opening_frame(loading, &target, 0.05) catch failure:
+                Canvas.set_progressive_loading(false)
+                error(failure.code, failure.message)
+            frames += 1
+        Canvas.set_progressive_loading(false)
+        try first_layer_texels(loading, in_background)
+        for index in 0..<cells:
+            assert(at_once[index] == in_background[index])

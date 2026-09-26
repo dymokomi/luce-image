@@ -1,6 +1,7 @@
 module.lucb
 drawing.lucb
 files.lucb
+opening.lucb
 package_format.lucb
 package_save.lucb
 package_open.lucb
@@ -54,3 +55,4 @@ channel_tests.lucb
 mesh_warp_tests.lucb
 selection_timing_tests.lucb
 vector_tests.lucb
+open_timing_tests.lucb

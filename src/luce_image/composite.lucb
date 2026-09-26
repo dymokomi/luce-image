@@ -164,6 +164,21 @@ pub struct Composer:
         try self.cache.put(digest | 1, texture, tile_bytes, precious = precious_level(document.width(), document.height(), level))
         return texture
 
+    ## Forget the composites and `tiles`' level tiles over row `row` of cells,
+    ## about to change as a picture loads into `tiles` a band at a time: made
+    ## from the rows so far, they would only fill the caches until pushed out.
+    pub mutating func forget_band(document: const Document*, tiles: const Tiles*, row: u32):
+        var level: u32 = 0
+        while level <= 16:
+            let span = (u64)tile_size << level
+            let columns = (u32)(((u64)document.width() + span - 1) // span)
+            for column in 0..<columns:
+                self.cache.forget(self.composite_key(document, column, row >> level, level) | 1)
+            if (u64)document.width() <= span and (u64)document.height() <= span:
+                break
+            level += 1
+        self.pyramid.forget_band(tiles, row, false)
+
     ## What the composite of cell (`column`, `row`) at `level` is made from, as
     ## a key: every contributing layer's cells by stamp, and the stand-ins shown.
     func composite_key(document: const Document*, column: u32, row: u32, level: u32) -> u64:

@@ -1,0 +1,224 @@
+#==============================================================================================
+#
+#   canvas/opening - A picture opened as a document, loading while frames go on
+#
+#   DESCRIPTION:
+#       A 216-megapixel PNG takes seconds to decode. Rather than a blank window until it
+#       is done, the document binds at once with its layer empty, and a worker thread
+#       decodes the picture a band of 256 rows at a time (luce_image/streaming), packing
+#       each band into half-float tiles' bytes: a PNG's or JPEG's encoded samples through
+#       tables of their half floats, any other picture from linear floats. Frames upload the bands packed so far
+#       (`collect_opening`) through the layer's ordinary tiles, and the layer's pyramid is
+#       brought up to date after each, so the view fills in from the top, zoomed in or
+#       out, while the decode goes on. A few bands are packed ahead at most: the worker
+#       waits for a free slot, so memory stays a few rows of tiles whatever the picture.
+#
+#       Edits and saves are refused until it is done (`require_loaded`); `opening_percent`
+#       is the progress for the window to show.
+#
+#==============================================================================================
+
+## Bands the worker may pack ahead of the uploads.
+let opening_slots: usize = 3
+
+## A frame uploads bands for at most this long, so it stays a frame.
+let opening_upload_budget_ns: u64 = 12000000
+
+## One packed band: its row of cells, and the bytes `pack_band` made.
+struct OpeningSlot:
+    var row: u32
+    var band: u8[]
+    var painted: bool[]
+
+## A picture loading into layer `layer` of the document.
+struct Opening:
+    ## The picture, released on the main thread once the worker has stopped.
+    var picture: interop.Reference[Image]
+    var image: Image*
+    var layer: u64
+    var extent_x: u32
+    var extent_y: u32
+    var slots: OpeningSlot[3]
+    ## Each code's half float, made at the first band of encoded samples.
+    var color: u16[]
+    var alpha: u16[]
+    ## Slots the worker may fill; the uploads give them back.
+    var free_slots: sync.Semaphore
+    ## Bands packed (by the worker) and uploaded (by frames).
+    var packed: @usize
+    var uploaded: usize
+    ## Picture rows decoded, for the progress.
+    var rows: @usize
+    var finished: @u32
+    var cancelled: @u32
+    ## The worker's failure, if any, kept until the frame that reports it.
+    var failed: bool
+    var failure_code: ErrorCode
+    var failure_text: u8[256]
+    var failure_length: usize
+    var handle: thread.Handle
+    var started: bool
+
+## Whether `picture`, the document's own picture, loads in the background:
+## frames draw progressively (the window's setting) and it decodes on the CPU
+## alone (a camera raw develops on the GPU; an SVG draws with the fonts).
+func opens_in_background(canvas: const Canvas*, picture: interop.Reference[Image]) -> bool:
+    return canvas.open_in_background and progressive_loading and not picture.value().is_camera_raw()
+
+## Start loading `picture` into record `index`'s layer: the layer gets empty
+## tiles now, and a worker begins decoding.
+func begin_opening(canvas: Canvas*, index: usize, picture: interop.Reference[Image]) -> !:
+    let device = canvas.device else trap("bound")
+    let document = canvas.document else trap("bound")
+    var tiles = try Tiles.create(device, canvas.extent_x, canvas.extent_y)
+    try document.set_tiles(canvas.records[index].id, tiles)
+    let opening = try new Opening(picture = picture, image = picture.value(), layer = canvas.records[index].id, extent_x = canvas.extent_x, extent_y = canvas.extent_y,
+                                  uploaded = 0, failed = false, failure_code = invalid, failure_length = 0, started = false) in memory.heap
+    errdefer free_opening(opening)
+    for slot in 0..<opening_slots:
+        opening.slots[slot].band = try alloc u8[packed_band_bytes(canvas.extent_x)] in memory.heap
+        opening.slots[slot].painted = try alloc bool[(usize)tile_columns(canvas.extent_x)] in memory.heap
+    for unused in 0..<opening_slots:
+        opening.free_slots.release()
+    opening.handle = try thread.spawn(opening_worker, (void*)opening, name = "picture open")
+    opening.started = true
+    canvas.opening = opening
+
+## The worker: the picture a band at a time into the slots.
+func opening_worker(context: void*?):
+    let opening = (Opening*)(context else return)
+    opening_decode(opening) catch failure:
+        if opening.cancelled.load(.acquire) == 0:
+            let length = failure.message.length if failure.message.length < opening.failure_text.length else opening.failure_text.length
+            memory.copy(opening.failure_text, failure.message.bytes, length)
+            opening.failure_length = length
+            opening.failure_code = failure.code
+            opening.failed = true
+        recover ()
+    opening.finished.store(1, .release)
+
+## Encoded samples where the format gives them, else linear floats.
+func opening_decode(opening: Opening*) -> !:
+    if not (try opening.image.encoded_rgba_bands((usize)tile_size, opening_coded_band, (void*)opening)):
+        try opening.image.linear_rgba_bands((usize)tile_size, opening_band, (void*)opening)
+
+## `linear_rgba_bands`' sink on the worker: pack the band into a free slot.
+func opening_band(context: void*?, first: usize, count: usize, pixels: f32[]) -> !:
+    let opening = (Opening*)(context else return)
+    let slot = try free_slot(opening, first)
+    try pack_band(opening.extent_x, opening.extent_y, slot.row, pixels, slot.band, slot.painted)
+    band_packed(opening, first + count)
+
+## `encoded_rgba_bands`' sink on the worker: the samples through the tables into a free slot.
+func opening_coded_band(context: void*?, first: usize, count: usize, samples: const u8[], deep: bool) -> !:
+    let opening = (Opening*)(context else return)
+    let slot = try free_slot(opening, first)
+    if opening.color.length == 0:
+        let codes: usize = 65536 if deep else 256
+        opening.color = try alloc u16[codes] in memory.heap
+        opening.alpha = try alloc u16[codes] in memory.heap
+        try encoded_tables(deep, opening.color, opening.alpha)
+    try pack_band_coded(opening.extent_x, opening.extent_y, slot.row, samples, deep, opening.color, opening.alpha, slot.band, slot.painted)
+    band_packed(opening, first + count)
+
+## The slot for the band starting at picture row `first`, once the uploads
+## have left one free.
+func free_slot(opening: Opening*, first: usize) -> OpeningSlot*!:
+    opening.free_slots.acquire()
+    if opening.cancelled.load(.acquire) != 0:
+        error(invalid, "the document closed while its picture opened")
+    let slot = &opening.slots[opening.packed.load(.acquire) % opening_slots]
+    slot.row = (u32)(first // (usize)tile_size)
+    return slot
+
+## A slot is packed, the picture's rows through `rows` with it.
+func band_packed(opening: Opening*, rows: usize):
+    opening.rows.store(rows, .release)
+    discard(opening.packed.add(1))
+
+## Upload the bands packed since the last frame (for a frame's time at most),
+## each followed by the pyramid levels it completes, and once the worker is
+## done, finish: its failure, if any, is returned here, once.
+func collect_opening(canvas: Canvas*) -> !:
+    let opening = canvas.opening else return
+    let document = canvas.document else return
+    let composer = canvas.composer else return
+    let layer = document.find(opening.layer) else trap("the opening layer is gone")
+    let tiles = layer.tiles() else trap("the opening layer has no tiles")
+    let started = time.now()
+    while opening.uploaded < opening.packed.load(.acquire):
+        let slot = &opening.slots[opening.uploaded % opening_slots]
+        # What was made from this row so far is stale once it is in.
+        composer.forget_band(document, tiles, slot.row)
+        try tiles.write_packed(slot.row, slot.band, slot.painted)
+        try build_band_levels(canvas, composer, tiles, slot.row)
+        opening.uploaded += 1
+        opening.free_slots.release()
+        try settle_job(canvas)
+        if time.now() - started > opening_upload_budget_ns:
+            break
+    if opening.finished.load(.acquire) == 0 or opening.uploaded < opening.packed.load(.acquire):
+        return
+    canvas.opening = none
+    let failed = opening.failed
+    let code = opening.failure_code
+    # The message outlives the opening: the canvas keeps it.
+    let length = opening.failure_length
+    memory.copy(canvas.open_failure, opening.failure_text, length)
+    free_opening(opening)
+    if failed:
+        error(code, (str)canvas.open_failure[..<length])
+
+## The level tiles row `row` of cells completes, each level's row made once
+## every row of cells under it is in: a zoomed-out view has the rows loaded so
+## far ready, and no level tile is made twice.
+func build_band_levels(canvas: Canvas*, composer: Composer*, tiles: const Tiles*, row: u32) -> !:
+    let pyramid = composer.levels()
+    let last = row + 1 == tile_columns(canvas.extent_y)
+    let mark = transient_mark()
+    defer release_transients(mark)
+    var level: u32 = 1
+    while level <= 16 and (last or (row + 1) % (1u32 << level) == 0):
+        for column in 0..<level_cells(canvas.extent_x, level):
+            pyramid.hold()
+            discard(try pyramid.texture(tiles, column, row >> level, level))
+        if level_cells(canvas.extent_x, level) == 1 and level_cells(canvas.extent_y, level) == 1:
+            return
+        level += 1
+
+## Stop a load under way (the document is closing): the worker ends at its
+## next band and the picture goes.
+func cancel_opening(canvas: Canvas*):
+    let opening = canvas.opening else return
+    canvas.opening = none
+    opening.cancelled.store(1, .release)
+    for unused in 0..<opening_slots:
+        opening.free_slots.release()
+    free_opening(opening)
+
+## Join the worker (it has stopped or is stopping) and free everything.
+func free_opening(opening: Opening*):
+    if opening.started:
+        opening.handle.join() catch _:
+            recover ()
+    opening.picture.release()
+    if opening.color.length > 0:
+        free(opening.color) in memory.heap
+        free(opening.alpha) in memory.heap
+    for slot in 0..<opening_slots:
+        if opening.slots[slot].band.length > 0:
+            free(opening.slots[slot].band) in memory.heap
+        if opening.slots[slot].painted.length > 0:
+            free(opening.slots[slot].painted) in memory.heap
+    free(opening) in memory.heap
+
+## How far the picture has come, 0..100; 100 when nothing is opening.
+func opening_progress(canvas: const Canvas*) -> i64:
+    let opening = canvas.opening else return 100
+    let rows = (u64)opening.rows.load(.acquire)
+    return (i64)(rows * 100 // (u64)opening.extent_y)
+
+## Refuse what changes or saves the document while its picture is still opening.
+func require_loaded(canvas: const Canvas*) -> !:
+    if canvas.opening != none:
+        error(invalid, "the picture is still opening")

@@ -1,0 +1,75 @@
+## A timing program for opening a large picture as the editor does: the
+## document opened and drawn fitted into a 1600 by 1000 view, a frame each
+## 1/60 s as a window draws, until the picture is whole. It prints milliseconds to the file read
+## and probed, to the first frame showing the picture's top rows, and to the
+## whole picture, then the frames drawn. `--background` loads as the window does
+## (canvas/opening); without it the first draw decodes it all. Peak memory is
+## the caller's to measure (`/usr/bin/time -l`).
+import gpu
+import thread
+import time
+from luce_image.canvas import Canvas
+
+let view_width: u32 = 1600
+let view_height: u32 = 1000
+
+pub func main(arguments: str[]) -> i32!:
+    if arguments.length < 2:
+        print("usage: open_benchmark PICTURE [--background]")
+        return 2
+    let background = arguments.length > 2 and arguments[2] == "--background"
+    Canvas.set_progressive_loading(background)
+    var device = try gpu.Device.open()
+    defer device.destroy()
+    var target = try gpu.Texture.create(device, view_width, view_height, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    let started = time.now()
+    let opened = try Canvas.open(arguments[1])
+    defer opened.release()
+    let canvas = opened.value()
+    let probed = time.now()
+    let width = (f64)canvas.width()
+    let height = (f64)canvas.height()
+    let zoom = (f64)view_width / width if (f64)view_width / width < (f64)view_height / height else (f64)view_height / height
+    # Samples in the middle of the picture's columns.
+    let middle = (u32)(width * zoom / 2.0)
+    var first: u64 = 0
+    var frames: u64 = 0
+    while true:
+        let frame_started = time.now()
+        try draw_fitted(canvas, &target, zoom)
+        frames += 1
+        # The picture's top rows are on screen once the view's second row is not the clear black.
+        if first == 0 and not black(try pixel(&target, middle, 1)):
+            first = time.now()
+        if not canvas.is_opening():
+            break
+        let spent = (time.now() - frame_started) // 1000000
+        if spent < 16:
+            thread.sleep(16 - spent)
+    let whole = time.now()
+    # The last rows are in the last frame.
+    let bottom = (u32)(height * zoom) - 2
+    if black(try pixel(&target, middle, bottom)):
+        print("the picture's bottom rows are missing")
+        return 1
+    print(f"read {(probed - started) // 1000000} ms  first {(first - started) // 1000000} ms  whole {(whole - started) // 1000000} ms  frames {frames}")
+    print(f"tiles on the GPU {canvas.memory_gpu_bytes() // 1048576} MiB, in RAM {canvas.memory_ram_bytes() // 1048576} MiB, derived {canvas.memory_derived_bytes() // 1048576} MiB, process {canvas.memory_process_bytes() // 1048576} MiB")
+    canvas.close()
+    return 0
+
+func draw_fitted(canvas: Canvas*, target: gpu.Texture*, zoom: f64) -> !:
+    let frame = try target.frame()
+    defer frame.release()
+    let root = try frame.value().target()
+    defer root.release()
+    try canvas.draw(root, gpu.Rect(width = (f64)view_width, height = (f64)view_height), zoom, 0.0, 0.0)
+    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+
+func pixel(target: gpu.Texture*, x: u32, y: u32) -> u8[4]!:
+    var read: u8[4]
+    try target.read(read, gpu.Region(x, y, 1, 1))
+    return read
+
+func black(color: u8[4]) -> bool:
+    return color[0] == 0 and color[1] == 0 and color[2] == 0

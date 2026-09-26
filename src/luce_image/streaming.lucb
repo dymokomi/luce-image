@@ -10,6 +10,11 @@
 #       band of rows at a time (`stream_linear`), each band made and passed on before the next
 #       is decoded. The canvas turns each band of 256 rows into a row of tiles.
 #
+#       A PNG or JPEG can also go as its encoded 8 or 16-bit RGBA samples (`stream_encoded`),
+#       for a reader that turns codes into what it keeps through tables (`encoded_tables`)
+#       rather than making floats first: what lets a document's tiles keep up with the
+#       decoder when a picture opens.
+#
 #==============================================================================================
 
 import math
@@ -18,12 +23,18 @@ import png
 import jpeg
 import tiff
 import raster as model
+from half import to_half
 from raster_errors import invalid
 
 ## Receives rows `first..<first + count` of a picture as linear-light straight
 ## RGBA f32, `width * count * 4` samples, in order from the top. The samples
 ## are valid only during the call.
 pub type LinearSink = func(void*?, usize, usize, f32[]) -> unit!
+
+## Receives rows `first..<first + count` of a picture as encoded RGBA, in
+## order from the top: 8-bit samples, or native-endian 16-bit ones when the
+## last argument says so. The samples are valid only during the call.
+pub type EncodedSink = func(void*?, usize, usize, const u8[], bool) -> unit!
 
 ## The sRGB decoding of an encoded component in 0..1.
 pub func decode_srgb(value: f64) -> f64:
@@ -70,6 +81,70 @@ pub func stream_linear(raster: model.Raster*, rows: usize, sink: LinearSink, con
     if banding.top + banding.filled != banding.height:
         error(invalid, "the picture ended before its last row")
     return true
+
+## `raster`'s picture (probed, not decoded) to `sink` in bands of `rows` as
+## the encoded samples its decoder makes, when it is a PNG or a JPEG; false
+## for any other, which goes through `stream_linear`.
+pub func stream_encoded(raster: model.Raster*, rows: usize, sink: EncodedSink, context: void*?) -> bool!:
+    let named = raster.file_format
+    if named != "PNG" and named != "JPEG":
+        return false
+    if rows == 0:
+        error(invalid, "a band has at least one row")
+    let deep = named == "PNG" and (try png.info(raster.encoded)).bits == 16
+    let pixel: usize = 8 if deep else 4
+    var banding = EncodedBands(width = raster.width, height = raster.height, rows = rows, pixel = pixel, deep = deep, band = try alloc u8[raster.width * rows * pixel] in memory.heap,
+                               top = 0, filled = 0, sink = sink, context = context)
+    defer free(banding.band) in memory.heap
+    if named == "PNG":
+        try png.decode_rows(raster.encoded, encoded_rows, (void*)&banding, deep, png.DecodeOptions(max_bytes = raster.max_bytes))
+    else:
+        try jpeg.decode_rows(raster.encoded, encoded_rows, (void*)&banding, .rgba, jpeg.Options(max_bytes = raster.max_bytes))
+    if banding.top + banding.filled != banding.height:
+        error(invalid, "the picture ended before its last row")
+    return true
+
+## Each code's half float for `stream_encoded`'s samples: `color` as linear
+## light from sRGB, `alpha` as coverage; 256 entries each, 65536 when `deep`.
+pub func encoded_tables(deep: bool, color: u16[], alpha: u16[]) -> !:
+    let codes: usize = 65536 if deep else 256
+    if color.length < codes or alpha.length < codes:
+        error(invalid, "a table has an entry for every code")
+    let maximum = (f64)(codes - 1)
+    for code in 0..<codes:
+        color[code] = to_half((f32)decode_srgb((f64)code / maximum))
+        alpha[code] = to_half((f32)((f64)code / maximum))
+
+## Encoded rows gathered into bands of `rows` for a sink.
+struct EncodedBands:
+    var width: usize
+    var height: usize
+    var rows: usize
+    ## Bytes a pixel: 4, or 8 for 16-bit samples.
+    var pixel: usize
+    var deep: bool
+    var band: u8[]
+    var top: usize
+    var filled: usize
+    var sink: EncodedSink
+    var context: void*?
+
+## A decoder's rows into the band; a full band (or the last) goes to the sink.
+func encoded_rows(context: void*?, first: usize, count: usize, bytes: const u8[]) -> !:
+    let banding = (EncodedBands*)(context else return)
+    let line = banding.width * banding.pixel
+    var at: usize = 0
+    while at < count:
+        if first + at != banding.top + banding.filled:
+            error(invalid, "a picture's rows came out of order")
+        let taken = min_rows(count - at, banding.rows - banding.filled)
+        memory.copy(banding.band[banding.filled * line..], bytes[at * line..], taken * line)
+        banding.filled += taken
+        at += taken
+        if banding.filled == banding.rows or banding.top + banding.filled == banding.height:
+            try banding.sink(banding.context, banding.top, banding.filled, banding.band[..<banding.filled * line], banding.deep)
+            banding.top += banding.filled
+            banding.filled = 0
 
 ## `table[value]`: encoded `value` of `maximum` as linear light.
 func fill_table(table: f32[], maximum: f64):
