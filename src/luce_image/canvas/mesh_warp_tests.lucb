@@ -1,6 +1,6 @@
 #==============================================================================================
 #
-#   canvas/mesh_warp_tests - Warp and Puppet Warp: identity, bends, previews, undo
+#   canvas/mesh_warp_tests - Warp and Puppet Warp: identity, bends, previews, undo, big canvases
 #
 #==============================================================================================
 
@@ -99,3 +99,31 @@ test "puppet pins left in place change nothing, and a dragged pin bends its side
     let same = try pushed_samples(&canvas, layer, 600, 400)
     defer free(same) in memory.heap
     assert(alpha_at(same, 450, 60) == alpha_at(moved, 450, 60))
+
+test "a puppet warp on 15000 by 24000 makes only the cells its box leaves or lands on":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(15000, 24000)
+    defer canvas.close()
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    let layer = try canvas.add_layer("Paint")
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.1, 0.2, 1.0, false)
+    try canvas.select_rectangle(7000, 12000, 1000, 800, 0)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    let started = time.now()
+    try canvas.begin_puppet(layer)
+    discard(try canvas.puppet_add_pin(7100.0, 12400.0))
+    discard(try canvas.puppet_add_pin(7900.0, 12400.0))
+    try canvas.puppet_move_pin(1, 7900.0, 12100.0)
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.end_mesh_warp(true)
+    let elapsed = time.now() - started
+    # The box spans 5 by 4 cells and rises 300 pixels at most: 5 by 6, of 59 by 94.
+    assert(canvas.mesh_cells_made > 0 and canvas.mesh_cells_made <= 36)
+    assert(elapsed < 10000000000)
+    assert(canvas.undo_name() == "Puppet Warp")

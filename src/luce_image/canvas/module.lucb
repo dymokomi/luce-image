@@ -226,6 +226,8 @@ pub struct Canvas:
     var liquify: Liquifying*?
     ## A Warp or Puppet Warp under way (canvas/mesh_warping.lucb).
     var mesh_warp: MeshWarping*?
+    ## Cells the last kept warp made at full size (tests hold it to its box).
+    var mesh_cells_made: usize
     var heal_opacity: f64
     ## Inside `begin_edit`: changes record nothing more, the edit's first snapshot covers them.
     var edit_depth: i64
@@ -336,6 +338,7 @@ pub struct Canvas:
         self.warp_async = true
         self.liquify = none
         self.mesh_warp = none
+        self.mesh_cells_made = 0
         self.smudge_spacing = default_smudge_spacing
         self.transform_session = none
         self.selection_origin = none

@@ -130,9 +130,10 @@ func end_mesh_warp(canvas: Canvas*, keep: bool) -> !:
     let last_column = (u32)math.min((f64)tiles.columns() - 1.0, math.floor((right + 1.0) / span))
     let last_row = (u32)math.min((f64)tiles.rows() - 1.0, math.floor((bottom + 1.0) / span))
     if right >= 0.0 and bottom >= 0.0:
-        var into = Landing(tiles = tiles)
+        var into = Landing(tiles = tiles, made = 0)
         for row in first_row..<last_row + 1:
             try shown.mesher.row_of_cells(&mesh, &shown.original, composer.levels(), row, first_column, last_column, mesh_threads, (void*)&into, land)
+        canvas.mesh_cells_made = into.made
     layer.revision += 1
     try canvas.restrict_to_selection(shown.layer, &canvas.history[canvas.history_count - 1].tiles)
 
@@ -142,9 +143,11 @@ let mesh_threads: usize = 8
 ## Where a kept warp's cells go: the layer's tiles.
 struct Landing:
     var tiles: Tiles*
+    var made: usize
 
 func land(context: void*, column: u32, row: u32, made: gpu.Texture?) -> !:
     let into = (Landing*)context
+    into.made += 1
     if let texture = made:
         try into.tiles.set(column, row, texture)
     else:
