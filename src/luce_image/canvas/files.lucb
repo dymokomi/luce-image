@@ -4,6 +4,9 @@
 #
 #==============================================================================================
 
+## The most pixels a flattened save in a format without streaming takes (TIFF, OpenEXR).
+let whole_picture_save_limit: u64 = 64 * 1024 * 1024
+
 ## The deflate level of a PNG export.
 let png_export_level: i32 = 4
 
@@ -11,12 +14,20 @@ let png_export_level: i32 = 4
 func save_flattened(canvas: Canvas*, path: str, quality: i64, matte_red: f64, matte_green: f64, matte_blue: f64) -> !:
     let lower = try strings.to_lower(path)
     defer strings.release(lower)
-    if matte_red >= 0.0 and (strings.ends_with(lower, ".jpg") or strings.ends_with(lower, ".jpeg")):
-        try save_jpeg_streamed(canvas, path, quality, matte_red, matte_green, matte_blue)
+    if strings.ends_with(lower, ".jpg") or strings.ends_with(lower, ".jpeg"):
+        # JPEG has no alpha: without a matte, white is what shows through.
+        if matte_red >= 0.0:
+            try save_jpeg_streamed(canvas, path, quality, matte_red, matte_green, matte_blue)
+        else:
+            try save_jpeg_streamed(canvas, path, quality, 1.0, 1.0, 1.0)
         return
     if strings.ends_with(lower, ".png"):
         try save_png_streamed(canvas, path, matte_red, matte_green, matte_blue)
         return
+    # TIFF and OpenEXR encode a whole picture at once; past a size their
+    # encoders would need the document many times over in memory.
+    if (u64)canvas.extent_x * (u64)canvas.extent_y > whole_picture_save_limit:
+        error(limit, "documents over 64 megapixels export as PNG or JPEG, or save as .l2d; TIFF and OpenEXR are not streamed yet")
     let pixels = try flattened_pixels(canvas)
     defer free(pixels) in memory.heap
     # Under a matte (linear light; a negative red means none) the picture comes out
@@ -139,33 +150,67 @@ func level_size(extent: u32, level: u32) -> u32:
 func measure_trim_bounds(canvas: Canvas*, based_on: i64) -> bool!:
     if based_on < 0 or based_on > 2:
         error(invalid, "trim is based on 0 transparency, 1 the top-left color or 2 the bottom-right color")
-    let pixels = try flattened_pixels(canvas)
-    defer free(pixels) in memory.heap
+    # The flattened picture a band of 8-bit sRGB rows at a time: what Trim
+    # compares (a step of 8-bit color) without the document in floats.
+    var corner: u8[4] = [0, 0, 0, 0]
+    # Before the scan's bands open: each holds two of the device's three read slots.
+    if based_on == 2:
+        corner = try bottom_right_pixel(canvas)
+    var bands = try Bands.begin(canvas, [-1.0, -1.0, -1.0])
+    defer bands.close()
     let width = (usize)canvas.extent_x
-    let height = (usize)canvas.extent_y
-    let corner = 0 if based_on == 1 else (width * height - 1)
+    let band_count = tile_columns(canvas.extent_y)
     var found = false
-    var bounds = Bounds(left = (i64)width, top = (i64)height, right = 0, bottom = 0)
-    for y in 0..<height:
-        for x in 0..<width:
-            let at = (y * width + x) * 4
-            var kept = false
-            if based_on == 0:
-                kept = pixels[at + 3] > 0.0
-            else:
-                # Unlike the corner by more than a step of 8-bit color.
-                for channel in 0..<(usize)4:
-                    if math.abs((f64)(pixels[at + channel] - pixels[corner * 4 + channel])) > 0.5 / 255.0:
-                        kept = true
-            if not kept:
+    var bounds = Bounds(left = (i64)width, top = (i64)canvas.extent_y, right = 0, bottom = 0)
+    for row in 0..<band_count:
+        let rows = try bands.fill(canvas, row)
+        if row == 0 and based_on == 1:
+            for channel in 0..<(usize)4:
+                corner[channel] = bands.band[channel]
+        for y in 0..<rows:
+            let line = y * width * 4
+            # From the left to the first kept pixel, and from the right to the last.
+            var first = width
+            for x in 0..<width:
+                if trim_kept(bands.band, line + x * 4, based_on, corner):
+                    first = x
+                    break
+            if first == width:
                 continue
+            var last = first
+            var x = width
+            while x > first + 1:
+                x -= 1
+                if trim_kept(bands.band, line + x * 4, based_on, corner):
+                    last = x
+                    break
+            let document_y = (i64)(row * tile_size) + (i64)y
             found = true
-            bounds.left = math.imin(bounds.left, (i64)x)
-            bounds.top = math.imin(bounds.top, (i64)y)
-            bounds.right = math.imax(bounds.right, (i64)x + 1)
-            bounds.bottom = math.imax(bounds.bottom, (i64)y + 1)
+            bounds.left = math.imin(bounds.left, (i64)first)
+            bounds.right = math.imax(bounds.right, (i64)last + 1)
+            bounds.top = math.imin(bounds.top, document_y)
+            bounds.bottom = math.imax(bounds.bottom, document_y + 1)
     canvas.content = bounds if found else Bounds(left = 0, top = 0, right = 0, bottom = 0)
     return found
+
+## The flattened picture's bottom-right pixel as 8-bit sRGB, from its last band
+## on bands of their own (the scan that follows goes through them in order).
+func bottom_right_pixel(canvas: Canvas*) -> u8[4]!:
+    var bands = try Bands.begin(canvas, [-1.0, -1.0, -1.0])
+    defer bands.close()
+    let width = (usize)canvas.extent_x
+    let rows = try bands.fill(canvas, tile_columns(canvas.extent_y) - 1)
+    let at = ((rows - 1) * width + width - 1) * 4
+    # Copied out first: returning the array made from the band straight away, with
+    # `bands.close()` pending, double-freed (a compiler bug to look at separately).
+    var pixel: u8[4] = [bands.band[at], bands.band[at + 1], bands.band[at + 2], bands.band[at + 3]]
+    return pixel
+
+## Whether the pixel at `at` stays: any alpha (`based_on` 0), else unlike `corner`.
+func trim_kept(band: const u8[], at: usize, based_on: i64, corner: u8[4]) -> bool:
+    if based_on == 0:
+        return band[at + 3] > 0
+    return band[at] != corner[0] or band[at + 1] != corner[1] or band[at + 2] != corner[2] or band[at + 3] != corner[3]
 
 ## A text layer's words and setting, in its manifest element.
 func write_type(manifest: prism.Document*, element: str, spec: TypeSpec) -> !:
@@ -279,9 +324,26 @@ func read_shape(doc: prism.Document*, element: str, canvas: Canvas*, id: i64) ->
 func type_value_names() -> str[10]:
     return ["type_size", "type_red", "type_green", "type_blue", "type_x", "type_y", "box_width", "alignment", "tracking", "leading"]
 
+## Pictures a document opens or places may be this large: they go to tiles a
+## band at a time (`linear_rgba_bands`), so only the file itself is held.
+let picture_pixels: usize = (usize)1 << 32
+let picture_bytes: usize = (usize)1 << 40
+
+## Tiles being made from a picture, a band of 256 rows at a time.
+struct PictureBands:
+    var canvas: Canvas*
+    var tiles: Tiles*
+
+## `linear_rgba_bands`' sink: a band of rows becomes a row of cells.
+func picture_band(context: void*?, first: usize, count: usize, pixels: f32[]) -> !:
+    let banding = (PictureBands*)(context else return)
+    discard(count)
+    try banding.tiles.write_band((u32)(first // (usize)tile_size), pixels)
+    try settle_job(banding.canvas)
+
 ## `Canvas.place_layer`: the picture at `path` on layer `id`, centred on a document point.
 func place_picture(canvas: Canvas*, id: i64, path: str, center_x: i64, center_y: i64) -> !:
-    let picture = try Image.open(path)
+    let picture = try Image.open(path, max_bytes = picture_bytes, max_pixels = picture_pixels)
     defer picture.release()
     try place_image_at(canvas, id, picture, center_x, center_y)
 
@@ -293,33 +355,9 @@ func place_image_at(canvas: Canvas*, id: i64, picture: interop.Reference[Image],
     discard(try canvas.index((u64)id))
     let width = try picture.value().width()
     let height = try picture.value().height()
-    let source = try alloc f32[width * height * 4] in memory.heap
-    defer free(source) in memory.heap
-    try picture.value().linear_rgba(source)
-    let x = center_x - (i64)width // 2
-    let y = center_y - (i64)height // 2
-    let columns = (usize)canvas.extent_x
-    let rows = (usize)canvas.extent_y
-    let pixels = try alloc f32[columns * rows * 4] in memory.heap
-    defer free(pixels) in memory.heap
-    for index in 0..<pixels.length:
-        pixels[index] = 0.0
-    for row in 0..<height:
-        let target_y = y + (i64)row
-        if target_y < 0 or target_y >= (i64)canvas.extent_y:
-            continue
-        for column in 0..<width:
-            let target_x = x + (i64)column
-            if target_x < 0 or target_x >= (i64)canvas.extent_x:
-                continue
-            let from_index = (row * width + column) * 4
-            let to_index = ((usize)target_y * columns + (usize)target_x) * 4
-            for channel in 0..<(usize)4:
-                pixels[to_index + channel] = source[from_index + channel]
-    let device = canvas.device else error(invalid, "the document is not bound to a device")
-    var tiles = try Tiles.create(device, canvas.extent_x, canvas.extent_y)
-    errdefer tiles.destroy()
-    try tiles.write(pixels)
+    # The picture's tiles a band at a time, moved onto the canvas's grid: what
+    # lies past the canvas is kept past it, as a moved layer keeps it.
+    let tiles = try canvas.tiles_of(picture, center_x - (i64)width // 2, center_y - (i64)height // 2)
     try document.set_tiles((u64)id, tiles)
 
 ## `Canvas.open`: a picture, a Photoshop document or an `.l2d` package, by extension.
@@ -328,7 +366,7 @@ func open_canvas(path: str) -> interop.Reference[Canvas]!:
         return try open_package(path)
     if ends_with(path, ".psd") or ends_with(path, ".PSD") or ends_with(path, ".psb") or ends_with(path, ".PSB"):
         return try open_psd(path)
-    let picture = try Image.open(path)
+    let picture = try Image.open(path, max_bytes = picture_bytes, max_pixels = picture_pixels)
     errdefer picture.release()
     let width = try picture.value().width()
     let height = try picture.value().height()

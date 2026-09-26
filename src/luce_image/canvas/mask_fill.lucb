@@ -1,0 +1,53 @@
+#==============================================================================================
+#
+#   canvas/mask_fill - A new mask filled black, or from the selection, a cell at a time
+#
+#   DESCRIPTION:
+#       A mask's empty cell reads as white, so a mask needs tiles only where it hides
+#       something. Filled black, every cell shares one black tile. Filled from the selection,
+#       a cell wholly selected stays empty, one the selection's box misses shares the black
+#       tile, and only the cells the selection's edge crosses are drawn, one cell's samples at
+#       a time: nothing the size of the document is ever made.
+#
+#==============================================================================================
+
+## Fill `mask` (fresh, all white) black, or from the canvas's current selection.
+func fill_mask_cells(canvas: Canvas*, mask: Tiles*, from_selection: bool) -> !:
+    let selection = canvas.current()
+    let side = (usize)tile_size
+    let samples = try alloc f32[side * side * 4] in memory.heap
+    defer free(samples) in memory.heap
+    # The first cell painted black; every other black cell shares its tile.
+    var black_column: u32 = 0
+    var black_row: u32 = 0
+    var black_made = false
+    for row in 0..<mask.rows():
+        for column in 0..<mask.columns():
+            let left = (i64)(column * tile_size)
+            let top = (i64)(row * tile_size)
+            var black = not from_selection
+            if from_selection:
+                if selection.cell_full(column, row):
+                    continue
+                black = selection.is_empty() or left >= selection.right or top >= selection.bottom or left + (i64)tile_size <= selection.left or top + (i64)tile_size <= selection.top
+            if black:
+                if black_made:
+                    try mask.share(column, row, black_column, black_row)
+                    continue
+                for index in 0..<samples.length:
+                    samples[index] = 1.0 if index % 4 == 3 else 0.0
+                try mask.write_cell_premultiplied(column, row, samples)
+                black_column = column
+                black_row = row
+                black_made = true
+                continue
+            # The selection's edge crosses this cell: its coverage, opaque gray.
+            for y in 0..<side:
+                for x in 0..<side:
+                    let value = (f32)selection.at(left + (i64)x, top + (i64)y) / 255.0
+                    let at = (y * side + x) * 4
+                    samples[at] = value
+                    samples[at + 1] = value
+                    samples[at + 2] = value
+                    samples[at + 3] = 1.0
+            try mask.write_cell_premultiplied(column, row, samples)

@@ -1,0 +1,446 @@
+#==============================================================================================
+#
+#   canvas/moat_tests - Large-canvas paths that work a cell at a time
+#
+#==============================================================================================
+
+## The mask's value at (`x`, `y`) as read back: empty cells are white.
+func mask_value_at(mask: const Tiles*, samples: f32[], x: i64, y: i64) -> f32!:
+    let column = (u32)(x // (i64)tile_size)
+    let row = (u32)(y // (i64)tile_size)
+    if not mask.painted(column, row):
+        return 1.0
+    try mask.read_cell(column, row, samples)
+    return samples[(usize)((y % (i64)tile_size) * (i64)tile_size + x % (i64)tile_size) * 4]
+
+test "a mask filled from the selection matches it pixel for pixel; a black mask shares one tile":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(900, 700)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    # Wholly selected cells, cells the selection misses, and edges across cells.
+    try canvas.select_rectangle(10, 20, 600, 500)
+    try canvas.select_ellipse(500, 300, 380, 360, 1)
+    try canvas.set_mask(layer, true, 2)
+    let document = canvas.document else trap("bound")
+    let mask = (document.find((u64)layer) else trap("layer")).mask_tiles() else trap("masked")
+    let samples = try alloc f32[(usize)tile_size * (usize)tile_size * 4] in memory.heap
+    defer free(samples) in memory.heap
+    let selection = canvas.current()
+    var y: i64 = 0
+    while y < 700:
+        var x: i64 = 0
+        while x < 900:
+            let expected = (f32)selection.at(x, y) / 255.0
+            let found = try mask_value_at(mask, samples, x, y)
+            assert(math.abs((f64)(found - expected)) < 0.002)
+            x += 7
+        y += 5
+    # A wholly selected cell holds no tile at all.
+    assert(not mask.painted(1, 1))
+    try canvas.set_mask(layer, false)
+    try canvas.deselect()
+    try canvas.set_mask(layer, true, 1)
+    let black = (document.find((u64)layer) else trap("layer")).mask_tiles() else trap("masked")
+    assert(black.stamp(0, 0) == black.stamp(3, 2) and black.painted(3, 2))
+    assert((try mask_value_at(black, samples, 850, 650)) == 0.0)
+
+test "copy reads only the selection's box, from the layer or merged, across cell edges":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(700, 500)
+    defer canvas.close()
+    let background = try canvas.add_layer("Background")
+    let paint = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, false)
+    try canvas.fill(background, false)
+    try canvas.select_rectangle(200, 150, 300, 250)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.fill(paint, false)
+    try canvas.deselect()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    # A box across the square's corner and three cell edges.
+    let width: usize = 180
+    let height: usize = 140
+    let rgba = try alloc u8[width * height * 4] in memory.heap
+    defer free(rgba) in memory.heap
+    let document = canvas.document else trap("bound")
+    let tiles = (document.find((u64)paint) else trap("layer")).tiles() else trap("pixels")
+    try copy_layer_window(tiles, rgba, 150, 100, width, height)
+    # (150,100) is outside the square: clear. (260,200) inside: opaque red.
+    assert(rgba[3] == 0)
+    let inside = ((200 - 100) * width + (260 - 150)) * 4
+    assert(rgba[inside] == 255 and rgba[inside + 1] == 0 and rgba[inside + 3] == 255)
+    try copy_merged_window(&canvas, rgba, 150, 100, width, height)
+    # Merged: white where the square is not, red where it is.
+    assert(rgba[0] == 255 and rgba[1] == 255 and rgba[2] == 255 and rgba[3] == 255)
+    assert(rgba[inside] == 255 and rgba[inside + 1] == 0 and rgba[inside + 3] == 255)
+
+test "trim finds the box across cells from composited bands, on transparency and on a corner color":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(900, 700)
+    defer canvas.close()
+    let paint = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.2, 0.4, 0.6, false)
+    try canvas.select_rectangle(123, 240, 555, 301)
+    try canvas.fill(paint, false)
+    try canvas.select_rectangle(700, 600, 9, 7)
+    try canvas.fill(paint, false)
+    try canvas.deselect()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    assert(try canvas.measure_trim(0))
+    assert(canvas.content_left() == 123 and canvas.content_top() == 240 and canvas.content_width() == 709 - 123 and canvas.content_height() == 607 - 240)
+    # The top-left corner is clear too: the same box.
+    assert(try canvas.measure_trim(1))
+    assert(canvas.content_left() == 123 and canvas.content_width() == 709 - 123)
+
+test "the histogram counts a layer's cells and the picture's bands, transparency left out":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(700, 500)
+    defer canvas.close()
+    let paint = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.2, 0.4, 0.6, false)
+    try canvas.select_rectangle(200, 150, 300, 250)
+    try canvas.fill(paint, false)
+    try canvas.deselect()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.measure_histogram(paint)
+    let red = (i64)srgb_byte(0.2)
+    let blue = (i64)srgb_byte(0.6)
+    assert((try canvas.histogram(1, red)) == 300 * 250 and (try canvas.histogram(3, blue)) == 300 * 250)
+    var total: i64 = 0
+    for slot in 0..<(i64)256:
+        total += try canvas.histogram(0, slot)
+    assert(total == 300 * 250)
+    # Below a new top layer: the same picture, counted from composited bands.
+    let top = try canvas.add_layer("Top")
+    try canvas.measure_histogram_below(top)
+    assert((try canvas.histogram(1, red)) == 300 * 250)
+
+test "a large document refuses TIFF clearly instead of flattening; a small one still saves it":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var small = try Canvas(300, 200)
+    defer small.close()
+    discard(try small.add_layer("Paint"))
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&small, &target, 0, 0))
+    try small.save("build/moat-small.tif")
+    var large = try Canvas(9000, 8000)
+    defer large.close()
+    discard(try large.add_layer("Paint"))
+    discard(try shown_at(&large, &target, 0, 0))
+    var refused = false
+    large.save("build/moat-large.tif") catch failure:
+        refused = failure.code == limit
+    assert(refused)
+
+test "a placed picture goes in a band at a time and lands exactly where it was put":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(900, 700)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Placed")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    let width: usize = 700
+    let height: usize = 530
+    let pixels = try alloc f32[width * height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    for at in 0..<width * height:
+        pixels[at * 4] = (f32)(at % width) / (f32)width
+        pixels[at * 4 + 1] = (f32)(at // width) / (f32)height
+        pixels[at * 4 + 2] = 0.5
+        pixels[at * 4 + 3] = 1.0
+    let picture = try Image.from_linear_rgba(width, height, pixels)
+    defer picture.release()
+    # Centred at (400, 300): its top-left at (50, 35).
+    try place_image_at(&canvas, layer, picture, 400, 300)
+    let document = canvas.document else trap("bound")
+    let tiles = (document.find((u64)layer) else trap("layer")).tiles() else trap("pixels")
+    let samples = try alloc f32[(usize)tile_size * (usize)tile_size * 4] in memory.heap
+    defer free(samples) in memory.heap
+    # The picture went through 8-bit sRGB: compare what it holds now.
+    let expected = try alloc f32[width * height * 4] in memory.heap
+    defer free(expected) in memory.heap
+    try picture.value().linear_rgba(expected)
+    for (x, y) in [(50, 35), (299, 290), (749, 564), (400, 300), (260, 260)]:
+        let column = (u32)(x // 256)
+        let row = (u32)(y // 256)
+        try tiles.read_cell(column, row, samples)
+        let at = (usize)(((y % 256) * 256 + x % 256) * 4)
+        let source = (usize)(((y - 35) * (i64)width + (x - 50)) * 4)
+        for channel in 0..<(usize)4:
+            assert(math.abs((f64)(samples[at + channel] - expected[source + channel])) < 0.002)
+    # Outside the picture: clear.
+    try tiles.read_cell(0, 0, samples)
+    assert(samples[(10 * 256 + 10) * 4 + 3] == 0.0)
+
+test "a gradient previewed at the view's level matches the kept one, zoomed out and at 100%":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(2048, 1536)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Gradient")
+    var target = try gpu.Texture.create(device, 512, 384, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    let size = (usize)512 * 384 * 4
+    let shown = try alloc u8[size] in memory.heap
+    defer free(shown) in memory.heap
+    let kept = try alloc u8[size] in memory.heap
+    defer free(kept) in memory.heap
+    for pass in 0..<(usize)2:
+        # The second time within a selection, as a fill keeps to it.
+        if pass == 1:
+            try canvas.select_ellipse(300, 200, 1400, 1100)
+        try drawn(&canvas, &target, 0.25, 0.0, 0.0, shown)
+        try canvas.begin_preview(layer)
+        try canvas.preview_gradient(100.0, 200.0, 1900.0, 1300.0, 1.0, 0.2, 0.0, 1.0, 0.0, 0.3, 1.0, 1.0, pass == 1)
+        try drawn(&canvas, &target, 0.25, 0.0, 0.0, shown)
+        try canvas.end_preview(true)
+        try drawn(&canvas, &target, 0.25, 0.0, 0.0, kept)
+        let coarse = apart(shown, kept, 3)
+        assert(coarse.percent < 3.0 and coarse.mean < 4.0)
+        # At 100% the preview is the full-size gradient itself.
+        try canvas.undo()
+        try canvas.begin_preview(layer)
+        try canvas.preview_gradient(100.0, 200.0, 1900.0, 1300.0, 1.0, 0.2, 0.0, 1.0, 0.0, 0.3, 1.0, 1.0, pass == 1)
+        try drawn(&canvas, &target, 1.0, -700.0, -500.0, shown)
+        try canvas.end_preview(true)
+        try drawn(&canvas, &target, 1.0, -700.0, -500.0, kept)
+        let fine = apart(shown, kept, 1)
+        assert(fine.percent < 0.5)
+        try canvas.undo()
+
+test "a gradient's one-color cells share a tile at each end; the ramp between is drawn":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(1500, 1000)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Gradient")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    # A short ramp from x 600 to 800: red before, blue after.
+    try canvas.fill_gradient(layer, 600.0, 0.0, 800.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0)
+    let document = canvas.document else trap("bound")
+    let tiles = (document.find((u64)layer) else trap("layer")).tiles() else trap("pixels")
+    assert(tiles.stamp(0, 0) == tiles.stamp(1, 3) and tiles.stamp(0, 0) != tiles.stamp(2, 0))
+    assert(tiles.stamp(4, 0) == tiles.stamp(5, 2) and tiles.stamp(4, 0) != tiles.stamp(0, 0))
+    let samples = try alloc f32[(usize)tile_size * (usize)tile_size * 4] in memory.heap
+    defer free(samples) in memory.heap
+    try tiles.read_cell(1, 3, samples)
+    assert(samples[0] == 1.0 and samples[2] == 0.0 and samples[3] == 1.0)
+    try tiles.read_cell(5, 2, samples)
+    assert(samples[0] == 0.0 and samples[2] == 1.0)
+    # Within the ramp (cell 2 starts at x 512, the ramp at 600): still red at its left.
+    try tiles.read_cell(2, 0, samples)
+    assert(samples[0] == 1.0)
+    let middle = ((0 * 256) + (700 - 512)) * 4
+    assert(math.abs((f64)samples[middle] - 0.5) < 0.02 and math.abs((f64)samples[middle + 2] - 0.5) < 0.02)
+
+## Rows gathered from `linear_rgba_bands` into one buffer, checking the order.
+struct StreamedRows:
+    var pixels: f32[]
+    var next: usize
+    var width: usize
+    var calls: usize
+
+func keep_streamed(context: void*?, first: usize, count: usize, pixels: f32[]) -> !:
+    let into = (StreamedRows*)(context else return)
+    if first != into.next or count > 256 or pixels.length != into.width * count * 4:
+        error(invalid, "bands out of order")
+    for index in 0..<pixels.length:
+        into.pixels[first * into.width * 4 + index] = pixels[index]
+    into.next = first + count
+    into.calls += 1
+
+## `path` streamed a band at a time equals it decoded whole, and streaming
+## never decoded it whole.
+func streams_as_whole(path: str, width: usize, height: usize) -> !:
+    let streamed = try Image.open(path)
+    defer streamed.release()
+    var rows = StreamedRows(pixels = try alloc f32[width * height * 4] in memory.heap, next = 0, width = width, calls = 0)
+    defer free(rows.pixels) in memory.heap
+    try streamed.value().linear_rgba_bands(256, keep_streamed, (void*)&rows)
+    assert(rows.next == height and rows.calls == (height + 255) // 256)
+    assert(not streamed.value().is_loaded())
+    let whole = try Image.open(path)
+    defer whole.release()
+    let expected = try alloc f32[width * height * 4] in memory.heap
+    defer free(expected) in memory.heap
+    try whole.value().linear_rgba(expected)
+    for index in 0..<expected.length:
+        assert(expected[index] == rows.pixels[index])
+
+test "PNG, JPEG and TIFF pictures stream a band at a time exactly as they decode whole":
+    let width: usize = 700
+    let height: usize = 600
+    let bytes = try alloc u8[width * height * 4] in memory.heap
+    defer free(bytes) in memory.heap
+    for y in 0..<height:
+        for x in 0..<width:
+            let at = (y * width + x) * 4
+            bytes[at] = (u8)((x * 7 + y) % 256)
+            bytes[at + 1] = (u8)((y * 3) % 256)
+            bytes[at + 2] = (u8)((x * y) % 251)
+            bytes[at + 3] = (u8)(255 - (x + y) % 128)
+    let picture = try Image.from_rgba8(width, height, bytes)
+    defer picture.release()
+    try picture.value().save("build/stream.png")
+    try picture.value().save("build/stream-strips.tif")
+    try picture.value().save("build/stream-tiles.tif", tile = 256)
+    let opaque = try picture.value().convert("RGB")
+    defer opaque.release()
+    try opaque.value().save("build/stream.jpg", quality = 85)
+    try streams_as_whole("build/stream.png", width, height)
+    try streams_as_whole("build/stream-strips.tif", width, height)
+    try streams_as_whole("build/stream-tiles.tif", width, height)
+    try streams_as_whole("build/stream.jpg", width, height)
+
+test "a picture opened as a document becomes tiles a band at a time, exactly":
+    let width: usize = 600
+    let height: usize = 530
+    let bytes = try alloc u8[width * height * 4] in memory.heap
+    defer free(bytes) in memory.heap
+    for index in 0..<bytes.length:
+        bytes[index] = (u8)((index * 13) % 256) if index % 4 != 3 else 255
+    let source = try Image.from_rgba8(width, height, bytes)
+    defer source.release()
+    try source.value().save("build/stream-open.png")
+    let opened = try Canvas.open("build/stream-open.png")
+    defer opened.release()
+    var canvas = opened.value()
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    let record = canvas.records[0]
+    let document = canvas.document else trap("bound")
+    let layer = document.find(record.id) else trap("a layer")
+    let tiles = layer.tiles() else trap("pixels")
+    let samples = try alloc f32[256 * 256 * 4] in memory.heap
+    defer free(samples) in memory.heap
+    let expected = try alloc f32[width * height * 4] in memory.heap
+    defer free(expected) in memory.heap
+    let whole = try Image.open("build/stream-open.png")
+    defer whole.release()
+    try whole.value().linear_rgba(expected)
+    for row in 0..<tiles.rows():
+        for column in 0..<tiles.columns():
+            try tiles.read_cell(column, row, samples)
+            let area = tiles.region(column, row)
+            for y in 0..<(usize)area.height:
+                for x in 0..<(usize)area.width:
+                    let at = (((usize)row * 256 + y) * width + (usize)column * 256 + x) * 4
+                    for channel in 0..<(usize)4:
+                        assert(math.abs((f64)samples[(y * 256 + x) * 4 + channel] - (f64)expected[at + channel]) < 0.002)
+
+test "a picture that opens but cannot be decoded fails the bind that loads it, as an error":
+    let width: usize = 400
+    let height: usize = 300
+    let bytes = try alloc u8[width * height * 4] in memory.heap
+    defer free(bytes) in memory.heap
+    for index in 0..<bytes.length:
+        bytes[index] = (u8)((index * 31) % 256)
+    let source = try Image.from_rgba8(width, height, bytes)
+    defer source.release()
+    let opaque = try source.value().convert("RGB")
+    defer opaque.release()
+    try opaque.value().save("build/stream-broken.jpg")
+    # Its headers stay, so opening it (which reads just those) succeeds; its
+    # compressed pixels end halfway.
+    let data = try files.read((c_api.str)"build/stream-broken.jpg")
+    defer free(data)
+    try files.write_atomic((c_api.str)"build/stream-broken.jpg", data[..<data.length // 2])
+    let opened = try Canvas.open("build/stream-broken.jpg")
+    defer opened.release()
+    var canvas = opened.value()
+    var failed = false
+    canvas.bind_headless() catch failure:
+        if failure.code == gpu.unavailable:
+            return
+        failed = true
+    # The first draw's bind reports it (the window reports a draw's failure);
+    # the document stays bound, its layer empty, and closes cleanly.
+    assert(failed and canvas.is_bound() and canvas.layer_count() == 1)
+
+## Two gradient layers over a 1500 by 1100 document.
+func painted_pair(canvas: Canvas*) -> !:
+    let first = try canvas.add_layer("First")
+    let second = try canvas.add_layer("Second")
+    try canvas.fill_gradient(first, 0.0, 0.0, 1500.0, 1100.0, 1.0, 0.2, 0.1, 1.0, 0.1, 0.3, 0.9, 1.0)
+    try canvas.fill_gradient(second, 750.0, 550.0, 1300.0, 900.0, 0.9, 0.9, 0.2, 0.8, 0.2, 0.9, 0.4, 0.3, radial = true)
+
+test "a frame never waits for tiles coming back: a coarser level stands in, and the next frames draw them exactly":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var target = try gpu.Texture.create(device, 256, 192, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    var reference: u8[196608]
+    var seen: u8[196608]
+    # The same picture on a document that keeps everything, at 100%.
+    var plain = try Canvas(1500, 1100)
+    defer plain.close()
+    try frame_pixels(&plain, &target, 1.0, 0.0, 0.0, reference)
+    try painted_pair(&plain)
+    try frame_pixels(&plain, &target, 1.0, -600.0, -500.0, reference)
+    var canvas = try Canvas(1500, 1100)
+    defer canvas.close()
+    defer residency_budgets(0, 0)
+    try frame_pixels(&canvas, &target, 1.0, 0.0, 0.0, seen)
+    try painted_pair(&canvas)
+    # Seen whole once (its coarse levels kept), then every layer tile packed
+    # and moved out of the GPU and RAM.
+    try frame_pixels(&canvas, &target, 256.0 / 1500.0, 0.0, 0.0, seen)
+    Canvas.set_compressed_tier(true)
+    defer Canvas.set_compressed_tier(false)
+    Canvas.set_progressive_loading(true)
+    defer Canvas.set_progressive_loading(false)
+    try canvas.set_memory_budgets(24 * 524288, 524288)
+    try canvas.settle_memory()
+    assert(canvas.memory_packs() > 0)
+    # The first frame at 100% shows the coarse level and asks for more.
+    try frame_pixels(&canvas, &target, 1.0, -600.0, -500.0, seen)
+    assert(canvas.busy())
+    var frames: usize = 1
+    while canvas.busy() and frames < 500:
+        thread.sleep(1)
+        try frame_pixels(&canvas, &target, 1.0, -600.0, -500.0, seen)
+        frames += 1
+    assert(not canvas.busy())
+    assert(same_bytes(seen, reference))

@@ -45,7 +45,7 @@ import os
 import time
 import thread
 from luce_image.image import Image, Pixel
-from tiles import Cell, CellRange, read_cells, transient_mark, release_transients, Tiles, Bounds, tile_size, tile_columns, min_u32, max_u32, flatten, tiles_alive, tile_texture, residency_configure, residency_budgets, residency_advance, residency_frame, residency_over_budget, residency_begin_marking, residency_mark_live, residency_settle, residency_report, set_scratch_directory, release_scratch, TileSource, open_tile_source, release_tile_source, back_cell, detach_tile_source, tile_source_is
+from tiles import Cell, CellRange, read_cells, transient_mark, release_transients, Tiles, Bounds, tile_size, tile_columns, min_u32, max_u32, flatten, tiles_alive, tile_texture, residency_configure, residency_budgets, residency_advance, residency_frame, residency_over_budget, residency_begin_marking, residency_mark_live, residency_settle, residency_report, set_scratch_directory, residency_codec, clear_residency_codec, Gathering, prefetch_collect, prefetch_pending, prefetch_had_failure, prefetch_wait, release_scratch, TileSource, open_tile_source, release_tile_source, back_cell, detach_tile_source, tile_source_is
 from pyramid import covered_at
 from luce_image.heal import heal
 from luce_image.color_range import RangeSample, range_sample, range_coverage, range_labs
@@ -57,7 +57,7 @@ from luce_image.warp_patch import identity_patch, bend_patch, patch_mesh, patch_
 from luce_image.puppet import Puppet
 from luce_image.document import Style, Document, Layer, TreeState, release_snapshot, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
 from luce_image.composite import Composer, box_composer, unbox_composer
-from luce_image.brush import Brush, Painter, Stroke, EffectSource, begin_boxed, finish_boxed, fill_selection, fill_gradient, simulate_fill_failure
+from luce_image.brush import Brush, Painter, Stroke, EffectSource, begin_boxed, finish_boxed, fill_selection, fill_gradient, gradient_tile, simulate_fill_failure
 from luce_image.adjust import Adjuster, adjustment_count, parameter_count, curves, levels
 from luce_image.curves import Curves, lut_size
 from luce_image.filter import Filters
@@ -258,6 +258,11 @@ pub struct Canvas:
     var refine_view: i64
     ## A filter dialog's preview, shown through the compositor until kept or dropped.
     var filter_stand_in: FilterPreview*?
+    ## A gradient being dragged, shown through the compositor until kept or dropped.
+    var gradient_stand_in: GradientPreview*?
+    ## The last frame drew some cell from a coarser level while its tiles
+    ## come back in the background (canvas/drawing).
+    var coarse_shown: bool
     ## What `measure_histogram` counted: luminosity, red, green and blue, 256
     ## bins each of the encoded values.
     var histogram_counts: u64[1024]
@@ -346,6 +351,8 @@ pub struct Canvas:
         self.refine_origin = none
         self.refine_view = 0
         self.filter_stand_in = none
+        self.gradient_stand_in = none
+        self.coarse_shown = false
         self.heal_opacity = 1.0
         self.edit_depth = 0
         self.edit_captured = false
@@ -445,6 +452,19 @@ pub struct Canvas:
     pub static func set_scratch_folder(directory: str) -> !:
         try set_scratch_directory(directory)
 
+    ## Frames never wait for tiles to come back from compressed copies, the
+    ## scratch file or the document file: a cell lacking some draws from a
+    ## coarser level kept, while they decode in the background, and `busy`
+    ## says to draw again. Off by default (a frame shows everything at once).
+    pub static func set_progressive_loading(on: bool):
+        progressive_loading = on
+
+    ## Compress tiles past the RAM budget in RAM before they go to the scratch
+    ## file (off by default; see canvas/memory): for a slow or small scratch disk.
+    pub static func set_compressed_tier(on: bool):
+        compressed_tier = on
+        apply_compressed_tier()
+
     ## On quitting, once every document is closed: the scratch file closes and
     ## its folder goes (on Windows the folder would otherwise stay behind).
     pub static func release_scratch_file():
@@ -503,6 +523,13 @@ pub struct Canvas:
     pub func memory_spills() -> i64:
         return (i64)residency_report().spills
 
+    ## Bytes of tiles held compressed in RAM, and tiles compressed so far.
+    pub func memory_packed_bytes() -> i64:
+        return (i64)residency_report().packed_tiles
+
+    pub func memory_packs() -> i64:
+        return (i64)residency_report().packs
+
     pub func memory_loads() -> i64:
         return (i64)residency_report().loads
 
@@ -547,6 +574,11 @@ pub struct Canvas:
 
     ## Bind to `acquired`, which the canvas owns from here (on failure too).
     mutating func bind_device(acquired: gpu.Device) -> !:
+        try self.attach_device(acquired)
+        try self.load_pictures()
+
+    ## The GPU document on `acquired`, its layers as the records say, empty.
+    mutating func attach_device(acquired: gpu.Device) -> !:
         var binding = Binding(device = acquired)
         errdefer unwind(&binding)
         let device = binding.device else trap("bound")
@@ -601,18 +633,40 @@ pub struct Canvas:
         self.document = binding.document
         self.composer = binding.composer
         binding = Binding()
+
+    ## The pictures waiting in the records become their layers' tiles (or
+    ## masks), decoded a band at a time. The document stays bound whatever
+    ## happens: a picture that cannot be read leaves its layer empty, every
+    ## other still loads, and the first failure is returned, for the window to
+    ## report (a draw's bind is where a picture opened as a document loads).
+    mutating func load_pictures() -> !:
+        var failed: ErrorCode? = none
+        var message: str = ""
         for index in 0..<self.count:
             if let picture = self.records[index].picture:
                 self.records[index].picture = none
-                defer picture.release()
-                let tiles = try self.tiles_of(picture, self.records[index].picture_x, self.records[index].picture_y)
-                try (self.document else trap("bound")).set_tiles(self.records[index].id, tiles)
+                self.load_picture(index, picture, self.records[index].picture_x, self.records[index].picture_y, false) catch failure:
+                    if failed == none:
+                        failed = failure.code
+                        message = failure.message
             if let picture = self.records[index].mask_picture:
                 self.records[index].mask_picture = none
-                defer picture.release()
-                let tiles = try self.tiles_of(picture, self.records[index].mask_x, self.records[index].mask_y, true)
-                var old = try (self.document else trap("bound")).take_mask(self.records[index].id, tiles)
-                old.destroy()
+                self.load_picture(index, picture, self.records[index].mask_x, self.records[index].mask_y, true) catch failure:
+                    if failed == none:
+                        failed = failure.code
+                        message = failure.message
+        if let code = failed:
+            error(code, message)
+
+    mutating func load_picture(index: usize, picture: interop.Reference[Image], x: i64, y: i64, mask: bool) -> !:
+        defer picture.release()
+        let tiles = try self.tiles_of(picture, x, y, mask)
+        let document = self.document else trap("bound")
+        if not mask:
+            try document.set_tiles(self.records[index].id, tiles)
+            return
+        var old = try document.take_mask(self.records[index].id, tiles)
+        old.destroy()
 
     func require_open() -> !:
         if self.closed:
@@ -631,6 +685,7 @@ pub struct Canvas:
         drop_liquify(&self)
         drop_mesh_warp(&self)
         drop_filter_preview(&self)
+        drop_gradient_preview(&self)
         drop_selection_transform(&self)
         cancel_magnetic(&self)
         drop_refine(&self)
@@ -911,12 +966,12 @@ pub struct Canvas:
             # A raw develops a tile at a time straight into the grid.
             whole = try raw_tiles(device, picture)
         else:
-            let pixels = try alloc f32[width * height * 4] in memory.heap
-            defer free(pixels) in memory.heap
-            try picture.value().linear_rgba(pixels)
+            # A band of 256 rows at a time, decoded as it goes where the format
+            # allows: never the picture whole in floats.
             whole = try Tiles.create(device, (u32)width, (u32)height)
             errdefer whole.destroy()
-            try whole.write(pixels)
+            var banding = PictureBands(canvas = &self, tiles = &whole)
+            try picture.value().linear_rgba_bands((usize)tile_size, picture_band, (void*)&banding)
         errdefer whole.destroy()
         if x == 0 and y == 0 and width == (usize)self.extent_x and height == (usize)self.extent_y:
             return whole
@@ -1153,20 +1208,7 @@ pub struct Canvas:
             try document.set_mask((u64)id, present)
             if present and fill != 0:
                 let mask = (document.find((u64)id) else trap("masked layer")).mask_tiles() else trap("just masked")
-                let count = (usize)self.extent_x * (usize)self.extent_y
-                let pixels = try alloc f32[count * 4] in memory.heap
-                defer free(pixels) in memory.heap
-                let selection = self.current()
-                for at in 0..<count:
-                    var value: f32 = 0.0
-                    if fill == 2:
-                        value = (f32)selection.at((i64)(at % (usize)self.extent_x), (i64)(at // (usize)self.extent_x)) / 255.0
-                    pixels[at * 4] = value
-                    pixels[at * 4 + 1] = value
-                    pixels[at * 4 + 2] = value
-                    # Opaque everywhere, so every cell is kept, black ones too.
-                    pixels[at * 4 + 3] = 1.0
-                try mask.write(pixels)
+                try fill_mask_cells(&self, mask, fill == 2)
         elif present and fill != 0:
             error(invalid, "draw the document once before filling a mask")
         self.records[index].masked = present
@@ -1946,10 +1988,11 @@ pub struct Canvas:
     pub func painting() -> bool:
         return self.stroke != none or self.liquify != none or (self.warp != none and not self.warp_finishing)
 
-    ## Whether work goes on between frames (a smudge finishing on its worker):
-    ## the view keeps drawing until it is kept.
+    ## Whether work goes on between frames (a smudge finishing on its worker,
+    ## tiles coming back in the background while coarser ones stand in): the
+    ## view keeps drawing until it is done.
     pub func busy() -> bool:
-        return self.warp != none
+        return self.warp != none or self.coarse_shown or prefetch_pending()
 
     ## Wait for a smudge still finishing and keep it. Everything that
     ## changes or reads the whole document calls this first.
@@ -2410,12 +2453,11 @@ pub struct Canvas:
         try gpu_check_color(to_color)
         if a0 < 0.0 or a0 > 1.0 or a1 < 0.0 or a1 > 1.0:
             error(invalid, "gradient alphas must be in 0..1")
-        let mask = (self.preview else error(invalid, "no preview is in progress")).mask
-        let layer = try self.restore_preview()
-        let document = self.document else trap("preview without a document")
-        var painter = self.painter else trap("preview without a painter")
-        var drawn_over = try fill_gradient(&painter, document, layer, x0, y0, x1, y1, from_color, to_color, radial, mask)
-        drawn_over.destroy()
+        for value in [x0, y0, x1, y1]:
+            if not math.is_finite(value):
+                error(invalid, "gradient ends must be finite")
+        # Drawn at the view's level while the ends move; at full size once kept.
+        try show_gradient(&self, x0, y0, x1, y1, from_color, to_color, radial)
 
     ## Show a Gaussian blur of `radius` applied to the layer as it was when the
     ## preview began: drawn at the view's level until kept (filter_previews.lucb).
@@ -2428,10 +2470,12 @@ pub struct Canvas:
     ## layer's pixels back as they were.
     pub mutating func end_preview(keep: bool) -> !:
         try self.require_open()
-        # A filter shown at the view's level is made at full size now.
+        # A filter or gradient shown at the view's level is made at full size now.
         if keep:
             try apply_filter_preview(&self)
+            try apply_gradient_preview(&self)
         drop_filter_preview(&self)
+        drop_gradient_preview(&self)
         let preview = self.preview else error(invalid, "no preview is in progress")
         self.preview = none
         let document = self.document else trap("preview without a document")
@@ -2474,6 +2518,7 @@ pub struct Canvas:
     mutating func restore_preview() -> u64!:
         try self.require_open()
         drop_filter_preview(&self)
+        drop_gradient_preview(&self)
         let preview = self.preview else error(invalid, "no preview is in progress")
         let document = self.document else trap("preview without a document")
         if preview.mask:
@@ -2513,11 +2558,8 @@ pub struct Canvas:
         let document = self.document else error(invalid, "draw the document once before measuring")
         let layer = document.find((u64)id) else error(invalid, "no such layer")
         let tiles = layer.tiles() else error(invalid, "a group has no pixels to count")
-        let count = (usize)self.extent_x * (usize)self.extent_y
-        let pixels = try alloc f32[count * 4] in memory.heap
-        defer free(pixels) in memory.heap
-        try tiles.read(pixels)
-        self.count_histogram(pixels)
+        self.clear_histogram()
+        try count_layer(self.histogram_counts[..<1024], tiles)
 
     ## Count what shows below layer `id` — the whole picture with it and the
     ## layers over it hidden — for `histogram`: what an adjustment layer's
@@ -2534,12 +2576,11 @@ pub struct Canvas:
             hidden[at] = at >= index and record.visible and not self.holds(record.id, (u64)id)
             if hidden[at]:
                 try document.set_appearance(record.id, false, record.opacity, (u32)record.blend)
-        let flattened = flattened_pixels(&self) catch failure:
+        self.clear_histogram()
+        count_flattened(self.histogram_counts[..<1024], &self) catch failure:
             self.show_again(hidden)
             error(failure.code, failure.message)
-        defer free(flattened) in memory.heap
         self.show_again(hidden)
-        self.count_histogram(flattened)
 
     ## Whether group `group` holds layer `id`, however deep.
     func holds(group: u64, id: u64) -> bool:
@@ -2561,18 +2602,10 @@ pub struct Canvas:
                 document.set_appearance(record.id, true, record.opacity, (u32)record.blend) catch _:
                     recover ()
 
-    ## Count straight linear RGBA `pixels` by their encoded values; transparency is left out.
-    mutating func count_histogram(pixels: const f32[]):
+    ## Empty the histogram's bins before a count.
+    mutating func clear_histogram():
         for slot in 0..<(usize)1024:
             self.histogram_counts[slot] = 0
-        for at in 0..<pixels.length // 4:
-            if pixels[at * 4 + 3] <= 0.0:
-                continue
-            var encoded: f64[3]
-            for channel in 0..<(usize)3:
-                encoded[channel] = srgb_encode((f64)pixels[at * 4 + channel])
-                self.histogram_counts[(channel + 1) * 256 + bin_of(encoded[channel])] += 1
-            self.histogram_counts[bin_of(encoded[0] * 0.3 + encoded[1] * 0.59 + encoded[2] * 0.11)] += 1
 
     ## How many pixels `measure_histogram` counted in bin `slot` (0..255) of
     ## `channel`: 0 luminosity, 1 red, 2 green, 3 blue.

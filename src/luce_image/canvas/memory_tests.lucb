@@ -135,6 +135,9 @@ test "past the RAM budget six layers move to the scratch file, and undo and expo
     var reference: u8[196608]
     var seen: u8[196608]
     try frame_pixels(&canvas, &target, 1.0, -600.0, -500.0, reference)
+    # Compressed on the way out, as on a slow scratch disk.
+    Canvas.set_compressed_tier(true)
+    defer Canvas.set_compressed_tier(false)
     # Four tiles of GPU and eight of RAM against six layers of thirty tiles each.
     try canvas.set_memory_budgets(4 * 524288, 8 * 524288)
     var layers: i64[6]
@@ -147,6 +150,8 @@ test "past the RAM budget six layers move to the scratch file, and undo and expo
         try canvas.settle_memory()
         assert(canvas.memory_ram_bytes() <= 8 * 524288)
     assert(canvas.memory_disk_bytes() > 0 and canvas.memory_spills() > 0)
+    # Gradients pack with the .l2d codec before they go to disk.
+    assert(canvas.memory_packs() > 0)
     try frame_pixels(&canvas, &target, 1.0, -600.0, -500.0, reference)
     try canvas.save("build/memory-disk-reference.png")
     # An export reads every tile back, and leaves RAM within its budget.

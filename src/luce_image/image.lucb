@@ -16,8 +16,9 @@ import raw
 import heic
 import luce_image.parallel as parallel
 from luce_image.svg_import import is_svg, render_svg
+from luce_image.streaming import LinearSink, stream_linear, decode_srgb
 from binary import Buffer
-from raster_errors import invalid, unsupported
+from raster_errors import invalid, unsupported, limit
 
 pub type SampleType = model.SampleType
 
@@ -458,13 +459,21 @@ pub struct Image:
     ## linear already. For the editor's tiles; Base only.
     pub mutating func linear_rgba(pixels: f32[]) -> !:
         try self.load()
-        if pixels.length != self.raster.width * self.raster.height * 4:
-            error(invalid, "pixel buffer must hold width * height RGBA samples")
+        try self.linear_rgba_rows(0, self.raster.height, pixels)
+
+    ## Rows `first..<first + count` as `linear_rgba` gives them, into `pixels`
+    ## (`count` rows of RGBA f32): a picture turned into tiles a band at a time.
+    pub mutating func linear_rgba_rows(first: usize, count: usize, pixels: f32[]) -> !:
+        try self.load()
+        if first + count > self.raster.height or pixels.length != self.raster.width * count * 4:
+            error(invalid, "pixel buffer must hold width * count RGBA samples of rows in the picture")
         let kind = self.raster.channels[0].kind
+        let stride = self.raster.channels.length
+        let rows = self.raster.pixels[first * self.raster.width * stride..<(first + count) * self.raster.width * stride]
         # Which sample is which, worked out once as `getpixel` reads them.
-        var job = LinearJob(source = self.raster.pixels, pixels = pixels, stride = self.raster.channels.length, width = self.raster.width,
+        var job = LinearJob(source = rows, pixels = pixels, stride = stride, width = self.raster.width,
                             red = -1, green = -1, blue = -1, alpha = -1, scale = 1.0 / model.maximum(kind), encoded = kind != .float16 and kind != .float32 and kind != .float64,
-                            table = none, first = 0, last = self.raster.height)
+                            table = none, first = 0, last = count)
         for c in 0..<self.raster.channels.length:
             let name = self.raster.channels[c].name
             if name == "Y":
@@ -489,6 +498,28 @@ pub struct Image:
             table[value] = (f32)decode_srgb((f64)value * job.scale)
         job.table = table
         try linear_bands(&job)
+
+    ## The picture as linear-light straight RGBA f32, `rows` rows at a time,
+    ## to `sink` in order from the top (luce_image/streaming). A PNG, JPEG or
+    ## TIFF not yet decoded goes a band at a time and is never whole; any other
+    ## picture, or one already decoded, from its whole raster, which may take
+    ## at most `whole_picture_bytes`.
+    pub mutating func linear_rgba_bands(rows: usize, sink: LinearSink, context: void*?) -> !:
+        try self.ensure_open()
+        if not self.is_loaded() and (try stream_linear(&self.raster, rows, sink, context)):
+            return
+        if not self.is_loaded() and self.raster.width * self.raster.height * self.raster.channels.length > whole_picture_bytes // 8:
+            error(limit, "a picture this large opens only from PNG, JPEG or TIFF")
+        let width = self.raster.width
+        let height = self.raster.height
+        let band = try alloc f32[width * rows * 4] in memory.heap
+        defer free(band) in memory.heap
+        var top: usize = 0
+        while top < height:
+            let count = min_rows(rows, height - top)
+            try self.linear_rgba_rows(top, count, band[..<width * count * 4])
+            try sink(context, top, count, band[..<width * count * 4])
+            top += count
 
     ## An 8-bit RGBA image from straight-alpha linear-light RGBA f32 samples,
     ## sRGB-encoded and clamped. Base only.
@@ -643,9 +674,8 @@ pub struct Image:
 pub let image_type: interop.Type[Image] = interop.Type[Image]("Image", Image.close, closeable = true)
 
 ## The linear value of an sRGB-encoded component in 0..1.
-func decode_srgb(value: f64) -> f64:
-    let clamped = math.clamp(value, 0.0, 1.0)
-    return clamped / 12.92 if clamped <= 0.04045 else math.pow((clamped + 0.055) / 1.055, 2.4)
+## The most a picture decoded whole may take as f64 samples.
+pub let whole_picture_bytes: usize = 4294967296
 
 ## Rows `first..<last` of an image for `linear_rgba`.
 struct LinearJob:

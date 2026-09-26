@@ -1,0 +1,119 @@
+#==============================================================================================
+#
+#   canvas/gradient_previews - A gradient being dragged, drawn at the view's level
+#
+#   DESCRIPTION:
+#       Each move of a gradient's ends used to redraw every cell of the layer at full size.
+#       Now the ends and colors are recorded as a new generation of a stand-in, and the
+#       compositor draws the layer through it a cell at a time at the level the view shows:
+#       a gradient scales exactly, so at level L its ends and each cell's first texel are
+#       simply in that level's texels. The layer keeps its pixels as the preview began;
+#       keeping the preview draws the gradient once, at full size, with the last ends shown.
+#
+#==============================================================================================
+
+## A gradient shown through the compositor while its ends are being moved.
+struct GradientPreview:
+    ## Its ends in document pixels, colors and shape: `fill_gradient`'s settings.
+    var x0: f64
+    var y0: f64
+    var x1: f64
+    var y1: f64
+    var from_color: gpu.Color
+    var to_color: gpu.Color
+    var radial: bool
+    var layer: u64
+    var mask: bool
+    var generation: u64
+    var document: Document*
+    var painter: Painter
+    var device: gpu.Device
+    ## The pixels (or mask) as the preview began.
+    var original: Tiles
+    ## What an empty cell stands for: clear pixels, or a mask's white.
+    var clear: gpu.Texture
+    var white: gpu.Texture
+
+## Show a gradient over the previewed layer (as it was when the preview began).
+func show_gradient(canvas: Canvas*, x0: f64, y0: f64, x1: f64, y1: f64, from_color: gpu.Color, to_color: gpu.Color, radial: bool) -> !:
+    try canvas.require_open()
+    let preview = canvas.preview else error(invalid, "no preview is in progress")
+    let composer = canvas.composer else trap("preview without a compositor")
+    if canvas.gradient_stand_in == none:
+        # The layer as the preview began, drawn through the stand-in from now on.
+        discard(try canvas.restore_preview())
+        canvas.gradient_stand_in = try begin_gradient_preview(canvas, &preview)
+    let shown = canvas.gradient_stand_in else trap("made")
+    shown.x0 = x0
+    shown.y0 = y0
+    shown.x1 = x1
+    shown.y1 = y1
+    shown.from_color = from_color
+    shown.to_color = to_color
+    shown.radial = radial
+    shown.generation = next_generation()
+    try composer.stand_in(StandIn(layer = shown.layer, mask = shown.mask, generation = shown.generation, context = (void*)shown, make = gradient_cell))
+
+func begin_gradient_preview(canvas: Canvas*, preview: const Snapshot*) -> GradientPreview*!:
+    let document = canvas.document else trap("preview without a document")
+    let painter = canvas.painter else trap("preview without a painter")
+    let device = canvas.device else trap("preview without a device")
+    var original = try preview.tiles.clone()
+    errdefer original.destroy()
+    var clear = try tile_texture(device)
+    errdefer clear.destroy()
+    try fill_tile(&clear, gpu.Color(0.0, 0.0, 0.0, 0.0))
+    var white = try tile_texture(device)
+    errdefer white.destroy()
+    try fill_tile(&white, gpu.Color(1.0, 1.0, 1.0, 1.0))
+    return try new GradientPreview(x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0, from_color = gpu.Color(0.0, 0.0, 0.0, 0.0), to_color = gpu.Color(0.0, 0.0, 0.0, 0.0),
+                                   radial = false, layer = preview.layer, mask = preview.mask, generation = 0, document = document, painter = painter,
+                                   device = device, original = original, clear = clear, white = white) in memory.heap
+
+## A stand-in's cell (`column`, `row`) of `level`: the gradient over the
+## original's cell there, within the selection as `fill_gradient` keeps it.
+func gradient_cell(context: void*?, layer_levels: Pyramid*, layer: u64, mask: bool, column: u32, row: u32, level: u32) -> Made!:
+    let shown = (GradientPreview*)(context else return made_original())
+    let tiles = &shown.original
+    var clip = shown.painter.white
+    var selected = false
+    if let selection = try shown.document.selection_tiles():
+        # Outside the selection the cell is the layer's own, as a full-size fill leaves it.
+        clip = (try layer_levels.texture(selection, column, row, level, false)) else return made_original()
+        selected = true
+    let source = (try layer_levels.texture(tiles, column, row, level, mask)) else (shown.white if mask else shown.clear)
+    # One texel of level L is 2^L document pixels.
+    let scale = (f64)((u64)1 << level)
+    var fresh = try tile_texture(shown.device)
+    errdefer fresh.destroy()
+    try gradient_tile(&shown.painter, &fresh, source, clip, selected, (f64)(column * tile_size), (f64)(row * tile_size),
+                      shown.x0 / scale, shown.y0 / scale, shown.x1 / scale, shown.y1 / scale, shown.from_color, shown.to_color, shown.radial)
+    return made_texture(fresh)
+
+## Keep the gradient shown: drawn once at full size with the last ends.
+func apply_gradient_preview(canvas: Canvas*) -> !:
+    let shown = canvas.gradient_stand_in else return
+    let x0 = shown.x0
+    let y0 = shown.y0
+    let x1 = shown.x1
+    let y1 = shown.y1
+    let from_color = shown.from_color
+    let to_color = shown.to_color
+    let radial = shown.radial
+    let mask = shown.mask
+    let layer = try canvas.restore_preview()
+    let document = canvas.document else trap("preview without a document")
+    var painter = canvas.painter else trap("preview without a painter")
+    var drawn_over = try fill_gradient(&painter, document, layer, x0, y0, x1, y1, from_color, to_color, radial, mask)
+    drawn_over.destroy()
+
+## Stop showing a gradient through the compositor: the layer shows its own pixels.
+func drop_gradient_preview(canvas: Canvas*):
+    let shown = canvas.gradient_stand_in else return
+    canvas.gradient_stand_in = none
+    if let composer = canvas.composer:
+        composer.drop_stand_ins()
+    shown.original.destroy()
+    shown.clear.destroy()
+    shown.white.destroy()
+    free(shown) in memory.heap

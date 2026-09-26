@@ -1,0 +1,210 @@
+#==============================================================================================
+#
+#   streaming - A picture decoded a band of rows at a time
+#
+#   DESCRIPTION:
+#       Decoding a picture whole keeps every sample as an f64: a 15000 by 24000 RGB photograph
+#       is 8.6 GB before it becomes a single tile. PNG and JPEG decoders hand their rows over
+#       in order as they go, and a TIFF is strips or tiles decoded one row of them at a time,
+#       so a picture of these formats goes to its reader as linear-light straight RGBA f32 a
+#       band of rows at a time (`stream_linear`), each band made and passed on before the next
+#       is decoded. The canvas turns each band of 256 rows into a row of tiles.
+#
+#==============================================================================================
+
+import math
+import memory
+import png
+import jpeg
+import tiff
+import raster as model
+from raster_errors import invalid
+
+## Receives rows `first..<first + count` of a picture as linear-light straight
+## RGBA f32, `width * count * 4` samples, in order from the top. The samples
+## are valid only during the call.
+pub type LinearSink = func(void*?, usize, usize, f32[]) -> unit!
+
+## The sRGB decoding of an encoded component in 0..1.
+pub func decode_srgb(value: f64) -> f64:
+    let clamped = math.clamp(value, 0.0, 1.0)
+    return clamped / 12.92 if clamped <= 0.04045 else math.pow((clamped + 0.055) / 1.055, 2.4)
+
+## Rows gathered into bands of `rows` for a sink.
+struct Banding:
+    var width: usize
+    var height: usize
+    var rows: usize
+    var band: f32[]
+    ## The picture row the band starts at, and how many of its rows are made.
+    var top: usize
+    var filled: usize
+    ## Encoded 8 or 16-bit sample to linear light.
+    var table: f32[]
+    var sink: LinearSink
+    var context: void*?
+
+## `raster`'s picture (probed, not decoded) to `sink` in bands of `rows`,
+## when it is a PNG, a JPEG or a TIFF of strips or tiles upright; false for
+## any other, which must be decoded whole.
+pub func stream_linear(raster: model.Raster*, rows: usize, sink: LinearSink, context: void*?) -> bool!:
+    let named = raster.file_format
+    let streams = named == "PNG" or named == "JPEG" or (named == "TIFF" and tiff_streams(raster))
+    if not streams:
+        return false
+    if rows == 0:
+        error(invalid, "a band has at least one row")
+    var banding = Banding(width = raster.width, height = raster.height, rows = rows, band = try alloc f32[raster.width * rows * 4] in memory.heap,
+                          top = 0, filled = 0, table = try alloc f32[65536] in memory.heap, sink = sink, context = context)
+    defer free(banding.band) in memory.heap
+    defer free(banding.table) in memory.heap
+    if named == "PNG":
+        let deep = (try png.info(raster.encoded)).bits == 16
+        fill_table(banding.table, 65535.0 if deep else 255.0)
+        try png.decode_rows(raster.encoded, deep_rows if deep else byte_rows, (void*)&banding, deep, png.DecodeOptions(max_bytes = raster.max_bytes))
+    elif named == "JPEG":
+        fill_table(banding.table, 255.0)
+        try jpeg.decode_rows(raster.encoded, byte_rows, (void*)&banding, .rgba, jpeg.Options(max_bytes = raster.max_bytes))
+    else:
+        try tiff_bands(raster, &banding)
+    if banding.top + banding.filled != banding.height:
+        error(invalid, "the picture ended before its last row")
+    return true
+
+## `table[value]`: encoded `value` of `maximum` as linear light.
+func fill_table(table: f32[], maximum: f64):
+    for value in 0..<min_rows(table.length, (usize)maximum + 1):
+        table[value] = (f32)decode_srgb((f64)value / maximum)
+
+## The band's next row, to be filled; `row_made` passes it on.
+func next_row(banding: Banding*, row: usize) -> f32[]!:
+    if row != banding.top + banding.filled:
+        error(invalid, "a picture's rows came out of order")
+    let at = banding.filled * banding.width * 4
+    return banding.band[at..<at + banding.width * 4]
+
+## A row is made: a full band (or the last) goes to the sink.
+func row_made(banding: Banding*) -> !:
+    banding.filled += 1
+    if banding.filled < banding.rows and banding.top + banding.filled < banding.height:
+        return
+    try banding.sink(banding.context, banding.top, banding.filled, banding.band[..<banding.width * banding.filled * 4])
+    banding.top += banding.filled
+    banding.filled = 0
+
+## A decoder's 8-bit RGBA rows.
+func byte_rows(context: void*?, first: usize, count: usize, bytes: const u8[]) -> !:
+    let banding = (Banding*)(context else return)
+    let width = banding.width
+    for y in 0..<count:
+        let row = try next_row(banding, first + y)
+        let source = bytes[y * width * 4..<(y + 1) * width * 4]
+        for x in 0..<width * 4:
+            row[x] = banding.table[(usize)source[x]] if x % 4 != 3 else (f32)source[x] / 255.0
+        try row_made(banding)
+
+## A PNG's 16-bit RGBA rows, native-endian sample pairs.
+func deep_rows(context: void*?, first: usize, count: usize, bytes: const u8[]) -> !:
+    let banding = (Banding*)(context else return)
+    let width = banding.width
+    let samples = u16[]((u16*)&bytes[0], bytes.length // 2)
+    for y in 0..<count:
+        let row = try next_row(banding, first + y)
+        let source = samples[y * width * 4..<(y + 1) * width * 4]
+        for x in 0..<width * 4:
+            row[x] = banding.table[(usize)source[x]] if x % 4 != 3 else (f32)source[x] / 65535.0
+        try row_made(banding)
+
+# mark: TIFF ==================================================================================
+
+## Whether a probed TIFF decodes a row of strips or tiles at a time: upright,
+## its chunks in rows from the top (for each plane).
+func tiff_streams(raster: const model.Raster*) -> bool:
+    if raster.orientation != 1 or raster.chunks.length == 0:
+        return false
+    let planes = raster.channels.length if raster.planar == 2 else 1
+    if raster.chunks.length % planes != 0:
+        return false
+    let per_plane = raster.chunks.length // planes
+    for index in 1..<raster.chunks.length:
+        if index % per_plane != 0 and raster.chunks[index].y < raster.chunks[index - 1].y:
+            return false
+    return true
+
+## A TIFF a row of chunks at a time: each decoded into a raster of just those
+## rows (the chunk moved to its top), then made linear into the band.
+func tiff_bands(raster: model.Raster*, banding: Banding*) -> !:
+    let planes = raster.channels.length if raster.planar == 2 else 1
+    let per_plane = raster.chunks.length // planes
+    var names = ChannelPlaces(red = -1, green = -1, blue = -1, alpha = -1)
+    for channel in 0..<raster.channels.length:
+        names.take(raster.channels[channel].name, (i64)channel)
+    var first: usize = 0
+    while first < per_plane:
+        var last = first + 1
+        while last < per_plane and raster.chunks[last].y == raster.chunks[first].y:
+            last += 1
+        try tiff_rows(raster, banding, first, last, per_plane, &names)
+        first = last
+
+## Chunks `first..<last` of each plane (one row of them) decoded into a raster
+## of just their rows, the chunks read as if at its top, then made linear.
+func tiff_rows(raster: model.Raster*, banding: Banding*, first: usize, last: usize, per_plane: usize, names: const ChannelPlaces*) -> !:
+    let kind = raster.channels[0].kind
+    let scale = 1.0 / model.maximum(kind)
+    let encoded = kind != .float16 and kind != .float32 and kind != .float64
+    let top = raster.chunks[first].y
+    let rows = min_rows(raster.chunks[first].height, raster.height - top)
+    let stride = raster.channels.length
+    var part = *raster
+    part.height = rows
+    part.pixels = try alloc f64[raster.width * rows * stride] in memory.heap
+    defer free(part.pixels) in memory.heap
+    for index in 0..<part.pixels.length:
+        part.pixels[index] = 0.0
+    var one: model.Chunk[1] = ---
+    part.chunks = one[..<1]
+    for plane in 0..<raster.chunks.length // per_plane:
+        for index in first..<last:
+            one[0] = raster.chunks[plane * per_plane + index]
+            one[0].y = 0
+            try tiff.decode_chunk(&part, 0)
+    for y in 0..<rows:
+        let row = try next_row(banding, top + y)
+        for x in 0..<raster.width:
+            let at = (y * raster.width + x) * stride
+            row[x * 4] = linear_of(part.pixels, at, names.red, scale, encoded)
+            row[x * 4 + 1] = linear_of(part.pixels, at, names.green, scale, encoded)
+            row[x * 4 + 2] = linear_of(part.pixels, at, names.blue, scale, encoded)
+            row[x * 4 + 3] = (f32)(part.pixels[at + (usize)names.alpha] * scale) if names.alpha >= 0 else 1.0
+        try row_made(banding)
+
+func min_rows(a: usize, b: usize) -> usize:
+    return a if a < b else b
+
+## Where each color sits within a pixel's samples; -1 when absent.
+struct ChannelPlaces:
+    var red: i64
+    var green: i64
+    var blue: i64
+    var alpha: i64
+
+    mutating func take(name: str, channel: i64):
+        if name == "Y":
+            self.red = channel
+            self.green = channel
+            self.blue = channel
+        elif name == "R":
+            self.red = channel
+        elif name == "G":
+            self.green = channel
+        elif name == "B":
+            self.blue = channel
+        elif name == "A":
+            self.alpha = channel
+
+func linear_of(samples: const f64[], at: usize, channel: i64, scale: f64, encoded: bool) -> f32:
+    if channel < 0:
+        return 0.0
+    let value = samples[at + (usize)channel] * scale
+    return (f32)(decode_srgb(value) if encoded else value)

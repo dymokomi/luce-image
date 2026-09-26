@@ -736,16 +736,24 @@ pub func fill_gradient(painter: Painter*, document: Document*, layer: u64, x0: f
     var empty = gpu.Texture()
     var have_empty = false
     defer empty.destroy()
+    # Without a selection, a cell the gradient covers at one end throughout is one
+    # color: made once per end (and per empty-or-not source when that end is
+    # translucent), then shared. `made_cells` holds the cell each kind was made in.
+    var made_cells: i64[8] = [-1, -1, -1, -1, -1, -1, -1, -1]
     for row in 0..<tiles.rows():
         for column in 0..<tiles.columns():
             var clip = painter.white
-            var params: f32[16] = [(f32)from_color.red, (f32)from_color.green, (f32)from_color.blue, (f32)from_color.alpha,
-                                   (f32)to_color.red, (f32)to_color.green, (f32)to_color.blue, (f32)to_color.alpha,
-                                   (f32)(column * tile_size), (f32)(row * tile_size), (f32)x0, (f32)y0, (f32)x1, (f32)y1, 0.0, 0.0]
-            if let selected = selection:
-                clip = (try selected.texture(column, row)) else continue
-                params[14] = 1.0
-            params[15] = 1.0 if radial else 0.0
+            var selected = false
+            if let chosen = selection:
+                clip = (try chosen.texture(column, row)) else continue
+                selected = true
+            var kind: i64 = -1
+            if not selected:
+                kind = uniform_gradient_kind(column, row, x0, y0, x1, y1, radial, from_color, to_color, before.painted(column, row))
+                if kind >= 0 and made_cells[(usize)kind] >= 0:
+                    let cell = made_cells[(usize)kind]
+                    try tiles.share(column, row, (u32)(cell % (i64)tiles.columns()), (u32)(cell // (i64)tiles.columns()))
+                    continue
             var source = gpu.Texture()
             if let existing = (try before.texture(column, row)):
                 source = existing
@@ -761,16 +769,75 @@ pub func fill_gradient(painter: Painter*, document: Document*, layer: u64, x0: f
                 source = empty
             var fresh = try tiles.blank()
             errdefer fresh.destroy()
-            let frame = try fresh.frame()
-            defer frame.release()
-            let area = try frame.value().target()
-            defer area.release()
-            try gpu.shade(area.value(), painter.gradient, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 64),
-                          [source, clip], gpu.Filter.nearest)
-            discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+            try gradient_tile(painter, &fresh, source, clip, selected, (f64)(column * tile_size), (f64)(row * tile_size), x0, y0, x1, y1, from_color, to_color, radial)
             try tiles.set(column, row, fresh)
+            if kind >= 0:
+                made_cells[(usize)kind] = (i64)row * (i64)tiles.columns() + (i64)column
     target.revision += 1
     return before
+
+## Which kind of one-color cell (column, row) is under a gradient without a
+## selection, or -1 when it varies: 0 or 1 its from or to end reaching the
+## whole cell with that end opaque, 2 or 3 the same end translucent over an
+## empty cell (a translucent end over pixels depends on them).
+func uniform_gradient_kind(column: u32, row: u32, x0: f64, y0: f64, x1: f64, y1: f64, radial: bool, from_color: gpu.Color, to_color: gpu.Color, painted: bool) -> i64:
+    # The first and last pixel centres of the cell, as the shader samples them.
+    let left = (f64)(column * tile_size) + 0.5
+    let top = (f64)(row * tile_size) + 0.5
+    let right = left + (f64)tile_size - 1.0
+    let bottom = top + (f64)tile_size - 1.0
+    let dx = x1 - x0
+    let dy = y1 - y0
+    let length_squared = dx * dx + dy * dy
+    if length_squared < 1e-12:
+        return -1
+    var low = 0.0
+    var high = 0.0
+    if radial:
+        # Nearest and farthest points of the cell from the centre.
+        let near_x = math.clamp(x0, left, right) - x0
+        let near_y = math.clamp(y0, top, bottom) - y0
+        let far_x = math.max(math.abs(left - x0), math.abs(right - x0))
+        let far_y = math.max(math.abs(top - y0), math.abs(bottom - y0))
+        let radius = math.sqrt(length_squared)
+        low = math.sqrt(near_x * near_x + near_y * near_y) / radius
+        high = math.sqrt(far_x * far_x + far_y * far_y) / radius
+    else:
+        # Linear: the projection is extreme at two of the corners.
+        let t0 = ((left - x0) * dx + (top - y0) * dy) / length_squared
+        let t1 = ((right - x0) * dx + (top - y0) * dy) / length_squared
+        let t2 = ((left - x0) * dx + (bottom - y0) * dy) / length_squared
+        let t3 = ((right - x0) * dx + (bottom - y0) * dy) / length_squared
+        low = math.min(math.min(t0, t1), math.min(t2, t3))
+        high = math.max(math.max(t0, t1), math.max(t2, t3))
+    var end: i64 = -1
+    if high <= 0.0:
+        end = 0
+    elif low >= 1.0:
+        end = 1
+    else:
+        return -1
+    let alpha = from_color.alpha if end == 0 else to_color.alpha
+    if alpha >= 1.0:
+        return end
+    return end + 2 if not painted else -1
+
+## Draw one cell of a gradient into `fresh`: `source` under it (what shows
+## where `clip`, a selection's coverage when `selected`, leaves it), the cell's
+## first texel at (`origin_x`, `origin_y`) and the ends in the same texels (a
+## coarser pyramid level passes them divided by its scale).
+pub func gradient_tile(painter: const Painter*, fresh: gpu.Texture*, source: gpu.Texture, clip: gpu.Texture, selected: bool, origin_x: f64, origin_y: f64,
+                       x0: f64, y0: f64, x1: f64, y1: f64, from_color: gpu.Color, to_color: gpu.Color, radial: bool) -> !:
+    var params: f32[16] = [(f32)from_color.red, (f32)from_color.green, (f32)from_color.blue, (f32)from_color.alpha,
+                           (f32)to_color.red, (f32)to_color.green, (f32)to_color.blue, (f32)to_color.alpha,
+                           (f32)origin_x, (f32)origin_y, (f32)x0, (f32)y0, (f32)x1, (f32)y1, 1.0 if selected else 0.0, 1.0 if radial else 0.0]
+    let frame = try fresh.frame()
+    defer frame.release()
+    let area = try frame.value().target()
+    defer area.release()
+    try gpu.shade(area.value(), painter.gradient, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 64),
+                  [source, clip], gpu.Filter.nearest)
+    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
 
 ## A stroke on the heap, for holders that keep a pointer.
 pub func begin_boxed(painter: Painter*, document: Document*, layer: u64, brush: Brush, x: f64, y: f64, on_mask: bool = false, pressure: f64 = 1.0) -> Stroke*!:
