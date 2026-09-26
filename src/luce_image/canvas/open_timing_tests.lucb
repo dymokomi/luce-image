@@ -200,14 +200,15 @@ test "an 18000 by 12000 PNG and JPEG show their first rows at once and fill in w
     # On this Mac (2026-09-26) the PNG showed its top rows 0.33 s after the
     # open began and was whole at 2.5 s; before, nothing showed until 4.1 s.
     # The JPEG: 0.46 s and 0.8 s, from 2.3 s. Generous limits for slower machines.
+    let pace = build_pace()
     for path in ["build/open-timing.png", "build/open-timing.jpg"]:
         let times = try open_as_window(device, path)
-        assert(times.first < 2000 and times.whole < 30000)
+        assert((f64)times.first < 2000.0 * pace and (f64)times.whole < 30000.0 * pace)
         # Placed on a new layer off the cells' grid, as File > Import does: on this
         # Mac the PNG's top rows showed at 0.12 s and it was in at 2.0 s (the window
         # blocked 2.3 s before), the JPEG's at 0.08 s and 0.8 s.
         let placed = try place_as_window(device, path)
-        assert(placed.first < 2000 and placed.whole < 30000)
+        assert((f64)placed.first < 2000.0 * pace and (f64)placed.whole < 30000.0 * pace)
 
 ## Every texel of `canvas`'s first layer, straight RGBA f32 a cell after another.
 func first_layer_texels(canvas: Canvas*, into: f32[]) -> !:

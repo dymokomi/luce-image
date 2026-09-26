@@ -54,6 +54,7 @@ moat_tests.lucb
 refine_tests.lucb
 channel_tests.lucb
 mesh_warp_tests.lucb
+test_pace.lucb
 selection_timing_tests.lucb
 vector_tests.lucb
 open_timing_tests.lucb

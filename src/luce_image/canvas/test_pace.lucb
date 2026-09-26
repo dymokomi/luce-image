@@ -1,0 +1,31 @@
+#==============================================================================================
+#
+#   canvas/test_pace - How much slower this build runs than an optimized native one
+#
+#   DESCRIPTION:
+#       The timing tests hold limits measured on an optimized native build. A build that
+#       runs everything slower (the C backend's debug build is tens of times so) meets
+#       them only stretched: `build_pace` times a fixed workload and says by how much.
+#
+#==============================================================================================
+
+## What the workload takes in an optimized native build on the Mac the limits
+## were measured on (ms).
+let pace_native_ms: f64 = 70.0
+
+## This build's speed against an optimized native one: 1 or more.
+func build_pace() -> f64:
+    let started = time.now()
+    var state: u64 = 88172645463325252
+    var sum: u64 = 0
+    for step in 0..<(u64)50000000:
+        state ^= state << 13
+        state ^= state >> 7
+        state ^= state << 17
+        sum += (state & 0xffff) ^ step
+    let taken = (f64)(time.now() - started) / 1000000.0
+    # The sum is used, so the loop cannot be dropped.
+    if sum == 1:
+        print("unlikely")
+    print(f"build pace: workload {taken} ms")
+    return math.max(1.0, taken / pace_native_ms)

@@ -8,6 +8,10 @@
 func since(started: u64) -> u64:
     return (time.now() - started) // 1000000
 
+## Whether `started` was under `most` ms ago, stretched by `pace`.
+func paced_under(started: u64, most: f64, pace: f64) -> bool:
+    return (f64)since(started) < most * pace
+
 ## Soft blobs everywhere, as Color Range picks from a photograph: an edge in
 ## every cell of the document, the worst a selection's previews meet.
 func select_blobs(canvas: Canvas*) -> !:
@@ -38,6 +42,7 @@ test "select and mask and transform selection keep up with a 15000 by 24000 sele
     discard(try shown_at(&canvas, &target, 0, 0))
     try canvas.fill_gradient(layer, 0.0, 0.0, 15000.0, 24000.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0)
     try select_blobs(&canvas)
+    let pace = build_pace()
     # The whole document fitted (level 5), and 1:1 on 2000 by 1500 pixels.
     let fit = Scope(level = 5, box = CellBox(everything = false, left = 0, top = 0, right = 512, bottom = 768))
     let near = Scope(level = 0, box = CellBox(everything = false, left = 6912, top = 11008, right = 8960, bottom = 12544))
@@ -50,13 +55,13 @@ test "select and mask and transform selection keep up with a 15000 by 24000 sele
                 try canvas.preview_refine(radius, 5, feather, 30.0, 20.0)
                 try prepare_refine_preview(&canvas, scope)
                 # The frame asking never waits for the work.
-                assert(since(started) < 250)
+                assert(paced_under(started, 250.0, pace))
                 try collect_refine(session, true)
-                assert(since(started) < 3000 and session.shown.level == scope.level)
+                assert(paced_under(started, 3000.0, pace) and session.shown.level == scope.level)
     var started = time.now()
     try canvas.end_refine(true, 50, 5, 20, 30.0, 20.0)
     # Every cell worked out at full size (it was 13.6 s before windows were shared).
-    assert(since(started) < 20000 and canvas.undo_name() == "Select and Mask")
+    assert(paced_under(started, 20000.0, pace) and canvas.undo_name() == "Select and Mask")
     try canvas.begin_selection_transform()
     let warping = canvas.selection_warping else trap("a transform is under way")
     for step in 1..<(i64)4:
@@ -64,7 +69,7 @@ test "select and mask and transform selection keep up with a 15000 by 24000 sele
         try canvas.preview_selection_transform(1.0 + 0.02 * (f64)step, 1.0, 3.0 * (f64)step, 10.0 * (f64)step, 0.0, 7500.0, 12000.0)
         try prepare_selection_warp(warping, fit)
         try prepare_selection_warp(warping, near)
-        assert(since(started) < 500)
+        assert(paced_under(started, 500.0, pace))
     started = time.now()
     try canvas.end_selection_transform(true)
-    assert(since(started) < 5000 and canvas.undo_name() == "Transform Selection")
+    assert(paced_under(started, 5000.0, pace) and canvas.undo_name() == "Transform Selection")
