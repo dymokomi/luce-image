@@ -15,6 +15,8 @@ from luce_image.selection_mirror import Mirror
 import luce_image.selection_shapes as shapes
 import luce_image.selection_modify as modifying
 import luce_image.selection_sources as sources
+import luce_image.selection_refine as refining
+from luce_image.selection_refine import Refinement, CellBox
 from raster_errors import invalid
 from half import to_half
 
@@ -205,6 +207,33 @@ pub struct Selection:
         try sources.grow(&found, &self.cells, reader, tolerance, contiguous)
         var nothing_bytes: u8[]
         shapes.from_source(&self.cells, shapes.Source(other = &found, bytes = nothing_bytes), Mode.add)
+        self.finish()
+
+    ## Select and Mask: the edge refined as `refinement` says, its edge
+    ## detection guided by the pixels `reader` gives (none skips it), only in
+    ## the cells `limit` holds (selection_refine.lucb).
+    pub mutating func refine(reader: sources.Reader?, refinement: Refinement, limit: CellBox = CellBox()) -> !:
+        if refinement.radius < 0 or refinement.radius > 250 or refinement.smooth < 0 or refinement.smooth > 100 or refinement.feather < 0 or refinement.feather > 250:
+            error(invalid, "Select and Mask takes a radius and feather of 0..250 and smoothing of 0..100")
+        if not math.is_finite(refinement.contrast) or refinement.contrast < 0.0 or refinement.contrast > 100.0 or not math.is_finite(refinement.shift) or refinement.shift < -100.0 or refinement.shift > 100.0:
+            error(invalid, "Select and Mask takes a contrast of 0..100 and a shift of -100..100")
+        if self.empty or not refinement.changes():
+            return
+        var luma = try Cells.create(self.extent_x, self.extent_y)
+        defer luma.destroy()
+        var guided = false
+        if let pixels = reader:
+            if refinement.radius > 0:
+                # The lightness of the cells within reach of those worked out, no more.
+                let values = try alloc i64[self.cells.count()] in memory.heap
+                defer free(values) in memory.heap
+                discard(refining.pending_cells(&self.cells, refinement, limit, values))
+                var needed = try Cells.create(self.extent_x, self.extent_y)
+                defer needed.destroy()
+                refining.needed_cells(&self.cells, values, refinement.apron(), &needed)
+                try sources.luma(&luma, pixels, &needed)
+                guided = true
+        try refining.refine(&self.cells, &luma if guided else none, refinement, limit)
         self.finish()
 
     ## Grow (positive) or shrink (negative) the selection by `pixels` with a

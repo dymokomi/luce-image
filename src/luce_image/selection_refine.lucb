@@ -1,0 +1,423 @@
+## Select and Mask (Refine Edge) over a selection's cells, in Photoshop's
+## order: edge detection within `radius` of the edge (matting-lite: each
+## pixel there as its lightness between the sure inside's and the sure
+## outside's nearby — traditional, no learning), Smooth, Feather, Contrast
+## and Shift Edge.
+##
+## As Select › Modify (selection_modify.lucb): a cell whose neighbourhood of
+## the whole apron is one value keeps it, every other is worked out on its
+## own from a window of the cell plus the apron, on every processor, so the
+## work and memory follow the selection's edge, not the document. A `limit`
+## box leaves the cells outside it as they are: the live preview works out
+## only what the view shows.
+import math
+import time
+import memory
+from tiles import tile_size
+from luce_image.selection_cells import Cells, each
+from luce_image.selection_modify import Window, settled_value, keep_middle, gather, ramp, extreme_rows, extreme_columns, box_rows, box_columns
+
+## The refinement, in Photoshop's units.
+pub struct Refinement:
+    ## Edge detection: pixels either side of the edge the picture decides (0..250).
+    pub var radius: i64 = 0
+    ## Pixels the outline is smoothed over (0..100).
+    pub var smooth: i64 = 0
+    ## Pixels the edge is softened over (0..250).
+    pub var feather: i64 = 0
+    ## Percent the soft edge is sharpened (0..100).
+    pub var contrast: f64 = 0.0
+    ## Percent the edge moves out (+) or in (-) (-100..100).
+    pub var shift: f64 = 0.0
+
+    ## How far edge detection looks for the sure inside and outside: from
+    ## anywhere in the band (2 * radius wide) to past its far side.
+    func reach() -> i64:
+        return 0 if self.radius <= 0 else 2 * self.radius + 2
+
+    ## How far round a cell its result depends on.
+    pub func apron() -> i64:
+        return self.radius + self.reach() + self.smooth + self.feather + 1
+
+    ## Whether it changes anything at all.
+    pub func changes() -> bool:
+        return self.radius > 0 or self.smooth > 0 or self.feather > 0 or self.contrast > 0.0 or self.shift != 0.0
+
+## The cells `refine` works out (the rest keep one value): -1 at those, the
+## value to keep elsewhere, into `values`; how many there are.
+pub func pending_cells(cells: const Cells*, refinement: Refinement, limit: CellBox, values: i64[]) -> usize:
+    var pending: usize = 0
+    for index in 0..<cells.count():
+        values[index] = settled_value(cells, index, refinement.apron())
+        if values[index] < 0 and not limit.holds(cells, index):
+            # Outside the preview's box: left as it is.
+            values[index] = cells.uniform(index)
+            if values[index] < 0:
+                values[index] = -2
+        if values[index] == -1:
+            pending += 1
+    return pending
+
+## The cells whose pixels a refinement reads: every cell within the apron of
+## one worked out, into `needed` (255 there, 0 elsewhere).
+pub func needed_cells(cells: const Cells*, values: const i64[], apron: i64, needed: Cells*):
+    let reach = (apron + (i64)tile_size - 1) // (i64)tile_size
+    let columns = (i64)cells.columns()
+    let rows = (i64)cells.rows()
+    for index in 0..<cells.count():
+        if values[index] != -1:
+            continue
+        let column = (i64)index % columns
+        let row = (i64)index // columns
+        for near_row in math.imax(0, row - reach)..<math.imin(rows, row + reach + 1):
+            for near_column in math.imax(0, column - reach)..<math.imin(columns, column + reach + 1):
+                needed.fill((usize)(near_row * columns + near_column), 255)
+
+## The cells a preview works out: those overlapping a box of document pixels,
+## or every cell.
+pub struct CellBox:
+    pub var everything: bool = true
+    pub var left: i64 = 0
+    pub var top: i64 = 0
+    pub var right: i64 = 0
+    pub var bottom: i64 = 0
+
+    func holds(cells: const Cells*, index: usize) -> bool:
+        if self.everything:
+            return true
+        let x = cells.origin_x(index)
+        let y = cells.origin_y(index)
+        return x < self.right and y < self.bottom and x + cells.cell_width(index) > self.left and y + cells.cell_height(index) > self.top
+
+## Refine `cells` as `refinement` says, the edge detection guided by `luma`
+## (lightness bytes over at least `needed_cells`; none skips it), only in
+## the cells `limit` holds.
+pub func refine(cells: Cells*, luma: const Cells*?, refinement: Refinement, limit: CellBox) -> !:
+    if not refinement.changes():
+        return
+    let count = cells.count()
+    let values = try alloc i64[count] in memory.heap
+    defer free(values) in memory.heap
+    let pending = pending_cells(cells, refinement, limit, values)
+    let items = try alloc usize[pending] in memory.heap
+    defer free(items) in memory.heap
+    var before = try cells.copy()
+    defer before.destroy()
+    var at: usize = 0
+    for index in 0..<count:
+        if values[index] == -1:
+            items[at] = index
+            at += 1
+            discard(cells.fresh(index))
+        elif values[index] >= 0 and cells.uniform(index) != values[index]:
+            cells.fill(index, (u8)values[index])
+    var curve: u8[256]
+    tone_curve(refinement, &curve)
+    var job = RefineJob(source = &before, target = cells, luma = luma, items = items, refinement = refinement, curve = curve, failed = false)
+    each(pending, (void*)&job, refine_item)
+    if job.failed:
+        error(memory.exhausted, "out of memory refining the selection")
+
+## Contrast then Shift Edge as one table: contrast steepens the soft edge
+## about half coverage (all the way at 100), shift bends it out or in.
+func tone_curve(refinement: Refinement, curve: u8[256]*):
+    let gain = 1.0 / math.max(1e-3, 1.0 - refinement.contrast / 100.0)
+    let power = math.pow(4.0, -refinement.shift / 100.0)
+    for value in 0..<(usize)256:
+        var level = math.clamp(((f64)value / 255.0 - 0.5) * gain + 0.5, 0.0, 1.0)
+        level = math.pow(level, power)
+        (*curve)[value] = (u8)math.imin(255, (i64)(level * 255.0 + 0.5))
+
+struct RefineJob:
+    var source: const Cells*
+    var target: const Cells*
+    var luma: const Cells*?
+    var items: const usize[]
+    var refinement: Refinement
+    var curve: u8[256]
+    var failed: bool
+
+## Work out one cell: its window, edge detection, the separable passes, the curve.
+func refine_item(context: void*?, item: usize):
+    let job = (RefineJob*)(context else return)
+    let cells = job.source
+    let index = job.items[item]
+    let refinement = job.refinement
+    let apron = refinement.apron()
+    let width = cells.cell_width(index)
+    let height = cells.cell_height(index)
+    var window = Window(left = cells.origin_x(index) - apron, top = cells.origin_y(index) - apron,
+                        width = width + 2 * apron, height = height + 2 * apron, extent_x = (i64)cells.extent_x, extent_y = (i64)cells.extent_y)
+    let size = (usize)(window.width * window.height)
+    let a = alloc u8[size] in memory.heap catch failure:
+        job.failed = true
+        return
+    defer free(a) in memory.heap
+    let b = alloc u8[size] in memory.heap catch failure:
+        job.failed = true
+        return
+    defer free(b) in memory.heap
+    let scratch = alloc u8[(usize)math.imax(window.width, window.height) * 2] in memory.heap catch failure:
+        job.failed = true
+        return
+    defer free(scratch) in memory.heap
+    gather(cells, &window, a)
+    var margin: i64 = 0
+    if refinement.radius > 0:
+        if let guide = job.luma:
+            if not detect_edges(a, b, guide, &window, refinement, scratch):
+                job.failed = true
+                return
+            margin = refinement.radius + refinement.reach()
+    if refinement.smooth > 0:
+        box_rows(a, b, &window, refinement.smooth, margin)
+        window.clear_outside(b)
+        box_columns(b, a, &window, refinement.smooth, margin + refinement.smooth)
+        ramp(a)
+        margin += refinement.smooth
+    if refinement.feather > 0:
+        box_rows(a, b, &window, refinement.feather, margin)
+        window.clear_outside(b)
+        box_columns(b, a, &window, refinement.feather, margin + refinement.feather)
+    for at in 0..<size:
+        a[at] = job.curve[(usize)a[at]]
+    keep_middle(job.target, index, a, &window, apron, width, height)
+
+## Edge detection in the window: within `radius` of the edge (the selection
+## grown less the selection shrunk, the unknown band), each pixel's coverage
+## is where its lightness lies between the mean lightness of the sure inside
+## (the shrunk selection) and of the sure outside (beyond the grown one)
+## nearby; where those two barely differ the picture cannot tell and the
+## coverage stays. Into `a`; false when out of memory.
+func detect_edges(a: u8[], b: u8[], guide: const Cells*, window: const Window*, refinement: Refinement, scratch: u8[]) -> bool:
+    let size = a.length
+    let band = alloc u8[size] in memory.heap catch failure:
+        return false
+    defer free(band) in memory.heap
+    let shrunk = alloc u8[size] in memory.heap catch failure:
+        return false
+    defer free(shrunk) in memory.heap
+    # Past the passes' reach both stay clear: no band there.
+    memory.set(band, 0)
+    memory.set(shrunk, 0)
+    let radius = refinement.radius
+    extreme_rows(a, b, window, radius, true, 0, scratch)
+    window.clear_outside(b)
+    extreme_columns(b, band, window, radius, true, radius, scratch)
+    extreme_rows(a, b, window, radius, false, 0, scratch)
+    window.clear_outside(b)
+    extreme_columns(b, shrunk, window, radius, false, radius, scratch)
+    let floats = alloc f32[size * 5] in memory.heap catch failure:
+        return false
+    defer free(floats) in memory.heap
+    let inside_light = floats[..<size]
+    let inside = floats[size..<2 * size]
+    let outside_light = floats[2 * size..<3 * size]
+    let outside = floats[3 * size..<4 * size]
+    let line = floats[4 * size..<5 * size]
+    gather(guide, window, b)
+    for at in 0..<size:
+        let light = (f32)b[at] / 255.0
+        let sure_in: f32 = 1.0 if shrunk[at] == 255 else 0.0
+        let sure_out: f32 = 1.0 if band[at] == 0 else 0.0
+        inside_light[at] = light * sure_in
+        inside[at] = sure_in
+        outside_light[at] = light * sure_out
+        outside[at] = sure_out
+    let reach = refinement.reach()
+    box_float(inside_light, inside_light, window, reach, line)
+    box_float(inside, inside, window, reach, line)
+    box_float(outside_light, outside_light, window, reach, line)
+    box_float(outside, outside, window, reach, line)
+    for at in 0..<size:
+        if band[at] == shrunk[at] or inside[at] < 1e-4 or outside[at] < 1e-4:
+            continue
+        let front = inside_light[at] / inside[at]
+        let back = outside_light[at] / outside[at]
+        let apart = front - back
+        # Sure of the picture only where inside and outside differ by a tenth or more.
+        let trust = (f64)math.min(1.0, (f64)(apart if apart > 0.0 else -apart) * 10.0)
+        if trust <= 0.0:
+            continue
+        let matte = math.clamp((f64)(((f32)b[at] / 255.0 - back) / apart), 0.0, 1.0)
+        let value = trust * matte + (1.0 - trust) * (f64)a[at] / 255.0
+        a[at] = (u8)math.imin(255, math.imax(0, (i64)(value * 255.0 + 0.5)))
+    return true
+
+## A box mean of 2 * `radius` + 1 each way over the whole window, the box cut
+## at the window's edges (the mean of what is inside), into `target` (which
+## may be `source`); `line` is scratch the window's size.
+func box_float(source: const f32[], target: f32[], window: const Window*, radius: i64, line: f32[]):
+    let width = window.width
+    let height = window.height
+    # Along the rows into `line`, then down the columns into `target`.
+    for y in 0..<height:
+        let row = (usize)(y * width)
+        var total: f64 = 0.0
+        for x in 0..<math.imin(radius, width):
+            total += (f64)source[row + (usize)x]
+        for x in 0..<width:
+            if x + radius < width:
+                total += (f64)source[row + (usize)(x + radius)]
+            if x - radius - 1 >= 0:
+                total -= (f64)source[row + (usize)(x - radius - 1)]
+            let count = math.imin(width - 1, x + radius) - math.imax(0, x - radius) + 1
+            line[row + (usize)x] = (f32)(total / (f64)count)
+    for x in 0..<width:
+        var total: f64 = 0.0
+        for y in 0..<math.imin(radius, height):
+            total += (f64)line[(usize)(y * width + x)]
+        for y in 0..<height:
+            if y + radius < height:
+                total += (f64)line[(usize)((y + radius) * width + x)]
+            if y - radius - 1 >= 0:
+                total -= (f64)line[(usize)((y - radius - 1) * width + x)]
+            let count = math.imin(height - 1, y + radius) - math.imax(0, y - radius) + 1
+            target[(usize)(y * width + x)] = (f32)(total / (f64)count)
+
+# mark: Tests ===================================================================================
+
+## Cells `width` by `height` whose pixel (x, y) is `value(x, y)`, settled.
+func painted(width: u32, height: u32, value: func(i64, i64) -> u8) -> Cells!:
+    var cells = try Cells.create(width, height)
+    for index in 0..<cells.count():
+        let bytes = cells.writable(index)
+        for y in 0..<cells.cell_height(index):
+            for x in 0..<cells.cell_width(index):
+                bytes[(usize)(y * (i64)tile_size + x)] = value(cells.origin_x(index) + x, cells.origin_y(index) + y)
+    discard(try cells.settle())
+    return cells
+
+## A disc, a notch and a sliver: edges in many cells, and whole cells either way.
+func busy(x: i64, y: i64) -> u8:
+    let dx = x - 300
+    let dy = y - 260
+    if dx * dx + dy * dy < 200 * 200 and not (x > 280 and x < 320 and y > 40 and y < 200):
+        return 255
+    if x >= 560 and y < 30:
+        return 180
+    return 0
+
+## Lightness: bright left of column 306, dark from it, a gradient below.
+func lit(x: i64, y: i64) -> u8:
+    if y > 400:
+        return (u8)(x % 256)
+    return 230 if x < 306 else 20
+
+func left_of_300(x: i64, y: i64) -> u8:
+    discard(y)
+    return 255 if x < 300 else 0
+
+func left_of_280(x: i64, y: i64) -> u8:
+    discard(y)
+    return 255 if x < 280 else 0
+
+## Tests' oracle: the refinement over the whole document as one window.
+func dense_refine(cells: const Cells*, luma: const Cells*?, refinement: Refinement, out: u8[]):
+    let apron = refinement.apron()
+    let width = (i64)cells.extent_x
+    let height = (i64)cells.extent_y
+    var window = Window(left = -apron, top = -apron, width = width + 2 * apron, height = height + 2 * apron, extent_x = width, extent_y = height)
+    let size = (usize)(window.width * window.height)
+    let a = alloc u8[size] in memory.heap catch failure:
+        trap("out of memory in a test")
+    defer free(a) in memory.heap
+    let b = alloc u8[size] in memory.heap catch failure:
+        trap("out of memory in a test")
+    defer free(b) in memory.heap
+    let scratch = alloc u8[(usize)math.imax(window.width, window.height) * 2] in memory.heap catch failure:
+        trap("out of memory in a test")
+    defer free(scratch) in memory.heap
+    gather(cells, &window, a)
+    var margin: i64 = 0
+    if refinement.radius > 0:
+        if let guide = luma:
+            assert(detect_edges(a, b, guide, &window, refinement, scratch))
+            margin = refinement.radius + refinement.reach()
+    if refinement.smooth > 0:
+        box_rows(a, b, &window, refinement.smooth, margin)
+        window.clear_outside(b)
+        box_columns(b, a, &window, refinement.smooth, margin + refinement.smooth)
+        ramp(a)
+        margin += refinement.smooth
+    if refinement.feather > 0:
+        box_rows(a, b, &window, refinement.feather, margin)
+        window.clear_outside(b)
+        box_columns(b, a, &window, refinement.feather, margin + refinement.feather)
+    var curve: u8[256]
+    tone_curve(refinement, &curve)
+    for y in 0..<height:
+        for x in 0..<width:
+            out[(usize)(y * width + x)] = curve[(usize)a[(usize)((y + apron) * window.width + x + apron)]]
+
+test "refining cell by cell matches refining the whole document at once":
+    let cases: Refinement[6] = [Refinement(smooth = 4), Refinement(feather = 9), Refinement(contrast = 60.0, feather = 5), Refinement(shift = 40.0, feather = 6),
+                                Refinement(radius = 14), Refinement(radius = 30, smooth = 3, feather = 4, contrast = 20.0, shift = -30.0)]
+    var luma = try painted(620, 520, lit)
+    defer luma.destroy()
+    let dense = try alloc u8[620 * 520] in memory.heap
+    defer free(dense) in memory.heap
+    for refinement in cases:
+        var cells = try painted(620, 520, busy)
+        defer cells.destroy()
+        dense_refine(&cells, &luma, refinement, dense)
+        try refine(&cells, &luma, refinement, CellBox())
+        for y in 0..<(i64)520:
+            for x in 0..<(i64)620:
+                if cells.at(x, y) != dense[(usize)(y * 620 + x)]:
+                    trap(f"refine differs at {x}, {y}: {cells.at(x, y)} vs {dense[(usize)(y * 620 + x)]}")
+
+test "edge detection moves the edge to the picture's within the radius":
+    var luma = try painted(620, 520, lit)
+    defer luma.destroy()
+    # Selected left of column 300; the picture's edge is at 306.
+    var cells = try painted(620, 520, left_of_300)
+    defer cells.destroy()
+    try refine(&cells, &luma, Refinement(radius = 12), CellBox())
+    assert(cells.at(303, 200) > 200 and cells.at(309, 200) < 60 and cells.at(250, 200) == 255 and cells.at(400, 200) == 0)
+    # Beyond the radius of the edge the picture has no say.
+    var far = try painted(620, 520, left_of_280)
+    defer far.destroy()
+    try refine(&far, &luma, Refinement(radius = 12), CellBox())
+    assert(far.at(293, 200) == 0 and far.at(305, 200) == 0 and far.at(267, 200) == 255)
+
+test "a preview's box leaves the cells outside it alone":
+    var cells = try painted(620, 520, busy)
+    defer cells.destroy()
+    var whole = try painted(620, 520, busy)
+    defer whole.destroy()
+    try refine(&cells, none, Refinement(feather = 8), CellBox(everything = false, left = 0, top = 0, right = 256, bottom = 256))
+    try refine(&whole, none, Refinement(feather = 8), CellBox())
+    # Inside the box as the whole refinement; outside, untouched.
+    assert(cells.at(150, 100) == whole.at(150, 100) and cells.at(300, 455) == 255 and whole.at(300, 455) < 255 and cells.at(200, 90) == whole.at(200, 90))
+
+test "refining a 15000 by 24000 selection works out only the cells along its edge":
+    var cells = try Cells.create(15000, 24000)
+    defer cells.destroy()
+    # A rectangle with a soft left edge: its outline crosses a few hundred cells.
+    for index in 0..<cells.count():
+        let x = cells.origin_x(index)
+        let y = cells.origin_y(index)
+        if x >= 1024 and x < 12032 and y >= 2048 and y < 20224:
+            cells.fill(index, 255)
+    discard(try cells.settle())
+    let values = try alloc i64[cells.count()] in memory.heap
+    defer free(values) in memory.heap
+    let refinement = Refinement(radius = 20, smooth = 5, feather = 10, contrast = 10.0)
+    let pending = pending_cells(&cells, refinement, CellBox(), values)
+    assert(pending > 100 and pending < 700)
+    var needed = try Cells.create(15000, 24000)
+    defer needed.destroy()
+    needed_cells(&cells, values, refinement.apron(), &needed)
+    var read: usize = 0
+    for index in 0..<needed.count():
+        if needed.uniform(index) == 255:
+            read += 1
+    # The lightness read: the edge cells and their neighbours, far from all 5,546.
+    assert(read < 2000)
+    var luma = try Cells.create(15000, 24000)
+    defer luma.destroy()
+    let started = time.now()
+    try refine(&cells, &luma, refinement, CellBox())
+    assert(time.now() - started < 30000000000)
+    assert(cells.at(5000, 10000) == 255 and cells.at(100, 100) == 0 and cells.at(1024, 10000) > 0 and cells.at(1024, 10000) < 255)

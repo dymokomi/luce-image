@@ -213,3 +213,34 @@ test "the magnetic lasso on 15000 by 24000 reads only the cells round its wire":
     # Fifty moves in well under a second each, whatever the document's size.
     assert(elapsed < 10000000000)
     canvas.cancel_magnetic()
+
+test "select and mask previews in the view's box, keeps one step, and cancels back":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    # The picture's edge at column 306, the selection's at 300.
+    var canvas = try half_white(620, 400, 306, &target)
+    defer canvas.close()
+    try canvas.select_rectangle(300, 0, 320, 400, 0)
+    let steps = canvas.history_steps()
+    try canvas.begin_refine()
+    assert(canvas.refining())
+    try canvas.set_refine_view(2)
+    assert(canvas.refine_view_mode() == 2)
+    # Only the box's cells: the edge in the first row of cells moves, below it not yet.
+    try canvas.preview_refine(12, 0, 0, 0.0, 0.0, 0, 0, 620, 200)
+    assert(canvas.selected_at(303, 100) == 0 and canvas.selected_at(303, 300) == 255 and canvas.history_steps() == steps)
+    try canvas.end_refine(true, 12)
+    assert(not canvas.refining() and canvas.refine_view_mode() == 0 and canvas.undo_name() == "Select and Mask")
+    assert(canvas.selected_at(303, 300) == 0 and canvas.selected_at(309, 300) == 255)
+    try canvas.undo()
+    assert(canvas.selected_at(303, 300) == 255)
+    # Cancel puts it back.
+    try canvas.begin_refine()
+    try canvas.preview_refine(0, 0, 20, 0.0, 0.0)
+    assert(canvas.selected_at(295, 100) > 0)
+    try canvas.end_refine(false)
+    assert(canvas.selected_at(295, 100) == 0 and canvas.selected_at(303, 100) == 255)

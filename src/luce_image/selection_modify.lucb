@@ -71,7 +71,7 @@ func pass_cells(cells: Cells*, kind: i64, pixels: i64, feather: i64, apron: i64)
 
 ## The one value cell `index` holds after the change, when its neighbourhood
 ## of `apron` pixels decides it without looking; -1 when it must be worked out.
-func settled_value(cells: const Cells*, index: usize, apron: i64) -> i64:
+pub func settled_value(cells: const Cells*, index: usize, apron: i64) -> i64:
     let value = cells.uniform(index)
     if value < 0:
         return -1
@@ -163,7 +163,7 @@ func modify_item(context: void*?, item: usize):
     keep_middle(job.target, index, current, &window, apron, width, height)
 
 ## The cell itself: the window's middle, rows of 256 in its block.
-func keep_middle(target: const Cells*, index: usize, current: const u8[], window: const Window*, apron: i64, width: i64, height: i64):
+pub func keep_middle(target: const Cells*, index: usize, current: const u8[], window: const Window*, apron: i64, width: i64, height: i64):
     let result = (target.block(index) else return).bytes
     memory.set(result, 0)
     for y in 0..<height:
@@ -188,22 +188,22 @@ func border_window(a: u8[], b: u8[], c: u8[], window: const Window*, radius: i64
     box_columns(b, a, window, 1, radius + 1)
 
 ## Smooth's last step: a blurred edge taken back to a few pixels about half coverage.
-func ramp(bytes: u8[]):
+pub func ramp(bytes: u8[]):
     for at in 0..<bytes.length:
         let value = ((i64)bytes[at] - 128) * 4 + 128
         bytes[at] = (u8)math.imin(255, math.imax(0, value))
 
 ## A window onto the document, in document pixels, and the document's size.
-struct Window:
-    var left: i64
-    var top: i64
-    var width: i64
-    var height: i64
-    var extent_x: i64
-    var extent_y: i64
+pub struct Window:
+    pub var left: i64
+    pub var top: i64
+    pub var width: i64
+    pub var height: i64
+    pub var extent_x: i64
+    pub var extent_y: i64
 
     ## Zero every byte of `bytes` (the window's) that lies past the document.
-    func clear_outside(bytes: u8[]):
+    pub func clear_outside(bytes: u8[]):
         let inside_left = math.imax(0, -self.left)
         let inside_right = math.imin(self.width, self.extent_x - self.left)
         for y in 0..<self.height:
@@ -219,7 +219,7 @@ struct Window:
 
 ## The window's coverage from the cells, clear past the document: whole rows
 ## of each cell at a time.
-func gather(cells: const Cells*, window: const Window*, bytes: u8[]):
+pub func gather(cells: const Cells*, window: const Window*, bytes: u8[]):
     memory.set(bytes, 0)
     let left = math.imax(0, window.left)
     let top = math.imax(0, window.top)
@@ -256,14 +256,14 @@ func gather(cells: const Cells*, window: const Window*, bytes: u8[]):
 
 ## The largest (`grow`) or smallest value over each run of 2 * `radius` + 1 in
 ## every good row of `source`, into `target`.
-func extreme_rows(source: const u8[], target: u8[], window: const Window*, radius: i64, grow: bool, margin: i64, scratch: u8[]):
+pub func extreme_rows(source: const u8[], target: u8[], window: const Window*, radius: i64, grow: bool, margin: i64, scratch: u8[]):
     let width = window.width
     for y in margin..<window.height - margin:
         let line = (usize)(y * width)
         extreme_line(source, target, line, 1, width, radius, grow, scratch)
 
 ## As `extreme_rows`, down every good column.
-func extreme_columns(source: const u8[], target: u8[], window: const Window*, radius: i64, grow: bool, margin: i64, scratch: u8[]):
+pub func extreme_columns(source: const u8[], target: u8[], window: const Window*, radius: i64, grow: bool, margin: i64, scratch: u8[]):
     let width = window.width
     for x in margin..<width - margin:
         extreme_line(source, target, (usize)x, (usize)width, window.height, radius, grow, scratch)
@@ -298,12 +298,12 @@ func extreme_line(source: const u8[], target: u8[], start: usize, stride: usize,
         target[start + (usize)place * stride] = (low if low > high else high) if grow else (low if low < high else high)
 
 ## A box blur of 2 * `radius` + 1 along every good row, rounding down.
-func box_rows(source: const u8[], target: u8[], window: const Window*, radius: i64, margin: i64):
+pub func box_rows(source: const u8[], target: u8[], window: const Window*, radius: i64, margin: i64):
     for y in margin..<window.height - margin:
         box_line(source, target, (usize)(y * window.width), 1, window.width, radius)
 
 ## As `box_rows`, down every good column.
-func box_columns(source: const u8[], target: u8[], window: const Window*, radius: i64, margin: i64):
+pub func box_columns(source: const u8[], target: u8[], window: const Window*, radius: i64, margin: i64):
     for x in margin..<window.width - margin:
         box_line(source, target, (usize)x, (usize)window.width, window.height, radius)
 

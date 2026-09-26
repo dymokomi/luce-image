@@ -109,6 +109,38 @@ func load_item(context: void*?, item: usize):
             shape[y * (usize)tile_size + x] = job.table[(usize)((u16)halves[at] | ((u16)halves[at + 1] << 8))]
     combine_cell(job.cells, index, shape, job.mode)
 
+## Into `target` (empty to begin with): the pixels' perceptual lightness as a
+## byte, 0 where transparent, for every cell `only` selects anything in, read
+## a batch at a time: the guide Select and Mask's edge detection follows.
+pub func luma(target: Cells*, reader: Reader, only: const Cells*) -> !:
+    var no_indices: usize[]
+    var no_halves: u8[]
+    var no_ranges: u8[]
+    var no_ranged: bool[]
+    var no_table: u8[]
+    var job = CellJob(cells = target, table = no_table, channel = 0, mode = Mode.replace, low = [0, 0, 0, 0], high = [0, 0, 0, 0], limit = 0, only = only,
+                      ranges = no_ranges, ranged = no_ranged, indices = no_indices, halves = no_halves)
+    try read_batches(target, reader, &job, luma_item, 0)
+
+## Lightness for cell `job.indices[item]` from its halves: straight linear
+## light weighted as Rec. 709, square-rooted (about gamma 2), times alpha.
+func luma_item(context: void*?, item: usize):
+    let job = (CellJob*)(context else return)
+    let index = job.indices[item]
+    let halves = job.halves[item * cell_halves..<(item + 1) * cell_halves]
+    let bytes = job.cells.fresh(index)
+    memory.set(bytes, 0)
+    let width = (usize)job.cells.cell_width(index)
+    for y in 0..<(usize)job.cells.cell_height(index):
+        for x in 0..<width:
+            let at = (y * (usize)tile_size + x) * 8
+            let red = (f64)from_half((u16)halves[at] | ((u16)halves[at + 1] << 8))
+            let green = (f64)from_half((u16)halves[at + 2] | ((u16)halves[at + 3] << 8))
+            let blue = (f64)from_half((u16)halves[at + 4] | ((u16)halves[at + 5] << 8))
+            let alpha = math.clamp((f64)from_half((u16)halves[at + 6] | ((u16)halves[at + 7] << 8)), 0.0, 1.0)
+            let light = math.sqrt(math.clamp(0.2126 * red + 0.7152 * green + 0.0722 * blue, 0.0, 1.0)) * alpha
+            bytes[y * (usize)tile_size + x] = (u8)math.imin(255, (i64)(light * 255.0 + 0.5))
+
 # mark: The magic wand ==========================================================================
 
 ## Into `found` (empty to begin with): the pixels within `tolerance` (0..255,

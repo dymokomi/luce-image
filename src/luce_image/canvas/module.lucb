@@ -62,6 +62,7 @@ import luce_image.light_filters as light_filters
 from luce_image.transform import translate, Transformer, Landed, landing, sampling_nearest, sampling_smooth, sampling_high
 from luce_image.projective import Warp, affine_warp, quad_warp
 import luce_image.live_wire as live_wire
+from luce_image.selection_refine import Refinement, CellBox
 from luce_image.extent import full_bounds, pieces, relocate, Pieces
 from luce_image.transform_window import Footprint
 from luce_image.transform_preview import warp_preview_cell, lifted_preview_cell
@@ -241,6 +242,10 @@ pub struct Canvas:
     var selection_origin: Selection*?
     ## The Magnetic Lasso under way (magnetic.lucb).
     var magnetic: Magnetic*?
+    ## Select and Mask while open: the selection it began from, and how the
+    ## view shows the refined one (masking.lucb).
+    var refine_origin: Selection*?
+    var refine_view: i64
     ## A filter dialog's preview, shown through the compositor until kept or dropped.
     var filter_stand_in: FilterPreview*?
     ## What `measure_histogram` counted: luminosity, red, green and blue, 256
@@ -325,6 +330,8 @@ pub struct Canvas:
         self.transform_session = none
         self.selection_origin = none
         self.magnetic = none
+        self.refine_origin = none
+        self.refine_view = 0
         self.filter_stand_in = none
         self.heal_opacity = 1.0
         self.edit_depth = 0
@@ -612,6 +619,7 @@ pub struct Canvas:
         drop_filter_preview(&self)
         drop_selection_transform(&self)
         cancel_magnetic(&self)
+        drop_refine(&self)
         drop_quick_mask(&self)
         if let composer = self.composer:
             composer.drop_stand_ins()
@@ -1486,6 +1494,39 @@ pub struct Canvas:
         try shape.polygon(points, Mode.replace)
         try self.merge_shape(&shape, mode)
 
+    # mark: Select and Mask =====================================================================
+
+    ## Select › Select and Mask: begin refining the selection's edge;
+    ## `preview_refine` shows it, `end_refine` keeps it as one step or puts
+    ## the selection back.
+    pub mutating func begin_refine() -> !:
+        try begin_refine(&self)
+
+    pub func refining() -> bool:
+        return self.refine_origin != none
+
+    ## The selection as it began refined: edge detection `radius` (0..250),
+    ## `smooth` (0..100), `feather` (0..250), `contrast` (0..100%) and
+    ## `shift` edge (-100..100%), worked out only in the box of document
+    ## pixels at (`left`, `top`), `width` by `height` (the view; 0 wide is all).
+    pub mutating func preview_refine(radius: i64, smooth: i64, feather: i64, contrast: f64, shift: f64, left: i64 = 0, top: i64 = 0, width: i64 = 0, height: i64 = 0) -> !:
+        let within = CellBox() if width <= 0 or height <= 0 else CellBox(everything = false, left = left, top = top, right = left + width, bottom = top + height)
+        try show_refined(&self, Refinement(radius = radius, smooth = smooth, feather = feather, contrast = contrast, shift = shift), within)
+
+    ## OK (`keep`): the whole selection refined so, one step; Cancel: as it was.
+    pub mutating func end_refine(keep: bool, radius: i64 = 0, smooth: i64 = 0, feather: i64 = 0, contrast: f64 = 0.0, shift: f64 = 0.0) -> !:
+        try end_refine(&self, keep, Refinement(radius = radius, smooth = smooth, feather = feather, contrast = contrast, shift = shift))
+
+    ## How the view shows the selection while refining: 0 marching ants,
+    ## 1 a red overlay, 2 on black, 3 on white.
+    pub mutating func set_refine_view(mode: i64) -> !:
+        if mode < 0 or mode > 3:
+            error(invalid, "the view is 0 ants, 1 overlay, 2 on black or 3 on white")
+        self.refine_view = mode
+
+    pub func refine_view_mode() -> i64:
+        return self.refine_view
+
     # mark: Magnetic Lasso ======================================================================
 
     ## The Magnetic Lasso's first anchor at document point (`x`, `y`), its wire
@@ -1642,6 +1683,8 @@ pub struct Canvas:
     ## with the same rectangle, zoom and offset; `phase` animates the dashes.
     ## While Quick Mask is on, the masked part is tinted instead.
     pub mutating func draw_selection(target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, phase: f64) -> !:
+        if try draw_refine_view(&self, target, rectangle, zoom, offset_x, offset_y):
+            return
         if self.quick_mask():
             try self.require_open()
             if not math.is_finite(zoom) or zoom <= 0.0:

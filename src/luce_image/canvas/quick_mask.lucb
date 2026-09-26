@@ -137,12 +137,19 @@ func purge_steps(entries: Snapshot[]*, count: usize*, id: u64):
         kept += 1
     *count = kept
 
-## Tint what Quick Mask masks over the document as `draw` drew it, at the
-## view's level, only the cells on screen that hold a tile.
+## Tint what Quick Mask masks over the document as `draw` drew it.
 func draw_quick_overlay(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64) -> !:
     let document = canvas.document else return
     let quick = document.quick_layer() else return
     let mask = quick.mask_tiles() else return
+    try draw_matte(canvas, target, rectangle, zoom, offset_x, offset_y, mask, true, [quick_red, 0.0, 0.0], quick_opacity)
+
+## Cover what `coverage` leaves out (its red channel, a mask's or the
+## selection's) with `color` at `opacity`, over the document as `draw` drew
+## it, at the view's level, only the cells on screen. A cell without a tile
+## is wholly covered in a mask (`mask`), wholly left out in a selection.
+func draw_matte(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64,
+                coverage: const Tiles*, mask: bool, color: f32[3], opacity: f32) -> !:
     let checked = try target.get()
     let pipeline = try canvas.quick_pipeline()
     let clipped = try checked.clipped(rectangle)
@@ -166,8 +173,11 @@ func draw_quick_overlay(canvas: Canvas*, target: interop.View[gpu.RenderTarget],
             let height = (f64)covered_y * step * zoom
             if left >= rectangle.x + rectangle.width or top >= rectangle.y + rectangle.height or left + width <= rectangle.x or top + height <= rectangle.y:
                 continue
-            # A cell without a tile reveals: nothing to tint.
-            let texture = (try composer.level_texture(mask, column, row, level, true)) else continue
-            var params: f32[12] = [(f32)((placement.x + left) * scale), (f32)((placement.y + top) * scale), (f32)(zoom * step * scale), quick_opacity,
-                                   (f32)covered_x, (f32)covered_y, 0.0, 0.0, quick_red, 0.0, 0.0, 1.0]
+            let found = try composer.level_texture(coverage, column, row, level, mask)
+            if found == none and mask:
+                # A mask reveals where it has no tile: nothing to cover.
+                continue
+            let texture = found else composer_blank(canvas)
+            var params: f32[12] = [(f32)((placement.x + left) * scale), (f32)((placement.y + top) * scale), (f32)(zoom * step * scale), opacity,
+                                   (f32)covered_x, (f32)covered_y, 0.0, 0.0, color[0], color[1], color[2], 1.0]
             try gpu.shade(area, pipeline, gpu.Rect(left, top, width, height), u8[]((u8*)&params[0], 48), [texture], gpu.Filter.nearest if zoom * step >= 1.0 else gpu.Filter.linear)

@@ -1,0 +1,95 @@
+#==============================================================================================
+#
+#   canvas/masking - Select and Mask: the selection's edge refined, previewed live
+#
+#   DESCRIPTION:
+#       The selection as it began is kept aside; each preview refines a copy of it
+#       (Selection.refine, selection_refine.lucb) only in the cells the view shows, the
+#       edge detection guided by the flattened picture, so a slider's drag costs the screen's
+#       edge cells whatever the document's size. The view shows it as marching ants, a red
+#       overlay, or the picture on black or white. Keeping it refines every edge cell of the
+#       original once more, at full resolution, and records that as one undo step.
+#
+#==============================================================================================
+
+## How Select and Mask shows the selection.
+let refine_ants: i64 = 0
+let refine_overlay: i64 = 1
+let refine_on_black: i64 = 2
+let refine_on_white: i64 = 3
+
+## `Canvas.begin_refine`.
+func begin_refine(canvas: Canvas*) -> !:
+    try canvas.require_open()
+    try canvas.require_idle()
+    if canvas.refine_origin != none:
+        error(invalid, "Select and Mask is already open")
+    if not canvas.has_selection():
+        error(invalid, "nothing is selected to refine")
+    let copy = try canvas.live().copy()
+    let kept = try new Selection in memory.heap
+    *kept = copy
+    canvas.refine_origin = kept
+    canvas.refine_view = refine_ants
+
+## The selection it began from, refined by `refinement` in the cells `within`
+## holds, shown in its place.
+func show_refined(canvas: Canvas*, refinement: Refinement, within: CellBox) -> !:
+    let origin = canvas.refine_origin else error(invalid, "Select and Mask is not open")
+    let document = canvas.document else error(invalid, "draw the document once before refining the selection")
+    let composer = canvas.composer else error(invalid, "draw the document once before refining the selection")
+    let device = canvas.device else error(invalid, "draw the document once before refining the selection")
+    var shown = try origin.copy()
+    errdefer shown.destroy()
+    var picture = PictureSource(composer = composer, document = document, extent_y = canvas.extent_y)
+    try shown.refine(selection_sources.gpu_reader((void*)&picture, device, picture_cell_texture), refinement, within)
+    var live = canvas.live()
+    live.destroy()
+    *live = shown
+
+## `Canvas.end_refine`: refine all of it and keep that as one step, recorded
+## against the selection it began from, or put that one back.
+func end_refine(canvas: Canvas*, keep: bool, refinement: Refinement) -> !:
+    if canvas.refine_origin == none:
+        return
+    if keep:
+        try show_refined(canvas, refinement, CellBox())
+    let origin = canvas.refine_origin else return
+    canvas.refine_origin = none
+    canvas.refine_view = refine_ants
+    defer free(origin) in memory.heap
+    var live = canvas.live()
+    if not keep:
+        live.destroy()
+        *live = *origin
+        return
+    # History records the state before the change: the original, briefly back.
+    var shown = *live
+    *live = *origin
+    canvas.remember_state("Select and Mask") catch failure:
+        live.destroy()
+        *live = shown
+        error(failure.code, failure.message)
+    live.destroy()
+    *live = shown
+
+## Drop Select and Mask left open (the canvas closing).
+func drop_refine(canvas: Canvas*):
+    let origin = canvas.refine_origin else return
+    canvas.refine_origin = none
+    origin.destroy()
+    free(origin) in memory.heap
+
+## Select and Mask's view of the selection over the document as `draw` drew
+## it; false when it is the marching ants, which `draw_selection` draws.
+func draw_refine_view(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64) -> bool!:
+    if canvas.refine_origin == none or canvas.refine_view == refine_ants:
+        return false
+    let document = canvas.document else return true
+    let tiles = (try document.selection_tiles()) else return true
+    if canvas.refine_view == refine_overlay:
+        try draw_matte(canvas, target, rectangle, zoom, offset_x, offset_y, tiles, false, [quick_red, 0.0, 0.0], quick_opacity)
+    else:
+        let shade: f32 = 0.0 if canvas.refine_view == refine_on_black else 1.0
+        try draw_matte(canvas, target, rectangle, zoom, offset_x, offset_y, tiles, false, [shade, shade, shade], 1.0)
+    return true
