@@ -396,3 +396,51 @@ test "a picture that opens but cannot be decoded fails the bind that loads it, a
     # The first draw's bind reports it (the window reports a draw's failure);
     # the document stays bound, its layer empty, and closes cleanly.
     assert(failed and canvas.is_bound() and canvas.layer_count() == 1)
+
+## Two gradient layers over a 1500 by 1100 document.
+func painted_pair(canvas: Canvas*) -> !:
+    let first = try canvas.add_layer("First")
+    let second = try canvas.add_layer("Second")
+    try canvas.fill_gradient(first, 0.0, 0.0, 1500.0, 1100.0, 1.0, 0.2, 0.1, 1.0, 0.1, 0.3, 0.9, 1.0)
+    try canvas.fill_gradient(second, 750.0, 550.0, 1300.0, 900.0, 0.9, 0.9, 0.2, 0.8, 0.2, 0.9, 0.4, 0.3, radial = true)
+
+test "a frame never waits for tiles coming back: a coarser level stands in, and the next frames draw them exactly":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var target = try gpu.Texture.create(device, 256, 192, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    var reference: u8[196608]
+    var seen: u8[196608]
+    # The same picture on a document that keeps everything, at 100%.
+    var plain = try Canvas(1500, 1100)
+    defer plain.close()
+    try frame_pixels(&plain, &target, 1.0, 0.0, 0.0, reference)
+    try painted_pair(&plain)
+    try frame_pixels(&plain, &target, 1.0, -600.0, -500.0, reference)
+    var canvas = try Canvas(1500, 1100)
+    defer canvas.close()
+    defer residency_budgets(0, 0)
+    try frame_pixels(&canvas, &target, 1.0, 0.0, 0.0, seen)
+    try painted_pair(&canvas)
+    # Seen whole once (its coarse levels kept), then every layer tile packed
+    # and moved out of the GPU and RAM.
+    try frame_pixels(&canvas, &target, 256.0 / 1500.0, 0.0, 0.0, seen)
+    Canvas.set_compressed_tier(true)
+    defer Canvas.set_compressed_tier(false)
+    Canvas.set_progressive_loading(true)
+    defer Canvas.set_progressive_loading(false)
+    try canvas.set_memory_budgets(24 * 524288, 524288)
+    try canvas.settle_memory()
+    assert(canvas.memory_packs() > 0)
+    # The first frame at 100% shows the coarse level and asks for more.
+    try frame_pixels(&canvas, &target, 1.0, -600.0, -500.0, seen)
+    assert(canvas.busy())
+    var frames: usize = 1
+    while canvas.busy() and frames < 500:
+        thread.sleep(1)
+        try frame_pixels(&canvas, &target, 1.0, -600.0, -500.0, seen)
+        frames += 1
+    assert(not canvas.busy())
+    assert(same_bytes(seen, reference))

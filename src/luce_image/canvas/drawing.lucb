@@ -34,12 +34,21 @@ func draw_canvas(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectan
     let origin_y = rectangle.y + offset_y
     let columns = (tile_columns(canvas.extent_x) + span - 1) // span
     let rows = (tile_columns(canvas.extent_y) + span - 1) // span
-    # The layer tiles the cells in view will need, brought back together first.
     let first_column = visible_cell(rectangle.x - origin_x, tile_points, columns)
     let first_row = visible_cell(rectangle.y - origin_y, tile_points, rows)
     let last_column = max_u32(first_column, visible_cell(rectangle.x + rectangle.width - origin_x, tile_points, columns - 1) + 1)
     let last_row = max_u32(first_row, visible_cell(rectangle.y + rectangle.height - origin_y, tile_points, rows - 1) + 1)
-    try composer.gather(document, first_column, first_row, min_u32(last_column, columns), min_u32(last_row, rows), level)
+    # Tiles a background batch brought back since the last frame.
+    discard(try prefetch_collect())
+    # A batch that failed to decode something: this frame brings what it lacks
+    # back itself, so the failure is reported.
+    let waits = not progressive_loading or prefetch_had_failure()
+    if waits:
+        # The layer tiles the cells in view will need, brought back together first.
+        try composer.gather(document, first_column, first_row, min_u32(last_column, columns), min_u32(last_row, rows), level)
+    var lacking = Gathering.deferred()
+    defer lacking.release()
+    canvas.coarse_shown = false
     for row in 0..<rows:
         let top = origin_y + (f64)row * tile_points
         if top >= rectangle.y + rectangle.height or top + tile_points <= rectangle.y:
@@ -48,13 +57,22 @@ func draw_canvas(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectan
             let left = origin_x + (f64)column * tile_points
             if left >= rectangle.x + rectangle.width or left + tile_points <= rectangle.x:
                 continue
-            let texture = try composer.tile(document, column, row, level)
             # The texels the document covers in this tile, and their extent in points.
             let covered_x = min_u32(tile_size, (canvas.extent_x - column * span * tile_size + span - 1) // span)
             let covered_y = min_u32(tile_size, (canvas.extent_y - row * span * tile_size + span - 1) // span)
             let destination = gpu.Rect(left, top, (f64)covered_x * (f64)span * zoom, (f64)covered_y * (f64)span * zoom)
+            if not waits and not composer.kept(document, column, row, level) and (try composer.lacking(document, column, row, level, &lacking)) > 0:
+                # Its tiles come back in the background: a coarser level kept stands in.
+                if let coarse = composer.coarser(document, column, row, level, covered_x, covered_y):
+                    try gpu.draw_image(area, coarse.texture, destination, coarse.region, 1.0, gpu.Filter.linear)
+                    canvas.coarse_shown = true
+                    continue
+                # Nothing coarser is kept (the first frame): this cell waits.
+                try composer.gather(document, column, row, column + 1, row + 1, level)
+            let texture = try composer.tile(document, column, row, level)
             try gpu.draw_image(area, texture, destination, gpu.Region(0, 0, covered_x, covered_y), 1.0,
                                gpu.Filter.nearest if zoom >= 1.0 else gpu.Filter.linear)
+    try lacking.finish()
     if settles:
         try settle_tiers(canvas)
 
@@ -192,6 +210,10 @@ func draw_canvas_selection(canvas: Canvas*, target: interop.View[gpu.RenderTarge
             let limit_y = ((f64)canvas.extent_y - (f64)row * span) / step
             var params: f32[8] = [(f32)((placement.x + left) * scale), (f32)((placement.y + top) * scale), (f32)(zoom * step * scale), (f32)phase, (f32)covered_x, (f32)covered_y, (f32)limit_x, (f32)limit_y]
             try gpu.shade(area, pipeline, gpu.Rect(left, top, width, height), u8[]((u8*)&params[0], 32), [texture, right_tile, below_tile], gpu.Filter.nearest)
+
+## Whether frames draw cells lacking tiles from a coarser level while the
+## tiles come back in the background (`Canvas.set_progressive_loading`).
+var progressive_loading: bool = false
 
 ## The cell `offset` points into a row of cells `tile_points` wide lies in,
 ## held to 0..`most`.

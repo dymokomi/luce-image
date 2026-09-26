@@ -13,7 +13,7 @@
 ## document has one every key covers those neighbours.
 import gpu
 import memory
-from tiles import Gathering, Tiles, Tile, tile_size, min_u32, tile_texture, transient_mark, release_transients
+from tiles import Gathering, Tiles, Tile, tile_size, min_u32, max_u32, tile_texture, transient_mark, release_transients
 from pyramid import Pyramid, covered_at, tile_bytes, precious_level
 from tile_cache import TileCache
 from luce_image.document import Document, Layer, fnv_start, fnv_mix
@@ -48,6 +48,12 @@ let curve_table_budget: usize = 4
 
 ## How many styled layers keep their effects rendered at once.
 let effects_budget: usize = 8
+
+## A coarser composite standing in for a cell whose tiles are coming back:
+## its texture (borrowed like a composite) and the texels that cover the cell.
+pub struct Coarser:
+    pub var texture: gpu.Texture
+    pub var region: gpu.Region
 
 pub struct Composer:
     var owner: gpu.Device
@@ -193,6 +199,33 @@ pub struct Composer:
                     continue
                 try self.gather_layers(document.layers(), column, row, level, &pending)
         try pending.finish()
+
+    ## Whether the composite of cell (`column`, `row`) at `level` is kept.
+    pub mutating func kept(document: const Document*, column: u32, row: u32, level: u32) -> bool:
+        return self.cache.has(self.composite_key(document, column, row, level) | 1)
+
+    ## Add to `pending` (deferred) the layer tiles making that composite would
+    ## bring back; how many it lacks.
+    pub mutating func lacking(document: const Document*, column: u32, row: u32, level: u32, pending: Gathering*) -> usize!:
+        let before = pending.missing()
+        try self.gather_layers(document.layers(), column, row, level, pending)
+        return pending.missing() - before
+
+    ## The nearest coarser composite kept that covers cell (`column`, `row`) of
+    ## `level` (whose covered texels are `covered_x` by `covered_y`), and the
+    ## texels of it that stand for the cell; none when no coarser one is kept.
+    pub mutating func coarser(document: const Document*, column: u32, row: u32, level: u32, covered_x: u32, covered_y: u32) -> Coarser?:
+        for up in 1..<(u32)8:
+            let coarse = level + up
+            if coarse > 16:
+                break
+            let found = self.cache.find(self.composite_key(document, column >> up, row >> up, coarse) | 1) else continue
+            let side = tile_size >> up
+            let x = (column - ((column >> up) << up)) * side
+            let y = (row - ((row >> up) << up)) * side
+            let step = 1u32 << up
+            return Coarser(texture = found, region = gpu.Region(x, y, max_u32(1, (covered_x + step - 1) >> up), max_u32(1, (covered_y + step - 1) >> up)))
+        return none
 
     func gather_layers(layers: Layer*[], column: u32, row: u32, level: u32, pending: Gathering*) -> !:
         for layer in layers:
