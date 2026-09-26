@@ -1,0 +1,151 @@
+#==============================================================================================
+#
+#   canvas/filter_previews - Motion Blur, Lens Correction and Gaussian Blur, live
+#
+#   DESCRIPTION:
+#       A filter dialog's preview remade the whole layer at full size for every slider move.
+#       Instead each setting is a new generation of a stand-in the compositor draws the layer
+#       through, a cell at a time at the level the view shows (filter_preview.lucb), kept
+#       within the selection as the filter itself is. The layer keeps its pixels as the
+#       preview began; keeping the preview makes the filter once, at full size, with the last
+#       settings shown.
+#
+#==============================================================================================
+
+## The filters shown this way.
+let filter_motion: i64 = 0
+let filter_lens: i64 = 1
+let filter_gaussian: i64 = 2
+
+## A filter shown through the compositor while its dialog is open.
+struct FilterPreview:
+    ## Which filter, and its settings as the canvas takes them: motion blur's
+    ## angle (degrees) and distance, lens correction's three amounts, the
+    ## Gaussian's radius.
+    var kind: i64
+    var a: f64
+    var b: f64
+    var c: f64
+    var layer: u64
+    var mask: bool
+    var generation: u64
+    var document: Document*
+    var filters: Filters
+    var passes: SelectionPasses?
+    ## The pixels (or mask) as the preview began, and their pieces for cells at full size.
+    var original: Tiles
+    var parts: Pieces
+    ## Where the layer has pixels; none when it has none (a mask is always shown).
+    var painted: Footprint?
+    ## What an empty cell stands for: clear pixels, or a mask's white.
+    var clear: gpu.Texture
+    var white: gpu.Texture
+
+## Show filter `kind` with settings `a`, `b`, `c` on the previewed layer (as it
+## was when the preview began), named `name` in the history when kept.
+func show_filter(canvas: Canvas*, kind: i64, a: f64, b: f64, c: f64, name: str) -> !:
+    try canvas.require_open()
+    let preview = canvas.preview else error(invalid, "no preview is in progress")
+    let composer = canvas.composer else trap("preview without a compositor")
+    canvas.preview_name = name
+    if canvas.filter_stand_in == none:
+        # The layer as the preview began, drawn through the stand-in from now on.
+        discard(try canvas.restore_preview())
+        canvas.filter_stand_in = try begin_filter_preview(canvas, &preview)
+    let shown = canvas.filter_stand_in else trap("made")
+    shown.kind = kind
+    shown.a = a
+    shown.b = b
+    shown.c = c
+    shown.generation = next_generation()
+    try composer.stand_in(StandIn(layer = shown.layer, mask = shown.mask, generation = shown.generation, context = (void*)shown, make = filter_cell))
+
+func begin_filter_preview(canvas: Canvas*, preview: const Snapshot*) -> FilterPreview*!:
+    let document = canvas.document else trap("preview without a document")
+    let filters = canvas.filters else trap("preview without filters")
+    let device = canvas.device else trap("preview without a device")
+    var original = try preview.tiles.clone()
+    errdefer original.destroy()
+    var parts = try pieces(&original)
+    errdefer parts.destroy()
+    var clear = try gpu.Texture.create(device, tile_size, tile_size, gpu.Format.rgba16_float)
+    errdefer clear.destroy()
+    try fill_tile(&clear, gpu.Color(0.0, 0.0, 0.0, 0.0))
+    var white = try gpu.Texture.create(device, tile_size, tile_size, gpu.Format.rgba16_float)
+    errdefer white.destroy()
+    try fill_tile(&white, gpu.Color(1.0, 1.0, 1.0, 1.0))
+    let painted = none if preview.mask else occupied_limit(&original)
+    return try new FilterPreview(kind = 0, a = 0.0, b = 0.0, c = 0.0, layer = preview.layer, mask = preview.mask, generation = 0, document = document,
+                                 filters = filters, passes = canvas.passes, original = original, parts = parts, painted = painted, clear = clear, white = white) in memory.heap
+
+## A stand-in's cell (`column`, `row`) of `level`: the filter over the
+## original's cell there, kept within the selection.
+func filter_cell(context: void*?, layer_levels: Pyramid*, layer: u64, mask: bool, column: u32, row: u32, level: u32) -> Made!:
+    let shown = (FilterPreview*)(context else return made_original())
+    let tiles = &shown.original
+    if not mask:
+        let painted = shown.painted else return made_nothing()
+        # Blurs reach only so far past the pixels; lens correction pulls from anywhere.
+        let reach = shown.b * 0.5 + 4.0 if shown.kind == filter_motion else (shown.a * 3.0 + 4.0 if shown.kind == filter_gaussian else -1.0)
+        if reach >= 0.0:
+            let side = (f64)((u64)tile_size << level)
+            let x0 = (f64)column * side
+            let y0 = (f64)row * side
+            if x0 >= painted.right + reach or y0 >= painted.bottom + reach or x0 + side <= painted.left - reach or y0 + side <= painted.top - reach:
+                return made_nothing()
+    var filtered: gpu.Texture? = none
+    if shown.kind == filter_gaussian:
+        filtered = try blur_level_cell(&shown.filters, tiles, layer_levels, column, row, level, shown.a, mask, shown.white if mask else shown.clear)
+    else:
+        # Motion blur's angle goes to the shader in radians.
+        let a = shown.a * math.pi / 180.0 if shown.kind == filter_motion else shown.a
+        filtered = try resample_level_cell(&shown.filters, tiles, &shown.parts, layer_levels, (f64)shown.kind, a, shown.b, shown.c, column, row, level, mask)
+    var edited = filtered else return made_nothing()
+    # As `restrict_preview`: the filter only where the selection covers it.
+    let passes = shown.passes else return made_texture(edited)
+    let selection = (try shown.document.selection_tiles()) else return made_texture(edited)
+    let before = (try layer_levels.texture(tiles, column, row, level, mask)) else (shown.white if mask else shown.clear)
+    let coverage = (try layer_levels.texture(selection, column, row, level, false)) else shown.clear
+    let mixed = passes.mix_tile(before, edited, coverage) catch failure:
+        edited.destroy()
+        error(failure.code, failure.message)
+    # The pass holds what it samples.
+    edited.destroy()
+    return made_texture(mixed)
+
+## Keep the filter shown: made once at full size, as the preview's last settings.
+func apply_filter_preview(canvas: Canvas*) -> !:
+    let shown = canvas.filter_stand_in else return
+    let kind = shown.kind
+    let a = shown.a
+    let b = shown.b
+    let c = shown.c
+    let layer = try canvas.restore_preview()
+    let mask = try canvas.whiten_previewed_mask()
+    let document = canvas.document else trap("preview without a document")
+    let filters = canvas.filters else trap("preview without filters")
+    if kind == filter_motion:
+        try filters.motion_blur(document, layer, a, b, mask)
+    elif kind == filter_lens:
+        try filters.lens_correction(document, layer, a, b, c, mask)
+    else:
+        try filters.gaussian_blur(document, layer, a, mask)
+    try canvas.restrict_preview(layer)
+
+## Stop showing a filter through the compositor: the layer shows its own pixels.
+func drop_filter_preview(canvas: Canvas*):
+    let shown = canvas.filter_stand_in else return
+    canvas.filter_stand_in = none
+    if let composer = canvas.composer:
+        composer.drop_stand_ins()
+    shown.original.destroy()
+    shown.parts.destroy()
+    shown.clear.destroy()
+    shown.white.destroy()
+    free(shown) in memory.heap
+
+## Every texel of `texture` set to `color`.
+func fill_tile(texture: gpu.Texture*, color: gpu.Color) -> !:
+    let frame = try texture.frame()
+    defer frame.release()
+    discard(try frame.value().present(color))

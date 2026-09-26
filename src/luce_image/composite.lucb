@@ -24,6 +24,7 @@ from luce_image.shaders import composite_frag_words, composite_frag_msl, adjust_
 from luce_image.adjust import Adjuster, Place, curves, blur
 from luce_image.filter import Filters
 from luce_image.curves import lut_size
+from luce_image.stand_in import StandIn, Made, stand_in_limit
 
 ## A styled layer's rendered effects, kept while its pixels and style stand.
 struct Effects:
@@ -79,6 +80,9 @@ pub struct Composer:
     var filters: Filters
     var stop_at: u64
     var stopped: bool
+    ## Layers shown through a preview's stand-in rather than their tiles.
+    var stand_ins: StandIn[8]
+    var stand_in_count: usize
 
     ## A compositor keeping at most `budget` composited tiles (512 KiB each),
     ## and as many bytes again of layer levels.
@@ -117,12 +121,14 @@ pub struct Composer:
         var effects: Effects[8]
         for index in 0..<effects_budget:
             effects[index] = Effects(key = 0, tiles = Tiles(), over = Tiles(), has_over = false, used = 0, live = false)
+        var stand_ins: StandIn[8] = ---
         var tables: CurveTable[4]
         for index in 0..<curve_table_budget:
             tables[index] = CurveTable(key = 0, texture = gpu.Texture(), live = false)
         return Composer(owner = device, cache = cache, pyramid = pyramid, level = 0, tick = 0, shader = shader, pipeline = pipeline, blank = blank, white = white, styler = styler,
                         adjuster = adjuster, mix_shader = mix_shader, mix = mix, effects = effects, curve_tables = tables, next_curve_table = 0, renders = 0, extent_x = 0, extent_y = 0,
-                        drawing = none, filters = filters, stop_at = 0, stopped = false)
+                        drawing = none, filters = filters, stop_at = 0, stopped = false,
+                        stand_ins = stand_ins, stand_in_count = 0)
 
     ## The flattened tile at `column`, `row` of pyramid `level`, borrowed until
     ## the next call. Straight-alpha rgba16_float, transparent where nothing is.
@@ -153,6 +159,9 @@ pub struct Composer:
             digest = hash_layers(digest, document.layers(), 1.0, first_column, first_row, span + 2)
         else:
             digest = hash_layers(digest, document.layers(), 1.0, column * span, row * span, span)
+        for index in 0..<self.stand_in_count:
+            digest = fnv_mix(digest, self.stand_ins[index].layer * 2 + (1 if self.stand_ins[index].mask else 0))
+            digest = fnv_mix(digest, self.stand_ins[index].generation)
         if let found = self.cache.find(digest | 1):
             return found
         let texture = try self.flatten(document, column, row)
@@ -174,6 +183,50 @@ pub struct Composer:
     ## A layer's (or mask's) tile at the level being made; none where it is empty.
     mutating func source(tiles: const Tiles*, column: u32, row: u32, mask: bool = false) -> gpu.Texture?!:
         return try self.pyramid.texture(tiles, column, row, self.level, mask)
+
+    ## Show layer `stand_in.layer` (or its mask) through `stand_in` until
+    ## `drop_stand_ins`, replacing one it has already; a new generation
+    ## redraws every tile it reaches.
+    pub mutating func stand_in(stand_in: StandIn) -> !:
+        for index in 0..<self.stand_in_count:
+            if self.stand_ins[index].layer == stand_in.layer and self.stand_ins[index].mask == stand_in.mask:
+                self.stand_ins[index] = stand_in
+                return
+        if self.stand_in_count == stand_in_limit:
+            error(limit, "a preview shows at most 8 layers and masks")
+        self.stand_ins[self.stand_in_count] = stand_in
+        self.stand_in_count += 1
+
+    ## Show every layer through its own tiles again.
+    pub mutating func drop_stand_ins():
+        self.stand_in_count = 0
+
+    ## `layer`'s tile (or its mask's) at the level being made: its stand-in's
+    ## while a preview shows one, else its own `tiles`'.
+    mutating func layer_source(layer: const Layer*, tiles: const Tiles*, column: u32, row: u32, mask: bool = false) -> gpu.Texture?!:
+        for index in 0..<self.stand_in_count:
+            let stand_in = self.stand_ins[index]
+            if stand_in.layer != layer.id or stand_in.mask != mask:
+                continue
+            # Made once per generation, cell and level, then cached like a composite.
+            var key = fnv_start()
+            key = fnv_mix(key, 0x5374616e64496e)
+            key = fnv_mix(key, stand_in.layer * 2 + (1 if mask else 0))
+            key = fnv_mix(key, stand_in.generation)
+            key = fnv_mix(key, (u64)self.level)
+            key = fnv_mix(key, (u64)column)
+            key = fnv_mix(key, (u64)row)
+            key = key & ~(u64)1
+            if let found = self.cache.find(key):
+                return found
+            let make = stand_in.make else return try self.source(tiles, column, row, mask)
+            let result = try make(stand_in.context, &self.pyramid, stand_in.layer, mask, column, row, self.level)
+            if result.original:
+                return try self.source(tiles, column, row, mask)
+            let texture = result.texture else return none
+            try self.cache.put(key, texture, tile_bytes)
+            return texture
+        return try self.source(tiles, column, row, mask)
 
     ## The texels a cell covers at the level being made.
     func region_at(column: u32, row: u32) -> gpu.Region:
@@ -230,7 +283,7 @@ pub struct Composer:
                 continue
             let tiles = layer.tiles() else continue
             if not layer.clipped:
-                base = try self.source(tiles, column, row)
+                base = try self.layer_source(layer, tiles, column, row)
                 base_missing = base == none
             let area = self.region_at(column, row)
             var clip = self.blank if layer.clipped and base_missing else (base else self.blank)
@@ -238,12 +291,12 @@ pub struct Composer:
                 clip = self.white
             var mask = self.white
             if let mask_tiles = layer.active_mask():
-                if let mask_texture = try self.source(mask_tiles, column, row, true):
+                if let mask_texture = try self.layer_source(layer, mask_tiles, column, row, true):
                     mask = mask_texture
             # The layer's effects go under it, with its opacity and mask, blended
             # normally; those inside it (overlay, inner shadow, an inside stroke)
             # come as the layer itself, recolored.
-            var texture = try self.source(tiles, column, row)
+            var texture = try self.layer_source(layer, tiles, column, row)
             if layer.style.any():
                 let effects = try self.effects_for(layer)
                 if let effect = try self.source(&effects.tiles, column, row):

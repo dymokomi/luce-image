@@ -1,0 +1,97 @@
+#==============================================================================================
+#
+#   transform_preview - One cell of a free transform, at the level a view draws
+#
+#   DESCRIPTION:
+#       While Free Transform's box is dragged, the compositor asks for the moved layer a cell
+#       at a time, at the pyramid level it is drawing (canvas/transforming.lucb installs these
+#       as the layer's stand-in). A cell of level L covers 2^L by 2^L document tiles, so its
+#       footprint through the map is gathered from the source at level L or coarser, and the
+#       warp shader draws the cell with the output scaled back to document pixels: the same
+#       map, sampled at the view's resolution. Applying the transform makes every cell at
+#       full size once, with `Transformer.apply`, as before.
+#
+#==============================================================================================
+
+import gpu
+import math
+from tiles import Tiles, tile_size
+from pyramid import Pyramid
+from luce_image.extent import Pieces
+from luce_image.transform import Transformer, Landed, landing, shader_params
+from luce_image.transform_window import Footprint, footprint_at, level_for, gather, window_map, reach
+from luce_image.projective import Warp, multiply
+
+## Level `level`'s texels as document pixels: the output side of a preview's map.
+func level_scale(level: u32) -> Warp:
+    let scale = (f64)(1u32 << level)
+    return Warp(m = [scale, 0.0, 0.0, 0.0, scale, 0.0, 0.0, 0.0, 1.0])
+
+## Cell (`column`, `row`) of level `level` of `tiles` (a mask when `on_mask`)
+## taken through `warp`, the source's pixels lying within `limit` and the
+## transformed `box` (a distortion's, or `limit`); none where nothing lands.
+## `parts` are the source's pieces, read at level 0 (past the canvas too).
+pub func warp_preview_cell(transformer: const Transformer*, tiles: const Tiles*, parts: const Pieces*, pyramid: Pyramid*, warp: Warp, box: Landed, limit: Footprint,
+                           column: u32, row: u32, level: u32, on_mask: bool, sampling: i64) -> gpu.Texture?!:
+    let scale = (f64)(1u32 << level)
+    let side = (f64)tile_size * scale
+    let x0 = (f64)column * side
+    let y0 = (f64)row * side
+    # Past where the box lands nothing shows (for a mask, white: nothing either).
+    let landed = try landing(warp, box.left, box.top, box.right, box.bottom)
+    if x0 >= landed.right or y0 >= landed.bottom or x0 + side <= landed.left or y0 + side <= landed.top:
+        return none
+    let reachable = Footprint(left = math.max(limit.left, box.left - 2.0), top = math.max(limit.top, box.top - 2.0),
+                              right = math.min(limit.right, box.right + 2.0), bottom = math.min(limit.bottom, box.bottom + 2.0))
+    let outside = 1.0 if on_mask else 0.0
+    let reads = footprint_at(warp, x0, y0, side, reach * scale, reachable) else return none
+    # Never finer than the cell's own level: the view shows no more than that.
+    let coarsest = level_for(reads)
+    let at = coarsest if coarsest > level else level
+    var window = try gather(transformer.device(), tiles, parts, pyramid, reads, at, on_mask, gpu.Color(outside, outside, outside, outside))
+    defer window.destroy()
+    let width = (f64)(try window.texture.width())
+    let height = (f64)(try window.texture.height())
+    var params = shader_params(multiply(window_map(warp, &window), level_scale(level)), width, height, outside, false, sampling)
+    return try transformer.shade_tile(&params, (f64)(column * tile_size), (f64)(row * tile_size), window.texture, window.texture)
+
+## Cell (`column`, `row`) of level `level` of a layer whose selected pixels
+## float through `warp`: the lifted pixels (`selection`'s coverage of `tiles`,
+## within `lifted`) landed over what the selection leaves. Cells neither under
+## the selection nor where it lands are the layer's own (`original`). The far
+## place the pixels come from is gathered on its own; what is left under them
+## is the cell's own level tile, so no window spans both.
+pub func lifted_preview_cell(transformer: const Transformer*, tiles: const Tiles*, parts: const Pieces*, selection: const Tiles*, selection_parts: const Pieces*,
+                             pyramid: Pyramid*, warp: Warp, lifted: Footprint, column: u32, row: u32, level: u32, sampling: i64, original: bool*) -> gpu.Texture?!:
+    *original = false
+    let scale = (f64)(1u32 << level)
+    let side = (f64)tile_size * scale
+    let x0 = (f64)column * side
+    let y0 = (f64)row * side
+    let landed = try landing(warp, lifted.left, lifted.top, lifted.right, lifted.bottom)
+    let under = x0 < lifted.right and x0 + side > lifted.left and y0 < lifted.bottom and y0 + side > lifted.top
+    let landing_here = x0 < landed.right and x0 + side > landed.left and y0 < landed.bottom and y0 + side > landed.top
+    if not under and not landing_here:
+        *original = true
+        return none
+    # What is left under the moved pixels: the cell's own tiles at its level.
+    let base = try pyramid.texture(tiles, column, row, level)
+    let base_selection = try pyramid.texture(selection, column, row, level)
+    let clear = transformer.clear_tile()
+    let reads = footprint_at(warp, x0, y0, side, reach * scale, lifted)
+    if reads == none:
+        # Nothing lands here: only what the selection leaves.
+        var params = shader_params(Warp(m = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]), (f64)tile_size, (f64)tile_size, 0.0, true, sampling)
+        return try transformer.shade_floating(&params, 0.0, 0.0, clear, clear, base, base_selection)
+    let far = reads else trap("checked")
+    # A heavy shrink reads a coarser level, never a finer one than the cell's.
+    let coarsest = level_for(far)
+    let at = coarsest if coarsest > level else level
+    let empty = gpu.Color(0.0, 0.0, 0.0, 0.0)
+    var pixels = try gather(transformer.device(), tiles, parts, pyramid, far, at, false, empty)
+    defer pixels.destroy()
+    var coverage = try gather(transformer.device(), selection, selection_parts, pyramid, far, at, false, empty)
+    defer coverage.destroy()
+    # The cell's texels to document pixels, through the map, into the window's texels.
+    var params = shader_params(multiply(window_map(warp, &pixels), level_scale(level)), (f64)(try pixels.texture.width()), (f64)(try pixels.texture.height()), 0.0, true, sampling)
+    return try transformer.shade_floating(&params, (f64)(column * tile_size), (f64)(row * tile_size), pixels.texture, coverage.texture, base, base_selection)

@@ -1,0 +1,60 @@
+#==============================================================================================
+#
+#   stand_in - A layer shown some other way while a preview runs
+#
+#   DESCRIPTION:
+#       A live preview (Free Transform, a filter dialog) must not remake a whole layer at full
+#       size for every move of a handle or slider. Instead the compositor is handed a stand-in
+#       for the layer (or its mask): a function making any one cell at any pyramid level on
+#       demand. The compositor asks for just the cells a drawing request composites, at the
+#       level it draws, so a preview costs what the screen shows; each new setting is a new
+#       generation, and the cells made for older ones age out of the compositor's cache.
+#       Kept or applied, the edit is made once at full size by its own code.
+#
+#==============================================================================================
+
+import gpu
+from pyramid import Pyramid
+
+## What a stand-in makes for a cell: a tile of its own (handed over), nothing
+## (transparent pixels, or a mask revealing everything), or the layer's own
+## cell as it is (`original`).
+pub struct Made:
+    pub var texture: gpu.Texture?
+    pub var original: bool
+
+## Layer `layer` (its mask when `mask`) shown through `make` instead of its
+## tiles. `make(context, levels, layer, mask, column, row, level)` makes cell
+## (`column`, `row`) of pyramid `level`, reading layer levels from `levels`
+## (the compositor's pyramid, so what the view already built is reused).
+pub struct StandIn:
+    pub var layer: u64
+    pub var mask: bool
+    pub var generation: u64
+    pub var context: void*?
+    ## Optional only so a compositor holding stand-ins has a zero value.
+    pub var make: (func(void*?, Pyramid*, u64, bool, u32, u32, u32) -> Made!)?
+
+## The last generation handed out. Unique for all time, so no two previews
+## (of the same layer, one after another) ever share cached cells. Main thread only.
+var last_generation: u64 = 0
+
+## A generation no stand-in has had before.
+pub func next_generation() -> u64:
+    last_generation += 1
+    return last_generation
+
+## Stand-ins a compositor takes at once: a transform's layers each with a mask.
+pub let stand_in_limit: usize = 8
+
+## Nothing made: the cell is empty.
+pub func made_nothing() -> Made:
+    return Made(texture = none, original = false)
+
+## The layer's own cell, unchanged.
+pub func made_original() -> Made:
+    return Made(texture = none, original = true)
+
+## `texture`, made for the cell and handed over.
+pub func made_texture(texture: gpu.Texture) -> Made:
+    return Made(texture = texture, original = false)

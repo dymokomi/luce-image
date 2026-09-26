@@ -1,0 +1,88 @@
+#==============================================================================================
+#
+#   filter_preview - One cell of a filter, at the level a view draws
+#
+#   DESCRIPTION:
+#       While a filter dialog's sliders move, the compositor asks for the filtered layer a
+#       cell at a time at the pyramid level it is drawing (canvas/filter_previews.lucb
+#       installs these as the layer's stand-in). At level L a texel is 2^L document pixels,
+#       so what the filter measures in pixels is measured in the level's texels: a motion
+#       blur's distance and a Gaussian's radius shrink by 2^L; Lens Correction's settings are
+#       relative to the picture and stay as they are. Keeping the filter makes it once at
+#       full size, as before.
+#
+#==============================================================================================
+
+import gpu
+import math
+from tiles import Tiles, tile_size
+from pyramid import Pyramid, covered_at, cell_exists
+from luce_image.extent import Pieces
+from luce_image.filter import Filters, resample_reads
+from luce_image.transform_window import Footprint, gather
+
+## Cell (`column`, `row`) of level `level` of `tiles` through resample.frag's
+## `kind` (0 motion blur: `a` radians, `b` pixels; 1 lens correction), read
+## from a window of the level holding every place it reaches.
+pub func resample_level_cell(filters: const Filters*, tiles: const Tiles*, parts: const Pieces*, pyramid: Pyramid*, kind: f64, a: f64, b: f64, c: f64,
+                             column: u32, row: u32, level: u32, on_mask: bool) -> gpu.Texture!:
+    let scale = (f64)(1u32 << level)
+    # The layer's size and the cell's first texel, in the level's texels.
+    let width = (f64)level_extent(tiles.width(), level)
+    let height = (f64)level_extent(tiles.height(), level)
+    let x0 = (f64)(column * tile_size)
+    let y0 = (f64)(row * tile_size)
+    let distance = b / scale if kind < 0.5 else b
+    let reads = resample_reads(kind, a, distance, c, x0, y0, width, height)
+    # `gather` takes document pixels.
+    let box = Footprint(left = reads.left * scale, top = reads.top * scale, right = reads.right * scale, bottom = reads.bottom * scale)
+    let empty = 1.0 if on_mask else 0.0
+    var window = try gather(filters.device(), tiles, parts, pyramid, box, level, on_mask, gpu.Color(empty, empty, empty, empty))
+    defer window.destroy()
+    var params: f32[12] = [(f32)kind, (f32)a, (f32)distance, (f32)c, (f32)x0, (f32)y0, (f32)width, (f32)height,
+                           (f32)window.left, (f32)window.top, (f32)(try window.texture.width()), (f32)(try window.texture.height())]
+    return try filters.resample_tile(&params, window.texture)
+
+## Cell (`column`, `row`) of level `level` of `tiles` blurred by a Gaussian of
+## `radius` document pixels, as `Filters.blur_cell` at full size: across the
+## cell and the cells above and below, then down those. `fallback` stands for
+## an empty cell (clear pixels; white for a mask). None where it stays empty.
+pub func blur_level_cell(filters: const Filters*, tiles: const Tiles*, pyramid: Pyramid*, column: u32, row: u32, level: u32, radius: f64,
+                         on_mask: bool, fallback: gpu.Texture) -> gpu.Texture?!:
+    # The kernel as at full size (three sigma, cut at 255 taps), in the level's texels.
+    let scale = (f64)(1u32 << level)
+    let sigma = math.max(0.3, radius / scale)
+    let taps = math.max(1.0, math.ceil(math.min(255.0, math.ceil(radius * 3.0)) / scale))
+    var across: gpu.Texture[3] = [gpu.Texture(), gpu.Texture(), gpu.Texture()]
+    var made: bool[3] = [false, false, false]
+    defer across[0].destroy()
+    defer across[1].destroy()
+    defer across[2].destroy()
+    for index in 0..<(usize)3:
+        let at = (i64)row + (i64)index - 1
+        if at < 0 or not cell_exists(tiles, column, (u32)at, level):
+            continue
+        let line = (u32)at
+        let before = try level_cell(pyramid, tiles, (i64)column - 1, (i64)line, level, on_mask)
+        let middle = try level_cell(pyramid, tiles, (i64)column, (i64)line, level, on_mask)
+        let after = try level_cell(pyramid, tiles, (i64)column + 1, (i64)line, level, on_mask)
+        if middle == none and before == none and after == none and not on_mask:
+            continue
+        across[index] = try filters.blur_one(covered_at(tiles.width(), column, level), taps, sigma, true,
+                                             before else fallback, middle else fallback, after else fallback)
+        made[index] = true
+    if not made[0] and not made[1] and not made[2]:
+        return none
+    return try filters.blur_one(covered_at(tiles.height(), row, level), taps, sigma, false,
+                                across[0] if made[0] else fallback, across[1] if made[1] else fallback, across[2] if made[2] else fallback)
+
+## Cell (`column`, `row`) of `tiles` at `level`, none past the layer or where it is empty.
+func level_cell(pyramid: Pyramid*, tiles: const Tiles*, column: i64, row: i64, level: u32, mask: bool) -> gpu.Texture?!:
+    if column < 0 or row < 0 or not cell_exists(tiles, (u32)column, (u32)row, level):
+        return none
+    return try pyramid.texture(tiles, (u32)column, (u32)row, level, mask)
+
+## How many texels `extent` pixels are at `level`.
+func level_extent(extent: u32, level: u32) -> u32:
+    let span = 1u64 << level
+    return (u32)(((u64)extent + span - 1) // span)

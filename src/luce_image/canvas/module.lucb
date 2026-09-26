@@ -56,9 +56,14 @@ from luce_image.curves import Curves, lut_size
 from luce_image.filter import Filters
 import luce_image.filter as filtering
 import luce_image.light_filters as light_filters
-from luce_image.transform import translate, Transformer, Landed, sampling_nearest, sampling_smooth, sampling_high
+from luce_image.transform import translate, Transformer, Landed, landing, sampling_nearest, sampling_smooth, sampling_high
 from luce_image.projective import Warp, affine_warp, quad_warp
-from luce_image.extent import full_bounds, pieces, relocate
+from luce_image.extent import full_bounds, pieces, relocate, Pieces
+from luce_image.transform_window import Footprint
+from luce_image.transform_preview import warp_preview_cell, lifted_preview_cell
+from luce_image.filter_preview import resample_level_cell, blur_level_cell
+from luce_image.stand_in import StandIn, Made, made_texture, made_nothing, made_original, next_generation
+from pyramid import Pyramid
 from luce_image.selection_passes import SelectionPasses
 import psd
 import fonts
@@ -199,6 +204,8 @@ pub struct Canvas:
     var families: fonts.Names*?
     ## The free transform under way, if any.
     var transform_session: TransformSession*?
+    ## A filter dialog's preview, shown through the compositor until kept or dropped.
+    var filter_stand_in: FilterPreview*?
     ## What `measure_histogram` counted: luminosity, red, green and blue, 256
     ## bins each of the encoded values.
     var histogram_counts: u64[1024]
@@ -270,6 +277,7 @@ pub struct Canvas:
         self.warp = none
         self.warped = 0
         self.transform_session = none
+        self.filter_stand_in = none
         self.heal_opacity = 1.0
         self.edit_depth = 0
         self.edit_captured = false
@@ -451,6 +459,9 @@ pub struct Canvas:
         if self.closed:
             return
         self.closed = true
+        drop_filter_preview(&self)
+        if let composer = self.composer:
+            composer.drop_stand_ins()
         if let session = self.transform_session:
             self.transform_session = none
             drop_session(session)
@@ -1932,20 +1943,21 @@ pub struct Canvas:
         var drawn_over = try fill_gradient(&painter, document, layer, x0, y0, x1, y1, from_color, to_color, radial, mask)
         drawn_over.destroy()
 
-    ## Show a Gaussian blur of `radius` applied to the layer as it was when the preview began.
+    ## Show a Gaussian blur of `radius` applied to the layer as it was when the
+    ## preview began: drawn at the view's level until kept (filter_previews.lucb).
     pub mutating func preview_blur(radius: f64) -> !:
-        self.preview_name = "Gaussian Blur"
-        let layer = try self.restore_preview()
-        let mask = try self.whiten_previewed_mask()
-        let document = self.document else trap("preview without a document")
-        let filters = self.filters else trap("preview without filters")
-        try filters.gaussian_blur(document, layer, radius, mask)
-        try self.restrict_preview(layer)
+        if not math.is_finite(radius) or radius < 0.5 or radius > 250.0:
+            error(invalid, "blur radius must be 0.5..250 pixels")
+        try show_filter(&self, filter_gaussian, radius, 0.0, 0.0, "Gaussian Blur")
 
     ## Finish the preview: keep what it shows as one undoable edit, or put the
     ## layer's pixels back as they were.
     pub mutating func end_preview(keep: bool) -> !:
         try self.require_open()
+        # A filter shown at the view's level is made at full size now.
+        if keep:
+            try apply_filter_preview(&self)
+        drop_filter_preview(&self)
         let preview = self.preview else error(invalid, "no preview is in progress")
         self.preview = none
         let document = self.document else trap("preview without a document")
@@ -1987,6 +1999,7 @@ pub struct Canvas:
     ## Put the previewed layer's original pixels back; the layer's id.
     mutating func restore_preview() -> u64!:
         try self.require_open()
+        drop_filter_preview(&self)
         let preview = self.preview else error(invalid, "no preview is in progress")
         let document = self.document else trap("preview without a document")
         if preview.mask:
@@ -2126,16 +2139,24 @@ pub struct Canvas:
         let names: str[4] = ["Motion Blur", "Lens Correction", "Bloom", "Tonal Contrast"]
         if kind < 0 or kind >= 4:
             error(invalid, "no such filter")
+        # Motion Blur and Lens Correction are drawn at the view's level until kept.
+        if kind == 0:
+            if not math.is_finite(a) or not math.is_finite(b) or b < 1.0 or b > 999.0:
+                error(invalid, "a motion blur goes 1..999 pixels at a finite angle")
+            try show_filter(&self, filter_motion, a, b, c, names[0])
+            return
+        if kind == 1:
+            for amount in [a, b, c]:
+                if not math.is_finite(amount) or amount < -1.0 or amount > 1.0:
+                    error(invalid, "lens corrections are -1..1")
+            try show_filter(&self, filter_lens, a, b, c, names[1])
+            return
         self.preview_name = names[(usize)kind]
         let layer = try self.restore_preview()
         let mask = try self.whiten_previewed_mask()
         let document = self.document else trap("preview without a document")
         let filters = self.filters else trap("preview without filters")
-        if kind == 0:
-            try filters.motion_blur(document, layer, a, b, mask)
-        elif kind == 1:
-            try filters.lens_correction(document, layer, a, b, c, mask)
-        elif kind == 2:
+        if kind == 2:
             try light_filters.bloom(&filters, document, layer, a, b, c, mask)
         else:
             try light_filters.tonal_contrast(&filters, document, layer, a, b, mask)
