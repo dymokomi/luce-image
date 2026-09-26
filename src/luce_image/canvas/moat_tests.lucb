@@ -86,3 +86,27 @@ test "copy reads only the selection's box, from the layer or merged, across cell
     # Merged: white where the square is not, red where it is.
     assert(rgba[0] == 255 and rgba[1] == 255 and rgba[2] == 255 and rgba[3] == 255)
     assert(rgba[inside] == 255 and rgba[inside + 1] == 0 and rgba[inside + 3] == 255)
+
+test "trim finds the box across cells from composited bands, on transparency and on a corner color":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(900, 700)
+    defer canvas.close()
+    let paint = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.2, 0.4, 0.6, false)
+    try canvas.select_rectangle(123, 240, 555, 301)
+    try canvas.fill(paint, false)
+    try canvas.select_rectangle(700, 600, 9, 7)
+    try canvas.fill(paint, false)
+    try canvas.deselect()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    assert(try canvas.measure_trim(0))
+    assert(canvas.content_left() == 123 and canvas.content_top() == 240 and canvas.content_width() == 709 - 123 and canvas.content_height() == 607 - 240)
+    # The top-left corner is clear too: the same box.
+    assert(try canvas.measure_trim(1))
+    assert(canvas.content_left() == 123 and canvas.content_width() == 709 - 123)
