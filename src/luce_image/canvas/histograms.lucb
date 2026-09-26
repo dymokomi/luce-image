@@ -1,0 +1,60 @@
+#==============================================================================================
+#
+#   canvas/histograms - The Levels histogram, counted a cell or a band at a time
+#
+#   DESCRIPTION:
+#       A histogram's bins are the 256 values of 8-bit sRGB, so the counting reads exactly
+#       that: a layer's cells one at a time, turned to 8-bit sRGB through the same 4097-step
+#       table the export uses, or the flattened picture as the export's composited bands.
+#       Transparent pixels are left out; luminosity weighs the encoded channels 0.3, 0.59 and
+#       0.11. Nothing the size of the document is made.
+#
+#==============================================================================================
+
+## Count `count` straight 8-bit sRGB RGBA pixels of `rgba` into `counts`
+## (luminosity, then red, green and blue, 256 bins each).
+func count_rgba8(counts: u64[], rgba: const u8[], count: usize):
+    for at in 0..<count:
+        let base = at * 4
+        if rgba[base + 3] == 0:
+            continue
+        let red = (usize)rgba[base]
+        let green = (usize)rgba[base + 1]
+        let blue = (usize)rgba[base + 2]
+        counts[256 + red] += 1
+        counts[512 + green] += 1
+        counts[768 + blue] += 1
+        counts[(usize)(((f64)red * 0.3 + (f64)green * 0.59 + (f64)blue * 0.11) + 0.5)] += 1
+
+## Layer `tiles` counted a cell at a time into `counts`.
+func count_layer(counts: u64[], tiles: const Tiles*) -> !:
+    let side = (usize)tile_size
+    let samples = try alloc f32[side * side * 4] in memory.heap
+    defer free(samples) in memory.heap
+    let rgba = try alloc u8[side * 4] in memory.heap
+    defer free(rgba) in memory.heap
+    var steps: u8[4097] = ---
+    for step in 0..<(usize)4097:
+        steps[step] = srgb_byte((f64)step / 4096.0)
+    for row in 0..<tiles.rows():
+        for column in 0..<tiles.columns():
+            if not tiles.painted(column, row):
+                continue
+            try tiles.read_cell(column, row, samples)
+            let area = tiles.region(column, row)
+            for y in 0..<(usize)area.height:
+                for x in 0..<(usize)area.width:
+                    let source = (y * side + x) * 4
+                    for channel in 0..<(usize)3:
+                        rgba[x * 4 + channel] = steps[(usize)(math.clamp((f64)samples[source + channel], 0.0, 1.0) * 4096.0 + 0.5)]
+                    rgba[x * 4 + 3] = 0 if samples[source + 3] <= 0.0 else 255
+                count_rgba8(counts, rgba, (usize)area.width)
+
+## The flattened picture counted a composited band at a time into `counts`.
+func count_flattened(counts: u64[], canvas: Canvas*) -> !:
+    var bands = try Bands.begin(canvas, [-1.0, -1.0, -1.0])
+    defer bands.close()
+    let width = (usize)canvas.extent_x
+    for row in 0..<tile_columns(canvas.extent_y):
+        let rows = try bands.fill(canvas, row)
+        count_rgba8(counts, bands.band, width * rows)

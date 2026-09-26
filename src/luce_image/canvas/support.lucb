@@ -92,15 +92,6 @@ func post_order(layers: Layer*[], parent: u64, order: Order*):
             order.parents[order.count] = parent
         order.count += 1
 
-## A linear value 0..1 as sRGB encodes it.
-func srgb_encode(linear: f64) -> f64:
-    let v = math.clamp(linear, 0.0, 1.0)
-    return v * 12.92 if v <= 0.0031308 else 1.055 * math.pow(v, 1.0 / 2.4) - 0.055
-
-## The 256-bin histogram bin an encoded value 0..1 falls in.
-func bin_of(encoded: f64) -> usize:
-    return (usize)math.clamp(math.floor(encoded * 255.0 + 0.5), 0.0, 255.0)
-
 ## An adjustment's name for the history, by kind.
 func adjustment_name(kind: i64) -> str:
     let names: str[17] = ["Brightness/Contrast", "Hue/Saturation", "Invert", "Levels", "Desaturate", "Threshold", "Posterize", "Curves",

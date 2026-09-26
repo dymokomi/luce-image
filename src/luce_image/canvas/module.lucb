@@ -2250,11 +2250,8 @@ pub struct Canvas:
         let document = self.document else error(invalid, "draw the document once before measuring")
         let layer = document.find((u64)id) else error(invalid, "no such layer")
         let tiles = layer.tiles() else error(invalid, "a group has no pixels to count")
-        let count = (usize)self.extent_x * (usize)self.extent_y
-        let pixels = try alloc f32[count * 4] in memory.heap
-        defer free(pixels) in memory.heap
-        try tiles.read(pixels)
-        self.count_histogram(pixels)
+        self.clear_histogram()
+        try count_layer(self.histogram_counts[..<1024], tiles)
 
     ## Count what shows below layer `id` — the whole picture with it and the
     ## layers over it hidden — for `histogram`: what an adjustment layer's
@@ -2271,12 +2268,11 @@ pub struct Canvas:
             hidden[at] = at >= index and record.visible and not self.holds(record.id, (u64)id)
             if hidden[at]:
                 try document.set_appearance(record.id, false, record.opacity, (u32)record.blend)
-        let flattened = flattened_pixels(&self) catch failure:
+        self.clear_histogram()
+        count_flattened(self.histogram_counts[..<1024], &self) catch failure:
             self.show_again(hidden)
             error(failure.code, failure.message)
-        defer free(flattened) in memory.heap
         self.show_again(hidden)
-        self.count_histogram(flattened)
 
     ## Whether group `group` holds layer `id`, however deep.
     func holds(group: u64, id: u64) -> bool:
@@ -2298,18 +2294,10 @@ pub struct Canvas:
                 document.set_appearance(record.id, true, record.opacity, (u32)record.blend) catch _:
                     recover ()
 
-    ## Count straight linear RGBA `pixels` by their encoded values; transparency is left out.
-    mutating func count_histogram(pixels: const f32[]):
+    ## Empty the histogram's bins before a count.
+    mutating func clear_histogram():
         for slot in 0..<(usize)1024:
             self.histogram_counts[slot] = 0
-        for at in 0..<pixels.length // 4:
-            if pixels[at * 4 + 3] <= 0.0:
-                continue
-            var encoded: f64[3]
-            for channel in 0..<(usize)3:
-                encoded[channel] = srgb_encode((f64)pixels[at * 4 + channel])
-                self.histogram_counts[(channel + 1) * 256 + bin_of(encoded[channel])] += 1
-            self.histogram_counts[bin_of(encoded[0] * 0.3 + encoded[1] * 0.59 + encoded[2] * 0.11)] += 1
 
     ## How many pixels `measure_histogram` counted in bin `slot` (0..255) of
     ## `channel`: 0 luminosity, 1 red, 2 green, 3 blue.

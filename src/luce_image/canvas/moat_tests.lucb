@@ -110,3 +110,32 @@ test "trim finds the box across cells from composited bands, on transparency and
     # The top-left corner is clear too: the same box.
     assert(try canvas.measure_trim(1))
     assert(canvas.content_left() == 123 and canvas.content_width() == 709 - 123)
+
+test "the histogram counts a layer's cells and the picture's bands, transparency left out":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(700, 500)
+    defer canvas.close()
+    let paint = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.2, 0.4, 0.6, false)
+    try canvas.select_rectangle(200, 150, 300, 250)
+    try canvas.fill(paint, false)
+    try canvas.deselect()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.measure_histogram(paint)
+    let red = (i64)srgb_byte(0.2)
+    let blue = (i64)srgb_byte(0.6)
+    assert((try canvas.histogram(1, red)) == 300 * 250 and (try canvas.histogram(3, blue)) == 300 * 250)
+    var total: i64 = 0
+    for slot in 0..<(i64)256:
+        total += try canvas.histogram(0, slot)
+    assert(total == 300 * 250)
+    # Below a new top layer: the same picture, counted from composited bands.
+    let top = try canvas.add_layer("Top")
+    try canvas.measure_histogram_below(top)
+    assert((try canvas.histogram(1, red)) == 300 * 250)
