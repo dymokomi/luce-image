@@ -76,6 +76,7 @@ struct Bands:
             for part in 0..<self.parts:
                 try self.prepare(canvas, row, part, 0)
                 try self.take(canvas, row, part, 0)
+                try settle_job(canvas)
             return (usize)rows
         let turn = (usize)(row % 2)
         if self.prepared != (i64)row:
@@ -84,6 +85,7 @@ struct Bands:
         if row + 1 < tile_columns(canvas.extent_y):
             try self.prepare(canvas, row + 1, 0, 1 - turn)
         try self.take(canvas, row, 0, turn)
+        try settle_job(canvas)
         return (usize)rows
 
     ## Draw part `part` of band `row` as export bytes into its strips, and send

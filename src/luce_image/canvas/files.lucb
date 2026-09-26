@@ -89,6 +89,8 @@ func flattened_pixels(canvas: Canvas*) -> f32[]!:
     var flat = FlatRead(composer = composer, document = document, pixels = pixels, extent_x = canvas.extent_x, extent_y = canvas.extent_y, level = 0,
                         columns = tile_columns(canvas.extent_x), width = (usize)canvas.extent_x)
     try read_pieces(device, (usize)flat.columns * (usize)tile_columns(canvas.extent_y), (void*)&flat, flat_piece, flat_visit)
+    # The tiles the read brought back to RAM may leave again at once.
+    try settle_job(canvas)
     return pixels
 
 ## A flattened read at pyramid level `level`: the composited tiles, `columns`
@@ -401,6 +403,8 @@ func write_layer_picture(canvas: Canvas*, tiles: const Tiles*, directory: str, n
     let pixels = try alloc f32[(usize)width * (usize)height * 4] in memory.heap
     defer free(pixels) in memory.heap
     try whole.read(pixels)
+    # What the read brought back to RAM may leave before the next layer's.
+    try settle_job(canvas)
     if mask:
         # A cell never painted reveals everything: white.
         for row in 0..<whole.rows():

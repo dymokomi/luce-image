@@ -41,6 +41,16 @@ func settle_memory(canvas: Canvas*) -> !:
     residency_advance()
     try settle_tiers(canvas)
 
+## A step of a job that runs outside frames (an export's band, a saved layer):
+## what it has finished with may leave, so the tiers stay within their budgets
+## while it runs and after it ends, not only at the next frame (an idle
+## application draws none). Cheap within budget.
+func settle_job(canvas: Canvas*) -> !:
+    if not residency_over_budget():
+        return
+    residency_advance()
+    try settle_tiers(canvas)
+
 ## When the tiers hold too much, mark what every layer and mask of the
 ## document shows and move the least wanted tiles down a tier. Cheap within
 ## budget: one comparison.

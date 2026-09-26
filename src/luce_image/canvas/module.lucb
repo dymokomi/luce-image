@@ -416,6 +416,12 @@ pub struct Canvas:
     pub func memory_ram_bytes() -> i64:
         return (i64)residency_report().ram_tiles
 
+    ## What the system says the process holds (macOS footprint, Windows private
+    ## bytes, Linux resident pages), which the RAM budget also holds to; 0 where
+    ## it cannot tell.
+    pub func memory_process_bytes() -> i64:
+        return (i64)residency_report().process
+
     pub func memory_derived_bytes() -> i64:
         return (i64)residency_report().derived
 
