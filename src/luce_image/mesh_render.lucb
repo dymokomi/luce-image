@@ -15,6 +15,8 @@
 import gpu
 import math
 import memory
+import thread
+from raster_errors import limit
 from tiles import Tiles, tile_size, tile_texture
 from pyramid import Pyramid
 from luce_image.transform_window import Footprint, gather_tiles, level_for, Window
@@ -43,25 +45,39 @@ pub struct Mesher:
         self.shader.destroy()
 
     ## Cell (`column`, `row`) of pyramid `level` of `tiles` (as the warp began;
-    ## `pyramid` their levels) drawn through `mesh`; none where nothing lands.
+    ## `pyramid` their levels) drawn through `mesh` for a preview: its field a
+    ## sample every other texel, a quarter of the work, the rim a texel softer.
+    ## None where nothing lands.
     pub func cell(mesh: const MeshMap*, tiles: const Tiles*, pyramid: Pyramid*, column: u32, row: u32, level: u32) -> gpu.Texture?!:
+        var made = try prepare(mesh, column, row, level, 2)
+        defer made.destroy()
+        return try self.draw(&made, tiles, pyramid)
+
+    ## Cells `first`..`last` of row `row` at full size, their fields made on
+    ## `threads` threads at once and drawn one by one; `each` takes each cell's
+    ## texture (none where nothing lands) with `context`.
+    pub func row_of_cells(mesh: const MeshMap*, tiles: const Tiles*, pyramid: Pyramid*, row: u32, first: u32, last: u32, threads: usize,
+                          context: void*, each: func(void*, u32, u32, gpu.Texture?) -> unit!) -> !:
+        let count = (usize)(last - first + 1)
+        let fields = try alloc CellField[count] in memory.heap
+        for index in 0..<count:
+            fields[index] = CellField(bytes = none, wide = none, reach = nowhere())
+        defer destroy_fields(fields)
+        var batch = Batch(mesh = mesh, row = row, first = first, fields = fields)
+        try prepare_all(&batch, threads)
+        for index in 0..<count:
+            let texture = try self.draw(&fields[index], tiles, pyramid)
+            try each(context, first + (u32)index, row, texture)
+
+    ## A made field drawn: the window it reads gathered, the field and its
+    ## coverage uploaded and mesh.frag run over the cell.
+    func draw(made: const CellField*, tiles: const Tiles*, pyramid: Pyramid*) -> gpu.Texture?!:
+        let bytes = made.bytes else return none
+        let wide = made.wide else return none
+        let reach = made.reach
+        let level = made.level
         let scale = (f64)(1u32 << level)
-        let side = (f64)tile_size * scale
-        let x0 = (f64)column * side
-        let y0 = (f64)row * side
-        if not mesh.touches(x0 - scale, y0 - scale, x0 + side + scale, y0 + side + scale):
-            return none
-        # A sample for each texel of the cell, and one more along each side for the tap.
-        let spacing = scale
-        let n = (i64)tile_size + 1
-        let count = (usize)(n * n)
-        let bytes = try alloc u8[count * 8] in memory.heap
-        defer free(bytes) in memory.heap
-        let cover = try alloc u8[count] in memory.heap
-        defer free(cover) in memory.heap
-        let reach = mesh.field(x0, y0, spacing, n, scale, bytes, cover)
-        if not reach.moved:
-            return none
+        let n = made.n
         # The window: every place a covered sample reads, two texels of its
         # level around it for the tap, within the layer.
         var at = level
@@ -78,19 +94,11 @@ pub struct Mesher:
         var field = try gpu.Texture.create(self.owner, (u32)n, (u32)n, gpu.Format.rgba16_float)
         defer field.destroy()
         try field.upload(bytes)
-        # As rgba8, coverage in red: rows of whole words, whatever the width.
-        let wide = try alloc u8[count * 4] in memory.heap
-        defer free(wide) in memory.heap
-        for index in 0..<count:
-            wide[index * 4] = cover[index]
-            wide[index * 4 + 1] = 0
-            wide[index * 4 + 2] = 0
-            wide[index * 4 + 3] = 255
         var coverage = try gpu.Texture.create(self.owner, (u32)n, (u32)n, gpu.Format.rgba8_linear)
         defer coverage.destroy()
         try coverage.upload(wide)
-        var params: f32[12] = [(f32)x0, (f32)y0, (f32)scale, 0.0, (f32)window.left, (f32)window.top, (f32)(try window.texture.width()), (f32)(try window.texture.height()),
-                               (f32)(1u32 << at), (f32)spacing, (f32)n, 0.0]
+        var params: f32[12] = [(f32)made.x0, (f32)made.y0, (f32)scale, 0.0, (f32)window.left, (f32)window.top, (f32)(try window.texture.width()), (f32)(try window.texture.height()),
+                               (f32)(1u32 << at), (f32)made.spacing, (f32)n, 0.0]
         var fresh = try tile_texture(self.owner)
         errdefer fresh.destroy()
         let frame = try fresh.frame()
@@ -101,6 +109,107 @@ pub struct Mesher:
                       [window.texture, field, coverage], gpu.Filter.nearest)
         discard(try frame.value().present(clear))
         return fresh
+
+## A cell's field made on the CPU, for the GPU: each texel's displacement
+## (liquify's split halves), its coverage as rgba8 (red), and where they
+## read. No bytes where nothing lands or nothing moves.
+struct CellField:
+    var bytes: u8[]?
+    var wide: u8[]?
+    var reach: Reach
+    var x0: f64 = 0.0
+    var y0: f64 = 0.0
+    var level: u32 = 0
+    ## Document pixels between samples, and samples a side.
+    var spacing: f64 = 1.0
+    var n: i64 = 0
+
+    mutating func destroy():
+        if let bytes = self.bytes:
+            free(bytes) in memory.heap
+        if let wide = self.wide:
+            free(wide) in memory.heap
+        self.bytes = none
+        self.wide = none
+
+## Free `fields` and what each holds.
+func destroy_fields(fields: CellField[]):
+    for index in 0..<fields.length:
+        fields[index].destroy()
+    free(fields) in memory.heap
+
+func nowhere() -> Reach:
+    return Reach(moved = false, left = 0.0, top = 0.0, right = 0.0, bottom = 0.0)
+
+## Cell (`column`, `row`) of `level`'s field through `mesh`, a sample every
+## `step` texels: CPU only, so several cells' are made at once.
+func prepare(mesh: const MeshMap*, column: u32, row: u32, level: u32, step: i64) -> CellField!:
+    var made = CellField(bytes = none, wide = none, reach = nowhere(), level = level)
+    let scale = (f64)(1u32 << level)
+    let side = (f64)tile_size * scale
+    made.x0 = (f64)column * side
+    made.y0 = (f64)row * side
+    if not mesh.touches(made.x0 - scale, made.y0 - scale, made.x0 + side + scale, made.y0 + side + scale):
+        return made
+    # A sample each `step` texels of the cell, and one more along each side for the tap.
+    let n = (i64)tile_size // step + 1
+    made.spacing = scale * (f64)step
+    made.n = n
+    let count = (usize)(n * n)
+    let bytes = try alloc u8[count * 8] in memory.heap
+    errdefer free(bytes) in memory.heap
+    let cover = try alloc u8[count] in memory.heap
+    defer free(cover) in memory.heap
+    made.reach = mesh.field(made.x0, made.y0, made.spacing, n, scale, bytes, cover)
+    if not made.reach.moved:
+        free(bytes) in memory.heap
+        return made
+    # As rgba8, coverage in red: rows of whole words, whatever the width.
+    let wide = try alloc u8[count * 4] in memory.heap
+    for index in 0..<count:
+        wide[index * 4] = cover[index]
+        wide[index * 4 + 1] = 0
+        wide[index * 4 + 2] = 0
+        wide[index * 4 + 3] = 255
+    made.bytes = bytes
+    made.wide = wide
+    return made
+
+## A row of cells whose fields are made on several threads.
+struct Batch:
+    var mesh: const MeshMap*
+    var row: u32
+    var first: u32
+    var fields: CellField[]
+    var next: @usize
+    var failed: @bool
+
+func prepare_some(raw: void*?):
+    let batch = (Batch*)(raw else return)
+    while not batch.failed.load(.acquire):
+        let index = batch.next.add(1, .relaxed)
+        if index >= batch.fields.length:
+            return
+        batch.fields[index] = prepare(batch.mesh, batch.first + (u32)index, batch.row, 0, 1) catch failure:
+            batch.failed.store(true, .release)
+            return
+
+## Every field of `batch`, on up to `threads` threads (this one among them).
+func prepare_all(batch: Batch*, threads: usize) -> !:
+    var handles: thread.Handle[16]
+    var started: usize = 0
+    var wanted = threads if threads < 16 else 16
+    if wanted > batch.fields.length:
+        wanted = batch.fields.length
+    for index in 1..<(wanted if wanted > 1 else 1):
+        handles[started] = thread.spawn(prepare_some, (void*)batch, name = "luce-image mesh") catch failure:
+            break
+        started += 1
+    prepare_some((void*)batch)
+    for index in 0..<started:
+        try handles[index].join()
+    if batch.failed.load(.acquire):
+        error(limit, "out of memory making a warp's cells")
 
 ## Where a cell's samples read (`reach`), two texels of `scale` pixels around
 ## for the tap, within `tiles`' layer; none when that is past it.

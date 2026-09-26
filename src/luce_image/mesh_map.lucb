@@ -224,33 +224,80 @@ pub struct MeshMap:
         let i1 = math.imin(n - 1, (i64)math.floor((box.right - x0) / spacing))
         let j1 = math.imin(n - 1, (i64)math.floor((box.bottom - y0) / spacing))
         let edges = self.outer[t]
+        # Each weight is k x + m along a row: the row's samples inside are
+        # an interval, walked alone (a big triangle over a cell tests no more).
+        let kb = (cy - ay) / area
+        let kc = -(by - ay) / area
+        let ka = -(kb + kc)
+        let slack = 1e-7 * spacing
         for j in j0..<j1 + 1:
             let y = y0 + (f64)j * spacing
-            for i in i0..<i1 + 1:
+            let mb = (-ax * (cy - ay) - (y - ay) * (cx - ax)) / area
+            let mc = ((bx - ax) * (y - ay) + (by - ay) * ax) / area
+            let ma = 1.0 - mb - mc
+            var low = x0 + (f64)i0 * spacing - slack
+            var high = x0 + (f64)i1 * spacing + slack
+            if not narrow(ka, ma, &low, &high) or not narrow(kb, mb, &low, &high) or not narrow(kc, mc, &low, &high):
+                continue
+            let first = math.imax(i0, (i64)math.ceil((low - slack - x0) / spacing))
+            let last = math.imin(i1, (i64)math.floor((high + slack - x0) / spacing))
+            var seen_first: i64 = -1
+            var seen_last: i64 = -1
+            for i in first..<last + 1:
                 let x = x0 + (f64)i * spacing
                 # Barycentric weights of b and c; a has what is left.
-                let wb = ((x - ax) * (cy - ay) - (y - ay) * (cx - ax)) / area
-                let wc = ((bx - ax) * (y - ay) - (by - ay) * (x - ax)) / area
+                let wb = kb * x + mb
+                let wc = kc * x + mc
                 let wa = 1.0 - wb - wc
                 if wa < -1e-9 or wb < -1e-9 or wc < -1e-9:
                     continue
                 let at = (usize)(j * n + i)
-                let sx = wa * p[a] + wb * p[b] + wc * p[c]
-                let sy = wa * p[a + 1] + wb * p[b + 1] + wc * p[c + 1]
-                shift[at * 2] = (f32)(sx - x)
-                shift[at * 2 + 1] = (f32)(sy - y)
-                var coverage = 1.0
+                shift[at * 2] = (f32)(wa * p[a] + wb * p[b] + wc * p[c] - x)
+                shift[at * 2 + 1] = (f32)(wa * p[a + 1] + wb * p[b + 1] + wc * p[c + 1] - y)
+                var value: u8 = 255
                 if edges != 0 and rim > 0.0:
                     let inside = edge_distance(edges, x, y, ax, ay, bx, by, cx, cy)
-                    coverage = math.clamp(0.5 + inside / rim, 0.5, 1.0)
-                let value = (u8)(coverage * 255.0 + 0.5)
+                    if inside < 0.5 * rim:
+                        value = (u8)(math.clamp(0.5 + inside / rim, 0.5, 1.0) * 255.0 + 0.5)
                 if value > cover[at]:
                     cover[at] = value
-                reach.moved = true
-                reach.left = math.min(reach.left, sx)
-                reach.top = math.min(reach.top, sy)
-                reach.right = math.max(reach.right, sx)
-                reach.bottom = math.max(reach.bottom, sy)
+                if seen_first < 0:
+                    seen_first = i
+                seen_last = i
+            if seen_first < 0:
+                continue
+            # Where the row's samples read is affine along it: its ends bound it.
+            reach.moved = true
+            for which in 0..<(usize)2:
+                let x = x0 + (f64)(seen_first if which == 0 else seen_last) * spacing
+                let wb = kb * x + mb
+                let wc = kc * x + mc
+                let wa = 1.0 - wb - wc
+                let sx = wa * p[a] + wb * p[b] + wc * p[c]
+                let sy = wa * p[a + 1] + wb * p[b + 1] + wc * p[c + 1]
+                if sx < reach.left:
+                    reach.left = sx
+                if sx > reach.right:
+                    reach.right = sx
+                if sy < reach.top:
+                    reach.top = sy
+                if sy > reach.bottom:
+                    reach.bottom = sy
+
+## Narrow [`low`, `high`] to where k x + m ≥ 0 (a little under, for rounding);
+## false when nothing is left.
+func narrow(k: f64, m: f64, low: f64*, high: f64*) -> bool:
+    if k > 0.0:
+        let at = (-1e-9 - m) / k
+        if at > *low:
+            *low = at
+    elif k < 0.0:
+        let at = (-1e-9 - m) / k
+        if at < *high:
+            *high = at
+    elif m < -1e-9:
+        return false
+    return *low <= *high
 
 ## How far (`x`, `y`) lies inside the nearest of the triangle's outer edges `edges`.
 func edge_distance(edges: u8, x: f64, y: f64, ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64) -> f64:
@@ -289,6 +336,12 @@ func borrow(shift: f32[], cover: const u8[], n: i64, i: i64, j: i64):
 ## `value` as two half floats at `at` and `at + 4` in `bytes`, as liquify's:
 ## a multiple of 64, exact in a half, and what is left.
 func put_split(bytes: u8[], at: usize, value: f64):
+    if value == 0.0:
+        bytes[at] = 0
+        bytes[at + 1] = 0
+        bytes[at + 4] = 0
+        bytes[at + 5] = 0
+        return
     let coarse = math.round(value / 64.0) * 64.0
     put_half(bytes, at, coarse)
     put_half(bytes, at + 4, value - coarse)

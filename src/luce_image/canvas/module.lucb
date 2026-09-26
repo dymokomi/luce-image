@@ -2769,6 +2769,19 @@ pub struct Canvas:
     pub mutating func puppet_hit(x: f64, y: f64, reach: f64) -> i64!:
         return (try puppet_session(&self)).hit(x, y, reach)
 
+    ## Where the pins take the layer's point (`x`, `y`): for drawing the mesh as it bends.
+    pub mutating func puppet_place_x(x: f64, y: f64) -> f64!:
+        var px = 0.0
+        var py = 0.0
+        (try puppet_session(&self)).deform(x, y, &px, &py)
+        return px
+
+    pub mutating func puppet_place_y(x: f64, y: f64) -> f64!:
+        var px = 0.0
+        var py = 0.0
+        (try puppet_session(&self)).deform(x, y, &px, &py)
+        return py
+
     ## Keep the warp as one undo step (`keep`), or leave the layer as it was.
     pub mutating func end_mesh_warp(keep: bool) -> !:
         try end_mesh_warp(&self, keep)
