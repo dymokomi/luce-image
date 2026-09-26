@@ -826,6 +826,31 @@ test "streamed exports keep alpha in PNG, blend over the matte in JPEG, and reac
     let white = try matted.value().getpixel(100, 100)
     assert(white.r > 247.0 and white.g > 247.0 and white.b > 247.0)
 
+test "an export wider than one read-back strip keeps pixels either side of the join":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(16600, 40)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.select_rectangle(16380, 10, 8, 10)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.save("build/canvas-strips.png")
+    let saved = try Image.open("build/canvas-strips.png")
+    defer saved.release()
+    for x in [(usize)16380, 16383, 16384, 16387]:
+        let pixel = try saved.value().getpixel(x, 15)
+        assert(pixel.r == 255.0 and pixel.a == 255.0)
+    assert((try saved.value().getpixel(16379, 15)).a == 0.0 and (try saved.value().getpixel(16388, 15)).a == 0.0)
+    assert((try saved.value().getpixel(16599, 39)).a == 0.0)
+
 test "a canvas binds headless, without a window, and edits with history":
     var canvas = try Canvas(40, 30)
     defer canvas.close()
