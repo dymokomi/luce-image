@@ -4,7 +4,8 @@
 #
 #   DESCRIPTION:
 #       A progressive JPEG's rows come only after its last scan, but its first scans give
-#       the whole picture at 1/8 size (jpeg `Options.coarse`). The worker packs that
+#       the whole picture at 1/8 size (jpeg `Options.coarse`); an interlaced PNG's first
+#       pass is every eighth pixel each way, the same (png `DecodeOptions.coarse`). The worker packs that
 #       picture into half-float tiles' bytes as it packs bands; a frame uploads it into a
 #       small grid of its own and shows it through a stand-in for the layer (stand_in.lucb):
 #       a cell whose rows are not all in is the coarse picture scaled up, and a cell that is

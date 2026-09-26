@@ -137,6 +137,41 @@ func open_as_window(device: gpu.Device, path: str) -> OpenTimes!:
     canvas.close()
     return times
 
+## Place `path` centred on a new layer of an empty document 500 pixels bigger
+## each way, as the window does, drawing it fitted a frame at a time until it
+## is in: meanwhile edits are refused.
+func place_as_window(device: gpu.Device, path: str) -> OpenTimes!:
+    var target = try gpu.Texture.create(device, opening_view_width, opening_view_height, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    let info = try Image.open(path, max_bytes = (usize)1 << 40, max_pixels = (usize)1 << 32)
+    let picture_width = try info.value().width()
+    let picture_height = try info.value().height()
+    info.release()
+    var canvas = try Canvas((i64)picture_width + 500, (i64)picture_height + 500)
+    defer canvas.close()
+    let zoom = math.min((f64)opening_view_width / (f64)canvas.width(), (f64)opening_view_height / (f64)canvas.height())
+    let middle = (u32)((f64)canvas.width() * zoom / 2.0)
+    try draw_opening_frame(&canvas, &target, zoom)
+    let layer = try canvas.add_layer("Placed")
+    let started = time.now()
+    try canvas.place_layer(layer, path, (i64)canvas.width() // 2, (i64)canvas.height() // 2)
+    var times = OpenTimes(first = 0, whole = 0)
+    while true:
+        try draw_opening_frame(&canvas, &target, zoom)
+        if times.first == 0 and not dark(try opening_pixel(&target, middle, (u32)(314.0 * zoom))):
+            times.first = since(started)
+        if not canvas.is_opening():
+            break
+        var refused = false
+        canvas.add_layer("Too soon") catch failure:
+            refused = failure.code == invalid
+            recover 0
+        assert(refused)
+        thread.sleep(8)
+    times.whole = since(started)
+    assert(not dark(try opening_pixel(&target, middle, (u32)((f64)(250 + picture_height - 64) * zoom))))
+    return times
+
 func draw_opening_frame(canvas: Canvas*, target: gpu.Texture*, zoom: f64) -> !:
     let frame = try target.frame()
     defer frame.release()
@@ -168,6 +203,11 @@ test "an 18000 by 12000 PNG and JPEG show their first rows at once and fill in w
     for path in ["build/open-timing.png", "build/open-timing.jpg"]:
         let times = try open_as_window(device, path)
         assert(times.first < 2000 and times.whole < 30000)
+        # Placed on a new layer off the cells' grid, as File > Import does: on this
+        # Mac the PNG's top rows showed at 0.12 s and it was in at 2.0 s (the window
+        # blocked 2.3 s before), the JPEG's at 0.08 s and 0.8 s.
+        let placed = try place_as_window(device, path)
+        assert(placed.first < 2000 and placed.whole < 30000)
 
 ## Every texel of `canvas`'s first layer, straight RGBA f32 a cell after another.
 func first_layer_texels(canvas: Canvas*, into: f32[]) -> !:
@@ -351,14 +391,24 @@ test "a large PNG or JPEG opens from its file's start; a whole decode reads the 
             recover false)
         assert(refused)
 
-test "a progressive JPEG shows a coarse picture before its rows, and then the tiles of one opened at once":
+test "a progressive JPEG or interlaced PNG shows a coarse picture before its rows, then the tiles of one opened at once":
     var device = gpu.Device.open() catch failure:
         assert(failure.code == gpu.unavailable)
         return
     defer device.destroy()
-    # 480 by 360, progressive 4:2:0 (cjpeg's scans: the DC first).
-    let path = "tests/fixtures/progressive-480x360.jpg"
-    let cells = (usize)tile_columns(480) * (usize)tile_columns(360) * (usize)tile_size * (usize)tile_size * 4
+    # 480 by 360, progressive 4:2:0 (cjpeg's scans: the DC first); 33 by 17,
+    # 16-bit RGBA, Adam7.
+    for which in 0..<2:
+        let path = "tests/fixtures/progressive-480x360.jpg" if which == 0 else "tests/fixtures/interlaced-33x17.png"
+        let width: u32 = 480 if which == 0 else 33
+        let height: u32 = 360 if which == 0 else 17
+        try coarse_then_whole(device, path, width, height, which == 0)
+
+## `path` (`width` by `height`) opened as the window does: its coarse picture
+## comes before its rows (near the picture, when `near`), and it ends with the
+## tiles of an open at once.
+func coarse_then_whole(device: gpu.Device, path: str, width: u32, height: u32, near: bool) -> !:
+    let cells = (usize)tile_columns(width) * (usize)tile_columns(height) * (usize)tile_size * (usize)tile_size * 4
     let at_once = try alloc f32[cells] in memory.heap
     defer free(at_once) in memory.heap
     let in_background = try alloc f32[cells] in memory.heap
@@ -381,8 +431,8 @@ test "a progressive JPEG shows a coarse picture before its rows, and then the ti
             thread.sleep(1)
         let composer = loading.composer else trap("bound")
         try show_coarse(opening, composer)
-        assert(opening.coarse.shown and opening.coarse.width == 60 and opening.coarse.height == 45)
-        if opening.uploaded == 0:
+        assert(opening.coarse.shown and opening.coarse.width == (width + 7) // 8 and opening.coarse.height == (height + 7) // 8)
+        if near and opening.uploaded == 0:
             # Cell (0, 0) at full size is the coarse picture scaled up: near the real one.
             let made = try coarse_cell((void*)opening, composer.levels(), opening.layer, false, 0, 0, 0)
             var texture = made.texture else trap("a coarse cell")
@@ -392,8 +442,8 @@ test "a progressive JPEG shows a coarse picture before its rows, and then the ti
             try texture.read(texels)
             var difference = 0.0
             for index in 0..<(usize)tile_size * (usize)tile_size * 4:
-                let near = (f64)from_half((u16)texels[index * 2] | ((u16)texels[index * 2 + 1] << 8))
-                difference += math.abs(near - (f64)at_once[index])
+                let value = (f64)from_half((u16)texels[index * 2] | ((u16)texels[index * 2 + 1] << 8))
+                difference += math.abs(value - (f64)at_once[index])
             assert(difference / (f64)((usize)tile_size * (usize)tile_size * 4) < 0.08)
     while loading.is_opening():
         try draw_opening_frame(loading, &target, 0.05)

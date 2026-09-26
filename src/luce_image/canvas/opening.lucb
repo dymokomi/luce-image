@@ -18,8 +18,9 @@
 #       and each row of the layer's cells lands (`land_rows`) once the picture rows under
 #       it are in; the picture's cells no row needs any more are let go as it goes.
 #
-#       A progressive JPEG shows itself before any row: its first scans give the picture at
-#       1/8 size, which stands in for the layer's cells not yet in (canvas/opening_coarse).
+#       A progressive JPEG or interlaced PNG shows itself before any row: its first scans or
+#       pass give the picture at 1/8 size, which stands in for the layer's cells not yet in
+#       (canvas/opening_coarse).
 #
 #       Edits and saves are refused until it is done (`require_loaded`); `opening_percent`
 #       is the progress for the window to show.

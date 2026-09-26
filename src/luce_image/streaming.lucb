@@ -38,8 +38,8 @@ pub type LinearSink = func(void*?, usize, usize, f32[]) -> unit!
 pub type EncodedSink = func(void*?, usize, usize, const u8[], bool) -> unit!
 
 ## Receives a picture's first sight while its rows are still to come: the
-## picture at a fraction of its size, `width` by `height` 8-bit RGBA pixels
-## (a progressive JPEG's first scans). Valid only during the call.
+## picture at 1/8 size, `width` by `height` 8-bit RGBA pixels (a progressive
+## JPEG's first scans, an interlaced PNG's first pass). Valid only during the call.
 pub type CoarseSink = func(void*?, usize, usize, const u8[]) -> unit!
 
 ## The sRGB decoding of an encoded component in 0..1.
@@ -105,16 +105,17 @@ pub func stream_encoded(raster: model.Raster*, file: FileSource*?, rows: usize, 
                                top = 0, filled = 0, sink = sink, context = context)
     defer free(banding.band) in memory.heap
     if named == "PNG":
-        try png_rows(raster, file, encoded_rows, (void*)&banding, deep)
+        try png_rows(raster, file, encoded_rows, (void*)&banding, deep, coarse, context)
     else:
         try jpeg_rows(raster, file, encoded_rows, (void*)&banding, coarse, context)
     if banding.top + banding.filled != banding.height:
         error(invalid, "the picture ended before its last row")
     return true
 
-## A PNG's rows to `sink`, from its bytes held or from `file`.
-func png_rows(raster: const model.Raster*, file: FileSource*?, sink: png.RowSink, context: void*?, deep: bool) -> !:
-    let options = png.DecodeOptions(max_bytes = raster.max_bytes)
+## A PNG's rows to `sink`, from its bytes held or from `file`; an interlaced
+## one's first sight to `coarse` with `coarse_context`.
+func png_rows(raster: const model.Raster*, file: FileSource*?, sink: png.RowSink, context: void*?, deep: bool, coarse: CoarseSink? = none, coarse_context: void*? = none) -> !:
+    let options = png.DecodeOptions(max_bytes = raster.max_bytes, coarse = coarse, coarse_context = coarse_context)
     if let source = file:
         let size = source.size()
         try png.decode_rows_at(read_source, (void*)source, size, sink, context, deep, options)
