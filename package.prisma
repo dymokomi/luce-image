@@ -105,7 +105,7 @@ def package "luce-image" {
 
     def dependency "luce-canvas" {
         str owner = "dymokomi"
-        str version = "^0.1.1"
+        str version = "^0.1.2"
         str path = "../luce-canvas"
     }
 
