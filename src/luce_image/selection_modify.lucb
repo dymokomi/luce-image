@@ -1,7 +1,9 @@
 ## Select › Modify over a selection's cells (selection_cells.lucb): expand or
 ## contract by a square of `pixels`, then feather the edge with a box blur of
-## `feather`, each separable, a horizontal pass then a vertical one. Samples
-## past the document are clear in every pass.
+## `feather`, each separable, a horizontal pass then a vertical one; Border (a
+## band of a width along the edge) and Smooth (a box blur taken back to a
+## narrow edge, rounding corners and dropping specks). Samples past the
+## document are clear in every pass.
 ##
 ## Only cells within reach of an edge change: a cell whose neighbourhood (the
 ## cell and `pixels + feather` around it) is one value throughout keeps that
@@ -14,9 +16,28 @@ import memory
 from tiles import tile_size
 from luce_image.selection_cells import Cells, each
 
+## What a pass over the cells does.
+let kind_modify: i64 = 0
+let kind_border: i64 = 1
+let kind_smooth: i64 = 2
+
 ## Expand (`pixels` > 0) or contract (< 0) `cells`, then feather by `feather`.
 pub func modify(cells: Cells*, pixels: i64, feather: i64) -> !:
-    let apron = math.iabs(pixels) + feather
+    try pass_cells(cells, kind_modify, pixels, feather, math.iabs(pixels) + feather)
+
+## Select › Modify › Border: the band `width` pixels wide centered on the
+## selection's edge, softened by a pixel.
+pub func border(cells: Cells*, width: i64) -> !:
+    let radius = (width + 1) // 2
+    try pass_cells(cells, kind_border, radius, 1, radius + 1)
+
+## Select › Modify › Smooth: each pixel as the mean of the square `radius`
+## around it, taken back to a narrow soft edge at half coverage.
+pub func smooth(cells: Cells*, radius: i64) -> !:
+    try pass_cells(cells, kind_smooth, 0, radius, radius)
+
+## One pass of `kind` over every cell within `apron` of an edge.
+func pass_cells(cells: Cells*, kind: i64, pixels: i64, feather: i64, apron: i64) -> !:
     let count = cells.count()
     # Which cells need working out; the rest keep (or take) one value.
     let values = try alloc i64[count] in memory.heap
@@ -24,6 +45,9 @@ pub func modify(cells: Cells*, pixels: i64, feather: i64) -> !:
     var pending: usize = 0
     for index in 0..<count:
         values[index] = settled_value(cells, index, apron)
+        # A band along the edge: away from any edge there is none.
+        if kind == kind_border and values[index] > 0:
+            values[index] = 0
         if values[index] < 0:
             pending += 1
     let items = try alloc usize[pending] in memory.heap
@@ -40,7 +64,7 @@ pub func modify(cells: Cells*, pixels: i64, feather: i64) -> !:
             discard(cells.fresh(index))
         elif cells.uniform(index) != values[index]:
             cells.fill(index, (u8)values[index])
-    var job = ModifyJob(source = &before, target = cells, items = items, pixels = pixels, feather = feather, apron = apron, failed = false)
+    var job = ModifyJob(source = &before, target = cells, items = items, kind = kind, pixels = pixels, feather = feather, apron = apron, failed = false)
     each(pending, (void*)&job, modify_item)
     if job.failed:
         error(memory.exhausted, "out of memory modifying the selection")
@@ -74,6 +98,7 @@ struct ModifyJob:
     var source: const Cells*
     var target: const Cells*
     var items: const usize[]
+    var kind: i64
     var pixels: i64
     var feather: i64
     var apron: i64
@@ -105,6 +130,21 @@ func modify_item(context: void*?, item: usize):
     gather(cells, &window, a)
     var current = a
     var other = b
+    if job.kind == kind_border:
+        let c = alloc u8[size] in memory.heap catch failure:
+            job.failed = true
+            return
+        defer free(c) in memory.heap
+        border_window(a, b, c, &window, job.pixels, scratch)
+        keep_middle(job.target, index, a, &window, apron, width, height)
+        return
+    if job.kind == kind_smooth:
+        box_rows(a, b, &window, job.feather, 0)
+        window.clear_outside(b)
+        box_columns(b, a, &window, job.feather, job.feather)
+        ramp(a)
+        keep_middle(job.target, index, a, &window, apron, width, height)
+        return
     # Each pass leaves good values a radius further in than the last.
     var margin: i64 = 0
     if job.pixels != 0:
@@ -120,12 +160,38 @@ func modify_item(context: void*?, item: usize):
         window.clear_outside(other)
         box_columns(other, current, &window, job.feather, margin + job.feather)
         margin += job.feather
-    # The cell itself: the window's middle, rows of 256 in the result.
-    let result = (job.target.block(index) else return).bytes
+    keep_middle(job.target, index, current, &window, apron, width, height)
+
+## The cell itself: the window's middle, rows of 256 in its block.
+func keep_middle(target: const Cells*, index: usize, current: const u8[], window: const Window*, apron: i64, width: i64, height: i64):
+    let result = (target.block(index) else return).bytes
     memory.set(result, 0)
     for y in 0..<height:
         let source_at = (usize)((y + apron) * window.width + apron)
         memory.copy(result[(usize)y * (usize)tile_size..<(usize)y * (usize)tile_size + (usize)width], current[source_at..<source_at + (usize)width], (usize)width)
+
+## Border in a window: the selection grown by `radius` less it shrunk by
+## `radius` (both from the same pixels), then a box of one: into `a`.
+func border_window(a: u8[], b: u8[], c: u8[], window: const Window*, radius: i64, scratch: u8[]):
+    memory.copy(c, a, a.length)
+    extreme_rows(a, b, window, radius, true, 0, scratch)
+    window.clear_outside(b)
+    extreme_columns(b, a, window, radius, true, radius, scratch)
+    extreme_rows(c, b, window, radius, false, 0, scratch)
+    window.clear_outside(b)
+    extreme_columns(b, c, window, radius, false, radius, scratch)
+    for at in 0..<a.length:
+        a[at] = a[at] - c[at] if a[at] > c[at] else 0
+    window.clear_outside(a)
+    box_rows(a, b, window, 1, radius)
+    window.clear_outside(b)
+    box_columns(b, a, window, 1, radius + 1)
+
+## Smooth's last step: a blurred edge taken back to a few pixels about half coverage.
+func ramp(bytes: u8[]):
+    for at in 0..<bytes.length:
+        let value = ((i64)bytes[at] - 128) * 4 + 128
+        bytes[at] = (u8)math.imin(255, math.imax(0, value))
 
 ## A window onto the document, in document pixels, and the document's size.
 struct Window:

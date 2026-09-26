@@ -1,0 +1,85 @@
+#==============================================================================================
+#
+#   canvas/refine_tests - Select › Modify › Border and Smooth, Grow and Similar, and
+#   Transform Selection through the canvas, with their undo steps
+#
+#==============================================================================================
+
+test "border, smooth, grow and similar change the selection as one step each":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(700, 500)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    # A red block on the left, a blue one on the right, a red one past a gap.
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(0, 0, 300, 500, 0)
+    try canvas.fill(layer, false)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, false)
+    try canvas.select_rectangle(300, 0, 100, 500, 0)
+    try canvas.fill(layer, false)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(400, 0, 300, 500, 0)
+    try canvas.fill(layer, false)
+    # Grow from a small red patch takes the red block, not past the blue.
+    try canvas.select_rectangle(50, 50, 10, 10, 0)
+    try canvas.grow_selection(layer, 10.0, true)
+    assert(canvas.undo_name() == "Grow" and canvas.selected_at(250, 400) == 255 and canvas.selected_at(350, 250) == 0 and canvas.selected_at(600, 250) == 0)
+    try canvas.undo()
+    assert(canvas.selected_at(250, 400) == 0 and canvas.selected_at(55, 55) == 255)
+    # Similar reaches the red past the blue too.
+    try canvas.grow_selection(layer, 10.0, false)
+    assert(canvas.undo_name() == "Similar" and canvas.selected_at(600, 250) == 255 and canvas.selected_at(350, 250) == 0)
+    # Border of the left block: its edge, not its middle.
+    try canvas.select_rectangle(100, 100, 200, 200, 0)
+    try canvas.border_selection(10)
+    assert(canvas.undo_name() == "Border" and canvas.selected_at(100, 200) > 0 and canvas.selected_at(200, 200) == 0 and canvas.selected_at(60, 200) == 0)
+    try canvas.undo()
+    assert(canvas.selected_at(200, 200) == 255)
+    try canvas.smooth_selection(5)
+    assert(canvas.undo_name() == "Smooth" and canvas.selected_at(200, 200) == 255 and canvas.selected_at(101, 101) < 255)
+
+test "transform selection reshapes the outline, not the pixels, and undoes as one step":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(400, 300)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(100, 100, 100, 100, 0)
+    try canvas.fill(layer, false)
+    let steps = canvas.history_steps()
+    try canvas.begin_selection_transform()
+    assert(canvas.transforming_selection())
+    # Twice the size about the middle: the previews start from the original each time.
+    try canvas.preview_selection_transform(1.5, 1.5, 0.0, 0.0, 0.0, 150.0, 150.0)
+    try canvas.preview_selection_transform(2.0, 2.0, 0.0, 0.0, 0.0, 150.0, 150.0)
+    assert(canvas.selected_at(60, 60) == 255 and canvas.selected_at(40, 40) == 0)
+    try canvas.end_selection_transform(true)
+    assert(not canvas.transforming_selection() and canvas.history_steps() == steps + 1 and canvas.undo_name() == "Transform Selection")
+    # Bilinear edges may cover a pixel more, partly.
+    assert(canvas.selection_left() >= 49 and canvas.selection_left() <= 50 and canvas.selection_width() >= 200 and canvas.selection_width() <= 202)
+    assert(canvas.selected_at(52, 150) == 255 and canvas.selected_at(247, 150) == 255)
+    # The pixels stayed where they were.
+    let pixels = try alloc f32[400 * 300 * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    try layer_tiles(&canvas, layer).read(pixels)
+    assert(pixels[(60 * 400 + 60) * 4 + 3] == 0.0 and pixels[(150 * 400 + 150) * 4 + 3] == 1.0)
+    try canvas.undo()
+    assert(canvas.selection_left() == 100 and canvas.selection_width() == 100)
+    # Cancelled, it is as it was, and no step is added.
+    try canvas.begin_selection_transform()
+    try canvas.preview_selection_distort(100.0, 100.0, 100.0, 100.0, 80.0, 90.0, 220.0, 100.0, 200.0, 200.0, 100.0, 200.0)
+    assert(canvas.selected_at(85, 95) == 255)
+    try canvas.end_selection_transform(false)
+    assert(canvas.selection_left() == 100 and canvas.history_steps() == steps)
