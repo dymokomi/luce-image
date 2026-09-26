@@ -23,6 +23,7 @@ import png
 import jpeg
 import tiff
 import raster as model
+from luce_image.file_source import FileSource, read_source
 from half import to_half
 from raster_errors import invalid
 
@@ -57,8 +58,9 @@ struct Banding:
 
 ## `raster`'s picture (probed, not decoded) to `sink` in bands of `rows`,
 ## when it is a PNG, a JPEG or a TIFF of strips or tiles upright; false for
-## any other, which must be decoded whole.
-pub func stream_linear(raster: model.Raster*, rows: usize, sink: LinearSink, context: void*?) -> bool!:
+## any other, which must be decoded whole. A PNG or JPEG held only as its
+## file's start is read from `file`.
+pub func stream_linear(raster: model.Raster*, file: FileSource*?, rows: usize, sink: LinearSink, context: void*?) -> bool!:
     let named = raster.file_format
     let streams = named == "PNG" or named == "JPEG" or (named == "TIFF" and tiff_streams(raster))
     if not streams:
@@ -70,12 +72,12 @@ pub func stream_linear(raster: model.Raster*, rows: usize, sink: LinearSink, con
     defer free(banding.band) in memory.heap
     defer free(banding.table) in memory.heap
     if named == "PNG":
-        let deep = (try png.info(raster.encoded)).bits == 16
+        let deep = raster.bits == 16
         fill_table(banding.table, 65535.0 if deep else 255.0)
-        try png.decode_rows(raster.encoded, deep_rows if deep else byte_rows, (void*)&banding, deep, png.DecodeOptions(max_bytes = raster.max_bytes))
+        try png_rows(raster, file, deep_rows if deep else byte_rows, (void*)&banding, deep)
     elif named == "JPEG":
         fill_table(banding.table, 255.0)
-        try jpeg.decode_rows(raster.encoded, byte_rows, (void*)&banding, .rgba, jpeg.Options(max_bytes = raster.max_bytes))
+        try jpeg_rows(raster, file, byte_rows, (void*)&banding)
     else:
         try tiff_bands(raster, &banding)
     if banding.top + banding.filled != banding.height:
@@ -84,25 +86,44 @@ pub func stream_linear(raster: model.Raster*, rows: usize, sink: LinearSink, con
 
 ## `raster`'s picture (probed, not decoded) to `sink` in bands of `rows` as
 ## the encoded samples its decoder makes, when it is a PNG or a JPEG; false
-## for any other, which goes through `stream_linear`.
-pub func stream_encoded(raster: model.Raster*, rows: usize, sink: EncodedSink, context: void*?) -> bool!:
+## for any other, which goes through `stream_linear`. One held only as its
+## file's start is read from `file`.
+pub func stream_encoded(raster: model.Raster*, file: FileSource*?, rows: usize, sink: EncodedSink, context: void*?) -> bool!:
     let named = raster.file_format
     if named != "PNG" and named != "JPEG":
         return false
     if rows == 0:
         error(invalid, "a band has at least one row")
-    let deep = named == "PNG" and (try png.info(raster.encoded)).bits == 16
+    let deep = named == "PNG" and raster.bits == 16
     let pixel: usize = 8 if deep else 4
     var banding = EncodedBands(width = raster.width, height = raster.height, rows = rows, pixel = pixel, deep = deep, band = try alloc u8[raster.width * rows * pixel] in memory.heap,
                                top = 0, filled = 0, sink = sink, context = context)
     defer free(banding.band) in memory.heap
     if named == "PNG":
-        try png.decode_rows(raster.encoded, encoded_rows, (void*)&banding, deep, png.DecodeOptions(max_bytes = raster.max_bytes))
+        try png_rows(raster, file, encoded_rows, (void*)&banding, deep)
     else:
-        try jpeg.decode_rows(raster.encoded, encoded_rows, (void*)&banding, .rgba, jpeg.Options(max_bytes = raster.max_bytes))
+        try jpeg_rows(raster, file, encoded_rows, (void*)&banding)
     if banding.top + banding.filled != banding.height:
         error(invalid, "the picture ended before its last row")
     return true
+
+## A PNG's rows to `sink`, from its bytes held or from `file`.
+func png_rows(raster: const model.Raster*, file: FileSource*?, sink: png.RowSink, context: void*?, deep: bool) -> !:
+    let options = png.DecodeOptions(max_bytes = raster.max_bytes)
+    if let source = file:
+        let size = source.size()
+        try png.decode_rows_at(read_source, (void*)source, size, sink, context, deep, options)
+        return
+    try png.decode_rows(raster.encoded, sink, context, deep, options)
+
+## A JPEG's rows to `sink` as RGBA, from its bytes held or from `file`.
+func jpeg_rows(raster: const model.Raster*, file: FileSource*?, sink: jpeg.RowSink, context: void*?) -> !:
+    let options = jpeg.Options(max_bytes = raster.max_bytes)
+    if let source = file:
+        let size = source.size()
+        try jpeg.decode_rows_at(read_source, (void*)source, size, sink, context, .rgba, options)
+        return
+    try jpeg.decode_rows(raster.encoded, sink, context, .rgba, options)
 
 ## Each code's half float for `stream_encoded`'s samples: `color` as linear
 ## light from sRGB, `alpha` as coverage; 256 entries each, 65536 when `deep`.

@@ -17,6 +17,7 @@ import heic
 import luce_image.parallel as parallel
 from luce_image.svg_import import is_svg, render_svg
 from luce_image.streaming import LinearSink, EncodedSink, stream_linear, stream_encoded, decode_srgb
+from luce_image.file_source import FileSource, read_head
 from binary import Buffer
 from raster_errors import invalid, unsupported, limit
 
@@ -32,14 +33,19 @@ func check_path(path: str) -> !:
     if path.length == 0 or strings.contains(path, "\0"):
         error(invalid, "path is empty or contains a NUL byte")
 
-func probe(raster: model.Raster*) -> !:
+## Probe `raster`'s encoded bytes: the file whole, or when `head` its start
+## alone (file_source), which a PNG or JPEG's probe needs no more than.
+func probe(raster: model.Raster*, head: bool = false) -> !:
     if raster.encoded.length < 4:
         error(invalid, "image signature is truncated")
     let data = raster.encoded
     if data[0] == 137:
         if raster.frame != 0:
             error(invalid, "PNG has one frame")
-        try png.probe(raster)
+        if head:
+            try png.probe_head(raster)
+        else:
+            try png.probe(raster)
     elif data[0] == 255 and data[1] == 216:
         if raster.frame != 0:
             error(invalid, "JPEG has one frame")
@@ -77,12 +83,18 @@ pub struct Image:
     var threads: usize = 4
     var active_workers: usize
     var closed: bool
+    ## A PNG or JPEG opened from its file's start alone (file_source): its
+    ## bands decode from the file, which must stay `file_size` bytes.
+    var head_only: bool
+    var file_size: u64
 
     func init():
         self.raster = model.Raster()
         self.threads = 4
         self.active_workers = 0
         self.closed = false
+        self.head_only = false
+        self.file_size = 0
 
     static func own(raster: model.Raster, threads: usize = 4) -> interop.Reference[Image]!:
         var reservation = try interop.Reservation[Image](image_type)
@@ -96,7 +108,9 @@ pub struct Image:
         if self.closed:
             error(invalid, "image is closed")
 
-    ## Snapshot the encoded file now; decode pixels lazily on load/access/save.
+    ## Read the file now (a large PNG or JPEG only as far as its probe needs,
+    ## the rest read in pieces as it decodes); decode pixels lazily on
+    ## load/access/save.
     pub static func open(path: str, threads: usize = 4, frame: usize = 0, max_bytes: usize = 4294967296, max_pixels: usize = 268435456) -> interop.Reference[Image]!:
         try check_path(path)
         if threads < 1 or threads > 64:
@@ -110,9 +124,14 @@ pub struct Image:
         errdefer raster.close()
         with memory.heap:
             raster.path = try strings.copy(path)
-        raster.encoded = try read_whole((c_api.str)raster.path, max_bytes)
-        try probe(&raster)
-        return try Image.own(raster, threads)
+        var size: u64 = 0
+        raster.encoded = try read_head((c_api.str)raster.path, max_bytes, &size)
+        let head_only = (u64)raster.encoded.length < size
+        try probe(&raster, head_only)
+        let opened = try Image.own(raster, threads)
+        opened.value().head_only = head_only
+        opened.value().file_size = size
+        return opened
 
     ## As `open`, from encoded bytes held in memory; the bytes are copied.
     pub static func open_bytes(data: const u8[], threads: usize = 4, frame: usize = 0, max_bytes: usize = 4294967296, max_pixels: usize = 268435456) -> interop.Reference[Image]!:
@@ -226,7 +245,8 @@ pub struct Image:
     pub func is_camera_raw() -> bool:
         return not self.closed and is_raw_format(self.raster.file_format)
 
-    ## The file's bytes as read, for decoders working from them directly.
+    ## The file's bytes as read, for decoders working from them directly (a
+    ## camera raw's; only a PNG or JPEG is opened from its start alone).
     pub func encoded_bytes() -> const u8[]:
         return self.raster.encoded
 
@@ -247,6 +267,7 @@ pub struct Image:
         try self.ensure_open()
         if self.is_loaded():
             return
+        try self.read_whole_file()
         try self.raster.allocate()
         errdefer self.discard_pixels()
         if self.raster.file_format == "PNG":
@@ -267,6 +288,34 @@ pub struct Image:
         else:
             self.active_workers = try parallel.decode(&self.raster, exr.decode_chunk, self.threads)
 
+    ## A picture opened from its file's start alone gets the file whole, for a
+    ## decode that works from it all. The file must not have changed.
+    mutating func read_whole_file() -> !:
+        if not self.head_only:
+            return
+        let whole = try read_whole((c_api.str)self.raster.path, self.raster.max_bytes)
+        if (u64)whole.length != self.file_size:
+            free(whole) in memory.heap
+            error(invalid, "the picture's file changed since it was opened")
+        if self.raster.file_format == "PNG":
+            # The probe's palette and transparency, of the whole file now.
+            var scratch = model.Raster(max_bytes = self.raster.max_bytes, max_pixels = self.raster.max_pixels)
+            scratch.encoded = whole
+            png.probe(&scratch) catch failure:
+                var empty: u8[]
+                scratch.encoded = empty
+                scratch.close()
+                free(whole) in memory.heap
+                error(failure.code, failure.message)
+            self.raster.palette = scratch.palette
+            self.raster.transparency = scratch.transparency
+            var empty: u8[]
+            scratch.encoded = empty
+            scratch.close()
+        free(self.raster.encoded) in memory.heap
+        self.raster.encoded = whole
+        self.head_only = false
+
     mutating func discard_pixels():
         if self.raster.pixels.length > 0:
             free(self.raster.pixels) in memory.heap
@@ -279,6 +328,7 @@ pub struct Image:
         try self.ensure_open()
         if frame == self.raster.frame:
             return
+        try self.read_whole_file()
         let selected = try Image.open_bytes(self.raster.encoded, self.threads, frame, self.raster.max_bytes, self.raster.max_pixels)
         defer selected.release()
         let other = selected.value()
@@ -506,7 +556,7 @@ pub struct Image:
     ## at most `whole_picture_bytes`.
     pub mutating func linear_rgba_bands(rows: usize, sink: LinearSink, context: void*?) -> !:
         try self.ensure_open()
-        if not self.is_loaded() and (try stream_linear(&self.raster, rows, sink, context)):
+        if not self.is_loaded() and (try self.stream_linear_from(rows, sink, context)):
             return
         if not self.is_loaded() and self.raster.width * self.raster.height * self.raster.channels.length > whole_picture_bytes // 8:
             error(limit, "a picture this large opens only from PNG, JPEG or TIFF")
@@ -528,7 +578,19 @@ pub struct Image:
         try self.ensure_open()
         if self.is_loaded():
             return false
-        return try stream_encoded(&self.raster, rows, sink, context)
+        if not self.head_only:
+            return try stream_encoded(&self.raster, none, rows, sink, context)
+        var source = try FileSource.open(self.raster.path, self.file_size)
+        defer source.close()
+        return try stream_encoded(&self.raster, &source, rows, sink, context)
+
+    ## `stream_linear` from the file when only its start is held.
+    mutating func stream_linear_from(rows: usize, sink: LinearSink, context: void*?) -> bool!:
+        if not self.head_only:
+            return try stream_linear(&self.raster, none, rows, sink, context)
+        var source = try FileSource.open(self.raster.path, self.file_size)
+        defer source.close()
+        return try stream_linear(&self.raster, &source, rows, sink, context)
 
     ## An 8-bit RGBA image from straight-alpha linear-light RGBA f32 samples,
     ## sRGB-encoded and clamped. Base only.

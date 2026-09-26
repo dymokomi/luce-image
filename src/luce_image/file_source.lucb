@@ -1,0 +1,89 @@
+## A picture file read in pieces rather than whole. A PNG or JPEG of hundreds
+## of megabytes is opened from its start alone, up to its first IDAT chunk or
+## through its frame header (`read_head`), and decoded later from the file a
+## block at a time through a `FileSource` (png/jpeg `decode_rows_at`), so the
+## open never holds the file's bytes. Every other picture is read whole.
+import c as c_api
+import files
+import memory
+import png
+import jpeg
+from raster_errors import invalid, limit
+
+## The start read first: most files' headers fit, and a file this small is
+## read whole.
+let head_start: usize = 65536
+
+## An open picture file for a decoder's `ReadAt`.
+pub struct FileSource:
+    var file: files.File
+    var length: u64
+
+    ## `path` opened again for its bytes, which must still be `size` of them.
+    pub static func open(path: str, size: u64) -> FileSource!:
+        var file = try files.File.open((c_api.str)path)
+        errdefer file.destroy()
+        let now = try file.seek(0, files.SeekOrigin.end)
+        if now < 0 or (u64)now != size:
+            error(invalid, "the picture's file changed since it was opened")
+        return FileSource(file = file, length = size)
+
+    ## The file's size, as it was opened.
+    pub func size() -> u64:
+        return self.length
+
+    pub mutating func close():
+        self.file.destroy()
+
+## `ReadAt` over a `FileSource`.
+pub func read_source(context: void*?, at: u64, into: u8[]) -> usize!:
+    let source = (FileSource*)(context else return 0)
+    discard(try source.file.seek((i64)at))
+    return try source.file.read(into)
+
+## The file at `path` (at most `most` bytes, its size into `size`): the start
+## of a PNG or JPEG as far as its probe needs, any other file whole. Heap
+## storage, of exactly the bytes read.
+pub func read_head(path: c_api.str, most: usize, size: u64*) -> u8[]!:
+    var file = try files.File.open(path)
+    defer file.destroy()
+    let length = try file.seek(0, files.SeekOrigin.end)
+    if length < 0 or (u64)length > (u64)most:
+        error(limit, "the file exceeds the read limit")
+    *size = (u64)length
+    var data = try read_range(&file, 0, (usize)length if (u64)length < (u64)head_start else head_start)
+    while data.length < (usize)length:
+        let need = head_need(data, (usize)length)
+        if need == 0:
+            return data
+        # At least twice as much each time, the file whole at most.
+        var wanted = need if need > data.length * 2 else data.length * 2
+        wanted = wanted if wanted < (usize)length else (usize)length
+        free(data) in memory.heap
+        data = try read_range(&file, 0, wanted)
+    return data
+
+## How much of a file of `length` bytes starting with `data` its probe needs:
+## 0 when `data` is enough, the whole file for any picture but a PNG or JPEG
+## (or one too damaged to tell).
+func head_need(data: const u8[], length: usize) -> usize:
+    if data.length >= 8 and data[0] == 137 and data[1] == 80:
+        return png.head_bytes(data) catch failure:
+            recover length
+    if data.length >= 2 and data[0] == 255 and data[1] == 216:
+        return jpeg.head_bytes(data) catch failure:
+            recover length
+    return length
+
+## `count` bytes of `file` from `at`, in heap storage of exactly that size.
+func read_range(file: files.File*, at: u64, count: usize) -> u8[]!:
+    discard(try file.seek((i64)at))
+    let data = try alloc u8[count] in memory.heap
+    errdefer free(data) in memory.heap
+    var used: usize = 0
+    while used < count:
+        let read = try file.read(data[used..])
+        if read == 0:
+            error(invalid, "the file ended before its size")
+        used += read
+    return data

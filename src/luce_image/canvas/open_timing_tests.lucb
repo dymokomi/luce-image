@@ -312,3 +312,41 @@ test "a picture placed in the background makes the same layer as one placed at o
             assert(loaded.left == at_once.left and loaded.top == at_once.top and loaded.texels.length == at_once.texels.length)
             for index in 0..<at_once.texels.length:
                 assert(loaded.texels[index] == at_once.texels[index])
+
+func ignore_band(context: void*?, first: usize, count: usize, samples: const u8[], deep: bool) -> !:
+    discard(context)
+
+test "a large PNG or JPEG opens from its file's start; a whole decode reads the rest, a changed file is refused":
+    # Noise, so each file is well over the 64 KiB start read first.
+    let width: usize = 500
+    let height: usize = 400
+    let bytes = try alloc u8[width * height * 4] in memory.heap
+    defer free(bytes) in memory.heap
+    var seed: u32 = 99
+    for index in 0..<bytes.length:
+        seed = seed *% 1103515245 +% 12345
+        bytes[index] = (u8)(seed >> 24) if index % 4 != 3 else 255
+    let source = try Image.from_rgba8(width, height, bytes)
+    defer source.release()
+    let opaque = try source.value().convert("RGB")
+    defer opaque.release()
+    try source.value().save("build/head-open.png")
+    try opaque.value().save("build/head-open.jpg", quality = 95)
+    for path in ["build/head-open.png", "build/head-open.jpg"]:
+        let opened = try Image.open(path)
+        defer opened.release()
+        var picture = opened.value()
+        # Its samples decode from the file whole, as from a file read at once.
+        let sample = try picture.get_sample(123, 77, 1)
+        let again = try Image.open(path)
+        defer again.release()
+        assert((try again.value().get_sample(123, 77, 1)) == sample)
+        # A file changed underneath is refused rather than misread.
+        let changed = try Image.open(path)
+        defer changed.release()
+        try write_file(path, b"\x89PNG\r\n\x1a\n")
+        var refused = false
+        discard(changed.value().encoded_rgba_bands(64, ignore_band, none) catch failure:
+            refused = failure.code == invalid
+            recover false)
+        assert(refused)
