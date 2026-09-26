@@ -1,0 +1,52 @@
+#==============================================================================================
+#
+#   canvas/moat_tests - Large-canvas paths that work a cell at a time
+#
+#==============================================================================================
+
+## The mask's value at (`x`, `y`) as read back: empty cells are white.
+func mask_value_at(mask: const Tiles*, samples: f32[], x: i64, y: i64) -> f32!:
+    let column = (u32)(x // (i64)tile_size)
+    let row = (u32)(y // (i64)tile_size)
+    if not mask.painted(column, row):
+        return 1.0
+    try mask.read_cell(column, row, samples)
+    return samples[(usize)((y % (i64)tile_size) * (i64)tile_size + x % (i64)tile_size) * 4]
+
+test "a mask filled from the selection matches it pixel for pixel; a black mask shares one tile":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(900, 700)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    # Wholly selected cells, cells the selection misses, and edges across cells.
+    try canvas.select_rectangle(10, 20, 600, 500)
+    try canvas.select_ellipse(500, 300, 380, 360, 1)
+    try canvas.set_mask(layer, true, 2)
+    let document = canvas.document else trap("bound")
+    let mask = (document.find((u64)layer) else trap("layer")).mask_tiles() else trap("masked")
+    let samples = try alloc f32[(usize)tile_size * (usize)tile_size * 4] in memory.heap
+    defer free(samples) in memory.heap
+    let selection = canvas.current()
+    var y: i64 = 0
+    while y < 700:
+        var x: i64 = 0
+        while x < 900:
+            let expected = (f32)selection.at(x, y) / 255.0
+            let found = try mask_value_at(mask, samples, x, y)
+            assert(math.abs((f64)(found - expected)) < 0.002)
+            x += 7
+        y += 5
+    # A wholly selected cell holds no tile at all.
+    assert(not mask.painted(1, 1))
+    try canvas.set_mask(layer, false)
+    try canvas.deselect()
+    try canvas.set_mask(layer, true, 1)
+    let black = (document.find((u64)layer) else trap("layer")).mask_tiles() else trap("masked")
+    assert(black.stamp(0, 0) == black.stamp(3, 2) and black.painted(3, 2))
+    assert((try mask_value_at(black, samples, 850, 650)) == 0.0)

@@ -1104,20 +1104,7 @@ pub struct Canvas:
             try document.set_mask((u64)id, present)
             if present and fill != 0:
                 let mask = (document.find((u64)id) else trap("masked layer")).mask_tiles() else trap("just masked")
-                let count = (usize)self.extent_x * (usize)self.extent_y
-                let pixels = try alloc f32[count * 4] in memory.heap
-                defer free(pixels) in memory.heap
-                let selection = self.current()
-                for at in 0..<count:
-                    var value: f32 = 0.0
-                    if fill == 2:
-                        value = (f32)selection.at((i64)(at % (usize)self.extent_x), (i64)(at // (usize)self.extent_x)) / 255.0
-                    pixels[at * 4] = value
-                    pixels[at * 4 + 1] = value
-                    pixels[at * 4 + 2] = value
-                    # Opaque everywhere, so every cell is kept, black ones too.
-                    pixels[at * 4 + 3] = 1.0
-                try mask.write(pixels)
+                try fill_mask_cells(&self, mask, fill == 2)
         elif present and fill != 0:
             error(invalid, "draw the document once before filling a mask")
         self.records[index].masked = present

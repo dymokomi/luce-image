@@ -7,6 +7,7 @@ package_open.lucb
 bands.lucb
 clipboard.lucb
 layer_clip.lucb
+mask_fill.lucb
 warp_trace.lucb
 retouch.lucb
 retouch_effects.lucb
@@ -32,3 +33,4 @@ path_tests.lucb
 memory_tests.lucb
 shape_render_tests.lucb
 package_tests.lucb
+moat_tests.lucb
