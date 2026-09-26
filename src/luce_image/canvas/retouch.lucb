@@ -77,17 +77,24 @@ func begin_retouch(canvas: Canvas*, id: u64, x: f64, y: f64, pressure: f64) -> !
     try canvas.remember(id, try stroke.original().clone(), name = retouch_name(kind))
     canvas.stroke = stroke
 
-## Continue a smudge or push to (`x`, `y`), showing it at once.
+## Continue a smudge or push to (`x`, `y`); the next frame shows it.
 func extend_warp(canvas: Canvas*, warp: WarpStroke*, x: f64, y: f64) -> !:
+    try warp.extend(x, y)
+
+## Upload what a smudge or push changed since the last frame, once a frame
+## however many pointer moves came in.
+func settle_warp(canvas: Canvas*, warp: WarpStroke*) -> !:
+    if not warp.dirty():
+        return
     let document = canvas.document else trap("stroke without a document")
     let layer = document.find(canvas.warped) else error(invalid, "the retouched layer is gone")
     let tiles = layer.tiles() else error(invalid, "the retouched layer has no pixels")
-    try warp.extend(x, y)
     try warp.flush(tiles)
     layer.revision += 1
 
 ## End a smudge or push: it stays where the selection allows.
 func finish_warp(canvas: Canvas*, warp: WarpStroke*) -> !:
+    try settle_warp(canvas, warp)
     warp.destroy()
     free(warp) in memory.heap
     canvas.warp = none

@@ -12,6 +12,8 @@
 ##   each step, sampled back from behind the brush (bilinear).
 import math
 import memory
+import os
+import thread
 from tiles import Tiles, tile_size
 from raster_errors import invalid
 
@@ -40,6 +42,9 @@ pub struct WarpStroke:
     var last_x: f64
     var last_y: f64
     var debt: f64
+    ## The tip's weight at each offset of a dab's square, side by side: a
+    ## smudge's dabs land on whole pixels, so every one shares it.
+    var weights: f32[]
     ## The cells changed since the last upload.
     var dirty_left: i64
     var dirty_top: i64
@@ -66,11 +71,17 @@ pub struct WarpStroke:
         let side = (usize)(math.ceil(radius) * 2.0 + 1.0)
         let carried = try alloc f32[side * side * 4] in memory.heap
         errdefer free(carried) in memory.heap
+        let weights = try alloc f32[side * side] in memory.heap
+        errdefer free(weights) in memory.heap
         var no_scratch: f32[]
         var stroke = WarpStroke(width = width, height = height, columns = (usize)tiles.columns(), source = source, cells = cells, mode = mode, radius = radius,
                                 hardness = math.clamp(hardness, 0.0, 0.98), strength = math.clamp(strength, 0.01, 1.0),
-                                carried = carried, scratch = no_scratch, last_x = x, last_y = y, debt = 0.0,
+                                carried = carried, scratch = no_scratch, weights = weights, last_x = x, last_y = y, debt = 0.0,
                                 dirty_left = 1, dirty_top = 1, dirty_right = 0, dirty_bottom = 0)
+        let reach = (i64)math.ceil(radius)
+        for j in 0..<(i64)side:
+            for i in 0..<(i64)side:
+                weights[(usize)j * side + (usize)i] = (f32)stroke.weight(math.hypot((f64)(i - reach), (f64)(j - reach)))
         if mode == warp_smudge:
             try stroke.pick_up(x, y)
         return stroke
@@ -101,6 +112,10 @@ pub struct WarpStroke:
         self.last_x = x
         self.last_y = y
 
+    ## Whether any cell changed since the last upload.
+    pub func dirty() -> bool:
+        return self.dirty_right >= self.dirty_left
+
     ## Upload the cells changed since the last upload into `tiles`.
     pub mutating func flush(tiles: Tiles*) -> !:
         if self.dirty_right < self.dirty_left:
@@ -125,6 +140,7 @@ pub struct WarpStroke:
         free(self.cells) in memory.heap
         self.source.destroy()
         free(self.carried) in memory.heap
+        free(self.weights) in memory.heap
         if self.scratch.length > 0:
             free(self.scratch) in memory.heap
 
@@ -160,22 +176,10 @@ pub struct WarpStroke:
         let cx = (i64)math.round(x)
         let cy = (i64)math.round(y)
         try self.load(cx - reach, cy - reach, cx + reach, cy + reach)
-        for j in 0..<side:
-            for i in 0..<side:
-                let px = cx - reach + i
-                let py = cy - reach + j
-                if px < 0 or py < 0 or px >= (i64)self.width or py >= (i64)self.height:
-                    continue
-                let w = self.weight(math.hypot((f64)(i - reach), (f64)(j - reach)))
-                let k = ((usize)j * (usize)side + (usize)i) * 4
-                let pixels = self.cell_pixels(px, py)
-                let at = offset_in_cell(px, py)
-                for channel in 0..<(usize)4:
-                    let under = (f64)pixels[at + channel]
-                    let carried = (f64)self.carried[k + channel]
-                    let painted = under + (carried - under) * w
-                    pixels[at + channel] = (f32)painted
-                    self.carried[k + channel] = (f32)(painted + (carried - painted) * self.strength)
+        # Each row of the square is its own pixels and its own carried samples:
+        # the rows go to the processors.
+        var job = SmudgeJob(stroke = &self, cx = cx, cy = cy, reach = reach, first = 0, last = side)
+        try smudge_bands(&job)
         self.touch(cx - reach, cy - reach, cx + reach, cy + reach)
 
     ## Push: each pixel under the tip takes what was behind it along the
@@ -295,3 +299,65 @@ func texel(samples: const f32[], side: usize, x: i64, y: i64, channel: usize) ->
 ## Where document pixel (`x`, `y`)'s samples start within its cell.
 func offset_in_cell(x: i64, y: i64) -> usize:
     return ((usize)(y % (i64)tile_size) * (usize)tile_size + (usize)(x % (i64)tile_size)) * 4
+
+## One worker's rows `first..<last` of a smudge dab's square around (`cx`, `cy`).
+struct SmudgeJob:
+    var stroke: WarpStroke*
+    var cx: i64
+    var cy: i64
+    var reach: i64
+    var first: i64
+    var last: i64
+
+func smudge_entry(context: void*?):
+    smudge_rows((SmudgeJob*)(context else return))
+
+## Lay the carried pixels down by the tip's weight, and carry `strength` of
+## what was laid, row by row.
+func smudge_rows(job: SmudgeJob*):
+    let stroke = job.stroke
+    let side = job.reach * 2 + 1
+    let strength = (f32)stroke.strength
+    for j in job.first..<job.last:
+        let py = job.cy - job.reach + j
+        if py < 0 or py >= (i64)stroke.height:
+            continue
+        for i in 0..<side:
+            let px = job.cx - job.reach + i
+            if px < 0 or px >= (i64)stroke.width:
+                continue
+            let w = stroke.weights[(usize)(j * side + i)]
+            let k = (usize)(j * side + i) * 4
+            let pixels = stroke.cell_pixels(px, py)
+            let at = offset_in_cell(px, py)
+            for channel in 0..<(usize)4:
+                let under = pixels[at + channel]
+                let carried = stroke.carried[k + channel]
+                let painted = under + (carried - under) * w
+                pixels[at + channel] = painted
+                stroke.carried[k + channel] = painted + (carried - painted) * strength
+
+## `job`'s rows split across the processors; small dabs stay on this thread.
+func smudge_bands(job: SmudgeJob*) -> !:
+    let rows = job.last - job.first
+    let workers = math.imin(16, math.imax(1, (i64)os.cpus())) if rows * rows >= 65536 else 1
+    if workers <= 1:
+        smudge_rows(job)
+        return
+    var shares: SmudgeJob[16] = ---
+    var handles: thread.Handle[16]
+    var started: usize = 0
+    let per = (rows + workers - 1) // workers
+    for share in 0..<workers:
+        shares[(usize)share] = *job
+        shares[(usize)share].first = math.imin(job.last, job.first + share * per)
+        shares[(usize)share].last = math.imin(job.last, job.first + share * per + per)
+    for share in 1..<workers:
+        handles[started] = thread.spawn(smudge_entry, (void*)&shares[(usize)share], name = "smudge") catch failure:
+            for other in share..<workers:
+                smudge_rows(&shares[(usize)other])
+            break
+        started += 1
+    smudge_rows(&shares[0])
+    for index in 0..<started:
+        try handles[index].join()

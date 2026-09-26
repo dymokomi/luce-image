@@ -1542,6 +1542,9 @@ pub struct Canvas:
     ## Stamp the dabs the stroke queued since the last draw: pointer moves
     ## only queue them, so however many arrive, a frame stamps them once.
     mutating func settle_stroke() -> !:
+        if let warp = self.warp:
+            try settle_warp(&self, warp)
+            return
         let stroke = self.stroke else return
         let document = self.document else return
         var painter = self.painter else return
