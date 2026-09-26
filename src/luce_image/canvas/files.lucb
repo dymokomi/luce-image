@@ -4,6 +4,9 @@
 #
 #==============================================================================================
 
+## The most pixels a flattened save in a format without streaming takes (TIFF, OpenEXR).
+let whole_picture_save_limit: u64 = 64 * 1024 * 1024
+
 ## The deflate level of a PNG export.
 let png_export_level: i32 = 4
 
@@ -11,12 +14,20 @@ let png_export_level: i32 = 4
 func save_flattened(canvas: Canvas*, path: str, quality: i64, matte_red: f64, matte_green: f64, matte_blue: f64) -> !:
     let lower = try strings.to_lower(path)
     defer strings.release(lower)
-    if matte_red >= 0.0 and (strings.ends_with(lower, ".jpg") or strings.ends_with(lower, ".jpeg")):
-        try save_jpeg_streamed(canvas, path, quality, matte_red, matte_green, matte_blue)
+    if strings.ends_with(lower, ".jpg") or strings.ends_with(lower, ".jpeg"):
+        # JPEG has no alpha: without a matte, white is what shows through.
+        if matte_red >= 0.0:
+            try save_jpeg_streamed(canvas, path, quality, matte_red, matte_green, matte_blue)
+        else:
+            try save_jpeg_streamed(canvas, path, quality, 1.0, 1.0, 1.0)
         return
     if strings.ends_with(lower, ".png"):
         try save_png_streamed(canvas, path, matte_red, matte_green, matte_blue)
         return
+    # TIFF and OpenEXR encode a whole picture at once; past a size their
+    # encoders would need the document many times over in memory.
+    if (u64)canvas.extent_x * (u64)canvas.extent_y > whole_picture_save_limit:
+        error(limit, "documents over 64 megapixels export as PNG or JPEG, or save as .l2d; TIFF and OpenEXR are not streamed yet")
     let pixels = try flattened_pixels(canvas)
     defer free(pixels) in memory.heap
     # Under a matte (linear light; a negative red means none) the picture comes out

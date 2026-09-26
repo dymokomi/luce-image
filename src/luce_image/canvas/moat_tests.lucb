@@ -139,3 +139,24 @@ test "the histogram counts a layer's cells and the picture's bands, transparency
     let top = try canvas.add_layer("Top")
     try canvas.measure_histogram_below(top)
     assert((try canvas.histogram(1, red)) == 300 * 250)
+
+test "a large document refuses TIFF clearly instead of flattening; a small one still saves it":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var small = try Canvas(300, 200)
+    defer small.close()
+    discard(try small.add_layer("Paint"))
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&small, &target, 0, 0))
+    try small.save("build/moat-small.tif")
+    var large = try Canvas(9000, 8000)
+    defer large.close()
+    discard(try large.add_layer("Paint"))
+    discard(try shown_at(&large, &target, 0, 0))
+    var refused = false
+    large.save("build/moat-large.tif") catch failure:
+        refused = failure.code == limit
+    assert(refused)
