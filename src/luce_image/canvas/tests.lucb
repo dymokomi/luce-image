@@ -1572,3 +1572,90 @@ test "dodge lightens and burn darkens where they are brushed, each one step":
     let burned = pixels[(16 * 64 + 48) * 4]
     let untouched = pixels[(2 * 64 + 32) * 4]
     assert(dodged > untouched + 0.05 and burned < untouched - 0.05 and math.abs((f64)untouched - 0.2140) < 0.01)
+
+## Layer `id`'s straight-alpha linear texel at (`x`, `y`), read from its tile.
+func layer_texel(canvas: Canvas*, id: i64, x: u32, y: u32) -> f32[4]!:
+    let document = canvas.document else trap("no document")
+    let layer = document.find((u64)id) else trap("no layer")
+    let tiles = layer.tiles() else trap("no tiles")
+    var texel: f32[4] = [0.0, 0.0, 0.0, 0.0]
+    let texture = tiles.texture(x // tile_size, y // tile_size) else return texel
+    var bytes: u8[8]
+    try texture.read(bytes, gpu.Region(x % tile_size, y % tile_size, 1, 1))
+    for channel in 0..<(usize)4:
+        texel[channel] = from_half((u16)bytes[channel * 2] | ((u16)bytes[channel * 2 + 1] << 8))
+    return texel
+
+test "a clone stamp reads across cell edges at a large offset, and never its own paint":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(1200, 800)
+    defer canvas.close()
+    let base = try canvas.add_layer("Base")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    # Green everywhere, a red square across the corner of four cells at (256, 256).
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, false)
+    try canvas.select_all()
+    try canvas.fill(base, false)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(248, 248, 16, 16, 0)
+    try canvas.fill(base, false)
+    try canvas.deselect()
+    # Stamped at (1024, 512), itself a corner of four cells: 768 across, 256 down.
+    try canvas.set_retouch(1)
+    canvas.set_clone_source(256.0, 256.0)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, false)
+    try canvas.begin_stroke(base, 1024.0, 512.0)
+    try canvas.end_stroke()
+    for at in [(1021u32, 509u32), (1026u32, 509u32), (1021u32, 514u32), (1026u32, 514u32)]:
+        let texel = try layer_texel(&canvas, base, at.0, at.1)
+        assert(texel[0] > 0.99 and texel[1] < 0.01 and texel[2] < 0.01)
+    try canvas.undo()
+    # All Layers on an empty layer above, the stroke running over its own
+    # source: only the source's red start is red, the rest the green below.
+    let top = try canvas.add_layer("Clone")
+    canvas.set_clone_options(true, true)
+    canvas.set_clone_source(256.0, 256.0)
+    try canvas.set_brush(8.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, false)
+    try canvas.begin_stroke(top, 266.0, 256.0)
+    try canvas.extend_stroke(600.0, 256.0)
+    try canvas.end_stroke()
+    let start = try layer_texel(&canvas, top, 266, 256)
+    assert(start[0] > 0.99 and start[3] > 0.99)
+    # Just behind the first dab: a live read would find that dab's blue there.
+    let behind = try layer_texel(&canvas, top, 277, 256)
+    assert(behind[1] > 0.99 and behind[2] < 0.01)
+    let along = try layer_texel(&canvas, top, 500, 256)
+    assert(along[1] > 0.99 and along[0] < 0.01 and along[3] > 0.99)
+
+test "spot healing on a large canvas fills the spot and leaves the rest":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(6000, 5000)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.5, 0.5, 0.5, false)
+    try canvas.select_all()
+    try canvas.fill(layer, false)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(3070, 2558, 4, 4, 0)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    assert((try layer_texel(&canvas, layer, 3071, 2559))[0] < 0.01)
+    try canvas.set_retouch(2)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, false)
+    try canvas.begin_stroke(layer, 3072.0, 2560.0)
+    try canvas.end_stroke()
+    let healed = try layer_texel(&canvas, layer, 3071, 2559)
+    assert(math.abs((f64)healed[0] - 0.5) < 0.03 and healed[3] > 0.99)
+    let far = try layer_texel(&canvas, layer, 100, 100)
+    assert(math.abs((f64)far[0] - 0.5) < 0.001)

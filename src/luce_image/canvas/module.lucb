@@ -50,7 +50,7 @@ from luce_image.color_range import RangeSample, range_sample, range_coverage, ra
 from luce_image.warp import WarpStroke, warp_smudge, warp_push
 from luce_image.document import Style, Document, Layer, TreeState, release_snapshot, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
 from luce_image.composite import Composer, box_composer, unbox_composer
-from luce_image.brush import Brush, Painter, Stroke, begin_boxed, finish_boxed, fill_selection, fill_gradient
+from luce_image.brush import Brush, Painter, Stroke, EffectSource, begin_boxed, finish_boxed, fill_selection, fill_gradient
 from luce_image.adjust import Adjuster, adjustment_count, parameter_count, curves, levels
 from luce_image.curves import Curves, lut_size
 from luce_image.filter import Filters

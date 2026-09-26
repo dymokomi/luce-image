@@ -691,6 +691,17 @@ pub struct Document:
         errdefer layer_destroy(root)
         return TreeState(root = root, next_id = self.next_id, extent_x = self.extent_x, extent_y = self.extent_y, selection = try self.selection.copy())
 
+    ## The document as it is now, on the heap, sharing its tiles: what a
+    ## stroke reads while it paints (a Clone Stamp sampling every layer).
+    ## `unbox_document` frees it.
+    pub func frozen() -> Document*!:
+        let root = try clone_layer(self.root)
+        errdefer layer_destroy(root)
+        var selection = try self.selection.copy()
+        errdefer selection.destroy()
+        return try new Document(owner = self.owner, extent_x = self.extent_x, extent_y = self.extent_y, selection = selection,
+                                root = root, next_id = self.next_id, revision = self.revision, generation = self.generation) in memory.heap
+
     ## Take `state` as the document and leave what was in its place: undo and
     ## redo swap, never copy.
     pub mutating func exchange(state: TreeState*):

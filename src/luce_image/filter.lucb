@@ -115,6 +115,50 @@ pub struct Filters:
         discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         return fresh
 
+    ## Cell (`column`, `row`) of `tiles` as `blur_tiles` would leave it, made
+    ## alone: the horizontal pass over it and the cells above and below, then
+    ## the vertical pass over those three. None where it stays empty.
+    pub func blur_cell(tiles: const Tiles*, column: u32, row: u32, radius: f64) -> gpu.Texture?!:
+        let taps = math.min(255.0, math.ceil(radius * 3.0))
+        # Zero textures stand for lines left empty; destroying one does nothing.
+        var across: gpu.Texture[3] = [gpu.Texture(), gpu.Texture(), gpu.Texture()]
+        var made: bool[3] = [false, false, false]
+        defer across[0].destroy()
+        defer across[1].destroy()
+        defer across[2].destroy()
+        for index in 0..<(usize)3:
+            let at = (i64)row + (i64)index - 1
+            if at < 0 or at >= (i64)tiles.rows():
+                continue
+            let line = (u32)at
+            let before = tiles.texture(column - 1, line) if column > 0 else none
+            let after = tiles.texture(column + 1, line) if column + 1 < tiles.columns() else none
+            let middle = tiles.texture(column, line)
+            if middle == none and before == none and after == none:
+                continue
+            across[index] = try self.blur_one(tiles.region(column, line).width, taps, radius, true, before, middle, after)
+            made[index] = true
+        if not made[0] and not made[1] and not made[2]:
+            return none
+        let up: gpu.Texture? = across[0] if made[0] else none
+        let here: gpu.Texture? = across[1] if made[1] else none
+        let down: gpu.Texture? = across[2] if made[2] else none
+        return try self.blur_one(tiles.region(column, row).height, taps, radius, false, up, here, down)
+
+    ## One pass of the blur over three tiles in a line, into a new tile.
+    func blur_one(extent: u32, taps: f64, sigma: f64, horizontal: bool, before: gpu.Texture?, middle: gpu.Texture?, after: gpu.Texture?) -> gpu.Texture!:
+        var params: f32[4] = [(f32)taps, (f32)sigma, 1.0 if horizontal else 0.0, (f32)extent]
+        var fresh = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        errdefer fresh.destroy()
+        let frame = try fresh.frame()
+        defer frame.release()
+        let whole = try frame.value().target()
+        defer whole.release()
+        try gpu.shade(whole.value(), self.blur, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 16),
+                      [before else self.blank, middle else self.blank, after else self.blank], gpu.Filter.nearest)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        return fresh
+
     ## One direction over every tile that has pixels or a neighbour with pixels
     ## within reach; tiles that stay empty stay `none`.
     func pass(tiles: Tiles*, taps: f64, sigma: f64, horizontal: bool) -> !:
