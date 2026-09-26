@@ -794,6 +794,38 @@ test "the document knows whether it is as saved; exports leave that alone":
     try canvas.save("build/canvas-export.jpg", 80, 1.0, 1.0, 1.0)
     assert(canvas.modified())
 
+test "streamed exports keep alpha in PNG, blend over the matte in JPEG, and reach the last partial tile":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(600, 300)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.select_rectangle(300, 10, 290, 280)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    try canvas.set_layer(layer, true, 0.5)
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.save("build/canvas-bands.png")
+    let kept = try Image.open("build/canvas-bands.png")
+    defer kept.release()
+    let half = try kept.value().getpixel(550, 100)
+    assert(half.r == 255.0 and half.g == 0.0 and math.abs(half.a - 128.0) < 1.5)
+    assert((try kept.value().getpixel(100, 100)).a == 0.0)
+    try canvas.save("build/canvas-bands.jpg", 95, 1.0, 1.0, 1.0)
+    let matted = try Image.open("build/canvas-bands.jpg")
+    defer matted.release()
+    # Half red over white: red stays full, green and blue are half in linear light (sRGB 188).
+    let pink = try matted.value().getpixel(550, 100)
+    assert(pink.r > 247.0 and math.abs(pink.g - 188.0) < 6.0 and math.abs(pink.b - 188.0) < 6.0)
+    let white = try matted.value().getpixel(100, 100)
+    assert(white.r > 247.0 and white.g > 247.0 and white.b > 247.0)
+
 test "a canvas binds headless, without a window, and edits with history":
     var canvas = try Canvas(40, 30)
     defer canvas.close()

@@ -1,6 +1,7 @@
 module.lucb
 drawing.lucb
 files.lucb
+bands.lucb
 clipboard.lucb
 layer_clip.lucb
 retouch.lucb

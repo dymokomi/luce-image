@@ -1,0 +1,148 @@
+#==============================================================================================
+#
+#   canvas/bands - The flattened document as 8-bit sRGB, a row of cells at a time
+#
+#   DESCRIPTION:
+#       Streamed exports (JPEG, PNG) take the composited document a band of 256 pixel rows at
+#       a time. The main thread reads the band's composited tiles back from the GPU into one
+#       staging buffer of half floats; the band is then turned into sRGB bytes across the
+#       processors. Half floats have only 65536 values, so each channel is a table lookup
+#       indexed by its bits: no float maths at all for opaque pixels, the common case.
+#
+#==============================================================================================
+
+## The bits of a half float 1.0: an opaque pixel's alpha.
+let half_one: u16 = 0x3c00
+
+## A row of cells of the flattened document as 8-bit sRGB RGBA, one at a time:
+## over `matte` (linear light) when its red is not negative, else alpha kept.
+struct Bands:
+    ## The band's pixels, `extent_x` wide, 8-bit sRGB RGBA.
+    var band: u8[]
+    ## The band's composited tiles as read back: tile after tile, each packed
+    ## `columns` wide, 8 bytes (four half floats) a pixel.
+    var staged: u8[]
+    ## Half-float bits to a linear value, an sRGB byte and an alpha byte.
+    var linear: f32[]
+    var color: u8[]
+    var coverage: u8[]
+    ## Linear light to 8-bit sRGB, 4096 steps across 0..1: for blended pixels.
+    var table: u8[]
+    var matte: f64[3]
+
+    static func begin(canvas: Canvas*, matte: f64[3]) -> Bands!:
+        try canvas.require_open()
+        let band = try alloc u8[(usize)canvas.extent_x * (usize)tile_size * 4] in memory.heap
+        errdefer free(band) in memory.heap
+        let staged = try alloc u8[(usize)canvas.extent_x * (usize)tile_size * 8] in memory.heap
+        errdefer free(staged) in memory.heap
+        let linear = try alloc f32[65536] in memory.heap
+        errdefer free(linear) in memory.heap
+        let color = try alloc u8[65536] in memory.heap
+        errdefer free(color) in memory.heap
+        let coverage = try alloc u8[65536] in memory.heap
+        errdefer free(coverage) in memory.heap
+        let table = try alloc u8[4097] in memory.heap
+        errdefer free(table) in memory.heap
+        for step in 0..<(usize)4097:
+            table[step] = srgb_byte((f64)step / 4096.0)
+        for bits in 0..<(usize)65536:
+            let value = from_half((u16)bits)
+            # NaN compares false both ways: it lands on zero, as a negative does.
+            let clamped = (f64)value if value > 0.0 else 0.0
+            linear[bits] = value
+            color[bits] = table[(usize)(math.clamp(clamped, 0.0, 1.0) * 4096.0 + 0.5)]
+            coverage[bits] = (u8)(math.clamp(clamped, 0.0, 1.0) * 255.0 + 0.5)
+        return Bands(band = band, staged = staged, linear = linear, color = color, coverage = coverage, table = table, matte = matte)
+
+    ## Row `row` of cells into `band`; how many pixel rows it holds.
+    mutating func fill(canvas: Canvas*, row: u32) -> usize!:
+        let document = canvas.document else error(invalid, "draw the document once before saving it")
+        let composer = canvas.composer else error(invalid, "draw the document once before saving it")
+        let rows = (usize)min_u32(tile_size, canvas.extent_y - row * tile_size)
+        for column in 0..<tile_columns(canvas.extent_x):
+            let texture = try composer.tile(document, column, row, 0)
+            let columns = (usize)min_u32(tile_size, canvas.extent_x - column * tile_size)
+            let start = (usize)column * (usize)tile_size * rows * 8
+            try texture.read(self.staged[start..<start + columns * rows * 8], gpu.Region(0, 0, (u32)columns, (u32)rows))
+        var job = BandJob(bands = &self, width = (usize)canvas.extent_x, rows = rows, first = 0, last = rows)
+        try convert_band(&job)
+        return rows
+
+    mutating func close():
+        free(self.band) in memory.heap
+        free(self.staged) in memory.heap
+        free(self.linear) in memory.heap
+        free(self.color) in memory.heap
+        free(self.coverage) in memory.heap
+        free(self.table) in memory.heap
+
+## One worker's share of a band: pixel rows `first..<last`.
+struct BandJob:
+    var bands: const Bands*
+    var width: usize
+    var rows: usize
+    var first: usize
+    var last: usize
+
+func band_entry(context: void*?):
+    band_rows((BandJob*)(context else return))
+
+func band_rows(job: BandJob*):
+    let bands = job.bands
+    let over = bands.matte[0] >= 0.0
+    let staged = bands.staged
+    let band = bands.band
+    for y in job.first..<job.last:
+        var x: usize = 0
+        while x < job.width:
+            let column = x // (usize)tile_size
+            let columns = min_usize((usize)tile_size, job.width - x)
+            let base = column * (usize)tile_size * job.rows * 8 + y * columns * 8
+            let destination = (y * job.width + x) * 4
+            for index in 0..<columns:
+                let source = base + index * 8
+                let out = destination + index * 4
+                let alpha = (u16)staged[source + 6] | ((u16)staged[source + 7] << 8)
+                if not over or alpha == half_one:
+                    for channel in 0..<(usize)3:
+                        band[out + channel] = bands.color[(usize)((u16)staged[source + channel * 2] | ((u16)staged[source + channel * 2 + 1] << 8))]
+                    band[out + 3] = 255 if over else bands.coverage[(usize)alpha]
+                    continue
+                let a = math.clamp((f64)bands.linear[(usize)alpha], 0.0, 1.0)
+                for channel in 0..<(usize)3:
+                    let value = (f64)bands.linear[(usize)((u16)staged[source + channel * 2] | ((u16)staged[source + channel * 2 + 1] << 8))]
+                    let blended = value * a + bands.matte[channel] * (1.0 - a)
+                    band[out + channel] = bands.table[(usize)(math.clamp(blended, 0.0, 1.0) * 4096.0 + 0.5)]
+                band[out + 3] = 255
+            x += columns
+
+## `job`'s rows split across the processors.
+func convert_band(job: BandJob*) -> !:
+    let workers = (usize)math.imin(16, math.imax(1, (i64)os.cpus()))
+    if workers <= 1 or job.rows < 16:
+        band_rows(job)
+        return
+    var shares: BandJob[16] = ---
+    var handles: thread.Handle[16]
+    var started: usize = 0
+    let per = (job.rows + workers - 1) // workers
+    for share in 0..<workers:
+        shares[share] = *job
+        shares[share].first = min_usize(job.rows, share * per)
+        shares[share].last = min_usize(job.rows, share * per + per)
+    for share in 1..<workers:
+        handles[started] = thread.spawn(band_entry, (void*)&shares[share], name = "export-band") catch failure:
+            for other in share..<workers:
+                band_rows(&shares[other])
+            break
+        started += 1
+    band_rows(&shares[0])
+    for index in 0..<started:
+        try handles[index].join()
+
+## A linear component as an 8-bit sRGB value.
+func srgb_byte(linear: f64) -> u8:
+    let v = math.clamp(linear, 0.0, 1.0)
+    let encoded = v * 12.92 if v <= 0.0031308 else 1.055 * math.pow(v, 1.0 / 2.4) - 0.055
+    return (u8)math.floor(encoded * 255.0 + 0.5)

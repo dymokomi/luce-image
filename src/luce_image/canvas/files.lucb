@@ -71,61 +71,6 @@ func write_file(path: str, bytes: const u8[]) -> !:
     defer strings.release(destination)
     try files.write_atomic((c_api.str)destination, bytes)
 
-## A row of cells of the flattened document as 8-bit sRGB RGBA, one at a time:
-## over `matte` (linear light) when its red is not negative, else alpha kept.
-struct Bands:
-    var band: u8[]
-    var bytes: u8[]
-    var table: u8[]
-    var matte: f64[3]
-
-    static func begin(canvas: Canvas*, matte: f64[3]) -> Bands!:
-        try canvas.require_open()
-        let band = try alloc u8[(usize)canvas.extent_x * (usize)tile_size * 4] in memory.heap
-        errdefer free(band) in memory.heap
-        let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
-        errdefer free(bytes) in memory.heap
-        # Linear light to 8-bit sRGB, 4096 steps across 0..1.
-        let table = try alloc u8[4097] in memory.heap
-        for step in 0..<(usize)4097:
-            table[step] = srgb_byte((f64)step / 4096.0)
-        return Bands(band = band, bytes = bytes, table = table, matte = matte)
-
-    ## Row `row` of cells into `band`; how many pixel rows it holds.
-    mutating func fill(canvas: Canvas*, row: u32) -> usize!:
-        let document = canvas.document else error(invalid, "draw the document once before saving it")
-        let composer = canvas.composer else error(invalid, "draw the document once before saving it")
-        let width = (usize)canvas.extent_x
-        let rows = (usize)min_u32(tile_size, canvas.extent_y - row * tile_size)
-        let over = self.matte[0] >= 0.0
-        for column in 0..<tile_columns(canvas.extent_x):
-            let texture = try composer.tile(document, column, row, 0)
-            let columns = (usize)min_u32(tile_size, canvas.extent_x - column * tile_size)
-            try texture.read(self.bytes[..<columns * rows * 8], gpu.Region(0, 0, (u32)columns, (u32)rows))
-            for y in 0..<rows:
-                for x in 0..<columns:
-                    let source = (y * columns + x) * 8
-                    let alpha = math.clamp((f64)from_half((u16)self.bytes[source + 6] | ((u16)self.bytes[source + 7] << 8)), 0.0, 1.0)
-                    let destination = (y * width + (usize)column * (usize)tile_size + x) * 4
-                    for channel in 0..<(usize)3:
-                        var value = (f64)from_half((u16)self.bytes[source + channel * 2] | ((u16)self.bytes[source + channel * 2 + 1] << 8))
-                        if over:
-                            value = value * alpha + self.matte[channel] * (1.0 - alpha)
-                        self.band[destination + channel] = self.table[(usize)(math.clamp(value, 0.0, 1.0) * 4096.0 + 0.5)]
-                    self.band[destination + 3] = 255 if over else (u8)(alpha * 255.0 + 0.5)
-        return rows
-
-    mutating func close():
-        free(self.band) in memory.heap
-        free(self.bytes) in memory.heap
-        free(self.table) in memory.heap
-
-## A linear component as an 8-bit sRGB value.
-func srgb_byte(linear: f64) -> u8:
-    let v = math.clamp(linear, 0.0, 1.0)
-    let encoded = v * 12.92 if v <= 0.0031308 else 1.055 * math.pow(v, 1.0 / 2.4) - 0.055
-    return (u8)math.floor(encoded * 255.0 + 0.5)
-
 ## The flattened document as straight-alpha linear RGBA f32 samples, top-down,
 ## four per pixel: heap storage the caller frees.
 func flattened_pixels(canvas: Canvas*) -> f32[]!:
