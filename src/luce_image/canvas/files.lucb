@@ -201,10 +201,7 @@ func bottom_right_pixel(canvas: Canvas*) -> u8[4]!:
     let width = (usize)canvas.extent_x
     let rows = try bands.fill(canvas, tile_columns(canvas.extent_y) - 1)
     let at = ((rows - 1) * width + width - 1) * 4
-    # Copied out first: returning the array made from the band straight away, with
-    # `bands.close()` pending, double-freed (a compiler bug to look at separately).
-    var pixel: u8[4] = [bands.band[at], bands.band[at + 1], bands.band[at + 2], bands.band[at + 3]]
-    return pixel
+    return [bands.band[at], bands.band[at + 1], bands.band[at + 2], bands.band[at + 3]]
 
 ## Whether the pixel at `at` stays: any alpha (`based_on` 0), else unlike `corner`.
 func trim_kept(band: const u8[], at: usize, based_on: i64, corner: u8[4]) -> bool:
