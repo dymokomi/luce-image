@@ -1,0 +1,61 @@
+#==============================================================================================
+#
+#   canvas/refining - Select › Transform Selection: the outline reshaped, the pixels left
+#
+#   DESCRIPTION:
+#       The selection as it began is kept aside; each preview takes a copy of it through the
+#       warp the box describes (Selection.warp, which samples only the cells the edge
+#       crosses), so a drag costs the selection's edge whatever the document's size.
+#       Keeping it records the selection it began from as one undo step.
+#
+#==============================================================================================
+
+## `Canvas.begin_selection_transform`.
+func begin_selection_transform(canvas: Canvas*) -> !:
+    try canvas.require_open()
+    if canvas.selection_origin != none:
+        error(invalid, "the selection is already being transformed")
+    if not canvas.has_selection():
+        error(invalid, "nothing is selected to transform")
+    let copy = try canvas.live().copy()
+    let kept = try new Selection in memory.heap
+    *kept = copy
+    canvas.selection_origin = kept
+
+## Show the selection it began from through `warp`.
+func show_selection_warp(canvas: Canvas*, warp: Warp) -> !:
+    let origin = canvas.selection_origin else error(invalid, "no selection transform is under way")
+    var shown = try origin.copy()
+    errdefer shown.destroy()
+    try shown.warp(warp)
+    var live = canvas.live()
+    live.destroy()
+    *live = shown
+
+## `Canvas.end_selection_transform`: keep the shown selection as one step,
+## recorded against the one it began from, or put that one back.
+func end_selection_transform(canvas: Canvas*, keep: bool) -> !:
+    let origin = canvas.selection_origin else return
+    canvas.selection_origin = none
+    defer free(origin) in memory.heap
+    var live = canvas.live()
+    if not keep:
+        live.destroy()
+        *live = *origin
+        return
+    # History records the state before the change: the original, briefly back.
+    var shown = *live
+    *live = *origin
+    canvas.remember_state("Transform Selection") catch failure:
+        live.destroy()
+        *live = shown
+        error(failure.code, failure.message)
+    live.destroy()
+    *live = shown
+
+## Drop a selection transform left under way (the canvas closing).
+func drop_selection_transform(canvas: Canvas*):
+    let origin = canvas.selection_origin else return
+    canvas.selection_origin = none
+    origin.destroy()
+    free(origin) in memory.heap

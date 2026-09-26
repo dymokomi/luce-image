@@ -365,6 +365,12 @@ pub struct Document:
     ## How many times history has swapped the tree: each swap moves every
     ## layer's revision into a band of its own (see `exchange`).
     var generation: u64
+    ## Quick Mask's layer while it is on: outside the tree, so never composited,
+    ## exported or saved, but found by its id so every painting tool reaches
+    ## its mask, which holds the selection being painted.
+    var quick: Layer*? = none
+    ## While Quick Mask is on the selection clips nothing.
+    pub var selection_suspended: bool = false
 
     ## An empty `width` by `height` document with no layers.
     pub static func create(device: gpu.Device, width: u32, height: u32) -> Document!:
@@ -391,9 +397,40 @@ pub struct Document:
     pub func layers() -> Layer*[]:
         return self.root.layers()
 
-    ## The layer with `id`, borrowed.
+    ## The layer with `id`, borrowed: Quick Mask's too.
     pub func find(id: u64) -> Layer*?:
+        if let quick = self.quick:
+            if quick.id == id:
+                return quick
         return find_in(self.root, id)
+
+    ## Put Quick Mask's layer up with `mask` (taken) as its mask; its id.
+    pub mutating func begin_quick(mask: Tiles) -> u64!:
+        var owned_mask = mask
+        errdefer owned_mask.destroy()
+        if self.quick != none:
+            error(invalid, "Quick Mask is already on")
+        let pixels = try box(try Tiles.create(self.owner, self.extent_x, self.extent_y))
+        var name: str = ""
+        with memory.heap:
+            name = try strings.copy("Quick Mask")
+        let layer = try new Layer(id = self.next_id, name = name, group = false, pixels = pixels, revision = 1) in memory.heap
+        layer.mask = try box(owned_mask)
+        self.next_id += 1
+        self.quick = layer
+        self.selection_suspended = true
+        return layer.id
+
+    ## Quick Mask's layer, while it is on.
+    pub func quick_layer() -> Layer*?:
+        return self.quick
+
+    ## Take Quick Mask's layer down.
+    pub mutating func end_quick():
+        self.selection_suspended = false
+        let quick = self.quick else return
+        self.quick = none
+        layer_destroy(quick)
 
     ## Add a transparent raster layer on top of `parent` (the root by default).
     pub mutating func add_layer(name: str, parent: u64? = none) -> u64!:
@@ -739,6 +776,8 @@ pub struct Document:
 
     ## The selection's GPU tiles, or none when nothing is selected.
     pub mutating func selection_tiles() -> Tiles*?!:
+        if self.selection_suspended:
+            return none
         return try self.selection.gpu_tiles(self.owner)
 
     ## Give a layer or a group an empty mask (revealing everything) or take it away.
@@ -787,6 +826,7 @@ pub struct Document:
         self.revision += 1
 
     pub mutating func destroy():
+        self.end_quick()
         self.selection.destroy()
         layer_destroy(self.root)
 

@@ -1,0 +1,98 @@
+## The selection refinements on a 15000×24000 document: each works out only
+## the cells along the selection's edge (or, for Grow and Similar, the cells
+## with pixels), in bounded time, with the untouched cells still one value
+## and so costing no memory. The small-canvas correctness tests sit beside
+## each (selection.lucb, selection_refine.lucb).
+import math
+import memory
+import time
+from tiles import tile_size
+from half import to_half
+from luce_image.selection import Selection
+from luce_image.selection_cells import Mode
+import luce_image.selection_sources as sources
+
+let big_width: u32 = 15000
+let big_height: u32 = 24000
+
+## A big selection: a rectangle whose edges cross cells, and a disc.
+func big_selection() -> Selection!:
+    var selection = try Selection.create(big_width, big_height)
+    selection.rectangle(1000, 2000, 9000, 15000, Mode.replace)
+    selection.ellipse(11000, 18000, 3000, 3000, Mode.add)
+    return selection
+
+## How many cells hold bytes (the rest are one value and cost nothing).
+func blocks(selection: const Selection*) -> i64:
+    var count: i64 = 0
+    for row in 0..<(big_height + tile_size - 1) // tile_size:
+        for column in 0..<(big_width + tile_size - 1) // tile_size:
+            if selection.cell_value(column, row) < 0:
+                count += 1
+    return count
+
+## Nanoseconds since `started`, bounded by `seconds`.
+func within(started: u64, seconds: u64) -> bool:
+    return time.now() - started < seconds * 1000000000
+
+test "border and smooth on 15000 by 24000 touch only the edge's cells":
+    var selection = try big_selection()
+    defer selection.destroy()
+    let started = time.now()
+    try selection.border(20)
+    assert(within(started, 20))
+    # The rectangle's and the disc's outlines: a few hundred of the 5,546 cells.
+    assert(blocks(&selection) > 100 and blocks(&selection) < 900)
+    assert(selection.at(5000, 9000) == 0 and selection.at(1000, 9000) > 0)
+    var smoothed = try big_selection()
+    defer smoothed.destroy()
+    let again = time.now()
+    try smoothed.smooth(12)
+    assert(within(again, 20))
+    assert(blocks(&smoothed) < 900 and smoothed.at(5000, 9000) == 255 and smoothed.at(100, 100) == 0)
+
+## Pixels only in a band of columns 3000..3600 (red) and 3600..4200 (blue);
+## everywhere else transparent: cells a reader skips at once.
+struct Band:
+    var cells_read: @usize
+
+func read_band(context: void*?, column: u32, row: u32, halves: u8[]) -> bool!:
+    let band = (Band*)(context else return false)
+    let left = (i64)column * (i64)tile_size
+    if left + (i64)tile_size <= 3000 or left >= 4200:
+        return false
+    discard(band.cells_read.add(1, .relaxed))
+    let one = to_half(1.0)
+    memory.set(halves, 0)
+    for y in 0..<(usize)tile_size:
+        for x in 0..<(usize)tile_size:
+            let at = (y * (usize)tile_size + x) * 8
+            let document_x = left + (i64)x
+            if document_x < 3000 or document_x >= 4200:
+                continue
+            let channel: usize = 0 if document_x < 3600 else 2
+            halves[at + channel * 2] = (u8)(one & 0xff)
+            halves[at + channel * 2 + 1] = (u8)(one >> 8)
+            halves[at + 6] = (u8)(one & 0xff)
+            halves[at + 7] = (u8)(one >> 8)
+    return true
+
+test "grow and similar on 15000 by 24000 read each painted cell once, threaded":
+    var band = Band()
+    var selection = try Selection.create(big_width, big_height)
+    defer selection.destroy()
+    selection.rectangle(3100, 12000, 50, 50, Mode.replace)
+    let started = time.now()
+    try selection.grow(sources.cpu_reader((void*)&band, read_band), 32.0, true)
+    assert(within(started, 30))
+    # The red band, top to bottom, and not the blue beside it.
+    assert(selection.at(3300, 100) == 255 and selection.at(3300, 23900) == 255 and selection.at(3700, 12000) == 0 and selection.at(2000, 12000) == 0)
+    # A cell edge along each side of the band: only those hold bytes.
+    assert(blocks(&selection) <= 2 * 94)
+    var similar = try Selection.create(big_width, big_height)
+    defer similar.destroy()
+    similar.rectangle(3700, 500, 20, 20, Mode.replace)
+    let again = time.now()
+    try similar.grow(sources.cpu_reader((void*)&band, read_band), 32.0, false)
+    assert(within(again, 30))
+    assert(similar.at(4000, 20000) == 255 and similar.at(3300, 20000) == 0)
