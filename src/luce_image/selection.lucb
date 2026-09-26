@@ -13,6 +13,7 @@ from luce_image.projective import Warp
 from luce_image.selection_cells import Cells, Mode, block_bytes, each
 from luce_image.selection_mirror import Mirror
 import luce_image.selection_shapes as shapes
+import luce_image.selection_modify as modifying
 from raster_errors import invalid
 
 pub struct Selection:
@@ -239,34 +240,14 @@ pub struct Selection:
         self.finish()
 
     ## Grow (positive) or shrink (negative) the selection by `pixels` with a
-    ## square structuring element, then soften its edge over `feather` pixels.
-    ## Done on the whole document's bytes at once, put back into cells after.
+    ## square structuring element, then soften its edge over `feather` pixels
+    ## (a box blur): cell by cell, only near the edge (selection_modify.lucb).
     pub mutating func adjust(pixels: i64, feather: i64) -> !:
         if pixels < -512 or pixels > 512 or feather < 0 or feather > 512:
             error(invalid, "expand and contract are limited to 512 pixels, feather to 0..512")
         if pixels == 0 and feather == 0:
             return
-        let count = (usize)self.extent_x * (usize)self.extent_y
-        let coverage = try alloc u8[count] in memory.heap
-        defer free(coverage) in memory.heap
-        let scratch = try alloc u8[count] in memory.heap
-        defer free(scratch) in memory.heap
-        for y in 0..<(i64)self.extent_y:
-            for x in 0..<(i64)self.extent_x:
-                coverage[(usize)y * (usize)self.extent_x + (usize)x] = self.cells.at(x, y)
-        let w = (usize)self.extent_x
-        let h = (usize)self.extent_y
-        if pixels != 0:
-            let grow = pixels > 0
-            let radius = (usize)math.iabs(pixels)
-            morph(coverage, scratch, w, h, radius, grow, true)
-            morph(coverage, scratch, w, h, radius, grow, false)
-        if feather > 0:
-            soften(coverage, scratch, w, h, (usize)feather, true)
-            soften(coverage, scratch, w, h, (usize)feather, false)
-        var nothing: f32[]
-        self.cells.fill_all(0)
-        shapes.from_source(&self.cells, shapes.Source(bytes = coverage, samples = nothing), Mode.add)
+        try modifying.modify(&self.cells, pixels, feather)
         self.finish()
 
     ## Every pixel of `other` (a shape made alone) combined in by `mode`, as
@@ -427,44 +408,6 @@ func warp_item(context: void*?, index: usize):
                 value = upper * (1.0 - fy) + lower * fy
             shape[(usize)row * (usize)tile_size + (usize)column] = (u8)math.clamp(math.round(value), 0.0, 255.0)
     shapes.combine_cell(job.target, index, shape, Mode.add)
-
-# mark: Whole-document passes ===================================================================
-
-## One separable pass of a max (grow) or min (shrink) filter over `coverage`.
-func morph(coverage: u8[], scratch: u8[], w: usize, h: usize, radius: usize, grow: bool, horizontal: bool):
-    for y in 0..<h:
-        for x in 0..<w:
-            var value: u8 = 0 if grow else 255
-            let span = (i64)radius
-            for offset in -span..<(span + 1):
-                let sx = (i64)x + (offset if horizontal else 0)
-                let sy = (i64)y + (0 if horizontal else offset)
-                var sample: u8 = 0
-                if sx >= 0 and sy >= 0 and sx < (i64)w and sy < (i64)h:
-                    sample = coverage[(usize)sy * w + (usize)sx]
-                if grow:
-                    if sample > value:
-                        value = sample
-                elif sample < value:
-                    value = sample
-            scratch[y * w + x] = value
-    memory.copy(coverage, scratch, coverage.length)
-
-## One separable pass of a box blur of `radius` over `coverage`.
-func soften(coverage: u8[], scratch: u8[], w: usize, h: usize, radius: usize, horizontal: bool):
-    let span = (i64)radius
-    for y in 0..<h:
-        for x in 0..<w:
-            var total: i64 = 0
-            var count: i64 = 0
-            for offset in -span..<(span + 1):
-                let sx = (i64)x + (offset if horizontal else 0)
-                let sy = (i64)y + (0 if horizontal else offset)
-                if sx >= 0 and sy >= 0 and sx < (i64)w and sy < (i64)h:
-                    total += (i64)coverage[(usize)sy * w + (usize)sx]
-                count += 1
-            scratch[y * w + x] = (u8)(total // count)
-    memory.copy(coverage, scratch, coverage.length)
 
 ## A linear-light sample as an 8-bit sRGB value.
 func srgb_byte(value: f32) -> u8:
@@ -640,3 +583,98 @@ test "the GPU tiles follow the cells, uploading only the cells that changed":
         assert(pixels[(usize)probe * 4] == expected)
     selection.clear()
     assert((try selection.gpu_tiles(device)) == none)
+
+# mark: Select › Modify against the whole-document passes ======================================
+
+## Tests' oracle: one separable pass of a max (grow) or min (shrink) filter
+## over a whole document's `coverage`, as Select › Modify once ran.
+func morph(coverage: u8[], scratch: u8[], w: usize, h: usize, radius: usize, grow: bool, horizontal: bool):
+    for y in 0..<h:
+        for x in 0..<w:
+            var value: u8 = 0 if grow else 255
+            let span = (i64)radius
+            for offset in -span..<(span + 1):
+                let sx = (i64)x + (offset if horizontal else 0)
+                let sy = (i64)y + (0 if horizontal else offset)
+                var sample: u8 = 0
+                if sx >= 0 and sy >= 0 and sx < (i64)w and sy < (i64)h:
+                    sample = coverage[(usize)sy * w + (usize)sx]
+                if grow:
+                    if sample > value:
+                        value = sample
+                elif sample < value:
+                    value = sample
+            scratch[y * w + x] = value
+    memory.copy(coverage, scratch, coverage.length)
+
+## Tests' oracle: one separable pass of a box blur of `radius`.
+func soften(coverage: u8[], scratch: u8[], w: usize, h: usize, radius: usize, horizontal: bool):
+    let span = (i64)radius
+    for y in 0..<h:
+        for x in 0..<w:
+            var total: i64 = 0
+            var count: i64 = 0
+            for offset in -span..<(span + 1):
+                let sx = (i64)x + (offset if horizontal else 0)
+                let sy = (i64)y + (0 if horizontal else offset)
+                if sx >= 0 and sy >= 0 and sx < (i64)w and sy < (i64)h:
+                    total += (i64)coverage[(usize)sy * w + (usize)sx]
+                count += 1
+            scratch[y * w + x] = (u8)(total // count)
+    memory.copy(coverage, scratch, coverage.length)
+
+## Tests' oracle: Select › Modify on a whole document's bytes.
+func dense_adjust(coverage: u8[], w: usize, h: usize, pixels: i64, feather: i64):
+    let scratch = alloc u8[coverage.length] in memory.heap catch failure:
+        trap("out of memory in a test")
+    defer free(scratch) in memory.heap
+    if pixels != 0:
+        morph(coverage, scratch, w, h, (usize)math.iabs(pixels), pixels > 0, true)
+        morph(coverage, scratch, w, h, (usize)math.iabs(pixels), pixels > 0, false)
+    if feather > 0:
+        soften(coverage, scratch, w, h, (usize)feather, true)
+        soften(coverage, scratch, w, h, (usize)feather, false)
+
+## A selection with edges everywhere: cells wholly selected against the
+## document's edges, curves across cells, a corner, a partial last cell.
+func busy_selection(width: u32, height: u32) -> Selection!:
+    var selection = try Selection.create(width, height)
+    selection.rectangle(0, 0, 260, (i64)height, Mode.replace)
+    selection.ellipse(300, 60, 250, 330, Mode.add)
+    selection.rectangle(40, 200, 90, 60, Mode.subtract)
+    try selection.polygon([400.0, 380.0, 590.0, 400.0, 470.0, 515.0, 330.0, 470.0], Mode.add)
+    selection.rectangle((i64)width - 20, (i64)height - 20, 20, 20, Mode.add)
+    return selection
+
+test "modify matches the whole-document passes, near edges and across cells":
+    let width: u32 = 600
+    let height: u32 = 520
+    let pixels: i64[11] = [1, 7, 40, 270, -1, -7, -40, -270, 0, 0, 12]
+    let feathers: i64[11] = [0, 0, 0, 0, 0, 0, 0, 0, 3, 90, 9]
+    let dense = try alloc u8[(usize)width * (usize)height] in memory.heap
+    defer free(dense) in memory.heap
+    for case in 0..<(usize)13:
+        var selection = try busy_selection(width, height)
+        defer selection.destroy()
+        var p = pixels[case] if case < 11 else -15
+        var f = feathers[case] if case < 11 else 6
+        if case == 12:
+            # Everything selected: only the document's edge moves in.
+            selection.select_all()
+            p = -5
+            f = 0
+        for y in 0..<(i64)height:
+            for x in 0..<(i64)width:
+                dense[(usize)y * (usize)width + (usize)x] = selection.sample(x, y)
+        try selection.adjust(p, f)
+        dense_adjust(dense, (usize)width, (usize)height, p, f)
+        for y in 0..<(i64)height:
+            for x in 0..<(i64)width:
+                if selection.sample(x, y) != dense[(usize)y * (usize)width + (usize)x]:
+                    trap(f"modify {p}, {f} differs at {x}, {y}: {selection.sample(x, y)} vs {dense[(usize)y * (usize)width + (usize)x]}")
+    # Contracting a selection of whole cells keeps the untouched middle one value.
+    var whole = try Selection.create(2048, 2048)
+    defer whole.destroy()
+    whole.select_all()
+    try whole.adjust(-5, 0)
+    assert(whole.cells.uniform(9) == 255 and whole.cells.uniform(0) == -1 and whole.at(4, 100) == 0 and whole.at(5, 100) == 255)
