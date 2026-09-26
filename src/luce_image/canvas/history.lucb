@@ -45,6 +45,96 @@ func drop_snapshot(entry: Snapshot*):
     else:
         entry.tiles.destroy()
 
+## What the history may hold beyond the document by default: 4 GiB of tiles.
+let default_history_budget: u64 = 4294967296
+
+## GPU bytes of one tile: 256 by 256 half-float RGBA.
+let tile_memory_bytes: u64 = 524288
+
+## Drop the oldest step, and let what was joined to it start the oldest edit kept.
+func drop_oldest(canvas: Canvas*):
+    drop_snapshot(&canvas.history[0])
+    for index in 1..<canvas.history_count:
+        canvas.history[index - 1] = canvas.history[index]
+    canvas.history_count -= 1
+    if canvas.history_count > 0:
+        canvas.history[0].joined = false
+
+## Keep the history within its budget: while the tiles alive past those the
+## document shows take more than `history_budget`, drop the oldest step. The
+## newest step always stays, so the last change can be undone. Tiles are
+## counted across every open document, which only makes this cautious.
+func trim_history(canvas: Canvas*) -> !:
+    if (u64)tiles_alive() * tile_memory_bytes <= canvas.history_budget:
+        return
+    let document = canvas.document else return
+    let shown = try shown_tiles(document)
+    while canvas.history_count > 1:
+        let alive = (u64)tiles_alive()
+        let beyond = alive - shown if alive > shown else 0
+        if beyond * tile_memory_bytes <= canvas.history_budget:
+            return
+        drop_oldest(canvas)
+
+## How many different tiles the document's layers and masks show.
+func shown_tiles(document: Document*) -> u64!:
+    var seen = try StampSet.create(4096)
+    defer seen.destroy()
+    for layer in document.layers():
+        try count_layer_tiles(layer, &seen)
+    return (u64)seen.count
+
+func count_layer_tiles(layer: Layer*, seen: StampSet*) -> !:
+    if let tiles = layer.tiles():
+        try count_cells(tiles, seen)
+    if let mask = layer.mask_tiles():
+        try count_cells(mask, seen)
+    for child in layer.layers():
+        try count_layer_tiles(child, seen)
+
+func count_cells(tiles: const Tiles*, seen: StampSet*) -> !:
+    for row in 0..<tiles.rows():
+        for column in 0..<tiles.columns():
+            let stamp = tiles.stamp(column, row)
+            if stamp != 0:
+                try seen.add(stamp)
+
+## A set of tile stamps (never 0), open addressing, grown at half full.
+struct StampSet:
+    var slots: u64[]
+    var count: usize
+
+    static func create(capacity: usize) -> StampSet!:
+        let slots = try alloc u64[capacity] in memory.heap
+        memory.set(u8[]((u8*)slots.data, slots.length * 8), 0)
+        return StampSet(slots = slots, count = 0)
+
+    mutating func add(stamp: u64) -> !:
+        if (self.count + 1) * 2 > self.slots.length:
+            let old = self.slots
+            let grown = try alloc u64[old.length * 2] in memory.heap
+            memory.set(u8[]((u8*)grown.data, grown.length * 8), 0)
+            self.slots = grown
+            self.count = 0
+            for value in old:
+                if value != 0:
+                    self.insert(value)
+            free(old) in memory.heap
+        self.insert(stamp)
+
+    mutating func insert(stamp: u64):
+        let mask = self.slots.length - 1
+        var at = (usize)((stamp *% 0x9e3779b97f4a7c15) >> 20) & mask
+        while self.slots[at] != 0:
+            if self.slots[at] == stamp:
+                return
+            at = (at + 1) & mask
+        self.slots[at] = stamp
+        self.count += 1
+
+    mutating func destroy():
+        free(self.slots) in memory.heap
+
 ## Append `entry` to a snapshot list, growing it.
 func push(list: Snapshot[]*, count: usize*, entry: Snapshot) -> !:
     if *count == list.length:

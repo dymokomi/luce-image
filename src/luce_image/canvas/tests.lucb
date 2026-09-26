@@ -1684,3 +1684,101 @@ test "spot healing on a large canvas fills the spot and leaves the rest":
     assert(math.abs((f64)healed[0] - 0.5) < 0.03 and healed[3] > 0.99)
     let far = try layer_texel(&canvas, layer, 100, 100)
     assert(math.abs((f64)far[0] - 0.5) < 0.001)
+
+## The layer's tiles in the test document.
+func layer_tiles(canvas: Canvas*, layer: i64) -> Tiles*:
+    let document = canvas.document else trap("no document")
+    let found = document.find((u64)layer) else trap("no layer")
+    return found.tiles() else trap("no tiles")
+
+test "an opaque fill shares one tile over every wholly selected cell, and makes only its edge cells":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(1024, 1024)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    # 4 by 4 cells; the rectangle holds cells (1..2, 1..2) whole, and edges of the ring round them.
+    try canvas.select_rectangle(200, 200, 624, 624)
+    let before = tiles_alive()
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.fill(layer, false)
+    let tiles = layer_tiles(&canvas, layer)
+    let middle = tiles.stamp(1, 1)
+    assert(middle != 0 and tiles.stamp(2, 1) == middle and tiles.stamp(1, 2) == middle and tiles.stamp(2, 2) == middle)
+    assert(tiles.stamp(0, 0) != middle and tiles.stamp(0, 0) != tiles.stamp(3, 3))
+    # One shared middle tile and twelve edge tiles for the layer; the
+    # selection's own GPU tiles came before, when it was drawn or first used.
+    assert(tiles_alive() - before <= 13 + 13)
+    # The whole layer with nothing selected: one tile for all sixteen cells.
+    try canvas.deselect()
+    try canvas.fill(layer, false)
+    let whole = layer_tiles(&canvas, layer)
+    for row in 0..<(u32)4:
+        for column in 0..<(u32)4:
+            assert(whole.stamp(column, row) == whole.stamp(0, 0))
+    let shown = try shown_at(&canvas, &target, 10, 10)
+    assert(shown[0] > 200 and shown[1] < 30)
+
+test "the history keeps within its budget by dropping its oldest steps, keeping the last":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(1024, 1024)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    # Each gradient gives all sixteen cells tiles of their own; its step holds the last ones.
+    try canvas.set_history_limit(40 * 524288)
+    for step in 0..<(i64)6:
+        let shade = (f64)step / 6.0
+        try canvas.fill_gradient(layer, 0.0, 0.0, 1024.0, 1024.0 - (f64)step * 50.0, shade, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0)
+    let steps = canvas.undo_steps()
+    assert(steps >= 1 and steps < 6)
+    # What is kept undoes.
+    try canvas.undo()
+    assert(canvas.undo_steps() == steps - 1)
+    # A budget of nothing still keeps the last step.
+    try canvas.set_history_limit(0)
+    try canvas.fill_gradient(layer, 0.0, 0.0, 10.0, 10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    assert(canvas.undo_steps() == 1 and canvas.can_undo())
+
+test "a fill that fails part way leaves the layer as it was, with nothing in the history":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(1024, 1024)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.fill_gradient(layer, 0.0, 0.0, 1024.0, 1024.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0)
+    let tiles = layer_tiles(&canvas, layer)
+    var stamps: u64[16]
+    for index in 0..<(u32)16:
+        stamps[(usize)index] = tiles.stamp(index % 4, index // 4)
+    try canvas.select_rectangle(100, 100, 700, 700)
+    let steps = canvas.undo_steps()
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    simulate_fill_failure(5)
+    var failed = false
+    canvas.fill(layer, false) catch failure:
+        failed = true
+        assert(failure.code == limit)
+    assert(failed)
+    let kept = layer_tiles(&canvas, layer)
+    for index in 0..<(u32)16:
+        assert(kept.stamp(index % 4, index // 4) == stamps[(usize)index])
+    assert(canvas.undo_steps() == steps)
+    # And the next fill works.
+    try canvas.fill(layer, false)
+    assert(canvas.undo_steps() == steps + 1)

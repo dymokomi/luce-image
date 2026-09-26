@@ -311,8 +311,18 @@ pub struct Selection:
     ## date with the cells that changed; `none` when nothing is selected.
     pub mutating func gpu_tiles(device: gpu.Device) -> Tiles*?!:
         if self.empty:
+            # Nothing selected: the last selection's edge tiles go now, not
+            # when the next one replaces them, so two never have to fit at once.
+            self.mirror.destroy()
             return none
         return try self.mirror.update(device, &self.cells)
+
+    ## Whether cell (`column`, `row`) is selected throughout: a fill there
+    ## does not depend on what was under it.
+    pub func cell_full(column: u32, row: u32) -> bool:
+        if self.empty:
+            return false
+        return self.cells.uniform((usize)row * (usize)self.cells.columns() + (usize)column) == 255
 
     ## Let the GPU tiles go (a selection put away in history); they are made
     ## again when wanted.
