@@ -88,26 +88,39 @@ func begin_retouch(canvas: Canvas*, id: u64, x: f64, y: f64, pressure: f64) -> !
 ## Continue a smudge to (`x`, `y`): recorded for the worker, or
 ## walked here without one. The next frame shows it.
 func extend_warp(canvas: Canvas*, warp: WarpStroke*, x: f64, y: f64) -> !:
+    let started = time.now()
     if warp.walks_async():
         try warp.record(x, y)
     else:
         try warp.extend(x, y)
+    if tracing():
+        trace_extend(time.now() - started)
 
 ## Upload what a smudge changed since the last frame, once a frame
 ## however many pointer moves came in; a stroke finishing whose worker is done
 ## is kept.
 func settle_warp(canvas: Canvas*, warp: WarpStroke*) -> !:
+    let started = time.now()
+    # The cells whose reads are done go to the worker; the next reads go out.
+    if warp.walks_async():
+        try warp.service(false)
+    let serviced = time.now()
     if canvas.warp_finishing and warp.finished():
         try keep_warp(canvas, warp)
         return
-    try upload_warp(canvas, warp)
+    let cells = try upload_warp(canvas, warp)
+    if tracing():
+        trace_frame(serviced - started, time.now() - serviced, cells, warp.worker_stats(), warp.depth())
 
-func upload_warp(canvas: Canvas*, warp: WarpStroke*) -> !:
+## Upload what changed; how many cells went up.
+func upload_warp(canvas: Canvas*, warp: WarpStroke*) -> usize!:
     let document = canvas.document else trap("stroke without a document")
     let layer = document.find(canvas.warped) else error(invalid, "the retouched layer is gone")
     let tiles = layer.tiles() else error(invalid, "the retouched layer has no pixels")
-    if try warp.flush(tiles):
+    let cells = try warp.flush(tiles)
+    if cells > 0:
         layer.revision += 1
+    return cells
 
 ## End a smudge. Walked on a worker, it returns at once and the
 ## worker finishes the path; the stroke is kept once it is done.
@@ -126,7 +139,9 @@ func keep_warp(canvas: Canvas*, warp: WarpStroke*) -> !:
     defer free(warp) in memory.heap
     defer warp.destroy()
     try warp.wait()
-    try upload_warp(canvas, warp)
+    discard(try upload_warp(canvas, warp))
+    if tracing():
+        trace_end()
     try canvas.restrict_to_selection(canvas.warped, &canvas.history[canvas.history_count - 1].tiles)
 
 ## A retouching stroke's name for the history.

@@ -4,8 +4,10 @@
 ## uploaded them. Everything here is behind one lock.
 ##
 ## The main thread records points (`record`), ends the path (`end`) and, once
-## a frame, takes the changed cells (`take_dirty`); the worker takes points
-## (`next`) and reports what each dab changed (`mark_dirty`).
+## a frame, takes the changed cells (`take_dirty`) and hands over the cells it
+## read in (under `lock`, then `wake`); the worker takes points (`next`), waits
+## for the cells a segment needs (`sleep`), and reports what each dab changed
+## (`mark_dirty`) and how long its dabs took (`count_dab`).
 import memory
 import sync
 
@@ -31,6 +33,11 @@ pub struct WarpQueue:
     var dirty_top: i64
     var dirty_right: i64
     var dirty_bottom: i64
+    ## The worker's dabs since the last `take_dabs`, and their time in nanoseconds.
+    var dabs: u64
+    var dab_ns: u64
+    ## Time the worker spent waiting for cells to be read in, in nanoseconds.
+    var starved_ns: u64
 
     ## An empty queue, on the heap so its address holds while the worker runs.
     pub static func create() -> WarpQueue*!:
@@ -39,7 +46,8 @@ pub struct WarpQueue:
         var mutex: sync.Mutex
         var changed: sync.Condition
         return try new WarpQueue(mutex = mutex, changed = changed, points = points, head = 0, count = 0, ended = false, stopping = false,
-                                 done = false, failed = false, dirty_left = 1, dirty_top = 1, dirty_right = 0, dirty_bottom = 0) in memory.heap
+                                 done = false, failed = false, dirty_left = 1, dirty_top = 1, dirty_right = 0, dirty_bottom = 0,
+                                 dabs = 0, dab_ns = 0, starved_ns = 0) in memory.heap
 
     ## Free a queue whose worker has returned.
     pub static func destroy(queue: WarpQueue*):
@@ -111,7 +119,59 @@ pub struct WarpQueue:
         self.mutex.unlock()
         return taken
 
+    ## The points recorded and not yet walked to.
+    pub mutating func depth() -> usize:
+        self.mutex.lock()
+        let count = self.count
+        self.mutex.unlock()
+        return count
+
+    ## The worker's dabs, their nanoseconds and its nanoseconds waiting for cells
+    ## since the last call, forgetting them.
+    pub mutating func take_dabs() -> u64[3]:
+        self.mutex.lock()
+        let taken: u64[3] = [self.dabs, self.dab_ns, self.starved_ns]
+        self.dabs = 0
+        self.dab_ns = 0
+        self.starved_ns = 0
+        self.mutex.unlock()
+        return taken
+
+    # -- Either side: the working copy's cells are handed over under the lock.
+
+    ## Take the lock; the main thread installs read cells while holding it.
+    pub mutating func lock():
+        self.mutex.lock()
+
+    pub mutating func unlock():
+        self.mutex.unlock()
+
+    ## With the lock held: wake the worker, which may be waiting for cells.
+    pub mutating func wake():
+        self.changed.broadcast()
+
+    ## With the lock held: sleep until woken (the lock is let go meanwhile);
+    ## false when the stroke is stopping and the worker should give up.
+    pub mutating func sleep() -> bool:
+        if self.stopping:
+            return false
+        self.changed.wait(&self.mutex)
+        return not self.stopping
+
     # -- The worker.
+
+    ## One dab took `nanoseconds`.
+    pub mutating func count_dab(nanoseconds: u64):
+        self.mutex.lock()
+        self.dabs += 1
+        self.dab_ns += nanoseconds
+        self.mutex.unlock()
+
+    ## The worker waited `nanoseconds` for cells.
+    pub mutating func count_starved(nanoseconds: u64):
+        self.mutex.lock()
+        self.starved_ns += nanoseconds
+        self.mutex.unlock()
 
     ## The next point to walk to, waiting for one; none once the path has ended
     ## and is walked, or the stroke is stopping.
