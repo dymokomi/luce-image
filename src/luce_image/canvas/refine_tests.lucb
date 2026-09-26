@@ -133,3 +133,83 @@ test "quick mask paints the selection with the painting tools and turns back int
     try canvas.enter_quick_mask()
     try canvas.exit_quick_mask()
     assert(not canvas.has_selection())
+
+## A canvas `width` by `height`, black left of column `edge` and white from
+## it, drawn once: for the Magnetic Lasso.
+func half_white(width: u32, height: u32, edge: i64, target: gpu.Texture*) -> Canvas!:
+    var canvas = try Canvas((i64)width, (i64)height)
+    errdefer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    discard(try shown_at(&canvas, target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, false)
+    try canvas.fill(layer, false)
+    try canvas.select_rectangle(edge, 0, (i64)width - edge, (i64)height, 0)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, false)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    return canvas
+
+test "the magnetic lasso hugs an edge, takes anchors back and selects what it closes round":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    var canvas = try half_white(300, 300, 150, &target)
+    defer canvas.close()
+    try canvas.begin_magnetic(150.0, 10.0, width = 10.0, contrast = 10.0, frequency = 57)
+    # The pointer wanders beside the edge; the wire keeps to it.
+    try canvas.move_magnetic(141.0, 120.0)
+    var count = canvas.magnetic_count()
+    assert(count > 50)
+    for index in 0..<count:
+        assert(canvas.magnetic_x(index) >= 148.0 and canvas.magnetic_x(index) <= 152.0)
+    let last = canvas.magnetic_y(count - 1)
+    assert(last >= 118.0 and last <= 122.0)
+    # Anchors fell on their own along the way.
+    assert(canvas.magnetic_anchors() >= 2)
+    try canvas.anchor_magnetic(150.0, 290.0)
+    # Backspace takes the last anchor back, and the path after the one before.
+    try canvas.anchor_magnetic(290.0, 290.0)
+    let anchors = canvas.magnetic_anchors()
+    let before = canvas.magnetic_anchor(anchors - 2)
+    assert(canvas.remove_magnetic_anchor() and canvas.magnetic_anchors() == anchors - 1 and canvas.magnetic_count() == before + 1)
+    try canvas.anchor_magnetic(290.0, 290.0)
+    try canvas.anchor_magnetic(290.0, 10.0)
+    try canvas.close_magnetic(0)
+    assert(not canvas.magnetic_active() and canvas.undo_name() == "Magnetic Lasso")
+    assert(canvas.selected_at(220, 150) == 255 and canvas.selected_at(100, 150) == 0 and canvas.selected_at(147, 150) == 0)
+    # Esc lets it go; Backspace at the first anchor does nothing.
+    try canvas.begin_magnetic(20.0, 20.0, level = 1)
+    assert(not canvas.remove_magnetic_anchor())
+    try canvas.move_magnetic(60.0, 20.0)
+    assert(canvas.magnetic_count() > 1)
+    canvas.cancel_magnetic()
+    assert(not canvas.magnetic_active() and canvas.magnetic_count() == 0)
+
+test "the magnetic lasso on 15000 by 24000 reads only the cells round its wire":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    var canvas = try half_white(15000, 24000, 7040, &target)
+    defer canvas.close()
+    let started = time.now()
+    try canvas.begin_magnetic(7040.0, 12000.0)
+    var y = 12000.0
+    while y < 12400.0:
+        y += 8.0
+        try canvas.move_magnetic(7046.0, y)
+    let count = canvas.magnetic_count()
+    let elapsed = time.now() - started
+    for index in 0..<count:
+        assert(canvas.magnetic_x(index) >= 7038.0 and canvas.magnetic_x(index) <= 7042.0)
+    let magnetic = canvas.magnetic else trap("the lasso is under way")
+    # 400 pixels down one edge: the column of cells either side, no more.
+    assert(magnetic.cells_read() <= 8)
+    # Fifty moves in well under a second each, whatever the document's size.
+    assert(elapsed < 10000000000)
+    canvas.cancel_magnetic()

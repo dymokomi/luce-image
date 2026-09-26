@@ -1,0 +1,277 @@
+## The Magnetic Lasso's live wire, as intelligent scissors: the cheapest path
+## between two samples of a small window, a step costing little along a
+## strong edge and much across flat color. The window is a few hundred
+## samples of one pyramid level round the last anchor and the pointer, so a
+## trace costs the same on a postcard and on a 15000×24000 document.
+import math
+import memory
+from raster_errors import invalid
+
+## Edge strengths over a window of samples: 0 flat to 1 a full black-to-white
+## step, rows of `width`. (`left`, `top`) is the window's corner in the grid.
+pub struct Field:
+    pub var left: i64
+    pub var top: i64
+    pub var width: i64
+    pub var height: i64
+    pub var strength: f32[]
+
+    pub func contains(x: i64, y: i64) -> bool:
+        return x >= self.left and y >= self.top and x < self.left + self.width and y < self.top + self.height
+
+    pub func at(x: i64, y: i64) -> f32:
+        return self.strength[(usize)((y - self.top) * self.width + (x - self.left))]
+
+## Edge strengths from `luma` (0..1, perceptual), which holds the window with
+## one more sample all round: rows of `width` + 2, `height` + 2 of them. The
+## Sobel gradient's magnitude, a unit step reading 1.
+pub func strengths(luma: const f32[], width: i64, height: i64, out: f32[]) -> !:
+    let stride = width + 2
+    if width <= 0 or height <= 0 or luma.length < (usize)(stride * (height + 2)) or out.length < (usize)(width * height):
+        error(invalid, "the window's luma and strengths must cover it")
+    for y in 0..<height:
+        let above = (usize)(y * stride)
+        let here = above + (usize)stride
+        let below = here + (usize)stride
+        for x in 0..<width:
+            let at = (usize)x
+            let gx = (luma[above + at + 2] + 2.0 * luma[here + at + 2] + luma[below + at + 2]) - (luma[above + at] + 2.0 * luma[here + at] + luma[below + at])
+            let gy = (luma[below + at] + 2.0 * luma[below + at + 1] + luma[below + at + 2]) - (luma[above + at] + 2.0 * luma[above + at + 1] + luma[above + at + 2])
+            let magnitude = math.sqrt((f64)(gx * gx + gy * gy)) / 4.0
+            out[(usize)(y * width + x)] = (f32)math.min(1.0, magnitude)
+
+## An edge's pull once `contrast` (0..1) is taken off: edges weaker than it
+## count as flat, as the Magnetic Lasso's Contrast option.
+func pull(strength: f32, contrast: f64) -> f64:
+    if (f64)strength <= contrast:
+        return 0.0
+    return math.sqrt(((f64)strength - contrast) / math.max(1e-6, 1.0 - contrast))
+
+## The strongest edge within `radius` samples of (`x`, `y`) at `contrast` or
+## more, into (`out_x`, `out_y`); (`x`, `y`) itself when there is none: where
+## the Magnetic Lasso's Width lets the wire find the edge.
+pub func snap(field: const Field*, x: i64, y: i64, radius: i64, contrast: f64, out_x: i64*, out_y: i64*):
+    *out_x = x
+    *out_y = y
+    var best = contrast
+    var best_distance: i64 = 0
+    for sy in y - radius..<y + radius + 1:
+        for sx in x - radius..<x + radius + 1:
+            let distance = (sx - x) * (sx - x) + (sy - y) * (sy - y)
+            if distance > radius * radius or not field.contains(sx, sy):
+                continue
+            let strength = (f64)field.at(sx, sy)
+            # The strongest wins; of equals, the nearest.
+            if strength > best or (strength == best and strength > contrast and distance < best_distance):
+                best = strength
+                best_distance = distance
+                *out_x = sx
+                *out_y = sy
+
+## The cheapest 8-connected path from (`from_x`, `from_y`) to (`to_x`,
+## `to_y`), both inside the field, as x, y pairs from one end to the other,
+## heap-allocated for the caller to free. Dijkstra from the start, stopping
+## when the end is reached: an edge-following trace touches little more than
+## the samples near the edge.
+pub func trace(field: const Field*, from_x: i64, from_y: i64, to_x: i64, to_y: i64, contrast: f64) -> i64[]!:
+    if not field.contains(from_x, from_y) or not field.contains(to_x, to_y):
+        error(invalid, "the live wire's ends must lie inside its window")
+    let count = (usize)(field.width * field.height)
+    # The cost to enter each sample: little on a strong edge, 1 on flat color.
+    let step = try alloc f64[count] in memory.heap
+    defer free(step) in memory.heap
+    for index in 0..<count:
+        let pulled = pull(field.strength[index], contrast)
+        step[index] = 0.05 + 0.95 * (1.0 - pulled)
+    let cost = try alloc f64[count] in memory.heap
+    defer free(cost) in memory.heap
+    let back = try alloc u32[count] in memory.heap
+    defer free(back) in memory.heap
+    var queue = try Queue.create(count)
+    defer queue.destroy()
+    for index in 0..<count:
+        cost[index] = 1e300
+    let start = (usize)((from_y - field.top) * field.width + (from_x - field.left))
+    let goal = (usize)((to_y - field.top) * field.width + (to_x - field.left))
+    cost[start] = 0.0
+    back[start] = (u32)start
+    queue.lower(start, cost)
+    let width = field.width
+    let height = field.height
+    while not queue.empty():
+        let index = queue.pop(cost)
+        if index == goal:
+            break
+        let x = (i64)index % width
+        let y = (i64)index // width
+        for dy in (i64)-1..<2:
+            for dx in (i64)-1..<2:
+                if dx == 0 and dy == 0:
+                    continue
+                let nx = x + dx
+                let ny = y + dy
+                if nx < 0 or ny < 0 or nx >= width or ny >= height:
+                    continue
+                let next = (usize)(ny * width + nx)
+                if queue.done(next):
+                    continue
+                let length = 1.0 if dx == 0 or dy == 0 else 1.41421356
+                let reached = cost[index] + step[next] * length
+                if reached < cost[next]:
+                    cost[next] = reached
+                    back[next] = (u32)index
+                    queue.lower(next, cost)
+    # Walk back from the end, then turn the walk round.
+    var steps: usize = 1
+    var at = goal
+    while at != start:
+        at = (usize)back[at]
+        steps += 1
+    let path = try alloc i64[steps * 2] in memory.heap
+    at = goal
+    var slot = steps
+    while true:
+        slot -= 1
+        path[slot * 2] = (i64)at % width + field.left
+        path[slot * 2 + 1] = (i64)at // width + field.top
+        if at == start:
+            break
+        at = (usize)back[at]
+    return path
+
+## A binary heap of samples by cost, each sample in it at most once, its place
+## kept so a cheaper cost moves it up: Dijkstra's queue. Costs live in the
+## caller's array, passed to each call.
+struct Queue:
+    var heap: u32[]
+    var size: usize
+    ## Where each sample sits in the heap; `absent` or `finished` otherwise.
+    var place: i64[]
+
+    static func create(count: usize) -> Queue!:
+        let heap = try alloc u32[count] in memory.heap
+        errdefer free(heap) in memory.heap
+        let place = try alloc i64[count] in memory.heap
+        for index in 0..<count:
+            place[index] = absent
+        return Queue(heap = heap, size = 0, place = place)
+
+    mutating func destroy():
+        free(self.heap) in memory.heap
+        free(self.place) in memory.heap
+
+    func empty() -> bool:
+        return self.size == 0
+
+    ## Whether `index` has left the queue: its cost is final.
+    func done(index: usize) -> bool:
+        return self.place[index] == finished
+
+    ## Put `index` in, or move it up after its cost fell.
+    mutating func lower(index: usize, cost: const f64[]):
+        var at = self.size
+        if self.place[index] >= 0:
+            at = (usize)self.place[index]
+        else:
+            self.size += 1
+        while at > 0:
+            let parent = (at - 1) // 2
+            let above = (usize)self.heap[parent]
+            if cost[above] <= cost[index]:
+                break
+            self.heap[at] = (u32)above
+            self.place[above] = (i64)at
+            at = parent
+        self.heap[at] = (u32)index
+        self.place[index] = (i64)at
+
+    ## Take the cheapest out, finished.
+    mutating func pop(cost: const f64[]) -> usize:
+        let top = (usize)self.heap[0]
+        self.place[top] = finished
+        self.size -= 1
+        if self.size == 0:
+            return top
+        let last = (usize)self.heap[self.size]
+        var at: usize = 0
+        while true:
+            var child = at * 2 + 1
+            if child >= self.size:
+                break
+            if child + 1 < self.size and cost[(usize)self.heap[child + 1]] < cost[(usize)self.heap[child]]:
+                child += 1
+            let below = (usize)self.heap[child]
+            if cost[below] >= cost[last]:
+                break
+            self.heap[at] = (u32)below
+            self.place[below] = (i64)at
+            at = child
+        self.heap[at] = (u32)last
+        self.place[last] = (i64)at
+        return top
+
+let absent: i64 = -1
+let finished: i64 = -2
+
+# mark: Tests ===================================================================================
+
+## A window of `width` by `height` flat at 0.2 with a vertical step to 0.9 at
+## column `edge`: its strengths.
+func stepped(width: i64, height: i64, edge: i64) -> Field!:
+    let luma = try alloc f32[(usize)((width + 2) * (height + 2))] in memory.heap
+    defer free(luma) in memory.heap
+    for y in 0..<height + 2:
+        for x in 0..<width + 2:
+            luma[(usize)(y * (width + 2) + x)] = 0.9 if x - 1 >= edge else 0.2
+    let strength = try alloc f32[(usize)(width * height)] in memory.heap
+    try strengths(luma, width, height, strength)
+    return Field(left = 100, top = 50, width = width, height = height, strength = strength)
+
+test "a step's strength is its height, flat color none":
+    var field = try stepped(40, 30, 20)
+    defer free(field.strength) in memory.heap
+    assert(field.at(119, 60) > 0.3 and field.at(120, 60) > 0.3 and field.at(110, 60) == 0.0 and field.at(130, 60) == 0.0)
+
+test "snap finds the edge within the width, and stays put without one":
+    var field = try stepped(40, 30, 20)
+    defer free(field.strength) in memory.heap
+    var x: i64 = 0
+    var y: i64 = 0
+    snap(&field, 115, 60, 6, 0.1, &x, &y)
+    assert((x == 119 or x == 120) and y == 60)
+    snap(&field, 105, 60, 6, 0.1, &x, &y)
+    assert(x == 105 and y == 60)
+    # Above the contrast, the edge is too weak to snap to.
+    snap(&field, 115, 60, 6, 0.9, &x, &y)
+    assert(x == 115)
+
+test "the wire runs along an edge rather than straight across flat color":
+    var field = try stepped(60, 60, 30)
+    defer free(field.strength) in memory.heap
+    # From the edge's top to its bottom, bowing no further than its sides.
+    let path = try trace(&field, 130, 52, 130, 107, 0.1)
+    defer free(path) in memory.heap
+    assert(path[0] == 130 and path[1] == 52 and path[path.length - 2] == 130 and path[path.length - 1] == 107)
+    var off: usize = 0
+    var index: usize = 0
+    while index < path.length:
+        if path[index] < 129 or path[index] > 130:
+            off += 1
+        index += 2
+    assert(off == 0)
+    # Between points off the edge the wire detours to it: its middle lies on
+    # the edge although the straight line is ten samples away.
+    let detour = try trace(&field, 122, 55, 122, 105, 0.1)
+    defer free(detour) in memory.heap
+    let middle = detour.length // 4 * 2
+    assert(detour[middle] >= 129 and detour[middle] <= 130)
+
+test "a trace in flat color is the straight line, one sample a step":
+    var field = try stepped(50, 50, 1000)
+    defer free(field.strength) in memory.heap
+    let path = try trace(&field, 100, 50, 140, 50, 0.1)
+    defer free(path) in memory.heap
+    assert(path.length == 41 * 2)
+    let diagonal = try trace(&field, 100, 50, 120, 70, 0.1)
+    defer free(diagonal) in memory.heap
+    assert(diagonal.length == 21 * 2)

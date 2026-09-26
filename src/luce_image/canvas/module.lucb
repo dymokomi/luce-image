@@ -61,6 +61,7 @@ import luce_image.filter as filtering
 import luce_image.light_filters as light_filters
 from luce_image.transform import translate, Transformer, Landed, landing, sampling_nearest, sampling_smooth, sampling_high
 from luce_image.projective import Warp, affine_warp, quad_warp
+import luce_image.live_wire as live_wire
 from luce_image.extent import full_bounds, pieces, relocate, Pieces
 from luce_image.transform_window import Footprint
 from luce_image.transform_preview import warp_preview_cell, lifted_preview_cell
@@ -238,6 +239,8 @@ pub struct Canvas:
     var transform_session: TransformSession*?
     ## Select › Transform Selection under way: the selection as it began.
     var selection_origin: Selection*?
+    ## The Magnetic Lasso under way (magnetic.lucb).
+    var magnetic: Magnetic*?
     ## A filter dialog's preview, shown through the compositor until kept or dropped.
     var filter_stand_in: FilterPreview*?
     ## What `measure_histogram` counted: luminosity, red, green and blue, 256
@@ -321,6 +324,7 @@ pub struct Canvas:
         self.smudge_spacing = default_smudge_spacing
         self.transform_session = none
         self.selection_origin = none
+        self.magnetic = none
         self.filter_stand_in = none
         self.heal_opacity = 1.0
         self.edit_depth = 0
@@ -607,6 +611,7 @@ pub struct Canvas:
         drop_liquify(&self)
         drop_filter_preview(&self)
         drop_selection_transform(&self)
+        cancel_magnetic(&self)
         drop_quick_mask(&self)
         if let composer = self.composer:
             composer.drop_stand_ins()
@@ -1461,8 +1466,12 @@ pub struct Canvas:
 
     ## Select the polygon of the collected points, combined by `mode`, and forget them.
     pub mutating func select_polygon(mode: i64 = 0) -> !:
+        try self.select_collected(mode, "Lasso")
+
+    ## `select_polygon`, the undo step named `name`.
+    mutating func select_collected(mode: i64, name: str) -> !:
         try self.require_open()
-        try self.remember_state("Lasso")
+        try self.remember_state(name)
         if self.polygon_count < 6:
             self.polygon_count = 0
             error(invalid, "a polygon needs at least three points")
@@ -1476,6 +1485,61 @@ pub struct Canvas:
         defer shape.destroy()
         try shape.polygon(points, Mode.replace)
         try self.merge_shape(&shape, mode)
+
+    # mark: Magnetic Lasso ======================================================================
+
+    ## The Magnetic Lasso's first anchor at document point (`x`, `y`), its wire
+    ## traced over pyramid `level` (the view's): `width` pixels (1..256) round
+    ## the pointer are searched for an edge, edges under `contrast` percent
+    ## (1..100) are ignored, and `frequency` (0..100) sets how often anchors
+    ## fall on their own.
+    pub mutating func begin_magnetic(x: f64, y: f64, level: i64 = 0, width: f64 = 10.0, contrast: f64 = 10.0, frequency: i64 = 57) -> !:
+        try begin_magnetic(&self, x, y, level, width, contrast, frequency)
+
+    ## The live wire to the edge nearest the pointer at (`x`, `y`).
+    pub mutating func move_magnetic(x: f64, y: f64) -> !:
+        try move_magnetic(&self, x, y)
+
+    ## A click: the wire fixed to (`x`, `y`) with an anchor there.
+    pub mutating func anchor_magnetic(x: f64, y: f64) -> !:
+        try anchor_magnetic(&self, x, y)
+
+    ## Backspace: the last anchor taken back; false when only the first is left.
+    pub mutating func remove_magnetic_anchor() -> bool:
+        return remove_magnetic_anchor(&self)
+
+    ## Double-click or Enter: the shape closed along the edge back to the
+    ## start and selected, combined by `mode`, as one step.
+    pub mutating func close_magnetic(mode: i64 = 0) -> !:
+        try self.require_open()
+        try close_magnetic(&self, mode)
+
+    ## Esc: the Magnetic Lasso let go.
+    pub mutating func cancel_magnetic():
+        cancel_magnetic(&self)
+
+    pub func magnetic_active() -> bool:
+        return self.magnetic != none
+
+    ## The path so far, fixed then live, for drawing: its points in document pixels.
+    pub func magnetic_count() -> i64:
+        let magnetic = self.magnetic else return 0
+        return (i64)(magnetic.fixed.points() + magnetic.live.points())
+
+    pub func magnetic_x(index: i64) -> f64:
+        return magnetic_point(&self, index, false)
+
+    pub func magnetic_y(index: i64) -> f64:
+        return magnetic_point(&self, index, true)
+
+    ## The anchors, as indices into the path.
+    pub func magnetic_anchors() -> i64:
+        let magnetic = self.magnetic else return 0
+        return (i64)magnetic.anchor_count
+
+    pub func magnetic_anchor(index: i64) -> i64:
+        let magnetic = self.magnetic else return 0
+        return (i64)magnetic.anchors[(usize)index]
 
     pub mutating func select_all() -> !:
         try self.require_open()
