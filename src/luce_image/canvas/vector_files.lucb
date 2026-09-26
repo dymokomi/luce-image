@@ -91,7 +91,9 @@ func read_element(doc: prism.Document*, element: str, at: usize) -> VectorElemen
         errdefer release_spec_path(&spec)
         let runs = read_numbers(doc, element, try format_file(key, "vector_", at, "_runs"), 1) catch _:
             recover no_numbers()
-        defer free_numbers(runs)
+        defer:
+            if runs.length > 0:
+                free(runs) in memory.heap
         if runs.length > 0:
             let sizes = try alloc u32[runs.length] in memory.heap
             defer free(sizes) in memory.heap
@@ -130,7 +132,3 @@ func read_numbers(doc: prism.Document*, element: str, name: str, step: usize) ->
 func no_numbers() -> f64[]:
     var none_here: f64[]
     return none_here
-
-func free_numbers(numbers: f64[]):
-    if numbers.length > 0:
-        free(numbers) in memory.heap

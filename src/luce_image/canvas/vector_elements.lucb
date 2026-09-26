@@ -50,9 +50,8 @@ func copied_element(element: VectorElement) -> VectorElement!:
     var copy = element
     with memory.heap:
         copy.name = try strings.copy(element.name)
-    copy_spec_path(&copy.spec) catch failure:
-        strings.release(copy.name)
-        error(failure.code, failure.message)
+    errdefer strings.release(copy.name)
+    try copy_spec_path(&copy.spec)
     return copy
 
 func release_element(element: VectorElement*):
@@ -332,9 +331,8 @@ func rename_vector_element(canvas: Canvas*, id: u64, at: i64, name: str) -> !:
     var copied: str = ""
     with memory.heap:
         copied = try strings.copy(name)
-    canvas.remember_state("Rename Vector", 0) catch failure:
-        strings.release(copied)
-        error(failure.code, failure.message)
+    errdefer strings.release(copied)
+    try canvas.remember_state("Rename Vector", 0)
     strings.release(canvas.records[index].elements[slot].name)
     canvas.records[index].elements[slot].name = copied
 

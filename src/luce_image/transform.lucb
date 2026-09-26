@@ -162,18 +162,13 @@ pub struct Transformer:
                     reads = Footprint(left = math.min(reads.left, far.left), top = math.min(reads.top, far.top),
                                       right = math.max(reads.right, far.right), bottom = math.max(reads.bottom, far.bottom))
                 var pixels = try gather(self.owner, &before, &layer_parts, &pyramid, reads, 0, false, clear)
-                var coverage = gather(self.owner, selection, &mask_parts, &pyramid, reads, 0, false, clear) catch failure:
-                    pixels.destroy()
-                    error(failure.code, failure.message)
+                defer pixels.destroy()
+                var coverage = try gather(self.owner, selection, &mask_parts, &pyramid, reads, 0, false, clear)
+                defer coverage.destroy()
                 # The output pixel, and where it reads, both in the window's texels.
                 let back = Warp(m = [1.0, 0.0, (f64)pixels.left, 0.0, 1.0, (f64)pixels.top, 0.0, 0.0, 1.0])
                 var params = shader_params(multiply(window_map(warp, &pixels), back), (f64)(try pixels.texture.width()), (f64)(try pixels.texture.height()), 0.0, true, sampling)
-                let shaded = self.shade_cell(tiles, &params, x0 - (f64)pixels.left, y0 - (f64)pixels.top, pixels.texture, coverage.texture) catch failure:
-                    pixels.destroy()
-                    coverage.destroy()
-                    error(failure.code, failure.message)
-                pixels.destroy()
-                coverage.destroy()
+                let shaded = try self.shade_cell(tiles, &params, x0 - (f64)pixels.left, y0 - (f64)pixels.top, pixels.texture, coverage.texture)
                 try tiles.set(column, row, shaded)
         target.revision += 1
 

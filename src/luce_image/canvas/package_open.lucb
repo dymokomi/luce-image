@@ -197,8 +197,9 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
 func load_package(canvas: Canvas*) -> !:
     let source = canvas.package else return
     canvas.package = none
-    defer free(source) in memory.heap
-    defer source.destroy()
+    defer:
+        source.destroy()
+        free(source) in memory.heap
     let document = canvas.document else trap("loading an unbound document")
     var file = try files.File.open((c_api.str)source.path)
     defer file.destroy()

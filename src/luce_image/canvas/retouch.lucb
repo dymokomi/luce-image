@@ -138,8 +138,9 @@ func finish_warp(canvas: Canvas*, warp: WarpStroke*) -> !:
 func keep_warp(canvas: Canvas*, warp: WarpStroke*) -> !:
     canvas.warp = none
     canvas.warp_finishing = false
-    defer free(warp) in memory.heap
-    defer warp.destroy()
+    defer:
+        warp.destroy()
+        free(warp) in memory.heap
     try warp.wait()
     discard(try upload_warp(canvas, warp, 0))
     if tracing():

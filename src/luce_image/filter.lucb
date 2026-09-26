@@ -93,14 +93,12 @@ pub struct Filters:
             for column in 0..<tiles.columns():
                 let reads = resample_reads(kind, a, b, c, (f64)(column * tile_size), (f64)(row * tile_size), width, height)
                 var window = try gather(self.owner, &before, &parts, &pyramid, reads, 0, on_mask, gpu.Color(empty, empty, empty, empty))
+                defer window.destroy()
                 let window_width = (f64)(try window.texture.width())
                 let window_height = (f64)(try window.texture.height())
                 var params: f32[12] = [(f32)kind, (f32)a, (f32)b, (f32)c, (f32)(column * tile_size), (f32)(row * tile_size), (f32)width, (f32)height,
                                        (f32)window.left, (f32)window.top, (f32)window_width, (f32)window_height]
-                let fresh = self.resample_cell(tiles, &params, window.texture) catch failure:
-                    window.destroy()
-                    error(failure.code, failure.message)
-                window.destroy()
+                let fresh = try self.resample_cell(tiles, &params, window.texture)
                 try tiles.set(column, row, fresh)
         target.revision += 1
 

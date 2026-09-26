@@ -93,13 +93,10 @@ func read_channels(canvas: Canvas*, source: const PackageSource*, doc: prism.Doc
         var name: str = ""
         with memory.heap:
             name = try strings.copy(try name_value.value().text_at())
-        var selection = read_channel(canvas, source, &file, (u32)index, packed, first) catch failure:
-            strings.release(name)
-            error(failure.code, failure.message)
-        canvas.channels.insert(canvas.channels.count, Channel(name = name, selection = selection, shown = shown)) catch failure:
-            strings.release(name)
-            selection.destroy()
-            error(failure.code, failure.message)
+        errdefer strings.release(name)
+        var selection = try read_channel(canvas, source, &file, (u32)index, packed, first)
+        errdefer selection.destroy()
+        try canvas.channels.insert(canvas.channels.count, Channel(name = name, selection = selection, shown = shown))
 
 ## Channel `index`'s selection from the file (the channels before it read
 ## already): `packed` holds a record while it is inflated, `first` which

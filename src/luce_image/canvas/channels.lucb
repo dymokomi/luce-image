@@ -45,9 +45,8 @@ struct Channels:
             var name: str = ""
             with memory.heap:
                 name = try strings.copy(self.items[index].name)
-            var selection = self.items[index].selection.copy() catch failure:
-                strings.release(name)
-                error(failure.code, failure.message)
+            errdefer strings.release(name)
+            var selection = try self.items[index].selection.copy()
             copied.items[index] = Channel(name = name, selection = selection, shown = self.items[index].shown)
             copied.count += 1
         return copied

@@ -294,24 +294,21 @@ pub struct Image:
         if not self.head_only:
             return
         let whole = try read_whole((c_api.str)self.raster.path, self.raster.max_bytes)
+        errdefer free(whole) in memory.heap
         if (u64)whole.length != self.file_size:
-            free(whole) in memory.heap
             error(invalid, "the picture's file changed since it was opened")
         if self.raster.file_format == "PNG":
-            # The probe's palette and transparency, of the whole file now.
+            # The probe's palette and transparency, of the whole file now; the
+            # scratch raster only borrows the bytes.
             var scratch = model.Raster(max_bytes = self.raster.max_bytes, max_pixels = self.raster.max_pixels)
             scratch.encoded = whole
-            png.probe(&scratch) catch failure:
+            defer:
                 var empty: u8[]
                 scratch.encoded = empty
                 scratch.close()
-                free(whole) in memory.heap
-                error(failure.code, failure.message)
+            try png.probe(&scratch)
             self.raster.palette = scratch.palette
             self.raster.transparency = scratch.transparency
-            var empty: u8[]
-            scratch.encoded = empty
-            scratch.close()
         free(self.raster.encoded) in memory.heap
         self.raster.encoded = whole
         self.head_only = false

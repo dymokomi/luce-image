@@ -118,8 +118,9 @@ func collect_refine(session: SelectMask*, wait: bool = false) -> !:
         return
     join_background(task.background)
     session.task = none
-    defer free(task) in memory.heap
-    defer RefineWork.destroy(task.work)
+    defer:
+        RefineWork.destroy(task.work)
+        free(task) in memory.heap
     if task.work.out_of_memory():
         error(memory.exhausted, "out of memory refining the selection")
     if task.work.was_cancelled():

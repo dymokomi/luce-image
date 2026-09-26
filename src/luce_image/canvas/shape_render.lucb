@@ -65,13 +65,13 @@ struct WindowPainter:
         let span = (usize)window_cells * (usize)tile_size
         let windows = try alloc ShapeWindow[workers] in memory.heap
         var made: usize = 0
-        errdefer release_windows(windows[..<made])
-        errdefer free(windows) in memory.heap
+        errdefer:
+            release_windows(windows[..<made])
+            free(windows) in memory.heap
         for index in 0..<workers:
             let pixels = try alloc f32[span * (usize)tile_size * 4] in memory.heap
-            let cells = alloc u8[(usize)window_cells * per_tile] in memory.heap catch failure:
-                free(pixels) in memory.heap
-                error(failure.code, failure.message)
+            errdefer free(pixels) in memory.heap
+            let cells = try alloc u8[(usize)window_cells * per_tile] in memory.heap
             windows[index] = ShapeWindow(column = 0, row = 0, across = 0, width = 0, height = 0, drawing = drawing, canvas_width = width, canvas_height = height,
                                          pixels = pixels, cells = cells, painted = [false, false, false, false], uniform = [false, false, false, false], failed = false)
             made += 1

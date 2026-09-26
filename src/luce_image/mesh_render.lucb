@@ -62,7 +62,10 @@ pub struct Mesher:
         let fields = try alloc CellField[count] in memory.heap
         for index in 0..<count:
             fields[index] = CellField(bytes = none, wide = none, reach = nowhere())
-        defer destroy_fields(fields)
+        defer:
+            for index in 0..<fields.length:
+                fields[index].destroy()
+            free(fields) in memory.heap
         var batch = Batch(mesh = mesh, row = row, first = first, fields = fields)
         try prepare_all(&batch, threads)
         for index in 0..<count:
@@ -131,12 +134,6 @@ struct CellField:
             free(wide) in memory.heap
         self.bytes = none
         self.wide = none
-
-## Free `fields` and what each holds.
-func destroy_fields(fields: CellField[]):
-    for index in 0..<fields.length:
-        fields[index].destroy()
-    free(fields) in memory.heap
 
 func nowhere() -> Reach:
     return Reach(moved = false, left = 0.0, top = 0.0, right = 0.0, bottom = 0.0)

@@ -65,18 +65,13 @@ pub struct SelectionPasses:
                 let reads = Footprint(left = (f64)math.imax(0, math.imin(x0, x0 - dx)), top = (f64)math.imax(0, math.imin(y0, y0 - dy)),
                                       right = (f64)math.imin((i64)tiles.width(), math.imax(x1, x1 - dx)), bottom = (f64)math.imin((i64)tiles.height(), math.imax(y1, y1 - dy)))
                 var pixels = try gather(self.owner, &before, &layer_parts, &pyramid, reads, 0, false, clear)
-                var coverage = gather(self.owner, selection, &mask_parts, &pyramid, reads, 0, false, clear) catch failure:
-                    pixels.destroy()
-                    error(failure.code, failure.message)
+                defer pixels.destroy()
+                var coverage = try gather(self.owner, selection, &mask_parts, &pyramid, reads, 0, false, clear)
+                defer coverage.destroy()
                 # The lift shader reads the window as its whole document.
                 var params: f32[8] = [(f32)(x0 - pixels.left), (f32)(y0 - pixels.top), (f32)dx, (f32)dy,
                                       (f32)(reads.right - (f64)pixels.left), (f32)(reads.bottom - (f64)pixels.top), 1.0 if copy else 0.0, 0.0]
-                let fresh = self.lift_cell(tiles, &params, pixels.texture, coverage.texture) catch failure:
-                    pixels.destroy()
-                    coverage.destroy()
-                    error(failure.code, failure.message)
-                pixels.destroy()
-                coverage.destroy()
+                let fresh = try self.lift_cell(tiles, &params, pixels.texture, coverage.texture)
                 try tiles.set(column, row, fresh)
         target.revision += 1
 

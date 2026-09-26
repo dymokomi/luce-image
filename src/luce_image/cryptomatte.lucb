@@ -377,7 +377,9 @@ pub struct CryptomatteBuilder:
             let names = try new str[self.levels * 4]
             defer free(names)
             var initialized: usize = 0
-            defer release_names(names, &initialized)
+            defer:
+                for i in 0..<initialized:
+                    strings.release(names[i])
             let suffixes: str[4] = ["R", "G", "B", "A"]
             for level in 0..<self.levels:
                 for c in 0..<(usize)4:
@@ -441,9 +443,5 @@ pub struct CryptomatteBuilder:
         self.weights = weights
         self.entries = entries
         self.count = 0
-
-func release_names(names: str[], count: const usize*):
-    for i in 0..<*count:
-        strings.release(names[i])
 
 pub let builder_type: interop.Type[CryptomatteBuilder] = interop.Type[CryptomatteBuilder]("CryptomatteBuilder", CryptomatteBuilder.close, closeable = true)

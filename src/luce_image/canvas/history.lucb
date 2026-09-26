@@ -161,27 +161,26 @@ func clear_snapshots(list: Snapshot[]*, count: usize*):
 ## (pictures waiting to be bound are not kept: a bound document has none).
 func copy_records(records: const Record[], count: usize) -> Record[]!:
     let copies = try alloc Record[count if count > 0 else 1] in memory.heap
+    # On failure the records copied so far go, and the one being copied lets go
+    # of what it took.
+    var copied: usize = 0
+    errdefer release_records(copies, copied)
     for index in 0..<count:
         var name: str = ""
         with memory.heap:
-            name = strings.copy(records[index].name) catch failure:
-                release_records(copies, index)
-                error(failure.code, failure.message)
+            name = try strings.copy(records[index].name)
+        errdefer strings.release(name)
         copies[index] = records[index]
         copies[index].name = name
         copy_type(&copies[index]) catch failure:
-            strings.release(name)
             copies[index].typed = false
-            release_records(copies, index)
             error(failure.code, failure.message)
         # On failure the copy holds no elements, and its text is its own to free.
-        copy_elements(&copies[index]) catch failure:
-            strings.release(name)
-            release_type(&copies[index])
-            release_records(copies, index)
-            error(failure.code, failure.message)
+        errdefer release_type(&copies[index])
+        try copy_elements(&copies[index])
         copies[index].picture = none
         copies[index].mask_picture = none
+        copied += 1
     return copies
 
 ## Free a records copy and the first `count` names in it.

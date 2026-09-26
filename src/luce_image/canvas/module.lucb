@@ -1173,10 +1173,9 @@ pub struct Canvas:
         var copied: str = ""
         with memory.heap:
             copied = try strings.copy(name)
+        errdefer strings.release(copied)
         if let document = self.document:
-            document.rename((u64)id, name) catch failure:
-                strings.release(copied)
-                error(failure.code, failure.message)
+            try document.rename((u64)id, name)
         strings.release(self.records[index].name)
         self.records[index].name = copied
 
