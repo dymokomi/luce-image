@@ -1,0 +1,67 @@
+#==============================================================================================
+#
+#   canvas/path_layers - Shape layers drawn with the Pen: Bézier paths
+#
+#   DESCRIPTION:
+#       A pen path is a shape layer of kind 4 (shape_layers.lucb): a run of anchors, each a
+#       point with a handle coming in and a handle going out, joined by cubic curves and
+#       drawn through luce-svg as an SVG path, so it stays crisp moved, scaled or turned.
+#       The anchors are heap storage the layer's record owns: copied with the record (for
+#       the history and for pasting) and freed with it, as a text layer's words are.
+#
+#==============================================================================================
+
+## Values an anchor takes in a path: x, y, the in-handle's x and y, the out-handle's.
+let anchor_values: usize = 6
+
+## A record's path copied, for a copy of the record that owns its own.
+func copy_path(record: Record*) -> !:
+    let path = record.shape.path
+    if path.length == 0:
+        return
+    let copy = try alloc f64[path.length] in memory.heap
+    memory.copy(copy, path, path.length)
+    record.shape.path = copy
+
+## Free a record's path; the record keeps no anchors.
+func release_path(record: Record*):
+    release_spec_path(&record.shape)
+
+func release_spec_path(spec: ShapeSpec*):
+    if spec.path.length > 0:
+        free(spec.path) in memory.heap
+    var none_left: f64[]
+    spec.path = none_left
+
+## `values` (anchors as `anchor_values` each) as a new heap path.
+func owned_path(values: const f64[]) -> f64[]!:
+    if values.length == 0 or values.length % anchor_values != 0:
+        error(invalid, "a path takes six values an anchor: the point, the handle in, the handle out")
+    for value in values:
+        if not math.is_finite(value):
+            error(invalid, "path values must be finite")
+    let path = try alloc f64[values.length] in memory.heap
+    memory.copy(path, values, values.length)
+    return path
+
+## The SVG path data of `path`: a move to the first anchor, then a cubic
+## curve to each next one from the handle going out to the handle coming in,
+## and when `closed` one back to the first, then Z.
+func path_d(out: strings.Builder*, path: const f64[], closed: bool) -> !:
+    let count = path.length // anchor_values
+    if count == 0:
+        return
+    var text: u8[256]
+    try out.put(try format(text, f"M{path[0]} {path[1]}"))
+    for at in 1..<count:
+        try curve_to(out, path, at - 1, at)
+    if closed and count > 1:
+        try curve_to(out, path, count - 1, 0)
+        try out.put("Z")
+
+## ` C` from anchor `start`'s out-handle and anchor `end`'s in-handle to anchor `end`.
+func curve_to(out: strings.Builder*, path: const f64[], start: usize, end: usize) -> !:
+    let a = start * anchor_values
+    let b = end * anchor_values
+    var text: u8[256]
+    try out.put(try format(text, f" C{path[a + 4]} {path[a + 5]} {path[b + 2]} {path[b + 3]} {path[b]} {path[b + 1]}"))

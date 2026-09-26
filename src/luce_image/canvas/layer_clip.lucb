@@ -128,6 +128,10 @@ func copied_record(record: Record) -> Record!:
     copy_type(&copy) catch failure:
         strings.release(copy.name)
         error(failure.code, failure.message)
+    copy_path(&copy) catch failure:
+        strings.release(copy.name)
+        release_type(&copy)
+        error(failure.code, failure.message)
     return copy
 
 ## `Canvas.paste_layers`: the copied layers into group `parent` (0 the top

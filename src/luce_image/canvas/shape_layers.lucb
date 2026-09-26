@@ -3,7 +3,8 @@
 #   canvas/shape_layers - Shape layers that stay shapes
 #
 #   DESCRIPTION:
-#       A rectangle (with rounded corners), an ellipse, a line or a regular polygon kept as
+#       A rectangle (with rounded corners), an ellipse, a line, a regular polygon or a pen
+#       path (path_layers.lucb) kept as
 #       what it is — its box, its fill and stroke, and a 2×3 transform — and drawn again from
 #       that, through luce-svg, on every change: moved, scaled or turned it stays crisp, as
 #       Photoshop's shape layers. Painting, filtering or distorting its pixels turns it into
@@ -13,7 +14,7 @@
 
 ## What a shape layer is drawn from.
 struct ShapeSpec:
-    ## 0 rectangle, 1 ellipse, 2 line, 3 polygon.
+    ## 0 rectangle, 1 ellipse, 2 line, 3 polygon, 4 path.
     var kind: i64
     ## The box in the shape's own space; a line runs from its top-left to its bottom-right.
     var x: f64
@@ -35,6 +36,11 @@ struct ShapeSpec:
     var stroke_width: f64 = 1.0
     ## Shape space to document pixels: (a·x + c·y + e, b·x + d·y + f).
     var matrix: f64[6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    ## A path's anchors in shape space, six values each: the point, the handle
+    ## coming in and the handle going out (a corner's handles sit on it). Heap
+    ## storage its record owns (path_layers.lucb); empty for the other kinds.
+    var path: f64[]
+    var closed: bool = false
 
 ## The number of a spec's values `layer_shape_value` reads, in `shape_values` order.
 let shape_value_count: i64 = 23
@@ -56,8 +62,8 @@ func shape_from_values(values: const f64[]) -> ShapeSpec!:
         if not math.is_finite(value):
             error(invalid, "shape values must be finite")
     let kind = (i64)values[0]
-    if kind < 0 or kind > 3:
-        error(invalid, "a shape is 0 a rectangle, 1 an ellipse, 2 a line or 3 a polygon")
+    if kind < 0 or kind > 4:
+        error(invalid, "a shape is 0 a rectangle, 1 an ellipse, 2 a line, 3 a polygon or 4 a path")
     return ShapeSpec(kind = kind, x = values[1], y = values[2], width = values[3], height = values[4], sides = (i64)math.max(3.0, math.min(64.0, values[5])),
                      radius = math.max(0.0, values[6]), filled = values[7] != 0.0, fill_red = values[8], fill_green = values[9], fill_blue = values[10],
                      stroked = values[11] != 0.0, stroke_red = values[12], stroke_green = values[13], stroke_blue = values[14], stroke_width = math.max(0.0, values[15]),
@@ -71,12 +77,16 @@ func set_layer_shape(canvas: Canvas*, id: u64, spec: ShapeSpec) -> !:
     let record = canvas.records[index]
     if record.group or record.adjustment >= 0:
         error(invalid, "only a pixel layer can hold a shape")
+    # `spec`'s path is the record's from here on; freed if it does not get there.
+    var owned = spec
+    errdefer release_spec_path(&owned)
     let document = canvas.document else error(invalid, "draw the document once before drawing a shape")
     # Drawn first, so a shape that will not draw changes nothing.
     var tiles = try rendered_shape(canvas, spec)
     errdefer tiles.destroy()
-    try canvas.remember_state("Shape", id)
+    try canvas.remember_state("Path" if spec.kind == 4 else "Shape", id)
     release_type(&canvas.records[index])
+    release_path(&canvas.records[index])
     canvas.records[index].shaped = true
     canvas.records[index].shape = spec
     try document.set_tiles(id, tiles)
@@ -93,6 +103,7 @@ func rasterize_shape(canvas: Canvas*, id: u64):
     let index = canvas.index(id) catch _:
         return
     canvas.records[index].shaped = false
+    release_path(&canvas.records[index])
 
 ## Every shape layer's shape moved by (`dx`, `dy`), with its pixels.
 func shift_shapes(canvas: Canvas*, dx: f64, dy: f64):
@@ -165,6 +176,10 @@ func shape_svg(out: strings.Builder*, spec: ShapeSpec, width: u32, height: u32) 
         try out.put(try format(line, f"<ellipse cx=\"{spec.x + spec.width * 0.5}\" cy=\"{spec.y + spec.height * 0.5}\" rx=\"{spec.width * 0.5}\" ry=\"{spec.height * 0.5}\" {paints}/>"))
     elif spec.kind == 2:
         try out.put(try format(line, f"<line x1=\"{spec.x}\" y1=\"{spec.y}\" x2=\"{spec.x + spec.width}\" y2=\"{spec.y + spec.height}\" stroke-linecap=\"round\" {paints}/>"))
+    elif spec.kind == 4:
+        try out.put("<path d=\"")
+        try path_d(out, spec.path, spec.closed)
+        try out.put(try format(line, f"\" stroke-linecap=\"round\" {paints}/>"))
     else:
         try out.put("<polygon points=\"")
         for corner in 0..<spec.sides:

@@ -542,6 +542,7 @@ pub struct Canvas:
         for index in 0..<self.count:
             strings.release(self.records[index].name)
             release_type(&self.records[index])
+            release_path(&self.records[index])
             if let picture = self.records[index].picture:
                 picture.release()
             if let picture = self.records[index].mask_picture:
@@ -781,6 +782,7 @@ pub struct Canvas:
     mutating func drop_record(index: usize):
         strings.release(self.records[index].name)
         release_type(&self.records[index])
+        release_path(&self.records[index])
         if let picture = self.records[index].picture:
             picture.release()
         if let picture = self.records[index].mask_picture:
@@ -877,6 +879,7 @@ pub struct Canvas:
         release_type(&self.records[index - 1])
         strings.release(self.records[index].name)
         release_type(&self.records[index])
+        release_path(&self.records[index])
         if let picture = self.records[index].picture:
             picture.release()
         for shift in index..<(self.count - 1):
@@ -1764,7 +1767,57 @@ pub struct Canvas:
         values[13] = stroke_green
         values[14] = stroke_blue
         values[15] = stroke_width
-        try set_layer_shape(&self, (u64)id, try shape_from_values(values))
+        var spec = try shape_from_values(values)
+        # A path keeps its anchors: a copy for the new spec, which the record will own.
+        let old = self.records[index].shape
+        spec.closed = old.closed
+        if old.path.length > 0:
+            spec.path = try owned_path(old.path)
+        try set_layer_shape(&self, (u64)id, spec)
+
+    ## Layer `id` made (or kept) a pen path drawn from the points collected with
+    ## `add_point`, three an anchor in document pixels — the point, the handle
+    ## coming in, the handle going out — joined by cubic curves, closed back to
+    ## the first when `closed`; filled and stroked as `set_shape`. One step.
+    pub mutating func set_path(id: i64, closed: bool, filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
+                               stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64) -> !:
+        let collected = self.polygon[..<self.polygon_count]
+        self.polygon_count = 0
+        if collected.length < 2 * anchor_values:
+            error(invalid, "a path needs at least two anchors")
+        let values: f64[22] = [4.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 1.0 if filled else 0.0, fill_red, fill_green, fill_blue,
+                               1.0 if stroked else 0.0, stroke_red, stroke_green, stroke_blue, stroke_width, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+        var spec = try shape_from_values(values)
+        spec.closed = closed
+        spec.path = try owned_path(collected)
+        try set_layer_shape(&self, (u64)id, spec)
+
+    ## How many anchors the path layer at `index` has; 0 for any other layer.
+    pub func layer_path_count(index: i64) -> i64!:
+        let record = try self.record(index)
+        if not record.shaped or record.shape.kind != 4:
+            return 0
+        return (i64)(record.shape.path.length // anchor_values)
+
+    ## Whether the path layer at `index` is closed.
+    pub func layer_path_closed(index: i64) -> bool!:
+        return (try self.record(index)).shape.closed
+
+    ## Value `field` of anchor `anchor` of the path layer at `index`, in document
+    ## pixels: 0 and 1 the point, 2 and 3 the handle coming in, 4 and 5 the
+    ## handle going out.
+    pub func layer_path_value(index: i64, anchor: i64, field: i64) -> f64!:
+        let record = try self.record(index)
+        if not record.shaped or record.shape.kind != 4:
+            error(invalid, "the layer is not a path")
+        let count = (i64)(record.shape.path.length // anchor_values)
+        if anchor < 0 or anchor >= count or field < 0 or field > 5:
+            error(invalid, "no such path value")
+        let at = (usize)anchor * anchor_values + (usize)(field - field % 2)
+        let x = record.shape.path[at]
+        let y = record.shape.path[at + 1]
+        let m = record.shape.matrix
+        return m[0] * x + m[2] * y + m[4] if field % 2 == 0 else m[1] * x + m[3] * y + m[5]
 
     ## Whether the layer at `index` is a shape layer.
     pub func layer_shaped(index: i64) -> bool!:
