@@ -1,0 +1,53 @@
+#==============================================================================================
+#
+#   canvas/warp_trace - Where a smudge's time goes, frame by frame (LUCED_TRACE=1)
+#
+#   DESCRIPTION:
+#       With LUCED_TRACE set to 1, every frame of a smudge prints one line: the time since
+#       the last frame, the pointer moves recorded and how long they took (the slowest too),
+#       how long handing the worker its read cells took, the cells uploaded and their time,
+#       and the worker's dabs, their time, how long it waited for cells and how many points
+#       it still has to walk. The input path should cost next to nothing; frames should come
+#       at the display's rate whatever the worker is doing.
+#
+#==============================================================================================
+
+## -1 not yet read, 0 off, 1 on.
+var trace_state: i8 = -1
+var trace_frame_at: u64 = 0
+var trace_extends: u64 = 0
+var trace_extend_ns: u64 = 0
+var trace_extend_worst: u64 = 0
+
+## Whether LUCED_TRACE=1 asked for the trace.
+func tracing() -> bool:
+    if trace_state < 0:
+        let value = os.env((c_api.str)"LUCED_TRACE")
+        trace_state = 1 if value != none and (value else "") == "1" else 0
+    return trace_state == 1
+
+## One pointer move recorded in `nanoseconds`.
+func trace_extend(nanoseconds: u64):
+    trace_extends += 1
+    trace_extend_ns += nanoseconds
+    if nanoseconds > trace_extend_worst:
+        trace_extend_worst = nanoseconds
+
+## A frame's line: `service` and `upload` nanoseconds, `cells` uploaded, and
+## the worker's dabs, dab time, waiting time and points still to walk.
+func trace_frame(service: u64, upload: u64, cells: usize, worker: u64[3], depth: usize):
+    let now = time.now()
+    let gap = now - trace_frame_at if trace_frame_at > 0 else 0
+    trace_frame_at = now
+    print(f"warp: gap {milliseconds(gap)} ms | moves {trace_extends} ({milliseconds(trace_extend_ns)} ms, worst {milliseconds(trace_extend_worst)}) | reads in {milliseconds(service)} ms | upload {cells} cells {milliseconds(upload)} ms | worker {worker[0]} dabs {milliseconds(worker[1])} ms, waited {milliseconds(worker[2])} ms, {depth} to go")
+    trace_extends = 0
+    trace_extend_ns = 0
+    trace_extend_worst = 0
+
+## The stroke is done: the next one starts its gaps afresh.
+func trace_end():
+    trace_frame_at = 0
+
+## `nanoseconds` as milliseconds with two decimals.
+func milliseconds(nanoseconds: u64) -> f64:
+    return (f64)(nanoseconds // 10000) / 100.0
