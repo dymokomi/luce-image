@@ -115,3 +115,63 @@ test "cells wholly inside a filled shape share one tile":
     assert(tiles.stamp(0, 0) == tiles.stamp(1, 0) and tiles.stamp(0, 0) == tiles.stamp(0, 1) and tiles.stamp(0, 0) == tiles.stamp(1, 1))
     assert(tiles.stamp(2, 0) != tiles.stamp(0, 0) and tiles.painted(2, 2))
     try matches_whole(&canvas, spec)
+
+## The cell plan `spec` gets on a `width` by `height` canvas, as rendered_shape makes it.
+func plan_of(spec: ShapeSpec, width: u32, height: u32) -> CellPlan!:
+    let reach = shape_reach(spec, width, height) else error(invalid, "the shape misses the canvas")
+    var text = try strings.Builder.create()
+    defer text.destroy()
+    try shape_svg(&text, spec, 0, 0, width, height)
+    let parsed = try svg.parse(text.view())
+    defer parsed.release()
+    return try CellPlan.make(parsed.value(), spec, reach, width, height)
+
+test "only a shape's edge cells are drawn; its inside shares one tile":
+    var canvas = try Canvas(3000, 2000)
+    defer canvas.close()
+    discard(try canvas.add_layer("Shape"))
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    var no_path: f64[]
+    # A filled rectangle over cells 1..8 by 1..5: its edges run through the outer
+    # ring of those (22 cells), and the 18 within are inside.
+    let rectangle = ShapeSpec(kind = 0, x = 300.0, y = 300.0, width = 2000.0, height = 1200.0, filled = true, fill_red = 0.7, fill_green = 0.3,
+                              fill_blue = 0.1, path = no_path)
+    var plan = try plan_of(rectangle, 3000, 2000)
+    assert(plan.count(cell_edge) == 22 and plan.count(cell_inside) == 18)
+    plan.close()
+    var tiles = try rendered_shape(&canvas, rectangle)
+    assert(tiles.stamp(2, 2) == tiles.stamp(7, 4) and tiles.stamp(2, 2) == tiles.stamp(5, 3) and tiles.stamp(1, 1) != tiles.stamp(2, 2))
+    assert(not tiles.painted(0, 0) and not tiles.painted(10, 7))
+    tiles.destroy()
+    try matches_whole(&canvas, rectangle)
+    # A stroked ellipse: edge cells follow its outline, the middle shares a tile.
+    var ellipse = rectangle
+    ellipse.kind = 1
+    ellipse.x = 100.0
+    ellipse.y = 100.0
+    ellipse.width = 2800.0
+    ellipse.height = 1800.0
+    ellipse.stroked = true
+    ellipse.stroke_red = 0.0
+    ellipse.stroke_green = 0.0
+    ellipse.stroke_blue = 0.0
+    ellipse.stroke_width = 20.0
+    var oval = try plan_of(ellipse, 3000, 2000)
+    assert(oval.count(cell_inside) > 0 and oval.count(cell_edge) < oval.count(cell_inside) + oval.count(cell_edge))
+    oval.close()
+    try matches_whole(&canvas, ellipse)
+    # A stroked, filled pen path of curves, turned.
+    var anchors: f64[18] = [200.0, 200.0, 100.0, 900.0, 900.0, -100.0,
+                            2700.0, 400.0, 2300.0, -200.0, 2900.0, 1100.0,
+                            1300.0, 1850.0, 2400.0, 1950.0, 300.0, 1700.0]
+    var path = ellipse
+    path.kind = 4
+    path.closed = true
+    path.stroke_width = 30.0
+    path.path = anchors[..<18]
+    var curved = try plan_of(turned(path, 7.0), 3000, 2000)
+    assert(curved.count(cell_inside) > 0)
+    curved.close()
+    try matches_whole(&canvas, turned(path, 7.0))

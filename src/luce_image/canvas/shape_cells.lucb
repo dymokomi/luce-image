@@ -1,0 +1,243 @@
+#==============================================================================================
+#
+#   canvas/shape_cells - Which cells of a shape need drawing
+#
+#   DESCRIPTION:
+#       A shape's outlines are segments once luce-svg has parsed it (curves flattened, the
+#       transform applied), in document pixels when it is parsed over the whole canvas. A
+#       cell within a band of any segment — the stroke's reach, where a miter can go, and
+#       a pixel or two of anti-aliasing — is an edge cell and is drawn. Every other cell
+#       the shape can reach has no edge in it, so the nonzero winding at its centre holds
+#       for all of it: inside the fill, one color throughout; outside, nothing. Rows are
+#       classified a row of cells at a time, from the fill's crossings with the row's
+#       centre line, so the cost follows the outline and the rows, never the area.
+#
+#==============================================================================================
+
+## What a cell holds.
+let cell_outside: u8 = 0
+let cell_edge: u8 = 1
+let cell_inside: u8 = 2
+
+## Longest piece of a segment whose box, grown by the band, marks cells.
+let mark_piece: f64 = 128.0
+
+## The cells a shape can reach, `left..<right` by `top..<bottom`.
+struct ShapeReach:
+    var left: u32
+    var top: u32
+    var right: u32
+    var bottom: u32
+
+## One crossing of a fill outline with a row's centre line: where, and which way.
+struct Crossing:
+    var x: f64
+    var direction: i32
+
+## The kind of each cell in a shape's reach.
+struct CellPlan:
+    var reach: ShapeReach
+    var kinds: u8[]
+    var width: u32
+    var height: u32
+
+    ## Sort the cells of `reach` for `drawing` (`spec` parsed over the whole
+    ## `width` by `height` canvas).
+    static func make(drawing: const svg.Drawing*, spec: ShapeSpec, reach: ShapeReach, width: u32, height: u32) -> CellPlan!:
+        let columns = (usize)(reach.right - reach.left)
+        let rows = (usize)(reach.bottom - reach.top)
+        let kinds = try alloc u8[columns * rows] in memory.heap
+        for index in 0..<kinds.length:
+            kinds[index] = cell_outside
+        var plan = CellPlan(reach = reach, kinds = kinds, width = width, height = height)
+        errdefer plan.close()
+        plan.mark_edges(drawing, band_of(spec))
+        if spec.filled and spec.kind != 2:
+            try plan.mark_inside(drawing)
+        return plan
+
+    ## The kind of cell (`column`, `row`), which must be in reach.
+    func kind(column: u32, row: u32) -> u8:
+        return self.kinds[self.at(column, row)]
+
+    mutating func set(column: u32, row: u32, kind: u8):
+        self.kinds[self.at(column, row)] = kind
+
+    func at(column: u32, row: u32) -> usize:
+        return (usize)(row - self.reach.top) * (usize)(self.reach.right - self.reach.left) + (usize)(column - self.reach.left)
+
+    ## The first inside cell in reading order, as column and row; none when there is none.
+    func first_inside() -> u32[2]?:
+        for row in self.reach.top..<self.reach.bottom:
+            for column in self.reach.left..<self.reach.right:
+                if self.kind(column, row) == cell_inside:
+                    return [column, row]
+        return none
+
+    ## How many cells are of `kind`.
+    func count(kind: u8) -> usize:
+        var total: usize = 0
+        for value in self.kinds:
+            if value == kind:
+                total += 1
+        return total
+
+    mutating func close():
+        if self.kinds.length > 0:
+            free(self.kinds) in memory.heap
+        var none_left: u8[]
+        self.kinds = none_left
+
+    ## Mark every cell within `band` pixels of a segment of any outline.
+    mutating func mark_edges(drawing: const svg.Drawing*, band: f64):
+        for contour in 0..<drawing.contour_count():
+            let start = drawing.contour_start(contour)
+            let size = drawing.contour_size(contour)
+            if size == 0:
+                continue
+            if size == 1:
+                let point = drawing.point(start)
+                self.mark_box(point.x - band, point.y - band, point.x + band, point.y + band)
+                continue
+            # The closing segment too: a fill closes every outline.
+            for index in 0..<size:
+                let a = drawing.point(start + index)
+                let b = drawing.point(start + (index + 1) % size)
+                self.mark_segment(a.x, a.y, b.x, b.y, band)
+
+    ## Mark the cells a segment's steps reach, each piece's box grown by `band`.
+    mutating func mark_segment(x0: f64, y0: f64, x1: f64, y1: f64, band: f64):
+        let length = math.hypot(x1 - x0, y1 - y0)
+        let steps = math.max(1.0, math.ceil(length / mark_piece))
+        var piece: f64 = 0.0
+        while piece < steps:
+            let ax = x0 + (x1 - x0) * piece / steps
+            let ay = y0 + (y1 - y0) * piece / steps
+            let bx = x0 + (x1 - x0) * (piece + 1.0) / steps
+            let by = y0 + (y1 - y0) * (piece + 1.0) / steps
+            self.mark_box(math.min(ax, bx) - band, math.min(ay, by) - band, math.max(ax, bx) + band, math.max(ay, by) + band)
+            piece += 1.0
+
+    ## Mark the cells of reach a document-pixel box touches.
+    mutating func mark_box(low_x: f64, low_y: f64, high_x: f64, high_y: f64):
+        let size = (f64)tile_size
+        let left = math.max((f64)self.reach.left, math.floor(low_x / size))
+        let top = math.max((f64)self.reach.top, math.floor(low_y / size))
+        let right = math.min((f64)self.reach.right - 1.0, math.floor(high_x / size))
+        let bottom = math.min((f64)self.reach.bottom - 1.0, math.floor(high_y / size))
+        if right < left or bottom < top:
+            return
+        for row in (u32)top..<(u32)bottom + 1:
+            for column in (u32)left..<(u32)right + 1:
+                self.set(column, row, cell_edge)
+
+    ## Sort the cells no edge touches: inside the fill (nonzero winding at the centre)
+    ## or out. A cell past the document's edge is drawn instead, as its clear part
+    ## keeps it from being one color throughout.
+    mutating func mark_inside(drawing: const svg.Drawing*) -> !:
+        var capacity: usize = 64
+        var crossings = try alloc Crossing[capacity] in memory.heap
+        defer free(crossings) in memory.heap
+        let size = (f64)tile_size
+        for row in self.reach.top..<self.reach.bottom:
+            let y = ((f64)row + 0.5) * size
+            # The fill outlines' crossings with the row's centre line.
+            var count: usize = 0
+            for contour in 0..<drawing.contour_count():
+                if not drawing.contour_filled(contour) or drawing.contour_size(contour) < 3:
+                    continue
+                let start = drawing.contour_start(contour)
+                let points = drawing.contour_size(contour)
+                for index in 0..<points:
+                    let a = drawing.point(start + index)
+                    let b = drawing.point(start + (index + 1) % points)
+                    let upward = a.y <= y and y < b.y
+                    let downward = b.y <= y and y < a.y
+                    if not upward and not downward:
+                        continue
+                    if count == capacity:
+                        let grown = try alloc Crossing[capacity * 2] in memory.heap
+                        memory.copy(grown, crossings, count)
+                        free(crossings) in memory.heap
+                        crossings = grown
+                        capacity *= 2
+                    crossings[count] = Crossing(x = a.x + (y - a.y) * (b.x - a.x) / (b.y - a.y), direction = 1 if upward else -1)
+                    count += 1
+            sort_crossings(crossings[..<count])
+            # Walk the row's cells left to right, winding by the crossings passed.
+            var passed: usize = 0
+            var winding: i32 = 0
+            for column in self.reach.left..<self.reach.right:
+                let x = ((f64)column + 0.5) * size
+                while passed < count and crossings[passed].x < x:
+                    winding += crossings[passed].direction
+                    passed += 1
+                if self.kind(column, row) != cell_outside or winding == 0:
+                    continue
+                let partial = (column + 1) * tile_size > self.width or (row + 1) * tile_size > self.height
+                self.set(column, row, cell_edge if partial else cell_inside)
+
+## Sort crossings by x (insertion sort: a row crosses an outline a few times).
+func sort_crossings(crossings: Crossing[]):
+    for index in 1..<crossings.length:
+        let held = crossings[index]
+        var at = index
+        while at > 0 and crossings[at - 1].x > held.x:
+            crossings[at] = crossings[at - 1]
+            at -= 1
+        crossings[at] = held
+
+## How far past its outline a shape can paint, in document pixels: a miter reaches
+## four half widths (the limit luce-svg keeps), the widest the transform makes the
+## stroke, and two pixels of anti-aliasing past that.
+func band_of(spec: ShapeSpec) -> f64:
+    let stroked = spec.stroked or spec.kind == 2
+    if not stroked:
+        return 2.0
+    let m = spec.matrix
+    let det = math.abs(m[0] * m[3] - m[1] * m[2])
+    let scale = math.sqrt(det)
+    # The stroke is written in shape space (shape_svg); its widest in document pixels
+    # is that times the transform's largest stretch.
+    let in_shape = spec.stroke_width / scale if scale > 1e-9 else spec.stroke_width
+    let sum = m[0] * m[0] + m[1] * m[1] + m[2] * m[2] + m[3] * m[3]
+    let stretch = math.sqrt((sum + math.sqrt(math.max(0.0, sum * sum - 4.0 * det * det))) * 0.5)
+    return in_shape * stretch * 2.0 + 2.0
+
+## The cells `spec` can reach on a `width` by `height` canvas: its box (a path's anchors
+## and their handles) through its matrix, grown by twice its stroke (a miter reaches
+## four half widths out) and two pixels of antialiasing. None when it misses the canvas.
+func shape_reach(spec: ShapeSpec, width: u32, height: u32) -> ShapeReach?:
+    var low_x = math.infinity
+    var low_y = math.infinity
+    var high_x = -math.infinity
+    var high_y = -math.infinity
+    let m = spec.matrix
+    var corners: f64[8] = [spec.x, spec.y, spec.x + spec.width, spec.y, spec.x, spec.y + spec.height, spec.x + spec.width, spec.y + spec.height]
+    if spec.kind == 4:
+        for at in 0..<spec.path.length // 2:
+            let px = spec.path[at * 2]
+            let py = spec.path[at * 2 + 1]
+            low_x = math.min(low_x, m[0] * px + m[2] * py + m[4])
+            high_x = math.max(high_x, m[0] * px + m[2] * py + m[4])
+            low_y = math.min(low_y, m[1] * px + m[3] * py + m[5])
+            high_y = math.max(high_y, m[1] * px + m[3] * py + m[5])
+    else:
+        for at in 0..<(usize)4:
+            let px = corners[at * 2]
+            let py = corners[at * 2 + 1]
+            low_x = math.min(low_x, m[0] * px + m[2] * py + m[4])
+            high_x = math.max(high_x, m[0] * px + m[2] * py + m[4])
+            low_y = math.min(low_y, m[1] * px + m[3] * py + m[5])
+            high_y = math.max(high_y, m[1] * px + m[3] * py + m[5])
+    if not math.is_finite(low_x) or not math.is_finite(high_x) or not math.is_finite(low_y) or not math.is_finite(high_y):
+        return none
+    let grow = band_of(spec)
+    let size = (f64)tile_size
+    let left = math.max(0.0, math.floor((low_x - grow) / size))
+    let top = math.max(0.0, math.floor((low_y - grow) / size))
+    let right = math.min((f64)tile_columns(width), math.ceil((high_x + grow) / size))
+    let bottom = math.min((f64)tile_columns(height), math.ceil((high_y + grow) / size))
+    if right <= left or bottom <= top:
+        return none
+    return ShapeReach(left = (u32)left, top = (u32)top, right = (u32)right, bottom = (u32)bottom)

@@ -12,6 +12,7 @@ transforming.lucb
 filter_previews.lucb
 type_layers.lucb
 shape_layers.lucb
+shape_cells.lucb
 shape_render.lucb
 path_layers.lucb
 ranging.lucb
