@@ -15,6 +15,7 @@ retouch_effects.lucb
 liquifying.lucb
 transforming.lucb
 filter_previews.lucb
+gradient_previews.lucb
 type_layers.lucb
 shape_layers.lucb
 shape_cells.lucb

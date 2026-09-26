@@ -1230,6 +1230,17 @@ test "painting one cell leaves every other cached tile alone, and redraws its ow
     discard(try composer.tile(document, 0, 0, 1))
     assert(composer.renders == rendered + 2)
 
+## The composited picture's red at (`x`, `y`) in the first cell, as the view draws it.
+func composite_red(canvas: Canvas*, x: usize, y: usize) -> f32!:
+    let document = canvas.document else trap("bound")
+    let composer = canvas.composer else trap("bound")
+    let texture = try composer.tile(document, 0, 0, 0)
+    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    defer free(bytes) in memory.heap
+    try texture.read(bytes)
+    let at = (y * (usize)tile_size + x) * 8
+    return from_half((u16)bytes[at] | ((u16)bytes[at + 1] << 8))
+
 test "a gradient previews while its ends move, on pixels or on a mask, and keeps as one step":
     var canvas = try Canvas(64, 16)
     defer canvas.close()
@@ -1245,10 +1256,14 @@ test "a gradient previews while its ends move, on pixels or on a mask, and keeps
     try canvas.begin_preview(layer)
     try canvas.preview_gradient(0.0, 8.0, 64.0, 8.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0)
     try canvas.preview_gradient(64.0, 8.0, 0.0, 8.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    # Shown through the compositor while the ends move; the layer keeps its pixels until kept.
+    assert((try composite_red(&canvas, 1, 8)) > 0.9 and (try composite_red(&canvas, 62, 8)) < 0.1)
+    let unchanged = (document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")
+    assert(unchanged.tile(0, 0) == none)
+    try canvas.end_preview(true)
     let tiles = (document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")
     try tiles.read(pixels)
     assert(pixels[(8 * 64 + 1) * 4] > 0.9 and pixels[(8 * 64 + 62) * 4] < 0.1)
-    try canvas.end_preview(true)
     assert(canvas.step_serial() == steps + 1 and canvas.undo_name() == "Gradient")
     try canvas.undo()
     let restored = (document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")
@@ -1257,9 +1272,6 @@ test "a gradient previews while its ends move, on pixels or on a mask, and keeps
     try canvas.set_mask(layer, true)
     try canvas.begin_preview(layer, true)
     try canvas.preview_gradient(0.0, 8.0, 64.0, 8.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0)
-    let mask = (document.find((u64)layer) else trap("layer")).mask_tiles() else trap("mask")
-    try mask.read(pixels)
-    assert(pixels[(8 * 64 + 1) * 4] < 0.1)
     try canvas.end_preview(false)
     let kept = (document.find((u64)layer) else trap("layer")).mask_tiles() else trap("mask")
     if kept.tile(0, 0) != none:

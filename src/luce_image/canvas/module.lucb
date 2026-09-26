@@ -53,7 +53,7 @@ from luce_image.warp import WarpStroke, default_smudge_spacing, upload_budget_ns
 from luce_image.liquify import Liquifier, LiquifyStroke
 from luce_image.document import Style, Document, Layer, TreeState, release_snapshot, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
 from luce_image.composite import Composer, box_composer, unbox_composer
-from luce_image.brush import Brush, Painter, Stroke, EffectSource, begin_boxed, finish_boxed, fill_selection, fill_gradient, simulate_fill_failure
+from luce_image.brush import Brush, Painter, Stroke, EffectSource, begin_boxed, finish_boxed, fill_selection, fill_gradient, gradient_tile, simulate_fill_failure
 from luce_image.adjust import Adjuster, adjustment_count, parameter_count, curves, levels
 from luce_image.curves import Curves, lut_size
 from luce_image.filter import Filters
@@ -235,6 +235,8 @@ pub struct Canvas:
     var transform_session: TransformSession*?
     ## A filter dialog's preview, shown through the compositor until kept or dropped.
     var filter_stand_in: FilterPreview*?
+    ## A gradient being dragged, shown through the compositor until kept or dropped.
+    var gradient_stand_in: GradientPreview*?
     ## What `measure_histogram` counted: luminosity, red, green and blue, 256
     ## bins each of the encoded values.
     var histogram_counts: u64[1024]
@@ -314,6 +316,7 @@ pub struct Canvas:
         self.smudge_spacing = default_smudge_spacing
         self.transform_session = none
         self.filter_stand_in = none
+        self.gradient_stand_in = none
         self.heal_opacity = 1.0
         self.edit_depth = 0
         self.edit_captured = false
@@ -598,6 +601,7 @@ pub struct Canvas:
             free(warp) in memory.heap
         drop_liquify(&self)
         drop_filter_preview(&self)
+        drop_gradient_preview(&self)
         if let composer = self.composer:
             composer.drop_stand_ins()
         if let source = self.backing:
@@ -2152,12 +2156,11 @@ pub struct Canvas:
         try gpu_check_color(to_color)
         if a0 < 0.0 or a0 > 1.0 or a1 < 0.0 or a1 > 1.0:
             error(invalid, "gradient alphas must be in 0..1")
-        let mask = (self.preview else error(invalid, "no preview is in progress")).mask
-        let layer = try self.restore_preview()
-        let document = self.document else trap("preview without a document")
-        var painter = self.painter else trap("preview without a painter")
-        var drawn_over = try fill_gradient(&painter, document, layer, x0, y0, x1, y1, from_color, to_color, radial, mask)
-        drawn_over.destroy()
+        for value in [x0, y0, x1, y1]:
+            if not math.is_finite(value):
+                error(invalid, "gradient ends must be finite")
+        # Drawn at the view's level while the ends move; at full size once kept.
+        try show_gradient(&self, x0, y0, x1, y1, from_color, to_color, radial)
 
     ## Show a Gaussian blur of `radius` applied to the layer as it was when the
     ## preview began: drawn at the view's level until kept (filter_previews.lucb).
@@ -2170,10 +2173,12 @@ pub struct Canvas:
     ## layer's pixels back as they were.
     pub mutating func end_preview(keep: bool) -> !:
         try self.require_open()
-        # A filter shown at the view's level is made at full size now.
+        # A filter or gradient shown at the view's level is made at full size now.
         if keep:
             try apply_filter_preview(&self)
+            try apply_gradient_preview(&self)
         drop_filter_preview(&self)
+        drop_gradient_preview(&self)
         let preview = self.preview else error(invalid, "no preview is in progress")
         self.preview = none
         let document = self.document else trap("preview without a document")
@@ -2216,6 +2221,7 @@ pub struct Canvas:
     mutating func restore_preview() -> u64!:
         try self.require_open()
         drop_filter_preview(&self)
+        drop_gradient_preview(&self)
         let preview = self.preview else error(invalid, "no preview is in progress")
         let document = self.document else trap("preview without a document")
         if preview.mask:
