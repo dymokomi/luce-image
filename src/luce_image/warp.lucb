@@ -313,8 +313,11 @@ pub struct WarpStroke:
         if queue.failure():
             error(invalid, "a smudge dab could not be made")
 
-    func join() -> !:
+    ## Join the worker once: the handle is let go first, so a later `destroy`
+    ## after `wait` does not join a thread already gone (glibc faults on that).
+    mutating func join() -> !:
         if let handle = self.worker:
+            self.worker = none
             try handle.join()
 
     pub mutating func destroy():
