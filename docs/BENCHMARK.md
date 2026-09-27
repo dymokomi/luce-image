@@ -44,7 +44,7 @@ still leave room for substantial codec optimization. Reproduce with
 
 ## Opening a very large picture as a document — 2026-09-26
 
-`src/luce_image/open_benchmark.lucb` opens a picture with `Canvas.open` and draws
+`benchmarks/open_benchmark.lucb` opens a picture with `Canvas.open` and draws
 it fitted into a 1600×1000 view a frame each 1/60 s, as the editor window does,
 until it is whole: milliseconds to the first frame showing the top rows and to
 the whole picture, with peak resident memory (RSS) and macOS's peak footprint
@@ -71,7 +71,7 @@ Settings › Memory usage. What the open itself holds besides the file's bytes i
 a few rows of tiles: three packed bands, the inflate window and a band of
 samples. A progressive JPEG still decodes every scan before its first row.
 
-Reproduce: `luce-base build src/luce_image/open_benchmark.lucb --native --release -o build/open_benchmark`,
+Reproduce: `luce-base build benchmarks/open_benchmark.lucb --native --release -o build/open_benchmark`,
 then `/usr/bin/time -l build/open_benchmark PICTURE [--background]`.
 
 ## Opening and placing, files read in pieces — 2026-09-26 (later)
@@ -123,7 +123,7 @@ they can go as rows render) and it renders a coarse picture first. Reproduce wit
 
 luce-image 0.39.0 mixes colors as sRGB-encoded values by default, as Photoshop
 does ([BLENDING.md](BLENDING.md)). Every mixing shader encodes what it reads and
-decodes what it writes. `src/luce_image/view_benchmark.lucb` times the view of a
+decodes what it writes. `benchmarks/view_benchmark.lucb` times the view of a
 generated 15000×24000 (360 MP) JPEG, opened whole, with a Multiply layer over it
 at half opacity (`--stacked`: seven more layers in between, one pass each), in a
 1600×1000 view. It measures:
@@ -160,5 +160,5 @@ which mixed in linear light and whose view drew no checkerboard.
 Every difference is within run-to-run spread, which is about ±5% (single runs
 of the same build vary that much). Compositing is bound by reading and writing
 half-float tiles, not by the few power functions per texel. Reproduce with
-`luce-base build src/luce_image/view_benchmark.lucb --native --release -o build/view_benchmark`,
+`luce-base build benchmarks/view_benchmark.lucb --native --release -o build/view_benchmark`,
 then `build/view_benchmark PICTURE [--linear] [--plain] [--stacked]`.

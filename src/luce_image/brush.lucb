@@ -102,6 +102,10 @@ pub struct Painter:
     pub var white: gpu.Texture
     pub var black: gpu.Texture
     pub var clear: gpu.Texture
+    ## Called before a fill makes each tile, with how many it has made; its
+    ## error stops the fill there as running out of GPU memory would. The seam
+    ## tests fail a fill part way through; none otherwise.
+    pub var tile_fault: (func(usize) -> unit!)?
 
     pub static func create(device: gpu.Device) -> Painter!:
         var dab_shader = try gpu.Shader.create(device, dab_frag_words, dab_frag_msl)
@@ -760,13 +764,6 @@ func jitter_color(color: gpu.Color, hue: f64, saturation: f64, brightness: f64) 
 ## Fill the selection on `layer`'s pixels (or its mask) with `brush`'s color at
 ## its opacity, or erase it when the brush erases; the whole layer when nothing
 ## is selected. Returns the tiles from before, for history.
-## For tests: fail the next fill after it has made this many tiles, as when
-## GPU memory runs out part way; -1 never.
-var fill_failure_at: i64 = -1
-
-pub func simulate_fill_failure(after: i64):
-    fill_failure_at = after
-
 pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brush: Brush, on_mask: bool = false) -> Tiles!:
     try brush.check()
     let target = document.find(layer) else error(invalid, "no such layer")
@@ -797,6 +794,7 @@ pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brus
     var made_keys: u64[64]
     var made_cells: u32[128]
     var made_count: usize = 0
+    var tiles_made: usize = 0
     for row in 0..<tiles.rows():
         for column in 0..<tiles.columns():
             var clip = painter.white
@@ -837,11 +835,9 @@ pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brus
                         defer clear_frame.release()
                         discard(try clear_frame.value().present(fill))
                 source = empty
-            if fill_failure_at == 0:
-                fill_failure_at = -1
-                error(limit, "out of GPU memory (simulated)")
-            if fill_failure_at > 0:
-                fill_failure_at -= 1
+            if let fault = painter.tile_fault:
+                try fault(tiles_made)
+            tiles_made += 1
             var fresh = try tiles.blank()
             errdefer fresh.destroy()
             let frame = try fresh.frame()

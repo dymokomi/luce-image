@@ -1838,6 +1838,11 @@ test "the history keeps within its budget by dropping its oldest steps, keeping 
     try canvas.fill_gradient(layer, 0.0, 0.0, 10.0, 10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0)
     assert(canvas.undo_steps() == 1 and canvas.can_undo())
 
+## A fill's tile fault: out of GPU memory once five tiles are made.
+func fail_sixth_tile(made: usize) -> !:
+    if made == 5:
+        error(limit, "out of GPU memory (simulated)")
+
 test "a fill that fails part way leaves the layer as it was, with nothing in the history":
     var device = gpu.Device.open() catch failure:
         assert(failure.code == gpu.unavailable)
@@ -1857,12 +1862,16 @@ test "a fill that fails part way leaves the layer as it was, with nothing in the
     try canvas.select_rectangle(100, 100, 700, 700)
     let steps = canvas.undo_steps()
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
-    simulate_fill_failure(5)
+    var painter = canvas.painter else trap("the canvas was drawn")
+    painter.tile_fault = fail_sixth_tile
+    canvas.painter = painter
     var failed = false
     canvas.fill(layer, false) catch failure:
         failed = true
         assert(failure.code == limit)
     assert(failed)
+    painter.tile_fault = none
+    canvas.painter = painter
     let kept = layer_tiles(&canvas, layer)
     for index in 0..<(u32)16:
         assert(kept.stamp(index % 4, index // 4) == stamps[(usize)index])

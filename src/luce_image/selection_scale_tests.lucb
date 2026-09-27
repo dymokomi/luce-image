@@ -2,7 +2,7 @@
 ## the cells along the selection's edge (or, for Grow and Similar, the cells
 ## with pixels), in bounded time, with the untouched cells still one value
 ## and so costing no memory. The small-canvas correctness tests sit beside
-## each (selection.lucb, selection_refine.lucb).
+## each (selection_tests.lucb, selection_refine.lucb).
 import math
 import memory
 import time

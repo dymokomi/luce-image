@@ -1,53 +1,46 @@
-# Architecture and resource model
+# Architecture
 
-The package has no `[native]` manifest section and no foreign image codec calls.
-All `.lucb` sources are compiled with the consuming Luce program. The C backend
-is a compiler comparison target: compiling Base code to C does not substitute
-an external C image codec.
+luce-image is the layered-document engine behind luced-2d, plus the owning
+`Image` API it opens pictures through. Everything is Luce Base; the file
+formats are their own packages (luce-png, luce-jpeg, luce-tiff, luce-exr,
+luce-psd, luce-heic, luce-raw, luce-svg), and pixels live in luce-canvas's
+shared 256-pixel GPU tiles.
 
-| Component | Responsibility |
-| --- | --- |
-| `image.lucb` | Managed/owning public API, lazy loading, transformations, atomic save |
-| `model.lucb`, `binary.lucb` | Raster ownership, typed channels/attributes, checked reads and bounded buffers, IEEE conversion |
-| `png.lucb`, `jpeg.lucb`, `tiff.lucb`, `exr.lucb` | Format parsing, encoding and pixel reconstruction |
-| `deflate.lucb` | Stored/fixed/dynamic inflate, LZ77/fixed-Huffman encode, Adler32/CRC32 |
-| `piz.lucb`, `pxr24.lucb` | OpenEXR wavelet/Huffman and delta predictor algorithms ported to Base |
-| `parallel.lucb` | Atomic work queue for independent TIFF/EXR chunks |
-| `crypto_hash.lucb`, `manifest.lucb`, `cryptomatte.lucb` | Cryptomatte hash, bounded JSON, layer extraction, weighted-sample authoring |
+## Layers of the engine
 
-The encoded source is an immutable snapshot. Workers have independent decoder
-scratch space and write disjoint pixel/channel regions. Chunk selection uses an
-atomic counter; failure signals cancellation. All spawned threads are joined
-before pixels are published or released. Parallelism is per image load; callers
-loading many images concurrently should lower each image's thread count to avoid
-oversubscription. An `Image` itself is not a concurrent mutation API.
+| Part | Modules | Owns |
+| --- | --- | --- |
+| Facade | `canvas/` (one module, fragments in `ORDER`) | `Canvas`, the one object an editor drives: layers, tools, previews, history, files, drawing |
+| Document | `document`, `curves`, `geometry`, `extent` | the layer tree, masks, styles, canvas size and layers past the canvas |
+| Compositing | `composite`, `stand_in`, `blending` | per-tile compositing through one shader with a content-keyed cache; how colors mix (sRGB-encoded or gamma 1.0, [BLENDING.md](BLENDING.md)) |
+| Selection | `selection*`, `live_wire`, `color_range`, `selection_passes` | per-pixel selections kept in 256-pixel cells, their GPU mirror, and the passes that apply them |
+| Painting | `brush`, `dynamics`, `brush_images`, `brush_mask`, `warp*`, `heal` | dab strokes, fills and gradients, pen dynamics, tips and textures, smudge, healing |
+| Filters | `adjust`, `filter`, `filter_preview`, `light_filters`, `style` | adjustments, blurs and layer styles |
+| Transforms | `projective`, `transform*`, `liquify*`, `mesh_*`, `puppet`, `warp_patch` | free transform, distort, liquify, mesh and puppet warps |
+| Pictures | `image`, `file_source`, `streaming`, `parallel`, `svg_*` | the `Image` API, pictures read in pieces, SVG import |
+| Cryptomatte | `cryptomatte`, `manifest`, `crypto_hash` | Cryptomatte 1.2 reading and authoring |
+| Shaders | `shaders` and `shaders/*.frag` | the embedded GPU programs (see the README for regenerating them) |
 
-Pixels use interleaved f64 storage, preserving numerical UINT32, HALF, FLOAT and
-DOUBLE values without quantizing Cryptomatte IDs. NaN payload preservation is not
-promised; finite float32 IDs round-trip exactly. This favors correctness and a
-single API over minimum memory. A 4096×4096 RGBA image uses 512 MiB for pixels,
-plus encoded bytes, metadata and per-worker decompression buffers.
+The Canvas's methods are small and delegate to the engine objects (Document,
+Composer, Painter, Adjuster, Filters, Transformer); a larger body lives in the
+fragment for its concern.
 
-Default `max_bytes=1 GiB` bounds each primary encoded/pixel/chunk buffer, **not the
-sum of all allocations**. Default `max_pixels=268435456`, per-axis maximum
-1,000,000, and maximum 1024 channels are additional checks. A large-image caller
-can raise byte/pixel limits explicitly. EXR headers/manifests have separate
-bounded entry/field limits. Arbitrary metadata and worker counts still increase
-the total working set. No streaming/mmap or disk-backed pixel cache exists yet.
+## Resources
 
-Open probes metadata but reads the whole encoded file. Load allocates pixels and
-only marks success after all decoding completes; errors discard partial pixels.
-Save encodes into memory and then calls Base's atomic file replacement. Threads
-currently accelerate TIFF/EXR **decode**, not file reads or encoding. Compression
-ratio/throughput will vary; the Base compressor is intentionally simpler than
-the many tuned strategies in mature zlib/OpenEXR implementations.
+- A layer's pixels are luce-canvas `Tiles`: immutable 256×256 rgba16 tiles in
+  linear light, straight alpha, shared between copies. A change makes new
+  tiles, so an undo step is the old tiles kept. The residency governor moves
+  tiles between the GPU and RAM within the budgets the app sets.
+- Work sized by the document (a selection, a smudge, a flatten) goes a cell or a
+  band at a time, so a 360 MP canvas costs its edges, not its area.
+- Worker threads are joined before what they wrote is published or freed.
+  Pictures decode on bounded workers; a load shown while it runs goes a band
+  at a time.
+- `Image` stores interleaved f64 pixels, preserving UINT32, HALF, FLOAT and
+  DOUBLE values (Cryptomatte IDs round-trip exactly). `max_bytes` (1 GiB) bounds
+  each primary buffer, not the sum; `max_pixels` (268,435,456), 1,000,000 a side
+  and 1024 channels are further checks a caller can raise.
 
-The test corpus and mutation suite are not a security certification. Hostile
-assets should be processed in a resource-limited process. Sidecar path checks
-are lexical, not symlink confinement. See the Cryptomatte documentation.
-
-Language workarounds live here, not in the language repositories. The pinned C
-emitter double-evaluates a span-producing call used as a subscript receiver;
-`Reader.byte` binds a local first. `tests/regressions/c_span_call.lucb` preserves
-the independent compiler reproducer. Detailed language findings are kept in
-`../LUCE_IMAGE_LANGUAGE_AUDIT.md` in the development workspace as requested.
+The test corpus and mutation suite are not a security certification: process
+hostile files in a resource-limited process. Sidecar path checks are lexical,
+not symlink confinement.

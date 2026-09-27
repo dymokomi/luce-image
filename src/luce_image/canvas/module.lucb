@@ -62,7 +62,7 @@ from luce_image.warp_patch import identity_patch, bend_patch, patch_mesh, patch_
 from luce_image.puppet import Puppet
 from luce_image.document import Style, Document, Layer, TreeState, release_snapshot, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
 from luce_image.composite import Composer, box_composer, unbox_composer
-from luce_image.brush import Brush, Painter, Stroke, EffectSource, begin_boxed, finish_boxed, fill_selection, fill_gradient, gradient_tile, simulate_fill_failure
+from luce_image.brush import Brush, Painter, Stroke, EffectSource, begin_boxed, finish_boxed, fill_selection, fill_gradient, gradient_tile
 from luce_image.brush_images import BrushImages
 from luce_image.dynamics import Dynamic, Control, Pen, dynamic_count
 from luce_image.adjust import Adjuster, adjustment_count, parameter_count, curves, levels, replace_color

@@ -4,7 +4,7 @@ def package "luce-image" {
     str version = "0.39.0"
     str kind = "package"
     str language = "luce-base"
-    str description = "JPEG, PNG, TIFF and OpenEXR image I/O for Luce, implemented in Luce Base, with a Pillow-inspired owning Image API and Cryptomatte 1.2 reading and authoring."
+    str description = "The layered-document engine behind luced-2d: layers, GPU compositing, selections, painting, filters, transforms and history over shared GPU tiles, with a Pillow-inspired Image API and Cryptomatte 1.2."
     str readme = "README.md"
 
     def export "image" {

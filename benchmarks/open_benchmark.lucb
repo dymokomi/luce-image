@@ -10,8 +10,8 @@
 import gpu
 import thread
 import time
-from luce_image.canvas import Canvas
-from luce_image.image import Image
+from canvas import Canvas
+from image import Image
 
 let view_width: u32 = 1600
 let view_height: u32 = 1000

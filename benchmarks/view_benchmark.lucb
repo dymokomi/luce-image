@@ -13,7 +13,7 @@
 import gpu
 import math
 import time
-from luce_image.canvas import Canvas
+from canvas import Canvas
 
 let view_width: u32 = 1600
 let view_height: u32 = 1000

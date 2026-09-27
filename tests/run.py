@@ -37,7 +37,7 @@ def main():
     for flags in modes:
         print('MODE '+' '.join(flags),flush=True)
         for source,target in [('deflate_tests','deflate'),('codec_tests','codecs')]:
-            run([args.base.resolve(),'build',ROOT/f'src/luce_image/{source}.lucb',*flags,'-o',ROOT/f'build/{target}'])
+            run([args.base.resolve(),'build',ROOT/f'tests/{source}.lucb',*flags,'-o',ROOT/f'build/{target}'])
         with tempfile.TemporaryDirectory(prefix='luce-image-tests-') as tmp:
             for source,target in [('api','api'),('crypto_api','cryptomatte'),('crypto_fixture','crypto_fixture'),('validate','validate'),('navigation','navigation')]:
                 run([args.luce.resolve(),'build',ROOT/f'tests/{source}.luc',*flags,'-o',ROOT/f'build/{target}'])

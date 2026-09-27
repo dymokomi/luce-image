@@ -15,7 +15,7 @@ ROOT=Path(__file__).resolve().parents[1]
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--size',type=int,default=1024)
 args=parser.parse_args()
-subprocess.run([str(ROOT/'build/toolchain/luce-base'),'build',str(ROOT/'src/luce_image/benchmark.lucb'),'--opt','3','-o',str(ROOT/'build/benchmark')],check=True)
+subprocess.run([str(ROOT/'build/toolchain/luce-base'),'build',str(ROOT/'benchmarks/benchmark.lucb'),'--opt','3','-o',str(ROOT/'build/benchmark')],check=True)
 results={'host':platform.platform(),'size':[args.size,args.size],'results':[]}
 with tempfile.TemporaryDirectory() as tmp:
     p=Path(tmp); rng=np.random.default_rng(78)

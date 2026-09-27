@@ -21,16 +21,17 @@ unsupported encodings return errors. See [format coverage](docs/FORMATS.md).
 
 ## Use from Luce
 
-Keep this repository alongside the application, `luce-base`, and `luce`. In the
-application's `luce.toml`:
+Depend on it from the application's `package.prisma`:
 
-```toml
-[dependencies]
-luce_image = "../luce-image"
+```
+def dependency "luce-image" {
+    str owner = "dymokomi"
+    str version = "^0.39.0"
+}
 ```
 
-The repository name is `luce-image`; its public import is `image`, following the
-existing `luce-ui` → `ui` package convention. No language syntax changes are needed.
+Its public imports are `image` (the `Image` API), `cryptomatte`, `canvas` (the
+layered-document engine) and `brush_mask`.
 
 ```luce
 from image import Image

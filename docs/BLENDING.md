@@ -87,7 +87,7 @@ Select and Mask's mattes, which read the composite under them and mix with it.
 
 ## Cost
 
-Measured with `src/luce_image/view_benchmark.lucb` on a 15000×24000 (360 MP)
+Measured with `benchmarks/view_benchmark.lucb` on a 15000×24000 (360 MP)
 JPEG with a Multiply layer over it, on an Apple M4 Max. The numbers are the
 median of three runs; see [BENCHMARK.md](BENCHMARK.md). Composites, pans,
 opacity drags and brush strokes are within run-to-run noise of linear blending
