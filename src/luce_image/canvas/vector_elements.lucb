@@ -79,20 +79,24 @@ func free_list(list: VectorElement[]):
     if list.length > 0:
         free(list) in memory.heap
 
-## A record's elements copied, for a copy of the record that owns its own; on
-## failure it holds none.
+## A record's elements and graph copied, for a copy of the record that owns its
+## own; on failure it holds none.
 func copy_elements(record: Record*) -> !:
     let source = record.elements
     var none_left: VectorElement[]
     record.elements = none_left
-    record.elements = try copied_list(source)
+    try copy_graph_part(record)
+    record.elements = copied_list(source) catch failure:
+        release_graph_part(record)
+        error(failure.code, failure.message)
 
-## Free a record's elements; it holds none.
+## Free a record's elements and graph; it holds none.
 func release_elements(record: Record*):
     free_list(record.elements)
     var none_left: VectorElement[]
     record.elements = none_left
     record.active = -1
+    release_graph_part(record)
 
 ## The element edits without a choice act on: the active one, else the topmost.
 func target_element(record: const Record*) -> usize?:
@@ -146,30 +150,13 @@ func list_without(list: VectorElement[], at: usize) -> VectorElement[]!:
 ## list reaches (every cell when `dirty` is none), and `active` its active element.
 ## Takes the list over; freed, with nothing changed, when it cannot be drawn.
 ## `joins` lets a repeat of the same step on the layer coalesce (a slider dragged).
+## The graph is kept, and drawn again where its output changes (a Path node
+## follows its element).
 func commit_elements(canvas: Canvas*, index: usize, list: VectorElement[], dirty: CellMask*?, changed: i64, name: str, active: i64, joins: bool = false) -> !:
-    if canvas.document == none:
-        free_list(list)
-        error(invalid, "draw the document once before drawing a shape")
-    let document = canvas.document else trap("checked")
-    let id = canvas.records[index].id
-    if let cells = dirty:
-        if changed >= 0 and changed < (i64)list.length:
-            cells.mark(list[(usize)changed]) catch failure:
-                free_list(list)
-                error(failure.code, failure.message)
-    var tiles = vector_tiles(canvas, id, list, dirty) catch failure:
+    let graph = copied_graph(&canvas.records[index].graph) catch failure:
         free_list(list)
         error(failure.code, failure.message)
-    canvas.remember_state(name, id if joins else 0) catch failure:
-        tiles.destroy()
-        free_list(list)
-        error(failure.code, failure.message)
-    release_type(&canvas.records[index])
-    free_list(canvas.records[index].elements)
-    canvas.records[index].elements = list
-    canvas.records[index].shaped = true
-    canvas.records[index].active = active if active < (i64)list.length else -1
-    try document.set_tiles(id, tiles)
+    try commit_layer(canvas, index, list, graph, dirty, changed, name, active, joins)
 
 ## `spec` drawn as element `at` of the layer at `index` instead of what it was,
 ## as step `name`; takes the spec over.
@@ -354,6 +341,7 @@ func transform_vector_element(canvas: Canvas*, id: u64, at: i64, warp: Warp, nam
 func shift_vector_elements(canvas: Canvas*, index: usize, dx: f64, dy: f64, active_only: bool) -> !:
     var dirty = try CellMask.create(canvas.extent_x, canvas.extent_y)
     defer dirty.close()
+    try fresh_output(&canvas.records[index])
     let count = canvas.records[index].elements.length
     let active = canvas.records[index].active
     let only = active_only and active >= 0 and active < (i64)count
@@ -364,6 +352,10 @@ func shift_vector_elements(canvas: Canvas*, index: usize, dx: f64, dy: f64, acti
         canvas.records[index].elements[at].spec.matrix[4] += dx
         canvas.records[index].elements[at].spec.matrix[5] += dy
         try dirty.mark(canvas.records[index].elements[at])
+    if only:
+        try follow_elements(canvas, index, &dirty)
+    else:
+        try shift_generated(canvas, index, dx, dy, &dirty)
     try redraw_vector_cells(canvas, index, &dirty)
 
 ## Every element of the layer at `index` through `forward`, drawn again whole;
@@ -373,8 +365,12 @@ func transform_all_elements(canvas: Canvas*, index: usize, forward: Warp) -> boo
     for at in 0..<count:
         if transformed_shape(canvas.records[index].elements[at].spec, forward) == none:
             return false
+    # The output as it is, before the elements a Path node takes move.
+    try fresh_output(&canvas.records[index])
     for at in 0..<count:
         if let moved = transformed_shape(canvas.records[index].elements[at].spec, forward):
             canvas.records[index].elements[at].spec = moved
+    if let m = affine_of(forward):
+        place_graph(&canvas.records[index], m)
     try redraw_vector(canvas, index)
     return true

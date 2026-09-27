@@ -121,6 +121,15 @@ struct Record:
     var shaped: bool = false
     var elements: VectorElement[]
     var active: i64 = -1
+    ## A vector layer's node graph, drawn over its elements; the values its
+    ## nodes last made, the shapes it last put out (stale when not
+    ## `generated_fresh`), and how many nodes that evaluation computed
+    ## (graph_layers.lucb).
+    var graph: Graph
+    var graph_cache: GraphCache
+    var generated: ShapeList
+    var generated_fresh: bool = false
+    var graph_evaluated: usize = 0
     ## A picture waiting to become tiles once a device is bound, and a mask
     ## likewise, each with the document pixel its top-left goes at (a picture
     ## may reach past the canvas).
@@ -1115,6 +1124,7 @@ pub struct Canvas:
         # A vector layer's copy is a vector layer of copies of its elements.
         if self.records[index].shaped:
             self.records[copy].elements = self.records[index].elements
+            self.records[copy].graph = self.records[index].graph
             try copy_elements(&self.records[copy])
             self.records[copy].shaped = true
             self.records[copy].active = self.records[index].active
@@ -2606,6 +2616,138 @@ pub struct Canvas:
             let mask_before = try translate(document, id, dx, dy, true)
             try self.remember(id, mask_before, true, joined = true, name = "Move")
 
+    # mark: Node graphs ==========================================================================
+    # A vector layer's graph (graph_model.lucb): getters take the layer's stack
+    # index, edits its id and the node's id; every edit is one step.
+
+    ## A new vector layer named `name` on top, its graph a Star cloned round a
+    ## circle into the Output, drawn; selected nowhere, its id returned. One step.
+    pub mutating func add_vector_layer(name: str) -> i64!:
+        return try add_vector_layer_record(&self, name)
+
+    pub func graph_node_count(index: i64) -> i64!:
+        return (i64)(try self.record(index)).graph.nodes.length
+
+    ## Value `field` of node `node` (its place, 0 the first): 0 its id, 1 its
+    ## kind, 2 and 3 where the editor shows it, 4.. its values from slot 0.
+    pub func graph_node_value(index: i64, node: i64, field: i64) -> f64!:
+        let record = try self.record(index)
+        if node < 0 or node >= (i64)record.graph.nodes.length or field < 0 or field >= 4 + (i64)node_slots:
+            error(invalid, "no such node value")
+        let entry = record.graph.nodes[(usize)node]
+        if field == 0:
+            return (f64)entry.id
+        if field == 1:
+            return (f64)entry.kind
+        if field == 2:
+            return entry.x
+        if field == 3:
+            return entry.y
+        return entry.values[(usize)(field - 4)]
+
+    pub func graph_link_count(index: i64) -> i64!:
+        return (i64)(try self.record(index)).graph.links.length
+
+    ## Value `field` of link `link`: 0 the id of the node it leaves, 1 the id
+    ## of the node it enters, 2 that node's input.
+    pub func graph_link_value(index: i64, link: i64, field: i64) -> i64!:
+        let record = try self.record(index)
+        if link < 0 or link >= (i64)record.graph.links.length:
+            error(invalid, "no such link")
+        let entry = record.graph.links[(usize)link]
+        return (i64)entry.source_id if field == 0 else ((i64)entry.to if field == 1 else (i64)entry.port)
+
+    ## A node of `kind` at (`x`, `y`) in layer `id`'s graph, with its defaults; its id.
+    pub mutating func add_graph_node(id: i64, kind: i64, x: f64, y: f64) -> i64!:
+        let index = try graph_index(&self, (u64)id)
+        var made: u32 = 0
+        try commit_graph(&self, index, try graph_with_node(&self.records[index].graph, kind, x, y, &made), "Add Node", false)
+        return (i64)made
+
+    ## Node `node` of layer `id`'s graph taken away with its wires.
+    pub mutating func delete_graph_node(id: i64, node: i64) -> !:
+        let index = try graph_index(&self, (u64)id)
+        let ids: u32[1] = [(u32)node]
+        try commit_graph(&self, index, try graph_without_nodes(&self.records[index].graph, ids[..<1]), "Delete Node", false)
+
+    ## Node `from`'s output wired into input `port` of node `to`, replacing what
+    ## fed it; refused across types or round a loop.
+    pub mutating func link_graph(id: i64, source_id: i64, to: i64, port: i64) -> !:
+        let index = try graph_index(&self, (u64)id)
+        try commit_graph(&self, index, try graph_with_link(&self.records[index].graph, (u32)source_id, (u32)to, (u32)port), "Connect", false)
+
+    ## The wire into input `port` of node `to` taken away.
+    pub mutating func unlink_graph(id: i64, to: i64, port: i64) -> !:
+        let index = try graph_index(&self, (u64)id)
+        try commit_graph(&self, index, try graph_without_link(&self.records[index].graph, (u32)to, (u32)port), "Disconnect", false)
+
+    ## Value `slot` of node `node` set (held to its parameter's range); a drag coalesces.
+    pub mutating func set_graph_value(id: i64, node: i64, slot: i64, value: f64) -> !:
+        let index = try graph_index(&self, (u64)id)
+        if slot < 0:
+            error(invalid, "a node has values 0..23")
+        try commit_graph(&self, index, try graph_with_value(&self.records[index].graph, (u32)node, (usize)slot, value), "Node Setting", true)
+
+    ## Node `node` shown at (`x`, `y`) in the editor; nothing is drawn. A drag coalesces.
+    pub mutating func move_graph_node(id: i64, node: i64, x: f64, y: f64) -> !:
+        let index = try graph_index(&self, (u64)id)
+        try commit_graph(&self, index, try graph_with_position(&self.records[index].graph, (u32)node, x, y), "Move Node", true)
+
+    ## How many shapes the layer at `index`'s graph puts out, evaluating it if it must.
+    pub mutating func generated_count(index: i64) -> i64!:
+        discard(try self.record(index))
+        try fresh_output(&self.records[(usize)index])
+        return (i64)self.records[(usize)index].generated.count
+
+    ## How many nodes the layer's last graph evaluation computed rather than reused.
+    pub func graph_computed(index: i64) -> i64!:
+        return (i64)(try self.record(index)).graph_evaluated
+
+    # The catalog of node kinds (graph_nodes.lucb), for the editor.
+
+    pub func node_kind_count() -> i64:
+        return node_kinds
+
+    pub func node_kind_title(kind: i64) -> str:
+        return node_info(kind).title
+
+    ## A kind's output's port type (0 Shapes, 1 Points, 2 Number, 3 Color), -1 for none.
+    pub func node_kind_output(kind: i64) -> i64:
+        return node_info(kind).output
+
+    pub func node_input_count(kind: i64) -> i64:
+        return (i64)node_info(kind).input_count
+
+    pub func node_input_name(kind: i64, port: i64) -> str:
+        let info = node_info(kind)
+        return info.inputs[(usize)port].name if port >= 0 and port < (i64)info.input_count else ""
+
+    ## An input's port type; a Number wire may also go where a Color does.
+    pub func node_input_type(kind: i64, port: i64) -> i64:
+        let info = node_info(kind)
+        return info.inputs[(usize)port].port_type if port >= 0 and port < (i64)info.input_count else -1
+
+    ## The value slot an input drives, -1 for a data input.
+    pub func node_input_slot(kind: i64, port: i64) -> i64:
+        let info = node_info(kind)
+        return info.inputs[(usize)port].slot if port >= 0 and port < (i64)info.input_count else -1
+
+    pub func node_param_count(kind: i64) -> i64:
+        return (i64)node_info(kind).param_count
+
+    pub func node_param_name(kind: i64, param: i64) -> str:
+        let info = node_info(kind)
+        return info.params[(usize)param].name if param >= 0 and param < (i64)info.param_count else ""
+
+    ## Value `field` of a parameter: 0 how it is edited (0 a number, 1 a whole
+    ## number, 2 a toggle, 3 a color), 1 its slot, 2 and 3 its range.
+    pub func node_param_value(kind: i64, param: i64, field: i64) -> f64:
+        let info = node_info(kind)
+        if param < 0 or param >= (i64)info.param_count:
+            return 0.0
+        let entry = info.params[(usize)param]
+        return (f64)entry.kind if field == 0 else ((f64)entry.slot if field == 1 else (entry.low if field == 2 else entry.high))
+
     # mark: Adjustments, filters and previews =====================================================
 
     ## Stage parameter `index` (0..22) of the next adjustment, as adjust.frag
@@ -3320,6 +3462,7 @@ pub struct Canvas:
                     for at in [0, 2, 4]:
                         self.records[index].elements[element].spec.matrix[(usize)at] *= scale_x
                         self.records[index].elements[element].spec.matrix[(usize)at + 1] *= scale_y
+                place_graph(&self.records[index], [scale_x, 0.0, 0.0, scale_y, 0.0, 0.0])
                 try redraw_vector(&self, index)
 
     # mark: Guides ================================================================================

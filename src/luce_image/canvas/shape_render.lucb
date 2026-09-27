@@ -59,7 +59,7 @@ struct WindowPainter:
     var shared: SharedTile[16]
     var shared_count: usize
 
-    static func make(device: gpu.Device, drawing: const svg.Drawing*, width: u32, height: u32) -> WindowPainter!:
+    static func make(device: gpu.Device, drawing: const svg.Drawing*?, width: u32, height: u32) -> WindowPainter!:
         let workers = (usize)math.imin(16, math.imax(1, (i64)os.cpus()))
         let per_tile = (usize)tile_size * (usize)tile_size * 8
         let span = (usize)window_cells * (usize)tile_size

@@ -1,0 +1,274 @@
+#==============================================================================================
+#
+#   canvas/graph_model - A vector layer's node graph: nodes, wires and their edits
+#
+#   DESCRIPTION:
+#       Beside its hand-made elements a vector layer may hold a node graph whose Output
+#       node's shapes are drawn on top of them (graph_eval.lucb). A node is a kind
+#       (graph_nodes.lucb), an id that stays with it, where the editor shows it, and its
+#       parameter values; a link runs from a node's output to one input of another. The
+#       graph also keeps `placement`, an affine map applied to what it puts out, so moving
+#       or transforming the layer moves its generated art without touching a parameter.
+#
+#       A Graph is plain data in two heap arrays: copying it for the history is two copies,
+#       nothing to follow. Every edit here makes a new graph beside the old one and leaves
+#       the old untouched, so the caller can draw from the new, record the step, and only
+#       then swap it in (graph_layers.lucb).
+#
+#==============================================================================================
+
+struct GraphNode:
+    var id: u32
+    var kind: i64
+    ## Its top-left in the editor's graph space.
+    var x: f64
+    var y: f64
+    var values: f64[24]
+
+## A wire from node `from`'s output into input `port` of node `to`, by id.
+struct GraphLink:
+    var source_id: u32
+    var to: u32
+    var port: u32
+
+struct Graph:
+    var nodes: GraphNode[]
+    var links: GraphLink[]
+    var next_id: u32
+    ## What the layer's moves and transforms did to the output, when `placed`:
+    ## (a·x + c·y + e, b·x + d·y + f); the identity when not.
+    var placement: f64[6]
+    var placed: bool
+
+    ## Whether the graph has any node at all.
+    func present() -> bool:
+        return self.nodes.length > 0
+
+    ## The place of node `id` in `nodes`; none when it has none.
+    func slot_of(id: u32) -> usize?:
+        for at in 0..<self.nodes.length:
+            if self.nodes[at].id == id:
+                return at
+        return none
+
+    ## The link into input `port` of node `to`; none when it is not wired.
+    func link_into(to: u32, port: u32) -> usize?:
+        for at in 0..<self.links.length:
+            if self.links[at].to == to and self.links[at].port == port:
+                return at
+        return none
+
+    ## The placement as a matrix, the identity when there is none.
+    func placement_matrix() -> f64[6]:
+        if not self.placed:
+            return [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+        return self.placement
+
+## A copy of `graph` that owns its own arrays.
+func copied_graph(graph: const Graph*) -> Graph!:
+    var copy = *graph
+    var no_nodes: GraphNode[]
+    var no_links: GraphLink[]
+    copy.nodes = no_nodes
+    copy.links = no_links
+    if graph.nodes.length > 0:
+        copy.nodes = try alloc GraphNode[graph.nodes.length] in memory.heap
+        memory.copy(copy.nodes, graph.nodes, graph.nodes.length)
+    if graph.links.length > 0:
+        copy.links = alloc GraphLink[graph.links.length] in memory.heap catch failure:
+            free_graph(&copy)
+            error(failure.code, failure.message)
+        memory.copy(copy.links, graph.links, graph.links.length)
+    return copy
+
+## Free a graph's arrays; it is empty after.
+func free_graph(graph: Graph*):
+    if graph.nodes.length > 0:
+        free(graph.nodes) in memory.heap
+    if graph.links.length > 0:
+        free(graph.links) in memory.heap
+    var no_nodes: GraphNode[]
+    var no_links: GraphLink[]
+    graph.nodes = no_nodes
+    graph.links = no_links
+
+## `graph` with a node of `kind` added at (`x`, `y`) with its defaults, as a
+## new graph; its id goes in `made`.
+func graph_with_node(graph: const Graph*, kind: i64, x: f64, y: f64, made: u32*) -> Graph!:
+    if kind < 0 or kind >= node_kinds:
+        error(invalid, "no such node kind")
+    let nodes = try alloc GraphNode[graph.nodes.length + 1] in memory.heap
+    errdefer free(nodes) in memory.heap
+    if graph.nodes.length > 0:
+        memory.copy(nodes, graph.nodes, graph.nodes.length)
+    let id = graph.next_id + 1
+    nodes[graph.nodes.length] = GraphNode(id = id, kind = kind, x = x, y = y, values = node_info(kind).defaults)
+    var grown = *graph
+    grown.nodes = nodes
+    var no_links: GraphLink[]
+    grown.links = no_links
+    if graph.links.length > 0:
+        grown.links = try alloc GraphLink[graph.links.length] in memory.heap
+        memory.copy(grown.links, graph.links, graph.links.length)
+    grown.next_id = id
+    *made = id
+    return grown
+
+## `graph` without the nodes `ids` names and every wire to or from them.
+func graph_without_nodes(graph: const Graph*, ids: const u32[]) -> Graph!:
+    var kept_nodes: usize = 0
+    for node in graph.nodes:
+        if not holds(ids, node.id):
+            kept_nodes += 1
+    var kept_links: usize = 0
+    for link in graph.links:
+        if not holds(ids, link.source_id) and not holds(ids, link.to):
+            kept_links += 1
+    var result = *graph
+    var no_nodes: GraphNode[]
+    var no_links: GraphLink[]
+    result.nodes = no_nodes
+    result.links = no_links
+    if kept_nodes > 0:
+        result.nodes = try alloc GraphNode[kept_nodes] in memory.heap
+    errdefer free_graph(&result)
+    if kept_links > 0:
+        result.links = try alloc GraphLink[kept_links] in memory.heap
+    var at: usize = 0
+    for node in graph.nodes:
+        if not holds(ids, node.id):
+            result.nodes[at] = node
+            at += 1
+    at = 0
+    for link in graph.links:
+        if not holds(ids, link.source_id) and not holds(ids, link.to):
+            result.links[at] = link
+            at += 1
+    return result
+
+func holds(ids: const u32[], id: u32) -> bool:
+    for each in ids:
+        if each == id:
+            return true
+    return false
+
+## `graph` with node `from`'s output wired into input `port` of node `to`,
+## replacing whatever fed that input. Refused when the types do not fit or the
+## wire would close a loop.
+func graph_with_link(graph: const Graph*, source_id: u32, to: u32, port: u32) -> Graph!:
+    let source = graph.slot_of(source_id) else error(invalid, "no such node")
+    let target = graph.slot_of(to) else error(invalid, "no such node")
+    let out = node_info(graph.nodes[source].kind).output
+    let info = node_info(graph.nodes[target].kind)
+    if out < 0:
+        error(invalid, "the node has no output")
+    if (usize)port >= info.input_count:
+        error(invalid, "the node has no such input")
+    if not ports_fit(out, info.inputs[(usize)port].port_type):
+        error(invalid, "a wire joins ports of the same type")
+    if source_id == to or reaches(graph, to, source_id):
+        error(invalid, "a wire may not close a loop")
+    var result = try copied_graph(graph)
+    errdefer free_graph(&result)
+    if let at = result.link_into(to, port):
+        result.links[at].source_id = source_id
+        return result
+    let links = try alloc GraphLink[result.links.length + 1] in memory.heap
+    if result.links.length > 0:
+        memory.copy(links, result.links, result.links.length)
+        free(result.links) in memory.heap
+    links[result.links.length] = GraphLink(source_id = source_id, to = to, port = port)
+    result.links = links
+    return result
+
+## Whether node `goal` is downstream of node `start` (or is it).
+func reaches(graph: const Graph*, start: u32, goal: u32) -> bool:
+    if start == goal:
+        return true
+    for link in graph.links:
+        if link.source_id == start and reaches(graph, link.to, goal):
+            return true
+    return false
+
+## `graph` without the wire into input `port` of node `to`.
+func graph_without_link(graph: const Graph*, to: u32, port: u32) -> Graph!:
+    let at = graph.link_into(to, port) else error(invalid, "the input is not wired")
+    var result = try copied_graph(graph)
+    errdefer free_graph(&result)
+    var kept: GraphLink[]
+    if graph.links.length > 1:
+        kept = try alloc GraphLink[graph.links.length - 1] in memory.heap
+        var to_at: usize = 0
+        for index in 0..<graph.links.length:
+            if index != at:
+                kept[to_at] = graph.links[index]
+                to_at += 1
+    free(result.links) in memory.heap
+    result.links = kept
+    return result
+
+## `graph` with value `slot` of node `id` set (a color's channels are three slots).
+func graph_with_value(graph: const Graph*, id: u32, slot: usize, value: f64) -> Graph!:
+    let at = graph.slot_of(id) else error(invalid, "no such node")
+    if slot >= node_slots:
+        error(invalid, "a node has values 0..23")
+    if not math.is_finite(value):
+        error(invalid, "a node's values must be finite")
+    var result = try copied_graph(graph)
+    result.nodes[at].values[slot] = clamp_value(result.nodes[at].kind, slot, value)
+    return result
+
+## `value` held to the range of the parameter at `slot`, and whole when it counts.
+func clamp_value(kind: i64, slot: usize, value: f64) -> f64:
+    let info = node_info(kind)
+    for index in 0..<info.param_count:
+        let param = info.params[index]
+        let span = 3 if param.kind == param_color else 1
+        if slot < param.slot or slot >= param.slot + (usize)span:
+            continue
+        let held = math.clamp(value, param.low, param.high)
+        if param.kind == param_whole:
+            return math.round(held)
+        if param.kind == param_toggle:
+            return 1.0 if held >= 0.5 else 0.0
+        return held
+    return value
+
+## `graph` with node `id` shown at (`x`, `y`) in the editor.
+func graph_with_position(graph: const Graph*, id: u32, x: f64, y: f64) -> Graph!:
+    let at = graph.slot_of(id) else error(invalid, "no such node")
+    var result = try copied_graph(graph)
+    result.nodes[at].x = x
+    result.nodes[at].y = y
+    return result
+
+## The graph a new vector layer starts with, so something shows at once: a Star
+## cloned onto a Circle of points about the canvas's middle, into the Output.
+func default_graph(width: u32, height: u32) -> Graph!:
+    var empty: Graph
+    var made: u32 = 0
+    var graph = try graph_with_node(&empty, node_star, 40.0, 40.0, &made)
+    errdefer free_graph(&graph)
+    let star = made
+    let side = math.min((f64)width, (f64)height)
+    graph.nodes[0].values[slot_width] = math.max(8.0, side * 0.12)
+    graph.nodes[0].values[slot_height] = math.max(8.0, side * 0.12)
+    try replace_graph(&graph, try graph_with_node(&graph, node_circle, 40.0, 200.0, &made))
+    let circle = made
+    graph.nodes[1].values[0] = 12.0
+    graph.nodes[1].values[1] = side * 0.32
+    graph.nodes[1].values[3] = (f64)width * 0.5
+    graph.nodes[1].values[4] = (f64)height * 0.5
+    try replace_graph(&graph, try graph_with_node(&graph, node_clone, 290.0, 110.0, &made))
+    let clone = made
+    try replace_graph(&graph, try graph_with_node(&graph, node_output, 540.0, 130.0, &made))
+    let output = made
+    try replace_graph(&graph, try graph_with_link(&graph, star, clone, 0))
+    try replace_graph(&graph, try graph_with_link(&graph, circle, clone, 1))
+    try replace_graph(&graph, try graph_with_link(&graph, clone, output, 0))
+    return graph
+
+## `graph` freed and `next` in its place.
+func replace_graph(graph: Graph*, next: Graph) -> !:
+    free_graph(graph)
+    *graph = next

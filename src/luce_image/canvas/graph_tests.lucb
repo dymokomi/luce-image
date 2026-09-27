@@ -1,0 +1,423 @@
+#==============================================================================================
+#
+#   canvas/graph_tests - Node graphs: every node, clones, seeds, the cache, files, steps, cells
+#
+#==============================================================================================
+
+## A graph grown one edit at a time, as the editor grows it.
+struct TestGraph:
+    var graph: Graph
+
+    mutating func node(kind: i64) -> u32!:
+        var made: u32 = 0
+        try replace_graph(&self.graph, try graph_with_node(&self.graph, kind, 0.0, 0.0, &made))
+        return made
+
+    mutating func link(source: u32, target: u32, port: u32) -> !:
+        try replace_graph(&self.graph, try graph_with_link(&self.graph, source, target, port))
+
+    mutating func set(id: u32, slot: usize, value: f64) -> !:
+        try replace_graph(&self.graph, try graph_with_value(&self.graph, id, slot, value))
+
+    mutating func close():
+        free_graph(&self.graph)
+
+## `graph` evaluated afresh (no cache kept) into `out`.
+func evaluated(graph: const Graph*, elements: const VectorElement[], out: ShapeList*) -> !:
+    var cache: GraphCache
+    defer cache.release()
+    out.release()
+    discard(try evaluate_graph(graph, elements, &cache, out))
+
+## Where a shape's own origin lands: its matrix's translation.
+func origin_of(spec: ShapeSpec) -> f64[2]:
+    return [spec.matrix[4], spec.matrix[5]]
+
+func close_to(a: f64, b: f64) -> bool:
+    return math.abs(a - b) < 1e-6
+
+test "each shape generator makes one shape of its kind, placed and painted by its values":
+    var built = TestGraph()
+    defer built.close()
+    let output = try built.node(node_output)
+    var none_here: VectorElement[]
+    var shapes: ShapeList
+    defer shapes.release()
+    for kind in [node_rectangle, node_ellipse, node_polygon, node_star]:
+        let shape = try built.node(kind)
+        try built.set(shape, slot_x, 100.0)
+        try built.set(shape, slot_y, 50.0)
+        try built.set(shape, slot_width, 40.0)
+        try built.set(shape, slot_fill, 0.25)
+        try built.link(shape, output, 0)
+        try evaluated(&built.graph, none_here, &shapes)
+        assert(shapes.count == 1)
+        let spec = shapes.specs[0]
+        assert(close_to(origin_of(spec)[0], 100.0) and close_to(origin_of(spec)[1], 50.0) and close_to(spec.fill_red, 0.25) and spec.filled and not spec.stroked)
+        if kind == node_rectangle:
+            assert(spec.kind == 0 and close_to(spec.width, 40.0) and close_to(spec.x, -20.0))
+        elif kind == node_ellipse:
+            assert(spec.kind == 1)
+        elif kind == node_polygon:
+            assert(spec.kind == 3 and spec.sides == 6)
+        else:
+            # Five tips and five inner corners, closed.
+            assert(spec.kind == 4 and spec.closed and spec.path.length == 10 * anchor_values)
+    # A value past its range is held to it, and a count is whole.
+    let polygon = try built.node(node_polygon)
+    try built.set(polygon, slot_special, 200.7)
+    let at = built.graph.slot_of(polygon) else trap("added")
+    assert(built.graph.nodes[at].values[slot_special] == 64.0)
+
+test "point generators and Clone put a copy of every shape on every point":
+    var built = TestGraph()
+    defer built.close()
+    var none_here: VectorElement[]
+    var shapes: ShapeList
+    defer shapes.release()
+    let output = try built.node(node_output)
+    let star = try built.node(node_star)
+    let square = try built.node(node_rectangle)
+    let both = try built.node(node_merge)
+    try built.link(star, both, 0)
+    try built.link(square, both, 1)
+    let clone = try built.node(node_clone)
+    try built.link(both, clone, 0)
+    try built.link(clone, output, 0)
+    # A grid of 3 by 2: six points, two shapes on each.
+    let grid = try built.node(node_grid)
+    try built.set(grid, 0, 3.0)
+    try built.set(grid, 1, 2.0)
+    try built.set(grid, 2, 100.0)
+    try built.set(grid, 3, 50.0)
+    try built.link(grid, clone, 1)
+    try evaluated(&built.graph, none_here, &shapes)
+    assert(shapes.count == 12)
+    assert(close_to(origin_of(shapes.specs[0])[0], -100.0) and close_to(origin_of(shapes.specs[0])[1], -25.0) and shapes.specs[0].kind == 4 and shapes.specs[1].kind == 0)
+    assert(close_to(origin_of(shapes.specs[11])[0], 100.0) and close_to(origin_of(shapes.specs[11])[1], 25.0))
+    # A circle of 12, each copy turned to its point's angle: the one at the right
+    # stands a quarter turn round.
+    let circle = try built.node(node_circle)
+    try built.set(circle, 0, 12.0)
+    try built.set(circle, 1, 300.0)
+    try built.set(circle, 3, 500.0)
+    try built.set(circle, 4, 400.0)
+    try built.link(circle, clone, 1)
+    try evaluated(&built.graph, none_here, &shapes)
+    assert(shapes.count == 24)
+    assert(close_to(origin_of(shapes.specs[0])[0], 500.0) and close_to(origin_of(shapes.specs[0])[1], 100.0))
+    let right = shapes.specs[6]
+    assert(close_to(origin_of(right)[0], 800.0) and close_to(origin_of(right)[1], 400.0) and close_to(right.matrix[0], 0.0) and close_to(right.matrix[1], 1.0))
+    # Not turned, every copy stands upright.
+    try built.set(clone, 0, 0.0)
+    try evaluated(&built.graph, none_here, &shapes)
+    assert(close_to(shapes.specs[6].matrix[0], 1.0) and close_to(shapes.specs[6].matrix[1], 0.0))
+    # A line of 5 from (0, 0) to (400, 0): evenly, ends included.
+    let line = try built.node(node_line)
+    try built.set(line, 0, 5.0)
+    try built.link(line, clone, 1)
+    try evaluated(&built.graph, none_here, &shapes)
+    assert(shapes.count == 10 and close_to(origin_of(shapes.specs[2])[0], 100.0) and close_to(origin_of(shapes.specs[8])[0], 400.0))
+    # A Transform after the Clone moves them all, and turns them about their middle.
+    let move = try built.node(node_transform)
+    try built.set(move, 0, 30.0)
+    try built.set(move, 1, -20.0)
+    try built.link(clone, move, 0)
+    try built.link(move, output, 0)
+    try evaluated(&built.graph, none_here, &shapes)
+    assert(shapes.count == 10 and close_to(origin_of(shapes.specs[2])[0], 130.0) and close_to(origin_of(shapes.specs[2])[1], -20.0))
+
+test "scatter, points of a shape and the Number, Random and Gradient fields":
+    var built = TestGraph()
+    defer built.close()
+    var none_here: VectorElement[]
+    var shapes: ShapeList
+    defer shapes.release()
+    let output = try built.node(node_output)
+    let dot = try built.node(node_ellipse)
+    try built.set(dot, slot_width, 4.0)
+    try built.set(dot, slot_height, 4.0)
+    let clone = try built.node(node_clone)
+    try built.link(dot, clone, 0)
+    try built.link(clone, output, 0)
+    # Scattered in its box: all inside it.
+    let scatter = try built.node(node_scatter)
+    try built.set(scatter, 0, 200.0)
+    try built.set(scatter, 2, 1000.0)
+    try built.set(scatter, 3, 2000.0)
+    try built.set(scatter, 4, 300.0)
+    try built.set(scatter, 5, 100.0)
+    try built.link(scatter, clone, 1)
+    try evaluated(&built.graph, none_here, &shapes)
+    assert(shapes.count == 200)
+    for spec in shapes.view():
+        let at = origin_of(spec)
+        assert(at[0] >= 1000.0 and at[0] <= 1300.0 and at[1] >= 2000.0 and at[1] <= 2100.0)
+    # Inside a circle of radius 100 at the origin: every point within it.
+    let disc = try built.node(node_ellipse)
+    try built.set(disc, slot_width, 200.0)
+    try built.set(disc, slot_height, 200.0)
+    try built.link(disc, scatter, 0)
+    try evaluated(&built.graph, none_here, &shapes)
+    assert(shapes.count == 200)
+    for spec in shapes.view():
+        assert(math.hypot(origin_of(spec)[0], origin_of(spec)[1]) <= 100.5)
+    # A hexagon's corners, then 10 points along its outline.
+    let hexagon = try built.node(node_polygon)
+    let corners = try built.node(node_outline)
+    try built.link(hexagon, corners, 0)
+    try built.link(corners, clone, 1)
+    try evaluated(&built.graph, none_here, &shapes)
+    assert(shapes.count == 6 and close_to(origin_of(shapes.specs[0])[0], 0.0) and close_to(origin_of(shapes.specs[0])[1], -80.0))
+    try built.set(corners, 0, 1.0)
+    try built.set(corners, 1, 10.0)
+    try evaluated(&built.graph, none_here, &shapes)
+    assert(shapes.count == 10)
+    # A Number wired to the count drives it.
+    let number = try built.node(node_number)
+    try built.set(number, 0, 7.0)
+    try built.link(number, corners, 1)
+    try evaluated(&built.graph, none_here, &shapes)
+    assert(shapes.count == 7)
+    # A Random scale varies copy to copy, within its range; a Gradient colors
+    # the first copy its start and the last its end.
+    let random = try built.node(node_random)
+    try built.link(random, clone, 2)
+    let gradient = try built.node(node_gradient)
+    try built.link(gradient, clone, 4)
+    try evaluated(&built.graph, none_here, &shapes)
+    var smallest = 1e9
+    var largest = 0.0
+    for spec in shapes.view():
+        let scale = math.hypot(spec.matrix[0], spec.matrix[1])
+        smallest = math.min(smallest, scale)
+        largest = math.max(largest, scale)
+    assert(smallest >= 0.5 - 1e-9 and largest <= 1.5 + 1e-9 and largest - smallest > 0.05)
+    assert(close_to(shapes.specs[0].fill_red, 0.8069) and close_to(shapes.specs[6].fill_blue, 0.8))
+    # A wire of the wrong type, or round a loop, is refused.
+    let refused = graph_with_link(&built.graph, number, clone, 0) catch _:
+        recover Graph()
+    assert(not refused.present())
+    let looped = graph_with_link(&built.graph, clone, dot, 0) catch _:
+        recover Graph()
+    assert(not looped.present())
+
+test "a graph is the same every time, a seed changes it, and an edit computes only what is downstream":
+    var built = TestGraph()
+    defer built.close()
+    var none_here: VectorElement[]
+    let output = try built.node(node_output)
+    let star = try built.node(node_star)
+    let clone = try built.node(node_clone)
+    let scatter = try built.node(node_scatter)
+    let circle = try built.node(node_circle)
+    let both = try built.node(node_merge)
+    try built.set(clone, 2, 45.0)
+    try built.set(clone, 3, 0.5)
+    try built.set(clone, 4, 0.3)
+    try built.link(star, clone, 0)
+    try built.link(scatter, clone, 1)
+    try built.link(clone, both, 0)
+    let ring = try built.node(node_clone)
+    try built.link(star, ring, 0)
+    try built.link(circle, ring, 1)
+    try built.link(ring, both, 1)
+    try built.link(both, output, 0)
+    var first: ShapeList
+    defer first.release()
+    var second: ShapeList
+    defer second.release()
+    try evaluated(&built.graph, none_here, &first)
+    try evaluated(&built.graph, none_here, &second)
+    assert(first.count == 112 and second.count == 112)
+    for at in 0..<first.count:
+        assert(same_spec(&first.specs[at], &second.specs[at]))
+    try built.set(clone, 5, 2.0)
+    try evaluated(&built.graph, none_here, &second)
+    var differ: usize = 0
+    for at in 0..<first.count:
+        if not same_spec(&first.specs[at], &second.specs[at]):
+            differ += 1
+    # The jittered copies move; the ring's twelve do not.
+    assert(differ == 100)
+    # With a kept cache: all six at first, none again, then the circle, its
+    # Clone and the Merge after an edit to the circle.
+    var cache: GraphCache
+    defer cache.release()
+    var out: ShapeList
+    defer out.release()
+    assert((try evaluate_graph(&built.graph, none_here, &cache, &out)) == 6)
+    out.release()
+    assert((try evaluate_graph(&built.graph, none_here, &cache, &out)) == 0)
+    out.release()
+    try built.set(circle, 1, 90.0)
+    assert((try evaluate_graph(&built.graph, none_here, &cache, &out)) == 3)
+    assert(out.count == 112)
+
+## Layer `id`'s pixels read back into `pixels`.
+func graph_pixels(canvas: Canvas*, id: i64, pixels: f32[]) -> !:
+    let document = canvas.document else trap("bound")
+    try ((document.find((u64)id) else trap("layer")).tiles() else trap("tiles")).read(pixels)
+
+func graph_alpha(pixels: const f32[], width: usize, x: usize, y: usize) -> f32:
+    return pixels[(y * width + x) * 4 + 3]
+
+## The node of `kind` in the layer at `index`'s graph, by id.
+func node_of(canvas: Canvas*, index: i64, kind: i64) -> i64!:
+    for node in 0..<(try canvas.graph_node_count(index)):
+        if (try canvas.graph_node_value(index, node, 1)) == (f64)kind:
+            return (i64)(try canvas.graph_node_value(index, node, 0))
+    trap("no such node")
+
+test "a new vector layer draws its default graph; edits are steps, undone and saved":
+    var canvas = try Canvas(800, 600)
+    defer canvas.close()
+    discard(try canvas.add_layer("Background"))
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    let layer = try canvas.add_vector_layer("Vector 1")
+    assert((try canvas.layer_shaped(1)) and canvas.undo_name() == "New Vector Layer")
+    assert((try canvas.graph_node_count(1)) == 4 and (try canvas.graph_link_count(1)) == 3 and (try canvas.generated_count(1)) == 12)
+    let pixels = try alloc f32[800 * 600 * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    try graph_pixels(&canvas, layer, pixels)
+    # The top star of the ring sits above the middle; the middle itself is clear.
+    let radius = 600.0 * 0.32
+    assert(graph_alpha(pixels, 800, 400, (usize)(300.0 - radius)) > 0.99 and graph_alpha(pixels, 800, 400, 300) < 0.01)
+    # More stars round the ring: a step of its own, undone.
+    let circle = try node_of(&canvas, 1, node_circle)
+    try canvas.set_graph_value(layer, circle, 0, 20.0)
+    assert(canvas.undo_name() == "Node Setting" and (try canvas.generated_count(1)) == 20)
+    try canvas.set_graph_value(layer, circle, 0, 24.0)
+    assert((try canvas.generated_count(1)) == 24)
+    try canvas.undo()
+    assert((try canvas.generated_count(1)) == 12 and (try canvas.graph_node_value(1, 1, 4)) == 12.0)
+    try canvas.redo()
+    assert((try canvas.generated_count(1)) == 24)
+    # A square wired in instead of the star; the old wire's gone, both nodes kept.
+    let square = try canvas.add_graph_node(layer, node_rectangle, 0.0, 0.0)
+    let clone = try node_of(&canvas, 1, node_clone)
+    try canvas.link_graph(layer, square, clone, 0)
+    assert((try canvas.graph_link_count(1)) == 3 and canvas.undo_name() == "Connect")
+    try canvas.unlink_graph(layer, clone, 0)
+    assert((try canvas.generated_count(1)) == 0 and (try canvas.graph_link_count(1)) == 2)
+    try graph_pixels(&canvas, layer, pixels)
+    assert(graph_alpha(pixels, 800, 400, (usize)(300.0 - radius)) < 0.01)
+    try canvas.undo()
+    assert((try canvas.generated_count(1)) == 24)
+    try canvas.delete_graph_node(layer, square)
+    assert((try canvas.graph_node_count(1)) == 4 and (try canvas.graph_link_count(1)) == 2 and (try canvas.generated_count(1)) == 0)
+    try canvas.undo()
+    # A node moved in the editor draws nothing new, but is a step.
+    try canvas.move_graph_node(layer, square, 300.0, 500.0)
+    assert(canvas.undo_name() == "Move Node" and (try canvas.graph_node_value(1, 4, 2)) == 300.0)
+    # Saved and opened: the same graph, which puts out the same shapes.
+    let path = "build/canvas-graph.l2d"
+    try canvas.save_package(path)
+    let reopened = try Canvas.open(path)
+    defer reopened.release()
+    let opened = reopened.value()
+    assert((try opened.graph_node_count(1)) == 5 and (try opened.graph_link_count(1)) == 3)
+    for node in 0..<(i64)5:
+        for field in 0..<(i64)28:
+            assert((try opened.graph_node_value(1, node, field)) == (try canvas.graph_node_value(1, node, field)))
+    for link in 0..<(i64)3:
+        for field in 0..<(i64)3:
+            assert((try opened.graph_link_value(1, link, field)) == (try canvas.graph_link_value(1, link, field)))
+    assert((try opened.generated_count(1)) == 24)
+    # Undone back to before the layer, it is gone.
+    while canvas.can_undo():
+        try canvas.undo()
+    assert(canvas.layer_count() == 1)
+
+test "a Path node takes a hand-made element and follows it when it changes":
+    var canvas = try Canvas(400, 300)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Vector")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try canvas.set_shape(layer, 0, 10.0, 10.0, 20.0, 20.0, 5, 0.0, true, 1.0, 0.0, 0.0, false, 0.0, 0.0, 0.0, 1.0)
+    let output = try canvas.add_graph_node(layer, node_output, 0.0, 0.0)
+    let path = try canvas.add_graph_node(layer, node_path, 0.0, 0.0)
+    try canvas.set_graph_value(layer, path, (i64)slot_x, 200.0)
+    try canvas.link_graph(layer, path, output, 0)
+    assert((try canvas.generated_count(0)) == 1)
+    let pixels = try alloc f32[400 * 300 * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    try graph_pixels(&canvas, layer, pixels)
+    assert(graph_alpha(pixels, 400, 20, 20) > 0.99 and graph_alpha(pixels, 400, 220, 20) > 0.99)
+    # The element moved alone: its copy follows it.
+    try canvas.set_active_element(layer, 0)
+    try canvas.move_layer(layer, 0, 100)
+    try graph_pixels(&canvas, layer, pixels)
+    assert(graph_alpha(pixels, 400, 220, 20) < 0.01 and graph_alpha(pixels, 400, 220, 120) > 0.99)
+
+test "a graph edit draws again only the cells its changed shapes cover, at 15000 by 24000":
+    # Thousands of shapes' drawing is more than the test's fixed buffer holds.
+    with memory.heap:
+        try many_stars()
+
+func many_stars() -> !:
+    var canvas = try Canvas(15000, 24000)
+    defer canvas.close()
+    discard(try canvas.add_layer("Background"))
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    let started = time.now()
+    let layer = try canvas.add_vector_layer("Stars")
+    # Thousands of stars: a 60 by 80 grid over the canvas, and the default ring.
+    let star = try node_of(&canvas, 1, node_star)
+    try canvas.set_graph_value(layer, star, (i64)slot_width, 90.0)
+    try canvas.set_graph_value(layer, star, (i64)slot_height, 90.0)
+    let grid = try canvas.add_graph_node(layer, node_grid, 0.0, 0.0)
+    try canvas.set_graph_value(layer, grid, 0, 60.0)
+    try canvas.set_graph_value(layer, grid, 1, 80.0)
+    try canvas.set_graph_value(layer, grid, 2, 240.0)
+    try canvas.set_graph_value(layer, grid, 3, 290.0)
+    try canvas.set_graph_value(layer, grid, 4, 7500.0)
+    try canvas.set_graph_value(layer, grid, 5, 12000.0)
+    let field = try canvas.add_graph_node(layer, node_clone, 0.0, 0.0)
+    try canvas.link_graph(layer, star, field, 0)
+    try canvas.link_graph(layer, grid, field, 1)
+    let both = try canvas.add_graph_node(layer, node_merge, 0.0, 0.0)
+    let ring = try node_of(&canvas, 1, node_clone)
+    let output = try node_of(&canvas, 1, node_output)
+    try canvas.link_graph(layer, field, both, 0)
+    try canvas.link_graph(layer, ring, both, 1)
+    let built = time.now()
+    try canvas.link_graph(layer, both, output, 0)
+    let drawn_at = time.now()
+    assert((try canvas.generated_count(1)) == 4812)
+    let document = canvas.document else trap("bound")
+    let tiles = (document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")
+    let columns = tiles.columns()
+    let rows = tiles.rows()
+    let before = try alloc u64[(usize)columns * (usize)rows] in memory.heap
+    defer free(before) in memory.heap
+    for row in 0..<rows:
+        for column in 0..<columns:
+            before[(usize)row * (usize)columns + (usize)column] = tiles.stamp(column, row)
+    # The ring's radius changed: its twelve stars move, the grid's 4800 stay.
+    var expected = try CellMask.create(15000, 24000)
+    defer expected.close()
+    for at in 4800..<(usize)4812:
+        try expected.mark_spec(canvas.records[1].generated.specs[at])
+    let circle = try node_of(&canvas, 1, node_circle)
+    let edit = time.now()
+    try canvas.set_graph_value(layer, circle, 1, 5000.0)
+    let edited = time.now()
+    assert(canvas.records[1].graph_evaluated == 3)
+    for at in 4800..<(usize)4812:
+        try expected.mark_spec(canvas.records[1].generated.specs[at])
+    let after = (document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")
+    var changed: usize = 0
+    for row in 0..<rows:
+        for column in 0..<columns:
+            if after.stamp(column, row) != before[(usize)row * (usize)columns + (usize)column]:
+                changed += 1
+                assert(expected.marked(column, row))
+    assert(changed > 0 and changed <= expected.count())
+    print(f"graph timing: layer {(built - started) // 1000000} ms, 4812 stars drawn {(drawn_at - built) // 1000000} ms, ring edit {(edited - edit) // 1000000} ms over {changed} cells")

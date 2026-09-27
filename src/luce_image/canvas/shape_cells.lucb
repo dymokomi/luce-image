@@ -44,6 +44,10 @@ struct CellPlan:
     ## Sort the cells of `reach` for `drawing` (`spec` parsed over the whole
     ## `width` by `height` canvas).
     static func make(drawing: const svg.Drawing*, spec: ShapeSpec, reach: ShapeReach, width: u32, height: u32) -> CellPlan!:
+        return try CellPlan.make_from(drawing, 0, drawing.contour_count(), spec, reach, width, height)
+
+    ## `make` for one element of a drawing of several: its contours `first..<last`.
+    static func make_from(drawing: const svg.Drawing*, first: usize, last: usize, spec: ShapeSpec, reach: ShapeReach, width: u32, height: u32) -> CellPlan!:
         let columns = (usize)(reach.right - reach.left)
         let rows = (usize)(reach.bottom - reach.top)
         let kinds = try alloc u8[columns * rows] in memory.heap
@@ -51,9 +55,9 @@ struct CellPlan:
             kinds[index] = cell_outside
         var plan = CellPlan(reach = reach, kinds = kinds, width = width, height = height)
         errdefer plan.close()
-        plan.mark_edges(drawing, band_of(spec))
+        plan.mark_edges(drawing, first, last, band_of(spec))
         if spec.filled and spec.kind != 2:
-            try plan.mark_inside(drawing)
+            try plan.mark_inside(drawing, first, last)
         return plan
 
     ## The kind of cell (`column`, `row`), which must be in reach.
@@ -88,9 +92,9 @@ struct CellPlan:
         var none_left: u8[]
         self.kinds = none_left
 
-    ## Mark every cell within `band` pixels of a segment of any outline.
-    mutating func mark_edges(drawing: const svg.Drawing*, band: f64):
-        for contour in 0..<drawing.contour_count():
+    ## Mark every cell within `band` pixels of a segment of any outline `first..<last`.
+    mutating func mark_edges(drawing: const svg.Drawing*, first: usize, last: usize, band: f64):
+        for contour in first..<last:
             let start = drawing.contour_start(contour)
             let size = drawing.contour_size(contour)
             if size == 0:
@@ -134,7 +138,7 @@ struct CellPlan:
     ## Sort the cells no edge touches: inside the fill (nonzero winding at the centre)
     ## or out. A cell past the document's edge is drawn instead, as its clear part
     ## keeps it from being one color throughout.
-    mutating func mark_inside(drawing: const svg.Drawing*) -> !:
+    mutating func mark_inside(drawing: const svg.Drawing*, first: usize, last: usize) -> !:
         var capacity: usize = 64
         var crossings = try alloc Crossing[capacity] in memory.heap
         defer free(crossings) in memory.heap
@@ -143,7 +147,7 @@ struct CellPlan:
             let y = ((f64)row + 0.5) * size
             # The fill outlines' crossings with the row's centre line.
             var count: usize = 0
-            for contour in 0..<drawing.contour_count():
+            for contour in first..<last:
                 if not drawing.contour_filled(contour) or drawing.contour_size(contour) < 3:
                     continue
                 let start = drawing.contour_start(contour)

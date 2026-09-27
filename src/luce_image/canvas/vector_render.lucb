@@ -49,14 +49,43 @@ struct CellMask:
 
     ## Mark the cells `element` draws in, when it is shown.
     mutating func mark(element: VectorElement) -> !:
-        if not element.visible:
+        if element.visible:
+            try self.mark_spec(element.spec)
+
+    ## Mark the cells every one of `specs` draws in, from one drawing of them all.
+    mutating func mark_specs(specs: const ShapeSpec[]) -> !:
+        if specs.length == 0:
             return
-        var plan = try spec_plan(element.spec, self.width, self.height) else return
+        var set = try ShapeSet.make(specs, self.width, self.height)
+        defer set.close()
+        for at in 0..<specs.length:
+            var plan = try set.plan(at, specs[at]) else continue
+            for row in plan.reach.top..<plan.reach.bottom:
+                for column in plan.reach.left..<plan.reach.right:
+                    if plan.kind(column, row) != cell_outside:
+                        self.set(column, row)
+            plan.close()
+
+    ## Mark the cells `spec` draws in.
+    mutating func mark_spec(spec: ShapeSpec) -> !:
+        var plan = try spec_plan(spec, self.width, self.height) else return
         for row in plan.reach.top..<plan.reach.bottom:
             for column in plan.reach.left..<plan.reach.right:
                 if plan.kind(column, row) != cell_outside:
                     self.set(column, row)
         plan.close()
+
+    ## Whether any cell of `reach` is marked.
+    func touches(reach: ShapeReach) -> bool:
+        for row in reach.top..<reach.bottom:
+            for column in reach.left..<reach.right:
+                if self.marked(column, row):
+                    return true
+        return false
+
+    ## Every cell marked: the whole layer is drawn again.
+    mutating func mark_all():
+        memory.set(self.marks, 1)
 
     ## How many cells are marked.
     func count() -> usize:
@@ -93,6 +122,51 @@ func spec_plan(spec: ShapeSpec, width: u32, height: u32) -> CellPlan?!:
     defer parsed.release()
     return try CellPlan.make(parsed.value(), spec, reach, width, height)
 
+## Several specs parsed as one drawing over the whole canvas, and where each one's
+## contours begin in it (luce-svg numbers a drawing's shapes in order, one a spec):
+## one parse sorts every spec's cells and draws them all, where a parse each would
+## cost thousands for a graph's clones.
+struct ShapeSet:
+    var parsed: interop.Reference[svg.Drawing]
+    var starts: usize[]
+    var width: u32
+    var height: u32
+
+    ## `specs`, those that cannot draw left out of the drawing but kept in their places.
+    static func make(specs: const ShapeSpec[], width: u32, height: u32) -> ShapeSet!:
+        var text = try strings.Builder.create()
+        defer text.destroy()
+        try svg_open(&text, 0, 0, width, height)
+        for spec in specs:
+            try shape_group(&text, spec if drawable(spec) else empty_shape())
+        try text.put("</svg>")
+        let parsed = try svg.parse(text.view())
+        errdefer parsed.release()
+        let drawing = parsed.value()
+        let starts = try alloc usize[specs.length + 1] in memory.heap
+        var contour: usize = 0
+        for element in 0..<specs.length:
+            starts[element] = contour
+            while contour < drawing.contour_count() and drawing.contour_element(contour) <= element:
+                contour += 1
+        starts[specs.length] = drawing.contour_count()
+        return ShapeSet(parsed = parsed, starts = starts, width = width, height = height)
+
+    ## The cells spec `at` (which is `spec`) sorts into; none when it draws nothing.
+    func plan(at: usize, spec: ShapeSpec) -> CellPlan?!:
+        if not drawable(spec):
+            return none
+        let reach = shape_reach(spec, self.width, self.height) else return none
+        return try CellPlan.make_from(self.parsed.value(), self.starts[at], self.starts[at + 1], spec, reach, self.width, self.height)
+
+    mutating func close():
+        free(self.starts) in memory.heap
+        self.parsed.release()
+
+## A rectangle of no size: a stand-in keeping a spec that cannot draw in its place.
+func empty_shape() -> ShapeSpec:
+    return ShapeSpec(kind = 0, filled = false)
+
 ## Whether two boxes of cells share a cell.
 func reaches_overlap(a: ShapeReach, b: ShapeReach) -> bool:
     return a.left < b.right and b.left < a.right and a.top < b.bottom and b.top < a.bottom
@@ -116,9 +190,11 @@ func vector_tiles(canvas: Canvas*, id: u64, list: const VectorElement[], dirty: 
     memory.set(kinds, cell_outside)
     let owners = try alloc u32[cell_count] in memory.heap
     defer free(owners) in memory.heap
-    var text = try strings.Builder.create()
-    defer text.destroy()
-    try svg_open(&text, 0, 0, width, height)
+    # The elements the region needs.
+    let chosen = try alloc ShapeSpec[list.length if list.length > 0 else 1] in memory.heap
+    defer free(chosen) in memory.heap
+    let places = try alloc u32[list.length if list.length > 0 else 1] in memory.heap
+    defer free(places) in memory.heap
     var included: usize = 0
     for at in 0..<list.length:
         let spec = list[at].spec
@@ -127,21 +203,28 @@ func vector_tiles(canvas: Canvas*, id: u64, list: const VectorElement[], dirty: 
         let reach = shape_reach(spec, width, height) else continue
         if not reaches_overlap(reach, region):
             continue
-        var plan = try spec_plan(spec, width, height) else continue
-        merge_plan(&plan, dirty, kinds, owners, whole.right, (u32)at)
-        plan.close()
-        try shape_group(&text, spec)
+        # Only what reaches a marked cell: an edit far from most of a graph's
+        # clones parses and sorts the few near it.
+        if let cells = dirty:
+            if not cells.touches(reach):
+                continue
+        chosen[included] = spec
+        places[included] = (u32)at
         included += 1
-    try text.put("</svg>")
     if included == 0:
         return tiles
-    let parsed = try svg.parse(text.view())
-    defer parsed.release()
-    var plan = CellPlan(reach = whole, kinds = kinds, width = width, height = height)
-    var painter = try WindowPainter.make(device, parsed.value(), width, height)
+    # Sorted into bins, each parsed once: every element's cells come from its
+    # bin's drawing, and each window is drawn from the elements near it.
+    var bins = try Bins.make(chosen[..<included], width, height)
+    defer bins.close()
+    for at in 0..<included:
+        var plan = try bins.plan(at, chosen[at]) else continue
+        merge_plan(&plan, dirty, kinds, owners, whole.right, places[at])
+        plan.close()
+    var painter = try WindowPainter.make(device, none, width, height)
     defer painter.close()
-    try painter.draw_runs(&plan, cell_edge, &tiles)
-    try draw_insides(&painter, &plan, owners, list.length, &tiles)
+    try draw_binned(&painter, &bins, kinds, whole.right, whole.bottom, cell_edge, &tiles, none)
+    try draw_insides(&painter, &bins, kinds, whole.right, whole.bottom, owners, list.length, &tiles)
     return tiles
 
 ## The tiles an edit starts from: the layer's own, shared, with the marked cells
@@ -176,68 +259,51 @@ func merge_plan(plan: const CellPlan*, dirty: CellMask*?, kinds: u8[], owners: u
                 kinds[at] = cell_inside
                 owners[at] = owner
 
-## The inside cells of `plan`: each element's first drawn, and when it comes out
-## one color the element's others share its tile; when not, they are drawn too.
-func draw_insides(painter: WindowPainter*, plan: CellPlan*, owners: const u32[], elements: usize, tiles: Tiles*) -> !:
+## The inside cells: each element's first drawn, and when it comes out one color
+## the element's others share its tile; when not, they are drawn too.
+func draw_insides(painter: WindowPainter*, bins: const Bins*, kinds: u8[], columns: u32, rows: u32, owners: const u32[], elements: usize, tiles: Tiles*) -> !:
     if elements == 0:
         return
-    let columns = plan.reach.right
     let samples = try alloc i64[elements] in memory.heap
     defer free(samples) in memory.heap
-    let uniform = try alloc bool[elements] in memory.heap
-    defer free(uniform) in memory.heap
     for owner in 0..<elements:
         samples[owner] = -1
-        uniform[owner] = false
-    for at in 0..<plan.kinds.length:
-        if plan.kinds[at] == cell_inside and samples[(usize)owners[at]] < 0:
+    for at in 0..<kinds.length:
+        if kinds[at] == cell_inside and samples[(usize)owners[at]] < 0:
             samples[(usize)owners[at]] = (i64)at
-    # The samples a wave at a time, one a worker.
-    var runs: CellRun[16] = ---
-    var whose: usize[16] = ---
-    var count: usize = 0
-    for owner in 0..<elements:
-        let sample = samples[owner]
-        if sample < 0:
+            kinds[at] = cell_sample
+    let uniform = try alloc u8[kinds.length] in memory.heap
+    defer free(uniform) in memory.heap
+    memory.set(uniform, 0)
+    try draw_binned(painter, bins, kinds, columns, rows, cell_sample, tiles, uniform)
+    for at in 0..<kinds.length:
+        if kinds[at] == cell_sample:
+            kinds[at] = cell_outside
             continue
-        runs[count] = CellRun(column = (u32)((usize)sample % (usize)columns), row = (u32)((usize)sample // (usize)columns), across = 1)
-        whose[count] = owner
-        count += 1
-        if count == painter.workers:
-            try painter.draw(runs[..<count], tiles)
-            for index in 0..<count:
-                uniform[whose[index]] = painter.windows[index].uniform[0]
-            count = 0
-    if count > 0:
-        try painter.draw(runs[..<count], tiles)
-        for index in 0..<count:
-            uniform[whose[index]] = painter.windows[index].uniform[0]
-    for at in 0..<plan.kinds.length:
-        if plan.kinds[at] != cell_inside:
+        if kinds[at] != cell_inside:
             continue
-        let owner = (usize)owners[at]
-        let sample = (usize)samples[owner]
-        plan.kinds[at] = cell_outside
-        if at == sample:
-            continue
-        if uniform[owner]:
+        let sample = (usize)samples[(usize)owners[at]]
+        kinds[at] = cell_outside
+        if uniform[sample] != 0:
             try tiles.share((u32)(at % (usize)columns), (u32)(at // (usize)columns), (u32)(sample % (usize)columns), (u32)(sample // (usize)columns))
         else:
-            plan.kinds[at] = cell_redraw
-    try painter.draw_runs(plan, cell_redraw, tiles)
+            kinds[at] = cell_redraw
+    try draw_binned(painter, bins, kinds, columns, rows, cell_redraw, tiles, none)
 
-## Draw the vector layer at `index` again whole from its elements.
+## Draw the vector layer at `index` again whole from its elements and graph.
 func redraw_vector(canvas: Canvas*, index: usize) -> !:
-    let document = canvas.document else error(invalid, "draw the document once before drawing a shape")
-    let id = canvas.records[index].id
-    var tiles = try vector_tiles(canvas, id, canvas.records[index].elements, none)
-    errdefer tiles.destroy()
-    try document.set_tiles(id, tiles)
+    try redraw_layer(canvas, index, none)
 
 ## Draw the vector layer at `index` again in the cells `dirty` marks.
 func redraw_vector_cells(canvas: Canvas*, index: usize, dirty: CellMask*) -> !:
+    try redraw_layer(canvas, index, dirty)
+
+func redraw_layer(canvas: Canvas*, index: usize, dirty: CellMask*?) -> !:
     let document = canvas.document else error(invalid, "draw the document once before drawing a shape")
-    let id = canvas.records[index].id
-    var tiles = try vector_tiles(canvas, id, canvas.records[index].elements, dirty)
+    let record = &canvas.records[index]
+    try fresh_output(record)
+    let view = try drawn_elements(record.elements, &record.generated)
+    defer free_view(view)
+    var tiles = try vector_tiles(canvas, record.id, view, dirty)
     errdefer tiles.destroy()
-    try document.set_tiles(id, tiles)
+    try document.set_tiles(record.id, tiles)

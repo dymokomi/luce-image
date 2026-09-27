@@ -172,6 +172,7 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
         if not group and adjustment < 0:
             try read_type(doc, element, native, id)
             try read_elements(doc, element, native, id)
+            try read_graph(doc, element, native, id)
         if (try get_integer(doc, element, "mask")) != 0:
             try native.set_mask(id, true)
             native.records[slot].mask_linked = (try get_integer(doc, element, "mask_linked")) != 0

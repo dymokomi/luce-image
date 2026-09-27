@@ -106,26 +106,25 @@ func rasterize_shape(canvas: Canvas*, id: u64):
     canvas.records[index].shaped = false
     release_elements(&canvas.records[index])
 
-## Every vector layer's elements moved by (`dx`, `dy`), with its pixels.
+## Every vector layer's elements and graph output moved by (`dx`, `dy`), with its pixels.
 func shift_shapes(canvas: Canvas*, dx: f64, dy: f64):
     for index in 0..<canvas.count:
         for at in 0..<canvas.records[index].elements.length:
             canvas.records[index].elements[at].spec.matrix[4] += dx
             canvas.records[index].elements[at].spec.matrix[5] += dy
+        place_graph(&canvas.records[index], [1.0, 0.0, 0.0, 1.0, dx, dy])
 
 ## `spec` with the document map `forward` (an affine map, source to
 ## destination) applied after its own; false in `ok` when the map is not
 ## affine, which a shape cannot follow.
 func transformed_shape(spec: ShapeSpec, forward: Warp) -> ShapeSpec?:
-    let m = forward.m
-    if math.abs(m[6]) > 1e-9 or math.abs(m[7]) > 1e-9 or math.abs(m[8]) < 1e-12:
-        return none
-    let a = m[0] / m[8]
-    let c = m[1] / m[8]
-    let e = m[2] / m[8]
-    let b = m[3] / m[8]
-    let d = m[4] / m[8]
-    let f = m[5] / m[8]
+    let affine = affine_of(forward) else return none
+    let a = affine[0]
+    let b = affine[1]
+    let c = affine[2]
+    let d = affine[3]
+    let e = affine[4]
+    let f = affine[5]
     let old = spec.matrix
     var moved = spec
     moved.matrix = [a * old[0] + c * old[1], b * old[0] + d * old[1],
@@ -134,6 +133,14 @@ func transformed_shape(spec: ShapeSpec, forward: Warp) -> ShapeSpec?:
     # The stroke grows with the shape, as Photoshop's: by the map's mean scale.
     moved.stroke_width = spec.stroke_width * math.sqrt(math.abs(a * d - b * c))
     return moved
+
+## The document map `forward` as (a, b, c, d, e, f), as a shape's matrix is;
+## none when it is not affine.
+func affine_of(forward: Warp) -> f64[6]?:
+    let m = forward.m
+    if math.abs(m[6]) > 1e-9 or math.abs(m[7]) > 1e-9 or math.abs(m[8]) < 1e-12:
+        return none
+    return [m[0] / m[8], m[3] / m[8], m[1] / m[8], m[4] / m[8], m[2] / m[8], m[5] / m[8]]
 
 ## `spec` as a one-element SVG document whose viewBox is the `width` by `height`
 ## window of the canvas from (`left`, `top`), a pixel a unit.
@@ -152,7 +159,7 @@ func svg_open(out: strings.Builder*, left: u32, top: u32, width: u32, height: u3
 func shape_group(out: strings.Builder*, spec: ShapeSpec) -> !:
     var line: u8[512]
     let m = spec.matrix
-    try out.put(try format(line, f"<g transform=\"matrix({m[0]} {m[1]} {m[2]} {m[3]} {m[4]} {m[5]})\">"))
+    try out.put(try format(line, f"<g transform=\"matrix({svg_fine(m[0])} {svg_fine(m[1])} {svg_fine(m[2])} {svg_fine(m[3])} {svg_brief(m[4])} {svg_brief(m[5])})\">"))
     var fill_text: u8[16]
     var stroke_text: u8[16]
     let fill = try hex_color(fill_text, spec.fill_red, spec.fill_green, spec.fill_blue) if spec.filled and spec.kind != 2 else "none"
@@ -171,6 +178,13 @@ func shape_group(out: strings.Builder*, spec: ShapeSpec) -> !:
         try out.put(try format(line, f"<ellipse cx=\"{spec.x + spec.width * 0.5}\" cy=\"{spec.y + spec.height * 0.5}\" rx=\"{spec.width * 0.5}\" ry=\"{spec.height * 0.5}\" {paints}/>"))
     elif spec.kind == 2:
         try out.put(try format(line, f"<line x1=\"{spec.x}\" y1=\"{spec.y}\" x2=\"{spec.x + spec.width}\" y2=\"{spec.y + spec.height}\" stroke-linecap=\"round\" {paints}/>"))
+    elif spec.kind == 4 and spec.subpaths.length == 0 and cornered(spec.path):
+        # Corners only (a star, a polygon drawn with the Pen): its points, which
+        # luce-svg reads and draws without flattening a curve per side.
+        try out.put("<polygon points=\"" if spec.closed else "<polyline points=\"")
+        for at in 0..<spec.path.length // anchor_values:
+            try out.put(try format(line, f"{svg_brief(spec.path[at * anchor_values])},{svg_brief(spec.path[at * anchor_values + 1])} "))
+        try out.put(try format(line, f"\" stroke-linecap=\"round\" {paints}/>"))
     elif spec.kind == 4:
         try out.put("<path d=\"")
         try path_d(out, spec)
@@ -181,9 +195,27 @@ func shape_group(out: strings.Builder*, spec: ShapeSpec) -> !:
             let angle = -math.pi / 2.0 + (f64)corner * 2.0 * math.pi / (f64)spec.sides
             let px = spec.x + spec.width * 0.5 + math.cos(angle) * spec.width * 0.5
             let py = spec.y + spec.height * 0.5 + math.sin(angle) * spec.height * 0.5
-            try out.put(try format(line, f"{px},{py} "))
+            try out.put(try format(line, f"{svg_brief(px)},{svg_brief(py)} "))
         try out.put(try format(line, f"\" {paints}/>"))
     try out.put("</g>")
+
+## A coordinate to a ten-thousandth of a pixel, and a matrix's turn and scale to
+## a hundred-millionth: the drawing is the same, and its text, which luce-svg
+## reads a character at a time, a third as long for a graph's thousands of shapes.
+func svg_brief(value: f64) -> f64:
+    return math.round(value * 10000.0) / 10000.0 if math.abs(value) < 1e11 else value
+
+func svg_fine(value: f64) -> f64:
+    return math.round(value * 100000000.0) / 100000000.0 if math.abs(value) < 1e7 else value
+
+## Whether every anchor of `path` is a corner, both its handles on it.
+func cornered(path: const f64[]) -> bool:
+    for at in 0..<path.length // anchor_values:
+        let base = at * anchor_values
+        for handle in [2, 4]:
+            if path[base + (usize)handle] != path[base] or path[base + (usize)handle + 1] != path[base + 1]:
+                return false
+    return true
 
 ## A linear color as `#rrggbb` in sRGB, the way SVG reads it.
 func hex_color(buffer: u8[], red: f64, green: f64, blue: f64) -> str!:

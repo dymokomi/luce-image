@@ -26,8 +26,15 @@ shape_render.lucb
 path_layers.lucb
 vector_elements.lucb
 vector_render.lucb
+vector_bins.lucb
 vector_geometry.lucb
 vector_files.lucb
+graph_nodes.lucb
+graph_model.lucb
+graph_values.lucb
+graph_eval.lucb
+graph_layers.lucb
+graph_files.lucb
 svg_vectors.lucb
 ranging.lucb
 selecting.lucb
@@ -57,4 +64,5 @@ mesh_warp_tests.lucb
 test_pace.lucb
 selection_timing_tests.lucb
 vector_tests.lucb
+graph_tests.lucb
 open_timing_tests.lucb

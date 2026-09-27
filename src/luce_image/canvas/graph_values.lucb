@@ -1,0 +1,336 @@
+#==============================================================================================
+#
+#   canvas/graph_values - What flows along a node graph's wires
+#
+#   DESCRIPTION:
+#       Shapes are ShapeSpecs, the same a vector element is drawn from, each owning its
+#       path: a clone of a shape is its spec with another matrix, so thousands of them cost
+#       thousands of small records, never pixels. Points are x, y, an angle (degrees, the
+#       tangent where the points follow a line) and a scale. A Number or a Color is a Field:
+#       one value, or one per index (random from a seed, or a ramp from start to end), which
+#       whatever takes it samples at each copy's index.
+#
+#       Randomness is a hash of the seed and the index, never a running generator, so a
+#       node's output is the same on every evaluation and on every machine.
+#
+#==============================================================================================
+
+## A list of shapes, each spec owning its path.
+struct ShapeList:
+    var specs: ShapeSpec[]
+    var count: usize
+
+    func view() -> const ShapeSpec[]:
+        return self.specs[..<self.count]
+
+    ## `spec` on the end, taken over (its path freed if it cannot be kept).
+    mutating func push(spec: ShapeSpec) -> !:
+        var owned = spec
+        if self.count == self.specs.length:
+            let capacity = 16 if self.specs.length == 0 else self.specs.length * 2
+            let grown = alloc ShapeSpec[capacity] in memory.heap catch failure:
+                release_spec_path(&owned)
+                error(failure.code, failure.message)
+            if self.count > 0:
+                memory.copy(grown, self.specs, self.count)
+                free(self.specs) in memory.heap
+            self.specs = grown
+        self.specs[self.count] = owned
+        self.count += 1
+
+    ## A copy of `spec` with a path of its own on the end.
+    mutating func push_copy(spec: ShapeSpec) -> !:
+        var copy = spec
+        try copy_spec_path(&copy)
+        try self.push(copy)
+
+    ## Room for `more` shapes past those held, so a known count grows once.
+    mutating func reserve(more: usize) -> !:
+        if self.count + more <= self.specs.length:
+            return
+        let grown = try alloc ShapeSpec[self.count + more] in memory.heap
+        if self.count > 0:
+            memory.copy(grown, self.specs, self.count)
+        if self.specs.length > 0:
+            free(self.specs) in memory.heap
+        self.specs = grown
+
+    mutating func release():
+        for at in 0..<self.count:
+            release_spec_path(&self.specs[at])
+        if self.specs.length > 0:
+            free(self.specs) in memory.heap
+        var none_left: ShapeSpec[]
+        self.specs = none_left
+        self.count = 0
+
+## Points, four values each: x, y, angle in degrees, scale.
+struct PointList:
+    var values: f64[]
+    var count: usize
+
+    mutating func push(x: f64, y: f64, angle: f64, scale: f64) -> !:
+        if (self.count + 1) * 4 > self.values.length:
+            let capacity = 256 if self.values.length == 0 else self.values.length * 2
+            let grown = try alloc f64[capacity] in memory.heap
+            if self.count > 0:
+                memory.copy(grown, self.values, self.count * 4)
+                free(self.values) in memory.heap
+            self.values = grown
+        let at = self.count * 4
+        self.values[at] = x
+        self.values[at + 1] = y
+        self.values[at + 2] = angle
+        self.values[at + 3] = scale
+        self.count += 1
+
+    func x(at: usize) -> f64:
+        return self.values[at * 4]
+
+    func y(at: usize) -> f64:
+        return self.values[at * 4 + 1]
+
+    func angle(at: usize) -> f64:
+        return self.values[at * 4 + 2]
+
+    func scale(at: usize) -> f64:
+        return self.values[at * 4 + 3]
+
+    mutating func release():
+        if self.values.length > 0:
+            free(self.values) in memory.heap
+        var none_left: f64[]
+        self.values = none_left
+        self.count = 0
+
+## A Number (channel 0) or a Color (three channels, linear light) that may vary by index.
+struct Field:
+    ## 0 one value `a`; 1 random between `a` and `b` by `seed`; 2 a ramp from `a` to `b`.
+    var mode: i64
+    var a: f64[3]
+    var b: f64[3]
+    var seed: u64
+
+    ## Channel `channel` at `index` of `count`.
+    func at(index: usize, count: usize, channel: usize) -> f64:
+        if self.mode == 0:
+            return self.a[channel]
+        var t = 0.0
+        if self.mode == 1:
+            t = unit_hash(self.seed, (u64)index, 17)
+        elif count > 1:
+            t = (f64)index / (f64)(count - 1)
+        return self.a[channel] + (self.b[channel] - self.a[channel]) * t
+
+## A constant field of `value` in every channel.
+func constant_field(value: f64) -> Field:
+    return Field(mode = 0, a = [value, value, value], b = [value, value, value], seed = 0)
+
+## What a node puts out: shapes, points or a field, by its kind's output type.
+struct NodeValue:
+    var shapes: ShapeList
+    var points: PointList
+    var field: Field
+
+    mutating func release():
+        self.shapes.release()
+        self.points.release()
+
+## A number in 0..<1 from `seed`, `index` and `salt`, the same every time (SplitMix64).
+func unit_hash(seed: u64, index: u64, salt: u64) -> f64:
+    var z = seed *% 0x9e3779b97f4a7c15 +% index *% 0xbf58476d1ce4e5b9 +% salt *% 0x94d049bb133111eb +% 0x2545f4914f6cdd1d
+    z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9
+    z = (z ^ (z >> 27)) *% 0x94d049bb133111eb
+    z = z ^ (z >> 31)
+    return (f64)(z >> 11) / 9007199254740992.0
+
+## `m` after `n`: the matrix of applying `n`, then `m`.
+func compose(m: f64[6], n: f64[6]) -> f64[6]:
+    return [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1],
+            m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3],
+            m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]]
+
+## The map undoing `m`; none when it flattens the plane.
+func inverse_matrix(m: f64[6]) -> f64[6]?:
+    let det = m[0] * m[3] - m[1] * m[2]
+    if math.abs(det) < 1e-12:
+        return none
+    let a = m[3] / det
+    let b = -m[1] / det
+    let c = -m[2] / det
+    let d = m[0] / det
+    return [a, b, c, d, -(a * m[4] + c * m[5]), -(b * m[4] + d * m[5])]
+
+## Turn by `degrees` and scale by (`sx`, `sy`), then move to (`x`, `y`).
+func placed_matrix(x: f64, y: f64, degrees: f64, sx: f64, sy: f64) -> f64[6]:
+    let turn = degrees * math.pi / 180.0
+    let c = math.cos(turn)
+    let s = math.sin(turn)
+    return [c * sx, s * sx, -s * sy, c * sy, x, y]
+
+## `spec` with `m` applied after its own matrix, its stroke grown with the map's
+## mean scale as a transformed element's is.
+func spec_mapped(spec: ShapeSpec, m: f64[6]) -> ShapeSpec:
+    var moved = spec
+    moved.matrix = compose(m, spec.matrix)
+    moved.stroke_width = spec.stroke_width * math.sqrt(math.abs(m[0] * m[3] - m[1] * m[2]))
+    return moved
+
+## Where a spec's outline runs, in document pixels: its points as x, y pairs,
+## each run starting where `starts` says.
+struct Outline:
+    var points: f64[]
+    var count: usize
+    var starts: usize[]
+    var runs: usize
+    var closed: bool
+
+    mutating func clear():
+        self.count = 0
+        self.runs = 0
+
+    mutating func begin_run() -> !:
+        if self.runs == self.starts.length:
+            let grown = try alloc usize[16 if self.starts.length == 0 else self.starts.length * 2] in memory.heap
+            if self.runs > 0:
+                memory.copy(grown, self.starts, self.runs)
+                free(self.starts) in memory.heap
+            self.starts = grown
+        self.starts[self.runs] = self.count
+        self.runs += 1
+
+    mutating func put(x: f64, y: f64) -> !:
+        if (self.count + 1) * 2 > self.points.length:
+            let grown = try alloc f64[256 if self.points.length == 0 else self.points.length * 2] in memory.heap
+            if self.count > 0:
+                memory.copy(grown, self.points, self.count * 2)
+                free(self.points) in memory.heap
+            self.points = grown
+        self.points[self.count * 2] = x
+        self.points[self.count * 2 + 1] = y
+        self.count += 1
+
+    ## The end of run `run`.
+    func run_end(run: usize) -> usize:
+        return self.starts[run + 1] if run + 1 < self.runs else self.count
+
+    mutating func release():
+        if self.points.length > 0:
+            free(self.points) in memory.heap
+        if self.starts.length > 0:
+            free(self.starts) in memory.heap
+        var no_points: f64[]
+        var no_starts: usize[]
+        self.points = no_points
+        self.starts = no_starts
+        self.count = 0
+        self.runs = 0
+
+## Curve steps a path segment flattens to.
+let curve_steps: usize = 12
+
+## `spec`'s outline into `out`, in document pixels: its corners, or, when
+## `smooth`, its curves flattened and an ellipse as a ring of many points (its
+## corners alone are a path's anchors, an ellipse's 32).
+func spec_outline(spec: ShapeSpec, smooth: bool, out: Outline*) -> !:
+    out.clear()
+    out.closed = spec.kind != 2 and (spec.kind != 4 or spec.closed)
+    let m = spec.matrix
+    if spec.kind == 0 or spec.kind == 2:
+        try out.begin_run()
+        let corners: f64[8] = [spec.x, spec.y, spec.x + spec.width, spec.y, spec.x + spec.width, spec.y + spec.height, spec.x, spec.y + spec.height]
+        let used: usize = 2 if spec.kind == 2 else 4
+        for at in 0..<used:
+            # A line runs corner to opposite corner.
+            let index = at * 2 if spec.kind == 0 or at == 0 else 4
+            try put_mapped(out, m, corners[index], corners[index + 1])
+        return
+    if spec.kind == 1 or spec.kind == 3:
+        try out.begin_run()
+        let sides = (usize)spec.sides if spec.kind == 3 else (64 if smooth else 32)
+        for corner in 0..<sides:
+            let angle = -math.pi / 2.0 + (f64)corner * 2.0 * math.pi / (f64)sides
+            try put_mapped(out, m, spec.x + spec.width * 0.5 + math.cos(angle) * spec.width * 0.5, spec.y + spec.height * 0.5 + math.sin(angle) * spec.height * 0.5)
+        return
+    let anchors = spec.path.length // anchor_values
+    var first: usize = 0
+    var run: usize = 0
+    while first < anchors:
+        let size = (usize)spec.subpaths[run] if run < spec.subpaths.length else anchors - first
+        try out.begin_run()
+        let end = first + size
+        for at in first..<end:
+            let a = at * anchor_values
+            try put_mapped(out, m, spec.path[a], spec.path[a + 1])
+            if not smooth:
+                continue
+            let next = at + 1 if at + 1 < end else (first if spec.closed and size > 1 else end)
+            if next == end:
+                continue
+            let b = next * anchor_values
+            # The curve's inside points; its end is the next anchor's own.
+            for step in 1..<curve_steps:
+                let t = (f64)step / (f64)curve_steps
+                let u = 1.0 - t
+                let x = u * u * u * spec.path[a] + 3.0 * u * u * t * spec.path[a + 4] + 3.0 * u * t * t * spec.path[b + 2] + t * t * t * spec.path[b]
+                let y = u * u * u * spec.path[a + 1] + 3.0 * u * u * t * spec.path[a + 5] + 3.0 * u * t * t * spec.path[b + 3] + t * t * t * spec.path[b + 1]
+                try put_mapped(out, m, x, y)
+        first = end
+        run += 1
+
+func put_mapped(out: Outline*, m: f64[6], x: f64, y: f64) -> !:
+    try out.put(m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5])
+
+## The box of `list`'s outlines' corners: left, top, right, bottom; none when empty.
+func shapes_box(list: const ShapeSpec[], scratch: Outline*) -> f64[4]?!:
+    var box: f64[4] = [math.infinity, math.infinity, -math.infinity, -math.infinity]
+    for spec in list:
+        try spec_outline(spec, false, scratch)
+        for at in 0..<scratch.count:
+            box[0] = math.min(box[0], scratch.points[at * 2])
+            box[1] = math.min(box[1], scratch.points[at * 2 + 1])
+            box[2] = math.max(box[2], scratch.points[at * 2])
+            box[3] = math.max(box[3], scratch.points[at * 2 + 1])
+    if box[2] < box[0]:
+        return none
+    return box
+
+## Whether (`x`, `y`) is inside `outline`'s closed runs by the nonzero rule.
+func outline_contains(outline: const Outline*, x: f64, y: f64) -> bool:
+    if not outline.closed:
+        return false
+    var winding: i32 = 0
+    for run in 0..<outline.runs:
+        let first = outline.starts[run]
+        let end = outline.run_end(run)
+        let size = end - first
+        if size < 3:
+            continue
+        for at in first..<end:
+            let next = at + 1 if at + 1 < end else first
+            let ax = outline.points[at * 2]
+            let ay = outline.points[at * 2 + 1]
+            let bx = outline.points[next * 2]
+            let by = outline.points[next * 2 + 1]
+            if ay <= y and y < by and cross(ax, ay, bx, by, x, y) > 0.0:
+                winding += 1
+            elif by <= y and y < ay and cross(ax, ay, bx, by, x, y) < 0.0:
+                winding -= 1
+    return winding != 0
+
+## Whether two specs draw the same: every value, and their paths.
+func same_spec(a: const ShapeSpec*, b: const ShapeSpec*) -> bool:
+    let left = shape_values(*a)
+    let right = shape_values(*b)
+    for at in 0..<(usize)22:
+        if left[at] != right[at]:
+            return false
+    if a.closed != b.closed or a.path.length != b.path.length or a.subpaths.length != b.subpaths.length:
+        return false
+    for at in 0..<a.path.length:
+        if a.path[at] != b.path[at]:
+            return false
+    for at in 0..<a.subpaths.length:
+        if a.subpaths[at] != b.subpaths[at]:
+            return false
+    return true

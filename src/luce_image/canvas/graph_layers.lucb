@@ -1,0 +1,231 @@
+#==============================================================================================
+#
+#   canvas/graph_layers - A vector layer's node graph on the canvas: edits, steps and cells
+#
+#   DESCRIPTION:
+#       A vector layer draws its hand-made elements and then its graph's output
+#       (graph_eval.lucb), both through the same cell renderer (vector_render.lucb). Every
+#       change to either goes through `commit_layer`: the new elements and graph are
+#       evaluated and drawn beside the old, the step recorded, and only then swapped in, so
+#       an edit that cannot be made changes nothing. The cells drawn again are those the
+#       changed element reaches and those of every generated shape that differs from before,
+#       old place and new: a parameter that moves one clone redraws that clone's cells.
+#
+#       The output is kept on the record with the cache that made it. A copy for the history
+#       keeps the graph only; the output is evaluated again when next it is needed.
+#
+#==============================================================================================
+
+## The elements a vector layer draws: `list`, then `generated`, as elements that
+## borrow their specs. Only the array is the caller's to free (`free_view`).
+func drawn_elements(list: const VectorElement[], generated: const ShapeList*) -> VectorElement[]!:
+    var none_yet: VectorElement[]
+    let total = list.length + generated.count
+    if total == 0:
+        return none_yet
+    let view = try alloc VectorElement[total] in memory.heap
+    for at in 0..<list.length:
+        view[at] = list[at]
+    for at in 0..<generated.count:
+        view[list.length + at] = VectorElement(name = "", visible = true, spec = generated.specs[at])
+    return view
+
+func free_view(view: VectorElement[]):
+    if view.length > 0:
+        free(view) in memory.heap
+
+## The record's graph output brought up to date with its graph and elements.
+func fresh_output(record: Record*) -> !:
+    if record.generated_fresh:
+        return
+    var output: ShapeList
+    if record.graph.present():
+        record.graph_evaluated = evaluate_graph(&record.graph, record.elements, &record.graph_cache, &output) catch failure:
+            output.release()
+            error(failure.code, failure.message)
+    record.generated.release()
+    record.generated = output
+    record.generated_fresh = true
+
+## The graph parts of a record copied for a copy that owns its own: the graph
+## kept, its cache and output left to be made again. On failure it holds no graph.
+func copy_graph_part(record: Record*) -> !:
+    let source = record.graph
+    var empty: Graph
+    var no_cache: GraphCache
+    var no_output: ShapeList
+    record.graph = empty
+    record.graph_cache = no_cache
+    record.generated = no_output
+    record.generated_fresh = false
+    record.graph = try copied_graph(&source)
+
+## Free a record's graph, its cache and its output.
+func release_graph_part(record: Record*):
+    free_graph(&record.graph)
+    record.graph_cache.release()
+    record.generated.release()
+    record.generated_fresh = false
+
+## The layer at `index` with `list` as its elements and `graph` as its graph, as
+## step `name`: both taken over (freed, nothing changed, when it cannot be made).
+## `dirty` marks the cells to draw again besides the changed element `changed` of
+## `list` and the generated shapes that differ; none draws every cell. `active`
+## becomes the active element; `joins` lets a repeat of the step coalesce.
+func commit_layer(canvas: Canvas*, index: usize, list: VectorElement[], graph: Graph, dirty: CellMask*?, changed: i64, name: str, active: i64, joins: bool) -> !:
+    var owned_list = list
+    var owned_graph = graph
+    var output: ShapeList
+    errdefer:
+        free_list(owned_list)
+        free_graph(&owned_graph)
+        output.release()
+    let document = canvas.document else error(invalid, "draw the document once before drawing a shape")
+    let record = &canvas.records[index]
+    let id = record.id
+    try fresh_output(record)
+    if owned_graph.present():
+        record.graph_evaluated = try evaluate_graph(&owned_graph, owned_list, &record.graph_cache, &output)
+    var redraw = true
+    if let cells = dirty:
+        if changed >= 0 and changed < (i64)owned_list.length:
+            try cells.mark(owned_list[(usize)changed])
+        try mark_changed_shapes(cells, &record.generated, &output)
+        redraw = cells.count() > 0
+    var tiles: Tiles? = none
+    errdefer:
+        if let made = tiles:
+            var dropped = made
+            dropped.destroy()
+    if redraw:
+        let view = try drawn_elements(owned_list, &output)
+        defer free_view(view)
+        tiles = try vector_tiles(canvas, id, view, dirty)
+    try canvas.remember_state(name, id if joins else 0)
+    # From here nothing fails but the upload: the new content is the layer's.
+    let target = &canvas.records[index]
+    release_type(target)
+    free_list(target.elements)
+    target.elements = owned_list
+    free_graph(&target.graph)
+    target.graph = owned_graph
+    target.generated.release()
+    target.generated = output
+    target.generated_fresh = true
+    target.shaped = true
+    target.active = active if active < (i64)owned_list.length else -1
+    var no_list: VectorElement[]
+    var no_graph: Graph
+    var no_output: ShapeList
+    owned_list = no_list
+    owned_graph = no_graph
+    output = no_output
+    if let made = tiles:
+        tiles = none
+        try document.set_tiles(id, made)
+
+## Mark the cells of every shape that differs between `before` and `after`, by
+## place, where it was and where it is.
+func mark_changed_shapes(cells: CellMask*, before: const ShapeList*, after: const ShapeList*) -> !:
+    let common = before.count if before.count < after.count else after.count
+    # When most of many change, finding their cells costs what drawing every
+    # cell does: all are drawn.
+    var differ = before.count + after.count - 2 * common
+    for at in 0..<common:
+        if not same_spec(&before.specs[at], &after.specs[at]):
+            differ += 2
+    if differ > 512 and differ > before.count + after.count // 2:
+        cells.mark_all()
+        return
+    # The changed ones gathered (sharing their paths) and marked from one drawing.
+    let changed = try alloc ShapeSpec[before.count + after.count + 1] in memory.heap
+    defer free(changed) in memory.heap
+    var count: usize = 0
+    for at in 0..<common:
+        if not same_spec(&before.specs[at], &after.specs[at]):
+            changed[count] = before.specs[at]
+            changed[count + 1] = after.specs[at]
+            count += 2
+    for at in common..<before.count:
+        changed[count] = before.specs[at]
+        count += 1
+    for at in common..<after.count:
+        changed[count] = after.specs[at]
+        count += 1
+    try cells.mark_specs(changed[..<count])
+
+## The layer at `index`'s graph replaced by `graph` (taken over) as step `name`,
+## its elements kept.
+func commit_graph(canvas: Canvas*, index: usize, graph: Graph, name: str, joins: bool) -> !:
+    var owned = graph
+    let list = copied_list(canvas.records[index].elements) catch failure:
+        free_graph(&owned)
+        error(failure.code, failure.message)
+    var dirty = CellMask.create(canvas.extent_x, canvas.extent_y) catch failure:
+        free_list(list)
+        free_graph(&owned)
+        error(failure.code, failure.message)
+    defer dirty.close()
+    try commit_layer(canvas, index, list, owned, &dirty, -1, name, canvas.records[index].active, joins)
+
+## The vector layer `id`'s record index, for a graph edit.
+func graph_index(canvas: Canvas*, id: u64) -> usize!:
+    try canvas.require_open()
+    try canvas.require_idle()
+    let index = try canvas.index(id)
+    if not canvas.records[index].shaped:
+        error(invalid, "only a vector layer holds a node graph")
+    return index
+
+## `Canvas.add_vector_layer`: a new vector layer on top named `name`, its graph
+## the default one, drawn: one step. Its id.
+func add_vector_layer_record(canvas: Canvas*, name: str) -> i64!:
+    try canvas.require_idle()
+    try canvas.begin_edit("New Vector Layer")
+    defer canvas.end_edit()
+    let id = try canvas.add_layer(name)
+    let index = try canvas.index((u64)id)
+    canvas.records[index].shaped = true
+    let graph = try default_graph(canvas.extent_x, canvas.extent_y)
+    var no_list: VectorElement[]
+    if canvas.document == none:
+        canvas.records[index].graph = graph
+        return id
+    try commit_layer(canvas, index, no_list, graph, none, -1, "New Vector Layer", -1, false)
+    return id
+
+## The graph's output moved by the affine map `m` with the layer: its placement
+## and the shapes it last made, which stay current.
+func place_graph(record: Record*, m: f64[6]):
+    if not record.graph.present():
+        return
+    record.graph.placement = compose(m, record.graph.placement_matrix())
+    record.graph.placed = true
+    for at in 0..<record.generated.count:
+        record.generated.specs[at] = spec_mapped(record.generated.specs[at], m)
+
+## The layer at `index`'s elements changed in place (one moved alone): its graph
+## evaluated again from them, as a Path node takes one, and the cells of every
+## output shape that changed marked. Its output must have been fresh before.
+func follow_elements(canvas: Canvas*, index: usize, dirty: CellMask*) -> !:
+    let record = &canvas.records[index]
+    if not record.graph.present():
+        return
+    var output: ShapeList
+    errdefer output.release()
+    record.graph_evaluated = try evaluate_graph(&record.graph, record.elements, &record.graph_cache, &output)
+    try mark_changed_shapes(dirty, &record.generated, &output)
+    record.generated.release()
+    record.generated = output
+    record.generated_fresh = true
+
+## Move every generated shape of the layer at `index` by (`dx`, `dy`), marking
+## the cells each leaves and reaches.
+func shift_generated(canvas: Canvas*, index: usize, dx: f64, dy: f64, dirty: CellMask*) -> !:
+    let record = &canvas.records[index]
+    if not record.graph.present():
+        return
+    try fresh_output(record)
+    try dirty.mark_specs(record.generated.view())
+    place_graph(record, [1.0, 0.0, 0.0, 1.0, dx, dy])
+    try dirty.mark_specs(record.generated.view())

@@ -1,0 +1,156 @@
+#==============================================================================================
+#
+#   canvas/vector_bins - A layer's elements sorted into bins, so a window draws only its own
+#
+#   DESCRIPTION:
+#       luce-svg draws a window of a drawing by visiting every element in it. For a layer of a
+#       few elements that is nothing; for a graph's thousands of clones it is thousands of
+#       visits per window, most of them far away. So the canvas grid is cut into bins a few
+#       cells on a side, each element listed in the bins its reach touches, and each bin's
+#       elements parsed as one drawing: a window is drawn from its bin's, and each element's
+#       cells are sorted from the drawing of the bin its reach starts in. The cost follows
+#       what is near a cell, never the layer's count, and nothing is parsed twice but an
+#       element that straddles bins.
+#
+#==============================================================================================
+
+## Cells a bin spans on a side.
+let bin_cells: u32 = 4
+
+## A cell whose sample is drawn to learn whether its element's inside is one color.
+let cell_sample: u8 = 4
+
+## The elements of a layer, by the bins of cells their reaches touch.
+struct Bins:
+    var columns: u32
+    var rows: u32
+    var width: u32
+    var height: u32
+    ## Bin b lists `members[offsets[b]..<offsets[b + 1]]`, bottom first, and draws
+    ## from `sets[b]` when it lists any.
+    var offsets: u32[]
+    var members: u32[]
+    var sets: ShapeSet[]
+    var parsed: bool[]
+    ## Each element's place in the first bin that lists it.
+    var home: u32[]
+
+    ## `specs` (each drawable and reaching the canvas) sorted into the bins of a
+    ## `width` by `height` canvas, and each bin's parsed.
+    static func make(specs: const ShapeSpec[], width: u32, height: u32) -> Bins!:
+        let columns = (tile_columns(width) + bin_cells - 1) // bin_cells
+        let rows = (tile_columns(height) + bin_cells - 1) // bin_cells
+        let count = (usize)columns * (usize)rows
+        var bins = Bins(columns = columns, rows = rows, width = width, height = height)
+        errdefer bins.close()
+        bins.offsets = try alloc u32[count + 1] in memory.heap
+        for at in 0..<bins.offsets.length:
+            bins.offsets[at] = 0
+        bins.sets = try alloc ShapeSet[count] in memory.heap
+        bins.parsed = try alloc bool[count] in memory.heap
+        for at in 0..<count:
+            bins.parsed[at] = false
+        bins.home = try alloc u32[specs.length + 1] in memory.heap
+        for spec in specs:
+            let reach = shape_reach(spec, width, height) else continue
+            for row in reach.top // bin_cells..<(reach.bottom - 1) // bin_cells + 1:
+                for column in reach.left // bin_cells..<(reach.right - 1) // bin_cells + 1:
+                    bins.offsets[(usize)row * (usize)columns + (usize)column + 1] += 1
+        for at in 1..<bins.offsets.length:
+            bins.offsets[at] += bins.offsets[at - 1]
+        bins.members = try alloc u32[(usize)bins.offsets[count] + 1] in memory.heap
+        let filled = try alloc u32[count] in memory.heap
+        defer free(filled) in memory.heap
+        for at in 0..<count:
+            filled[at] = 0
+        for at in 0..<specs.length:
+            bins.home[at] = 0
+            let reach = shape_reach(specs[at], width, height) else continue
+            for row in reach.top // bin_cells..<(reach.bottom - 1) // bin_cells + 1:
+                for column in reach.left // bin_cells..<(reach.right - 1) // bin_cells + 1:
+                    let place = (usize)row * (usize)columns + (usize)column
+                    if row == reach.top // bin_cells and column == reach.left // bin_cells:
+                        bins.home[at] = filled[place]
+                    bins.members[(usize)bins.offsets[place] + (usize)filled[place]] = (u32)at
+                    filled[place] += 1
+        # Each bin's elements as one drawing.
+        let listed = try alloc ShapeSpec[specs.length + 1] in memory.heap
+        defer free(listed) in memory.heap
+        for place in 0..<count:
+            let first = (usize)bins.offsets[place]
+            let size = (usize)bins.offsets[place + 1] - first
+            if size == 0:
+                continue
+            for at in 0..<size:
+                listed[at] = specs[(usize)bins.members[first + at]]
+            bins.sets[place] = try ShapeSet.make(listed[..<size], width, height)
+            bins.parsed[place] = true
+        return bins
+
+    ## The cells spec `at` of the list the bins were made from (`spec`) sorts
+    ## into, from its home bin's drawing; none when it draws nothing.
+    func plan(at: usize, spec: ShapeSpec) -> CellPlan?!:
+        let reach = shape_reach(spec, self.width, self.height) else return none
+        let place = (usize)(reach.top // bin_cells) * (usize)self.columns + (usize)(reach.left // bin_cells)
+        if not self.parsed[place]:
+            return none
+        return try self.sets[place].plan((usize)self.home[at], spec)
+
+    mutating func close():
+        for place in 0..<self.parsed.length:
+            if self.parsed[place]:
+                self.sets[place].close()
+        if self.offsets.length > 0:
+            free(self.offsets) in memory.heap
+        if self.members.length > 0:
+            free(self.members) in memory.heap
+        if self.sets.length > 0:
+            free(self.sets) in memory.heap
+        if self.parsed.length > 0:
+            free(self.parsed) in memory.heap
+        if self.home.length > 0:
+            free(self.home) in memory.heap
+        var no_parsed: bool[]
+        self.parsed = no_parsed
+
+## Draw every cell of `kind` in `kinds` (the canvas grid, `columns` by `rows`) bin
+## by bin, a wave of windows at a time. When `uniform` is given, each cell drawn
+## says there whether it came out one pixel throughout.
+func draw_binned(painter: WindowPainter*, bins: const Bins*, kinds: const u8[], columns: u32, rows: u32, kind: u8, tiles: Tiles*, uniform: u8[]?) -> !:
+    var runs: CellRun[16] = ---
+    var count: usize = 0
+    for bin_row in 0..<bins.rows:
+        for bin_column in 0..<bins.columns:
+            let place = (usize)bin_row * (usize)bins.columns + (usize)bin_column
+            if not bins.parsed[place]:
+                continue
+            let left = bin_column * bin_cells
+            let right = min_u32(left + bin_cells, columns)
+            for row in bin_row * bin_cells..<min_u32(bin_row * bin_cells + bin_cells, rows):
+                var column = left
+                while column < right:
+                    if kinds[(usize)row * (usize)columns + (usize)column] != kind:
+                        column += 1
+                        continue
+                    var across: u32 = 1
+                    while across < window_cells and column + across < right and kinds[(usize)row * (usize)columns + (usize)(column + across)] == kind:
+                        across += 1
+                    runs[count] = CellRun(column = column, row = row, across = across)
+                    painter.windows[count].drawing = bins.sets[place].parsed.value()
+                    count += 1
+                    column += across
+                    if count == painter.workers:
+                        try flush_wave(painter, runs[..<count], columns, tiles, uniform)
+                        count = 0
+    try flush_wave(painter, runs[..<count], columns, tiles, uniform)
+
+## Draw a wave's runs, noting which cells came out one pixel.
+func flush_wave(painter: WindowPainter*, runs: const CellRun[], columns: u32, tiles: Tiles*, uniform: u8[]?) -> !:
+    if runs.length == 0:
+        return
+    try painter.draw(runs, tiles)
+    if let flags = uniform:
+        for index in 0..<runs.length:
+            let window = &painter.windows[index]
+            for cell in 0..<(usize)window.across:
+                flags[(usize)window.row * (usize)columns + (usize)window.column + cell] = 1 if window.uniform[cell] else 0

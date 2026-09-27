@@ -1,0 +1,104 @@
+#==============================================================================================
+#
+#   canvas/graph_files - A vector layer's node graph in the .l2d manifest
+#
+#   DESCRIPTION:
+#       Beside a vector layer's elements (vector_files.lucb) the manifest keeps its graph,
+#       when it has one, as three lists of numbers:
+#
+#           graph_nodes   per node: its id, its kind, its place in the editor (x, y),
+#                         then its 24 values
+#           graph_links   per wire: the id of the node it leaves, of the node it enters,
+#                         and that node's input
+#           graph_state   the next id's base, 1 or 0 for placed, then the placement's six
+#
+#       The layer's pixels are stored as any layer's are, so opening draws nothing: the
+#       graph is evaluated again the first time an edit needs its output.
+#
+#==============================================================================================
+
+## Numbers a node takes in `graph_nodes`.
+let node_file_values: usize = 28
+
+## The most nodes a graph may bring back from a file.
+let file_node_limit: usize = 100000
+
+## `graph` into the manifest's `element`, when it has nodes.
+func write_graph(manifest: prism.Document*, element: str, graph: const Graph*) -> !:
+    if not graph.present():
+        return
+    let nodes = try alloc f64[graph.nodes.length * node_file_values] in memory.heap
+    defer free(nodes) in memory.heap
+    for at in 0..<graph.nodes.length:
+        let node = graph.nodes[at]
+        let base = at * node_file_values
+        nodes[base] = (f64)node.id
+        nodes[base + 1] = (f64)node.kind
+        nodes[base + 2] = node.x
+        nodes[base + 3] = node.y
+        for slot in 0..<node_slots:
+            nodes[base + 4 + slot] = node.values[slot]
+    try put_numbers(manifest, element, "graph_nodes", nodes)
+    if graph.links.length > 0:
+        let links = try alloc f64[graph.links.length * 3] in memory.heap
+        defer free(links) in memory.heap
+        for at in 0..<graph.links.length:
+            links[at * 3] = (f64)graph.links[at].source_id
+            links[at * 3 + 1] = (f64)graph.links[at].to
+            links[at * 3 + 2] = (f64)graph.links[at].port
+        try put_numbers(manifest, element, "graph_links", links)
+    let m = graph.placement_matrix()
+    let state: f64[8] = [(f64)graph.next_id, 1.0 if graph.placed else 0.0, m[0], m[1], m[2], m[3], m[4], m[5]]
+    try put_numbers(manifest, element, "graph_state", state[..<8])
+
+func put_numbers(manifest: prism.Document*, element: str, name: str, values: const f64[]) -> !:
+    var shape_of: i64[1] = [(i64)values.length]
+    let numbers = try prism.Value.numbers(shape_of[..<1], values)
+    defer numbers.release()
+    try manifest.set(element, name, numbers)
+
+## The graph `element` holds, if any, as the graph of layer `id`. Every wire must
+## join nodes it names, inputs they have and types that fit.
+func read_graph(doc: prism.Document*, element: str, canvas: Canvas*, id: i64) -> !:
+    let nodes = read_numbers(doc, element, "graph_nodes", node_file_values) catch _:
+        return
+    defer free(nodes) in memory.heap
+    let count = nodes.length // node_file_values
+    if count > file_node_limit:
+        error(invalid, "a node graph is too large")
+    let links = read_numbers(doc, element, "graph_links", 3) catch _:
+        recover no_numbers()
+    defer:
+        if links.length > 0:
+            free(links) in memory.heap
+    let state = try read_numbers(doc, element, "graph_state", 8)
+    defer free(state) in memory.heap
+    var graph: Graph
+    errdefer free_graph(&graph)
+    graph.nodes = try alloc GraphNode[count] in memory.heap
+    var highest: u32 = 0
+    for at in 0..<count:
+        let base = at * node_file_values
+        let kind = (i64)nodes[base + 1]
+        if nodes[base] < 1.0 or nodes[base] > 4294967295.0 or kind < 0 or kind >= node_kinds:
+            error(invalid, "a node of the graph is damaged")
+        var values: f64[24] = ---
+        for slot in 0..<node_slots:
+            values[slot] = nodes[base + 4 + slot]
+        graph.nodes[at] = GraphNode(id = (u32)nodes[base], kind = kind, x = nodes[base + 2], y = nodes[base + 3], values = values)
+        highest = graph.nodes[at].id if graph.nodes[at].id > highest else highest
+    graph.next_id = (u32)math.clamp(state[0], (f64)highest, 4294967295.0)
+    graph.placed = state[1] != 0.0
+    graph.placement = [state[2], state[3], state[4], state[5], state[6], state[7]]
+    # Each wire is made as an edit would make it, so a damaged one is refused.
+    for at in 0..<links.length // 3:
+        let source_id = links[at * 3]
+        let to = links[at * 3 + 1]
+        let port = links[at * 3 + 2]
+        if source_id < 0.0 or to < 0.0 or port < 0.0 or source_id > 4294967295.0 or to > 4294967295.0 or port > 16.0:
+            error(invalid, "a wire of the graph is damaged")
+        try replace_graph(&graph, try graph_with_link(&graph, (u32)source_id, (u32)to, (u32)port))
+    let index = try canvas.index((u64)id)
+    free_graph(&canvas.records[index].graph)
+    canvas.records[index].graph = graph
+    canvas.records[index].generated_fresh = false

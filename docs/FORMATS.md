@@ -67,10 +67,10 @@ Layout, all numbers little-endian:
 
 | Part | Content |
 |---|---|
-| header | 16 bytes: `LUCED2D1`, the format version (u32, now 2), reserved (u32) |
+| header | 16 bytes: `LUCED2D1`, the format version (u32, now 4), reserved (u32) |
 | tiles | one record per stored tile, back to back |
 | preview | a PNG of the flattened document, at most 256 pixels a side |
-| manifest | the document as Prism text: size, resolution, profile, layers (name, visibility, opacity, blend, clipping, mask flags, group and parent, adjustment and its parameters or curves, text, shape and path values, style fields), guides, alpha channels (name, shown) |
+| manifest | the document as Prism text: size, resolution, profile, layers (name, visibility, opacity, blend, clipping, mask flags, group and parent, adjustment and its parameters or curves, text, a vector layer's elements and its node graph — nodes with their kinds, places and values, wires, and the placement of its output — style fields), guides, alpha channels (name, shown) |
 | index | the blob table, then the cell table |
 | trailer | 64 bytes: `L2DINDEX`, then offset and length (u64 each) of the manifest, the preview and the index, then 8 reserved bytes |
 
@@ -103,6 +103,9 @@ only when complete, so a failed save leaves the previous file as it was. Opening
 reads the trailer, manifest and index, builds the layers, and loads their tiles
 when the document is first bound to a GPU, building each layer's coarser levels
 as it goes.
+
+A vector layer's node graph is kept, not its output: the pixels it drew are stored
+as any layer's are, and the graph is evaluated again when an edit first needs it.
 
 There is no reader for earlier layouts (the `.l2d` folders of PNGs): saving over
 one replaces the folder with the file.
