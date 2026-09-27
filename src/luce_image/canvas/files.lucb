@@ -31,13 +31,19 @@ func save_flattened(canvas: Canvas*, path: str, quality: i64, matte_red: f64, ma
     let pixels = try flattened_pixels(canvas)
     defer free(pixels) in memory.heap
     # Under a matte (linear light; a negative red means none) the picture comes out
-    # opaque: what JPEG, without alpha, needs.
+    # opaque: what JPEG, without alpha, needs. It mixes as the document blends.
     if matte_red >= 0.0:
-        let matte: f32[3] = [(f32)matte_red, (f32)matte_green, (f32)matte_blue]
+        let matte: f64[3] = [matte_red, matte_green, matte_blue]
+        let encoded = not canvas.linear_blend()
         for at in 0..<pixels.length // 4:
-            let alpha = pixels[at * 4 + 3]
+            let alpha = (f64)pixels[at * 4 + 3]
             for channel in 0..<(usize)3:
-                pixels[at * 4 + channel] = pixels[at * 4 + channel] * alpha + matte[channel] * (1.0 - alpha)
+                let value = (f64)pixels[at * 4 + channel]
+                if encoded:
+                    let mixed = transfer.srgb_encode(value) * alpha + transfer.srgb_encode(matte[channel]) * (1.0 - alpha)
+                    pixels[at * 4 + channel] = (f32)transfer.srgb_decode(mixed)
+                else:
+                    pixels[at * 4 + channel] = (f32)(value * alpha + matte[channel] * (1.0 - alpha))
             pixels[at * 4 + 3] = 1.0
     let picture = try Image.from_linear_rgba((usize)canvas.extent_x, (usize)canvas.extent_y, pixels)
     defer picture.release()

@@ -34,6 +34,9 @@ pub struct Liquifier:
     var owner: gpu.Device
     var shader: gpu.Shader
     var pipeline: gpu.Pipeline
+    ## Whether samples mix as sRGB-encoded values: the document's blending, set
+    ## for each push (it cannot change while one is under way).
+    pub var srgb: bool = false
 
     pub static func create(device: gpu.Device) -> Liquifier!:
         var shader = try gpu.Shader.create(device, liquify_frag_words, liquify_frag_msl)
@@ -46,14 +49,14 @@ pub struct Liquifier:
         self.shader.destroy()
 
     ## liquify.frag with `params` over `window` and `field`, into a tile of its own.
-    func shade(params: f32[12]*, window: gpu.Texture, field: gpu.Texture) -> gpu.Texture!:
+    func shade(params: f32[16]*, window: gpu.Texture, field: gpu.Texture) -> gpu.Texture!:
         var fresh = try tile_texture(self.owner)
         errdefer fresh.destroy()
         let frame = try fresh.frame()
         defer frame.release()
         let area = try frame.value().target()
         defer area.release()
-        try gpu.shade(area.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&(*params)[0], 48), [window, field], gpu.Filter.nearest)
+        try gpu.shade(area.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&(*params)[0], 64), [window, field], gpu.Filter.nearest)
         discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         return fresh
 
@@ -99,8 +102,8 @@ pub struct Liquifier:
         var field = try gpu.Texture.create(self.owner, (u32)n, (u32)n, gpu.Format.rgba16_float)
         defer field.destroy()
         try field.upload(bytes)
-        var params: f32[12] = [(f32)x0, (f32)y0, (f32)scale, 0.0, (f32)window.left, (f32)window.top, (f32)(try window.texture.width()), (f32)(try window.texture.height()),
-                               (f32)(1u32 << at), (f32)spacing, (f32)n, 0.0]
+        var params: f32[16] = [(f32)x0, (f32)y0, (f32)scale, 0.0, (f32)window.left, (f32)window.top, (f32)(try window.texture.width()), (f32)(try window.texture.height()),
+                               (f32)(1u32 << at), (f32)spacing, (f32)n, 0.0, 1.0 if self.srgb else 0.0, 0.0, 0.0, 0.0]
         return try self.shade(&params, window.texture, field)
 
 ## Where a cell's pixels read (`reach`), two texels of `scale` pixels around

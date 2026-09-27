@@ -2,19 +2,24 @@
 // modes, at an opacity. Both inputs are straight-alpha tiles; the output is
 // straight alpha too, drawn with `replace`. `source` covers the whole tile;
 // `region` maps the fragment to the layer tile's texels (the backdrop tile
-// always covers the fragment one to one).
+// always covers the fragment one to one). With `srgb` the colors mix as
+// sRGB-encoded values, as Photoshop's do; without it in linear light.
 #version 450
+#extension GL_GOOGLE_include_directive : require
 layout(location = 0) in vec4 vertex_color;
 layout(location = 0) out vec4 fragment_color;
 layout(push_constant) uniform Params {
     vec4 region;      // layer texels: x, y, width, height of the tile's covered part
     float opacity;
     float mode;
+    float srgb;       // 1: mix the encoded values
+    float unused;
 } params;
 layout(set = 0, binding = 1) uniform sampler2D backdrop;
 layout(set = 0, binding = 2) uniform sampler2D layer;
 layout(set = 0, binding = 3) uniform sampler2D mask;   // red reveals; white when absent
 layout(set = 0, binding = 4) uniform sampler2D base;   // the clip base's alpha; white when unclipped
+#include "srgb.glsl"
 
 float lum(vec3 c) { return dot(c, vec3(0.3, 0.59, 0.11)); }
 vec3 clip_color(vec3 c) {
@@ -80,11 +85,16 @@ void main() {
     if (p.x >= params.region.z || p.y >= params.region.w) src = vec4(0.0);
     float sa = src.a * params.opacity * texture(mask, layer_uv).r * texture(base, layer_uv).a;
     int mode = int(params.mode + 0.5);
+    bool encoded = params.srgb > 0.5;
+    if (encoded) {
+        bd.rgb = srgb_encode(bd.rgb);
+        src.rgb = srgb_encode(src.rgb);
+    }
     vec3 mixed = blend(mode, bd.rgb, src.rgb);
     // W3C compositing: the blend applies where both are present, the plain
     // source where only the source is.
     vec3 cs = (1.0 - bd.a) * src.rgb + bd.a * mixed;
     float a = sa + bd.a * (1.0 - sa);
     vec3 rgb = a > 0.0 ? (cs * sa + bd.rgb * bd.a * (1.0 - sa)) / a : vec3(0.0);
-    fragment_color = vec4(rgb, a);
+    fragment_color = vec4(encoded ? srgb_decode(rgb) : rgb, a);
 }

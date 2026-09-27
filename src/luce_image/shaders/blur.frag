@@ -2,14 +2,18 @@
 // before, the tile itself and the tile after along `direction` (white
 // placeholders never occur; absent neighbours are passed as a transparent
 // tile). Straight alpha in, straight alpha out, weighted by alpha so
-// transparent texels do not darken edges.
+// transparent texels do not darken edges. To blur sRGB-encoded values, as
+// Photoshop does, the first pass encodes what it reads (`encode`) and the
+// second decodes what it writes (`decode`); the tile between holds them encoded.
 #version 450
+#extension GL_GOOGLE_include_directive : require
 layout(location = 0) in vec4 vertex_color;
 layout(location = 0) out vec4 fragment_color;
-layout(push_constant) uniform Params { float radius; float sigma; float horizontal; float extent; } params;
+layout(push_constant) uniform Params { float radius; float sigma; float horizontal; float extent; float encode; float decode; } params;
 layout(set = 0, binding = 1) uniform sampler2D before;
 layout(set = 0, binding = 2) uniform sampler2D middle;
 layout(set = 0, binding = 3) uniform sampler2D after;
+#include "srgb.glsl"
 vec4 fetch(vec2 texel) {
     // texel is in this tile's coordinates; reach into the neighbours past its edges.
     float along = params.horizontal > 0.5 ? texel.x : texel.y;
@@ -33,9 +37,11 @@ void main() {
         float w = exp(-0.5 * float(i * i) / (params.sigma * params.sigma));
         vec2 q = params.horizontal > 0.5 ? vec2(p.x + float(i), p.y) : vec2(p.x, p.y + float(i));
         vec4 c = fetch(q);
+        if (params.encode > 0.5) c.rgb = srgb_encode(c.rgb);
         sum += vec4(c.rgb * c.a, c.a) * w;
         weights += w;
     }
     sum /= max(weights, 1e-6);
-    fragment_color = vec4(sum.a > 0.0 ? sum.rgb / sum.a : vec3(0.0), sum.a);
+    vec3 rgb = sum.a > 0.0 ? sum.rgb / sum.a : vec3(0.0);
+    fragment_color = vec4(params.decode > 0.5 ? srgb_decode(rgb) : rgb, sum.a);
 }

@@ -87,7 +87,8 @@ func gradient_cell(context: void*?, layer_levels: Pyramid*, layer: u64, mask: bo
     var fresh = try tile_texture(shown.device)
     errdefer fresh.destroy()
     try gradient_tile(&shown.painter, &fresh, source, clip, selected, (f64)(column * tile_size), (f64)(row * tile_size),
-                      shown.x0 / scale, shown.y0 / scale, shown.x1 / scale, shown.y1 / scale, shown.from_color, shown.to_color, shown.radial)
+                      shown.x0 / scale, shown.y0 / scale, shown.x1 / scale, shown.y1 / scale, shown.from_color, shown.to_color, shown.radial,
+                      shown.document.mixing(mask))
     return made_texture(fresh)
 
 ## Keep the gradient shown: drawn once at full size with the last ends.

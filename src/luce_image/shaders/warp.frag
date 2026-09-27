@@ -14,7 +14,9 @@
 // image 2 is the selection (coverage in red) at the source's size, the moved
 // pixels are the layer's weighted by it, and they land over what the
 // selection leaves behind at the output pixel.
+// With `srgb` the samples mix as sRGB-encoded values, as Photoshop resamples.
 #version 450
+#extension GL_GOOGLE_include_directive : require
 layout(location = 0) in vec4 vertex_color;
 layout(location = 0) out vec4 fragment_color;
 layout(push_constant) uniform Params {
@@ -25,17 +27,25 @@ layout(push_constant) uniform Params {
     float g, h, i;
     float lifting;
     float sampling;
+    float srgb;
 } params;
 layout(set = 0, binding = 1) uniform sampler2D source;
 layout(set = 0, binding = 2) uniform sampler2D selection;
+#include "srgb.glsl"
+
+// A source texel premultiplied, in the space samples mix in.
+vec4 premultiplied_at(ivec2 p) {
+    vec4 s = texelFetch(source, p, 0);
+    if (params.srgb > 0.5) s.rgb = srgb_encode(s.rgb);
+    return vec4(s.rgb * s.a, s.a);
+}
 
 bool inside(ivec2 p) { return p.x >= 0 && p.y >= 0 && p.x < int(params.size.x) && p.y < int(params.size.y); }
 
 // A premultiplied source texel, weighted by the selection when lifting.
 vec4 tap(ivec2 p) {
     if (!inside(p)) return params.lifting > 0.5 ? vec4(0.0) : vec4(params.outside);
-    vec4 s = texelFetch(source, p, 0);
-    vec4 premultiplied = vec4(s.rgb * s.a, s.a);
+    vec4 premultiplied = premultiplied_at(p);
     return params.lifting > 0.5 ? premultiplied * texelFetch(selection, p, 0).r : premultiplied;
 }
 
@@ -80,11 +90,10 @@ void main() {
         ivec2 here = ivec2(floor(o));
         vec4 base = vec4(0.0);
         if (inside(here)) {
-            vec4 s = texelFetch(source, here, 0);
-            float kept = s.a * (1.0 - texelFetch(selection, here, 0).r);
-            base = vec4(s.rgb * kept, kept);
+            base = premultiplied_at(here) * (1.0 - texelFetch(selection, here, 0).r);
         }
         moved = moved + base * (1.0 - moved.a);
     }
-    fragment_color = moved.a > 0.0 ? vec4(moved.rgb / moved.a, moved.a) : vec4(0.0);
+    vec3 rgb = moved.a > 0.0 ? moved.rgb / moved.a : vec3(0.0);
+    fragment_color = moved.a > 0.0 ? vec4(params.srgb > 0.5 ? srgb_decode(rgb) : rgb, moved.a) : vec4(0.0);
 }

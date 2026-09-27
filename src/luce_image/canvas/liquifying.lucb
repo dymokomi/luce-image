@@ -27,7 +27,8 @@ func begin_liquify(canvas: Canvas*, id: u64, tiles: const Tiles*, x: f64, y: f64
     let device = canvas.device else error(invalid, "draw the document once before retouching")
     if canvas.liquifier == none:
         canvas.liquifier = try Liquifier.create(device)
-    let liquifier = canvas.liquifier else trap("made")
+    var liquifier = canvas.liquifier else trap("made")
+    liquifier.srgb = (canvas.document else trap("liquify without a document")).mixes_encoded()
     var stroke = try LiquifyStroke.begin(tiles.width(), tiles.height(), x, y, canvas.brush.diameter, canvas.brush.hardness, canvas.brush.opacity)
     errdefer stroke.destroy()
     var original = try tiles.clone()

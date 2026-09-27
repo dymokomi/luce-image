@@ -10,16 +10,20 @@
 //   1 lens correction: p0 distortion (positive straightens barrel, negative
 //     pincushion), p1 red-cyan and p2 blue-yellow fringe (-1..1, a percent of
 //     the radius each); what falls past the frame is transparent
+// With `srgb` the taps mix as sRGB-encoded values.
 #version 450
+#extension GL_GOOGLE_include_directive : require
 layout(location = 0) in vec4 vertex_color;
 layout(location = 0) out vec4 fragment_color;
-layout(push_constant) uniform Params { float kind; float p[3]; vec4 place; vec4 window; } params;
+layout(push_constant) uniform Params { float kind; float p[3]; vec4 place; vec4 window; float srgb; } params;
 layout(set = 0, binding = 1) uniform sampler2D layer;
+#include "srgb.glsl"
 
 // One texel premultiplied, the nearest edge texel past the edges.
 vec4 texel(ivec2 p) {
     ivec2 inside = clamp(p, ivec2(0), ivec2(params.place.zw) - 1);
     vec4 t = texelFetch(layer, clamp(inside - ivec2(params.window.xy), ivec2(0), ivec2(params.window.zw) - 1), 0);
+    if (params.srgb > 0.5) t.rgb = srgb_encode(t.rgb);
     return vec4(t.rgb * t.a, t.a);
 }
 // A premultiplied sample between texels at a layer pixel position: mixed
@@ -63,5 +67,6 @@ void main() {
         vec4 green = tap(green_at);
         sum = vec4(tap(red_at).r, green.g, tap(blue_at).b, green.a);
     }
-    fragment_color = sum.a > 1e-6 ? vec4(clamp(sum.rgb / sum.a, 0.0, 1.0), sum.a) : vec4(0.0);
+    vec3 rgb = clamp(sum.rgb / max(sum.a, 1e-6), 0.0, 1.0);
+    fragment_color = sum.a > 1e-6 ? vec4(params.srgb > 0.5 ? srgb_decode(rgb) : rgb, sum.a) : vec4(0.0);
 }

@@ -128,7 +128,9 @@ func draw_quick_overlay(canvas: Canvas*, target: interop.View[gpu.RenderTarget],
 ## selection's, its tiles `coverage_level` pyramid levels down: a preview's)
 ## with `color` at `opacity`, over the document as `draw` drew it, at the
 ## view's level, only the cells on screen. A cell without a tile is wholly
-## covered in a mask (`mask`), wholly left out in a selection.
+## covered in a mask (`mask`), wholly left out in a selection. In a document
+## that blends in sRGB the matte mixes with the composite under it (and the
+## checkerboard) as encoded values, as Photoshop's does.
 func draw_matte(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64,
                 coverage: const Tiles*, coverage_level: u32, mask: bool, color: f32[3], opacity: f32) -> !:
     let checked = try target.get()
@@ -140,6 +142,12 @@ func draw_matte(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectang
     let scale = size.pixel_width / size.width if size.width > 0.0 else 1.0
     let placement = try checked.placement()
     let composer = canvas.composer else return
+    let document = canvas.document else return
+    let srgb = document.srgb_flag()
+    let squares_x = (placement.x + rectangle.x + offset_x) * scale
+    let squares_y = (placement.y + rectangle.y + offset_y) * scale
+    let light_grey = canvas.checker_light
+    let dark_grey = canvas.checker_dark
     composer.hold()
     let level = max_u32(view_level(zoom), coverage_level)
     let within = level - coverage_level
@@ -155,11 +163,22 @@ func draw_matte(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectang
             let height = (f64)covered_y * step * zoom
             if left >= rectangle.x + rectangle.width or top >= rectangle.y + rectangle.height or left + width <= rectangle.x or top + height <= rectangle.y:
                 continue
-            let found = try composer.level_texture(coverage, column, row, within, mask)
-            if found == none and mask:
+            if mask and not (try coverage_here(composer, coverage, column, row, within)):
                 # A mask reveals where it has no tile: nothing to cover.
                 continue
-            let texture = found else composer_blank(canvas)
-            var params: f32[12] = [(f32)((placement.x + left) * scale), (f32)((placement.y + top) * scale), (f32)(zoom * step * scale), opacity,
-                                   (f32)covered_x, (f32)covered_y, 0.0, 0.0, color[0], color[1], color[2], 1.0]
-            try gpu.shade(area, pipeline, gpu.Rect(left, top, width, height), u8[]((u8*)&params[0], 48), [texture], gpu.Filter.nearest if zoom * step >= 1.0 else gpu.Filter.linear)
+            # What the matte mixes with, when it mixes encoded values: the
+            # composite as the view shows it (fetched first: its request lets
+            # go of what came before).
+            var under = composer_blank(canvas)
+            if srgb > 0.5:
+                under = try composer.tile(document, column, row, level)
+            let texture = (try composer.level_texture(coverage, column, row, within, mask)) else composer_blank(canvas)
+            var params: f32[24] = [(f32)((placement.x + left) * scale), (f32)((placement.y + top) * scale), (f32)(zoom * step * scale), opacity,
+                                   (f32)covered_x, (f32)covered_y, srgb, (f32)(canvas.checker_cell * scale), color[0], color[1], color[2], 1.0,
+                                   (f32)squares_x, (f32)squares_y, 0.0, 0.0, light_grey, light_grey, light_grey, 1.0, dark_grey, dark_grey, dark_grey, 1.0]
+            try gpu.shade(area, pipeline, gpu.Rect(left, top, width, height), u8[]((u8*)&params[0], 96), [texture, under],
+                          gpu.Filter.nearest if zoom * step >= 1.0 else gpu.Filter.linear)
+
+## Whether `coverage` has a tile in cell (`column`, `row`) at `level`.
+func coverage_here(composer: Composer*, coverage: const Tiles*, column: u32, row: u32, level: u32) -> bool!:
+    return (try composer.level_texture(coverage, column, row, level, true)) != none

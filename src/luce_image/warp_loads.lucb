@@ -47,6 +47,9 @@ pub struct CellLoader:
     var sent: bool
     var placed: Placed[]
     var placed_count: usize
+    ## Each half float's sRGB-encoded value (blending.lucb's table, borrowed)
+    ## when the samples are to be encoded; empty keeps them in linear light.
+    pub var encoded: f32[]
 
     ## A loader for `count` cells, `columns` a row.
     pub static func create(count: usize, columns: usize) -> CellLoader!:
@@ -57,8 +60,9 @@ pub struct CellLoader:
         let wanted = try alloc u32[64] in memory.heap
         errdefer free(wanted) in memory.heap
         let placed = try alloc Placed[64] in memory.heap
+        var linear: f32[]
         return CellLoader(columns = columns, requested = requested, wanted = wanted, wanted_head = 0, wanted_count = 0,
-                          batch = gpu.ReadBatch(), sent = false, placed = placed, placed_count = 0)
+                          batch = gpu.ReadBatch(), sent = false, placed = placed, placed_count = 0, encoded = linear)
 
     pub mutating func destroy():
         if self.sent:
@@ -168,7 +172,8 @@ pub struct CellLoader:
                     free(made[other].pixels) in memory.heap
                     free(made[other].halves) in memory.heap
                 error(failure.code, failure.message)
-            made[at] = Unpack(bytes = try self.batch.bytes(place.offset, (usize)place.rows * (usize)tile_size * 8), pixels = pixels, halves = halves, columns = (usize)place.columns)
+            made[at] = Unpack(bytes = try self.batch.bytes(place.offset, (usize)place.rows * (usize)tile_size * 8), pixels = pixels, halves = halves, columns = (usize)place.columns,
+                              encoded = self.encoded)
             allocated += 1
         try unpack_all(made)
         for at in 0..<count:
@@ -184,13 +189,15 @@ struct Unpack:
     var pixels: f32[]
     var halves: u8[]
     var columns: usize
+    var encoded: f32[]
 
 ## A cell's read-back bytes (rows of 256 texels of four half floats, straight
 ## alpha) as premultiplied f32 samples in `pixels`, 256 by 256, and kept as
 ## they are in `halves` (the tile's own bytes, for uploading the cell again
 ## without converting it): only the document's `columns` of each row; the rest,
-## and rows not read, clear.
-pub func unpack_cell(bytes: const u8[], columns: usize, pixels: f32[], halves: u8[]):
+## and rows not read, clear. With `encoded` (a table of every half float's
+## sRGB-encoded value) the samples hold encoded colors, for mixing those.
+pub func unpack_cell(bytes: const u8[], columns: usize, pixels: f32[], halves: u8[], encoded: const f32[]):
     for index in 0..<pixels.length:
         pixels[index] = 0.0
     memory.set(halves, 0)
@@ -202,7 +209,8 @@ pub func unpack_cell(bytes: const u8[], columns: usize, pixels: f32[], halves: u
             let at = y * (usize)tile_size + x
             let alpha = from_half((u16)bytes[at * 8 + 6] | ((u16)bytes[at * 8 + 7] << 8))
             for channel in 0..<(usize)3:
-                pixels[at * 4 + channel] = from_half((u16)bytes[at * 8 + channel * 2] | ((u16)bytes[at * 8 + channel * 2 + 1] << 8)) * alpha
+                let bits = (u16)bytes[at * 8 + channel * 2] | ((u16)bytes[at * 8 + channel * 2 + 1] << 8)
+                pixels[at * 4 + channel] = (encoded[(usize)bits] if encoded.length > 0 else from_half(bits)) * alpha
             pixels[at * 4 + 3] = alpha
 
 ## One worker's cells `first..<last` of `cells`.
@@ -216,7 +224,7 @@ func unpack_entry(context: void*?):
 
 func unpack_share(share: UnpackShare*):
     for at in share.first..<share.last:
-        unpack_cell(share.cells[at].bytes, share.cells[at].columns, share.cells[at].pixels, share.cells[at].halves)
+        unpack_cell(share.cells[at].bytes, share.cells[at].columns, share.cells[at].pixels, share.cells[at].halves, share.cells[at].encoded)
 
 ## Every cell of `cells` unpacked, split across the processors.
 func unpack_all(cells: Unpack[]) -> !:

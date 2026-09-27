@@ -420,9 +420,9 @@ func package_preview(canvas: Canvas*, out: Buffer*) -> !:
     try encoder.write_rows(pixels, (usize)height)
     try encoder.finish()
 
-## The document's manifest: its size, resolution and profile, every layer's
-## settings (with the text, shape or path it keeps), the guides and the
-## alpha channels.
+## The document's manifest: its size, resolution, profile and how its colors
+## blend, every layer's settings (with the text, shape or path it keeps), the
+## guides and the alpha channels.
 func package_manifest(canvas: Canvas*) -> interop.Reference[prism.Document]!:
     let native = try new prism.Document() in memory.heap
     let manifest = try interop.Reference[prism.Document].adopt(native, prism.document_type, memory.heap)
@@ -437,6 +437,8 @@ func package_manifest(canvas: Canvas*) -> interop.Reference[prism.Document]!:
     let profile = try prism.Value.text((str)canvas.profile_name[..<canvas.profile_length])
     defer profile.release()
     try manifest.value().set("/document", "profile", profile)
+    # Color Settings' "Blend RGB Colors Using Gamma 1.0": how the colors mix.
+    try set_integer(manifest.value(), "/document", "linear_blend", 1 if canvas.linear_blend() else 0)
     try manifest.value().add("/layers", "layers")
     for index in 0..<canvas.count:
         let record = canvas.records[index]

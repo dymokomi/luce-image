@@ -61,7 +61,10 @@ Luce-facing `Canvas` object:
 - A layer tree of 256×256 rgba16 tiles in linear light, straight alpha; the 26
   Photoshop blend modes, opacity, visibility, layer masks and clipping masks,
   composited per tile through one shader with a cache keyed on what each tile
-  depends on, and a pyramid for zoomed-out views.
+  depends on, and a pyramid for zoomed-out views. Colors mix as their
+  sRGB-encoded values wherever they mix, as Photoshop's do, unless the
+  document blends with gamma 1.0 (`set_linear_blend`; see
+  [how colors blend](docs/BLENDING.md)).
 - Per-pixel selections (rectangle, ellipse, polygon/lasso, magic wand; add,
   subtract, intersect, invert, expand, contract, feather) that painting, fills
   and crops respect, drawn as marching ants.
@@ -113,10 +116,11 @@ compiler versions instead. See [testing](docs/TESTING.md) for dependencies and C
 
 The GPU shaders are GLSL under `src/luce_image/shaders/`; after changing one, regenerate
 `src/luce_image/shaders.lucb` with luce-gpu's generator (needs `glslangValidator` and `spirv-cross`):
-`python3 ../luce-gpu/tools/embed_shaders.py --public src/luce_image/shaders.lucb src/luce_image/shaders/dab.frag src/luce_image/shaders/paint.frag src/luce_image/shaders/composite.frag src/luce_image/shaders/adjust.frag src/luce_image/shaders/blur.frag src/luce_image/shaders/ants.frag src/luce_image/shaders/warp.frag src/luce_image/shaders/spread.frag src/luce_image/shaders/style.frag src/luce_image/shaders/gradient.frag src/luce_image/shaders/lift.frag src/luce_image/shaders/mask_mix.frag src/luce_image/shaders/adjust_mix.frag src/luce_image/shaders/resample.frag src/luce_image/shaders/float.frag src/luce_image/shaders/encode.frag src/luce_image/shaders/liquify.frag src/luce_image/shaders/quickmask.frag src/luce_image/shaders/mesh.frag src/luce_image/shaders/channels.frag` (this order keeps the generated file stable).
+`python3 ../luce-gpu/tools/embed_shaders.py --public src/luce_image/shaders.lucb src/luce_image/shaders/dab.frag src/luce_image/shaders/paint.frag src/luce_image/shaders/composite.frag src/luce_image/shaders/adjust.frag src/luce_image/shaders/blur.frag src/luce_image/shaders/ants.frag src/luce_image/shaders/warp.frag src/luce_image/shaders/spread.frag src/luce_image/shaders/style.frag src/luce_image/shaders/gradient.frag src/luce_image/shaders/lift.frag src/luce_image/shaders/mask_mix.frag src/luce_image/shaders/adjust_mix.frag src/luce_image/shaders/resample.frag src/luce_image/shaders/float.frag src/luce_image/shaders/encode.frag src/luce_image/shaders/liquify.frag src/luce_image/shaders/quickmask.frag src/luce_image/shaders/mesh.frag src/luce_image/shaders/channels.frag src/luce_image/shaders/transfer.frag` (this order keeps the generated file stable).
 
 Documentation: [API](docs/API.md), [formats](docs/FORMATS.md),
-[design and limits](docs/DESIGN.md), [upstream attribution](THIRD_PARTY.md).
+[design and limits](docs/DESIGN.md), [how colors blend](docs/BLENDING.md),
+[upstream attribution](THIRD_PARTY.md).
 [Measured thread scaling](docs/BENCHMARK.md) records the initial benchmark.
 [Validation results](docs/VALIDATION.md) distinguish local checks from CI.
 

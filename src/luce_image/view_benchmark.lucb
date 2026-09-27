@@ -1,0 +1,131 @@
+## A timing program for the view of a very large picture: the picture opened
+## whole, a layer over it at half opacity in Multiply, and a 1600 by 1000 view
+## drawn over the app's checkerboard, as the editor draws it. It prints
+## milliseconds for a zoom sweep from fit to 100% (each level's first frame
+## composites its cells; the second finds them kept), a pan at 100% that
+## brings a new column of cells into view every frame, an opacity dragged on
+## the top layer (every cell in view composited again each frame, at fit, 25%
+## and 100%), and a soft brush stroke at half opacity drawn a frame every few
+## points. Each frame reads a texel back, so it is timed to the GPU's end.
+## `--linear` blends with gamma 1.0; `--plain` draws without the
+## checkerboard; `--stacked` puts seven more layers between them, each in its
+## own blend mode.
+import gpu
+import math
+import time
+from luce_image.canvas import Canvas
+
+let view_width: u32 = 1600
+let view_height: u32 = 1000
+
+pub func main(arguments: str[]) -> i32!:
+    if arguments.length < 2:
+        print("usage: view_benchmark PICTURE [--linear] [--plain] [--stacked]")
+        return 2
+    var linear = false
+    var plain = false
+    var stacked = false
+    for index in 2..<arguments.length:
+        linear = linear or arguments[index] == "--linear"
+        plain = plain or arguments[index] == "--plain"
+        stacked = stacked or arguments[index] == "--stacked"
+    Canvas.set_progressive_loading(false)
+    var device = try gpu.Device.open()
+    defer device.destroy()
+    var target = try gpu.Texture.create(device, view_width, view_height, gpu.Format.rgba8)
+    defer target.destroy()
+    let opened = try Canvas.open(arguments[1])
+    defer opened.release()
+    let canvas = opened.value()
+    canvas.set_view_format(gpu.Format.rgba8)
+    if not plain:
+        try canvas.set_checker(8.0, 0.061, 0.039)
+    let width = (f64)canvas.width()
+    let height = (f64)canvas.height()
+    let fit = math.min((f64)view_width / width, (f64)view_height / height)
+    # The first frame loads the picture whole.
+    let loaded = time.now()
+    try frame(canvas, &target, fit, 0.0, 0.0)
+    print(f"opened and drawn fitted {(time.now() - loaded) // 1000000} ms")
+    try canvas.set_linear_blend(linear)
+    # A layer over it all at half opacity, multiplied: every cell composites two layers.
+    let over = try canvas.add_layer("Over")
+    try canvas.set_brush(40.0, 0.5, 1.0, 1.0, 0.8, 0.6, 0.3, false)
+    try canvas.fill(over, false)
+    try canvas.set_layer(over, true, 0.5, 2)
+    # Seven more under it, each over everything in its own mode: eight passes a cell.
+    if stacked:
+        for index in 0..<7:
+            let more = try canvas.add_layer("More")
+            try canvas.set_brush(40.0, 0.5, 1.0, 1.0, 0.2 + (f64)index * 0.1, 0.5, 0.9 - (f64)index * 0.1, false)
+            try canvas.fill(more, false)
+            try canvas.set_layer(more, true, 0.4, index + 3)
+        try canvas.reorder_layer(over, 7)
+    # Zoom from fit to 100% about the middle: cold, then warm.
+    var cold = 0.0
+    var warm = 0.0
+    var zoom = fit
+    var levels = 0
+    while zoom <= 1.0:
+        let x = (f64)view_width / 2.0 - width * zoom / 2.0
+        let y = (f64)view_height / 2.0 - height * zoom / 2.0
+        cold += try timed(canvas, &target, zoom, x, y)
+        warm += try timed(canvas, &target, zoom, x, y)
+        levels += 1
+        zoom *= 2.0
+    print(f"zoom sweep {levels} levels: first frames {cold} ms, again {warm} ms")
+    # Pan at 100% along the middle row, 256 pixels a frame.
+    var panned = 0.0
+    var slowest = 0.0
+    let frames = 48
+    for step in 0..<frames:
+        let spent = try timed(canvas, &target, 1.0, -(f64)step * 256.0, -height / 2.0)
+        panned += spent
+        slowest = math.max(slowest, spent)
+    print(f"pan at 100%: {frames} frames, {panned / (f64)frames} ms a frame, slowest {slowest} ms")
+    # An opacity dragged on the top layer: every frame composites every cell in view again.
+    for scale in [fit, 0.25, 1.0]:
+        var dragged = 0.0
+        let x = (f64)view_width / 2.0 - width * scale / 2.0
+        let y = (f64)view_height / 2.0 - height * scale / 2.0
+        for step in 0..<30:
+            try canvas.set_layer(over, true, 0.3 + (f64)(step % 10) * 0.05, 2)
+            dragged += try timed(canvas, &target, scale, x, y)
+        print(f"opacity drag at {scale * 100.0}%: {dragged / 30.0} ms a frame")
+    try canvas.set_layer(over, true, 0.5, 2)
+    # A soft 120-pixel brush at half opacity across the view at 100%, a frame each 4 points.
+    try canvas.set_brush(120.0, 0.5, 0.5, 1.0, 0.0, 0.0, 0.0, false)
+    let left = width / 2.0 - 700.0
+    let top = height / 2.0
+    let started = time.now()
+    try canvas.begin_stroke(over, left, top)
+    var painted = 0
+    for step in 1..<400:
+        let t = (f64)step / 400.0
+        try canvas.extend_stroke(left + t * 1400.0, top + math.sin(t * 12.0) * 300.0)
+        if step % 4 == 0:
+            try frame(canvas, &target, 1.0, (f64)view_width / 2.0 - width / 2.0, (f64)view_height / 2.0 - height / 2.0)
+            painted += 1
+    try canvas.end_stroke()
+    try frame(canvas, &target, 1.0, (f64)view_width / 2.0 - width / 2.0, (f64)view_height / 2.0 - height / 2.0)
+    let stroke = (f64)(time.now() - started) / 1000000.0
+    print(f"brush stroke: 400 points, {painted + 1} frames, {stroke} ms, {stroke / (f64)(painted + 1)} ms a frame")
+    canvas.close()
+    return 0
+
+## One frame of the view at `zoom`, the document's corner at (`x`, `y`), and
+## its milliseconds to the GPU's end.
+func timed(canvas: Canvas*, target: gpu.Texture*, zoom: f64, x: f64, y: f64) -> f64!:
+    let started = time.now()
+    try frame(canvas, target, zoom, x, y)
+    return (f64)(time.now() - started) / 1000000.0
+
+func frame(canvas: Canvas*, target: gpu.Texture*, zoom: f64, x: f64, y: f64) -> !:
+    let root_frame = try target.frame()
+    defer root_frame.release()
+    let root = try root_frame.value().target()
+    defer root.release()
+    try canvas.draw(root, gpu.Rect(width = (f64)view_width, height = (f64)view_height), zoom, x, y)
+    discard(try root_frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    var texel: u8[4]
+    try target.read(texel, gpu.Region(view_width // 2, view_height // 2, 1, 1))

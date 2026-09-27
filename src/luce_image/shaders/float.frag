@@ -9,7 +9,9 @@
 // in the map's coordinates, reads ((a x + b y + c) / w, (d x + e y + f) / w)
 // with w = g x + h y + i. `sampling` picks nearest (0), bilinear (1) or bicubic
 // (2); all straight alpha in and out, mixed premultiplied.
+// With `srgb` the samples mix as sRGB-encoded values, as Photoshop resamples.
 #version 450
+#extension GL_GOOGLE_include_directive : require
 layout(location = 0) in vec4 vertex_color;
 layout(location = 0) out vec4 fragment_color;
 layout(push_constant) uniform Params {
@@ -18,17 +20,24 @@ layout(push_constant) uniform Params {
     vec2 size;
     float g, h, i;
     float sampling;
+    float srgb;
 } params;
 layout(set = 0, binding = 1) uniform sampler2D source;
 layout(set = 0, binding = 2) uniform sampler2D selection;
 layout(set = 0, binding = 3) uniform sampler2D base;
 layout(set = 0, binding = 4) uniform sampler2D base_selection;
+#include "srgb.glsl"
+
+// A texel premultiplied, in the space samples mix in.
+vec4 premultiplied(vec4 s) {
+    if (params.srgb > 0.5) s.rgb = srgb_encode(s.rgb);
+    return vec4(s.rgb * s.a, s.a);
+}
 
 // A premultiplied source texel weighted by the selection; nothing past the window.
 vec4 tap(ivec2 p) {
     if (p.x < 0 || p.y < 0 || p.x >= int(params.size.x) || p.y >= int(params.size.y)) return vec4(0.0);
-    vec4 s = texelFetch(source, p, 0);
-    return vec4(s.rgb * s.a, s.a) * texelFetch(selection, p, 0).r;
+    return premultiplied(texelFetch(source, p, 0)) * texelFetch(selection, p, 0).r;
 }
 
 // Catmull-Rom weights for the four taps around a sample `t` past the second.
@@ -68,8 +77,8 @@ void main() {
     }
     // What the selection leaves behind here, under the moved pixels.
     ivec2 here = ivec2(gl_FragCoord.xy);
-    vec4 s = texelFetch(base, here, 0);
-    float kept = s.a * (1.0 - texelFetch(base_selection, here, 0).r);
-    moved = moved + vec4(s.rgb * kept, kept) * (1.0 - moved.a);
-    fragment_color = moved.a > 0.0 ? vec4(moved.rgb / moved.a, moved.a) : vec4(0.0);
+    vec4 kept = premultiplied(texelFetch(base, here, 0)) * (1.0 - texelFetch(base_selection, here, 0).r);
+    moved = moved + kept * (1.0 - moved.a);
+    vec3 rgb = moved.a > 0.0 ? moved.rgb / moved.a : vec3(0.0);
+    fragment_color = moved.a > 0.0 ? vec4(params.srgb > 0.5 ? srgb_decode(rgb) : rgb, moved.a) : vec4(0.0);
 }

@@ -10,7 +10,9 @@
 ## one way to produce pixels; export asks for level-0 tiles like the screen.
 ## A Blur adjustment layer is the one thing that reaches past its cell: it
 ## flattens what is below it in the eight cells around too, and while a
-## document has one every key covers those neighbours.
+## document has one every key covers those neighbours. Colors mix as the
+## document blends them: as sRGB-encoded values, or in linear light with
+## `Document.linear_blend` (part of every key).
 import gpu
 import memory
 from tiles import Gathering, Tiles, Tile, tile_size, min_u32, max_u32, tile_texture, transient_mark, release_transients
@@ -62,6 +64,8 @@ pub struct Composer:
     var pyramid: Pyramid
     ## The level the tile being made is at.
     var level: u32
+    ## Whether the tile being made mixes sRGB-encoded values: 1 or 0, as the shaders take it.
+    var srgb: f32
     var tick: u64
     var shader: gpu.Shader
     var pipeline: gpu.Pipeline
@@ -136,7 +140,7 @@ pub struct Composer:
         var tables: CurveTable[4]
         for index in 0..<curve_table_budget:
             tables[index] = CurveTable(key = 0, texture = gpu.Texture(), live = false)
-        return Composer(owner = device, cache = cache, pyramid = pyramid, level = 0, tick = 0, shader = shader, pipeline = pipeline, blank = blank, white = white, styler = styler,
+        return Composer(owner = device, cache = cache, pyramid = pyramid, level = 0, srgb = 1.0, tick = 0, shader = shader, pipeline = pipeline, blank = blank, white = white, styler = styler,
                         adjuster = adjuster, mix_shader = mix_shader, mix = mix, effects = effects, curve_tables = tables, next_curve_table = 0, renders = 0, extent_x = 0, extent_y = 0,
                         drawing = none, filters = filters, stop_at = 0, stopped = false,
                         stand_ins = stand_ins, stand_in_count = 0)
@@ -154,6 +158,7 @@ pub struct Composer:
         self.extent_y = document.height()
         self.drawing = document
         self.level = level
+        self.srgb = document.srgb_flag()
         # What this tile fetches stays until the next request.
         self.cache.hold()
         self.pyramid.hold()
@@ -195,6 +200,7 @@ pub struct Composer:
         digest = fnv_mix(digest, (u64)row)
         digest = fnv_mix(digest, (u64)document.width())
         digest = fnv_mix(digest, (u64)document.height())
+        digest = fnv_mix(digest, 1 if document.linear_blend else 2)
         if has_blur(document.layers()):
             # What is below a blur in the cells around shows through it.
             let first_column = column * span - 1 if column > 0 else 0
@@ -448,14 +454,14 @@ pub struct Composer:
 
     ## One layer (or effects) tile composited over the backdrop so far.
     mutating func pass(backdrop: gpu.Texture*, owned: bool*, texture: gpu.Texture, mask: gpu.Texture, clip: gpu.Texture, area: gpu.Region, opacity: f64, blend: u32) -> !:
-        var params: f32[6] = [0.0, 0.0, (f32)area.width, (f32)area.height, (f32)opacity, (f32)blend]
+        var params: f32[8] = [0.0, 0.0, (f32)area.width, (f32)area.height, (f32)opacity, (f32)blend, self.srgb, 0.0]
         var fresh = try tile_texture(self.owner)
         errdefer fresh.destroy()
         let frame = try fresh.frame()
         defer frame.release()
         let target = try frame.value().target()
         defer target.release()
-        try gpu.shade(target.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 24), [*backdrop, texture, mask, clip], gpu.Filter.nearest)
+        try gpu.shade(target.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 32), [*backdrop, texture, mask, clip], gpu.Filter.nearest)
         discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         if *owned:
             backdrop.destroy()
@@ -477,14 +483,14 @@ pub struct Composer:
                               height = (u32)(((u64)self.extent_y + (1u64 << self.level) - 1) >> self.level))
             adjusted = try self.adjuster.adjusted(*backdrop, (u32)layer.adjustment, layer.adjustment_values[..<23], table, place)
         defer adjusted.destroy()
-        var params: f32[1] = [(f32)opacity]
+        var params: f32[2] = [(f32)opacity, self.srgb]
         var fresh = try tile_texture(self.owner)
         errdefer fresh.destroy()
         let frame = try fresh.frame()
         defer frame.release()
         let target = try frame.value().target()
         defer target.release()
-        try gpu.shade(target.value(), self.mix, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 4), [*backdrop, adjusted, mask, clip], gpu.Filter.nearest)
+        try gpu.shade(target.value(), self.mix, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 8), [*backdrop, adjusted, mask, clip], gpu.Filter.nearest)
         discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
         drop_owned(backdrop, *owned)
         *backdrop = fresh
@@ -515,7 +521,7 @@ pub struct Composer:
                 dx += 1
             dy += 1
         # A coarser level blurs by as many of its own, larger, texels.
-        try self.filters.blur_tiles(&block, clamp_radius(layer.adjustment_values[0] / (f64)(1u64 << self.level)))
+        try self.filters.blur_tiles(&block, clamp_radius(layer.adjustment_values[0] / (f64)(1u64 << self.level)), self.srgb > 0.5)
         var result = try block.blank()
         errdefer result.destroy()
         if let blurred = (try block.texture(1, 1)):
@@ -576,13 +582,14 @@ pub struct Composer:
         key = fnv_mix(key, layer.id)
         key = fnv_mix(key, layer.revision)
         key = fnv_mix(key, layer.style.digest())
+        key = fnv_mix(key, (u64)self.srgb)
         if let tiles = layer.tiles():
             key = tiles.stamps(key)
         for index in 0..<effects_budget:
             if self.effects[index].live and self.effects[index].key == key:
                 self.effects[index].used = self.tick
                 return &self.effects[index]
-        var rendered = try self.styler.render(layer)
+        var rendered = try self.styler.render(layer, self.srgb > 0.5)
         errdefer rendered.destroy()
         var slot: usize = 0
         for index in 1..<effects_budget:
@@ -615,14 +622,14 @@ pub struct Composer:
                     if let mask_texture = (try mask_tiles.texture(column, row)):
                         mask = mask_texture
                 let clip = ((try tiles.texture(column, row)) else self.blank) if top.clipped else self.white
-                var params: f32[6] = [0.0, 0.0, (f32)area.width, (f32)area.height, (f32)top.opacity, (f32)top.blend]
+                var params: f32[8] = [0.0, 0.0, (f32)area.width, (f32)area.height, (f32)top.opacity, (f32)top.blend, document.srgb_flag(), 0.0]
                 var fresh = try tile_texture(self.owner)
                 errdefer fresh.destroy()
                 let frame = try fresh.frame()
                 defer frame.release()
                 let target = try frame.value().target()
                 defer target.release()
-                try gpu.shade(target.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 24), [backdrop, texture, mask, clip], gpu.Filter.nearest)
+                try gpu.shade(target.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 32), [backdrop, texture, mask, clip], gpu.Filter.nearest)
                 discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
                 try tiles.set(column, row, fresh)
         lower.revision += 1
@@ -799,7 +806,8 @@ test "composite flattens layers with opacity, caches by identity and scales leve
     let r = from_half((u16)bytes[0] | ((u16)bytes[1] << 8))
     let g = from_half((u16)bytes[2] | ((u16)bytes[3] << 8))
     let a = from_half((u16)bytes[6] | ((u16)bytes[7] << 8))
-    assert(r > 0.49 and r < 0.51 and g > 0.49 and g < 0.51 and a == 1.0)
+    # Mixed as sRGB-encoded values: half of each encoded, 0.214 in linear light.
+    assert(r > 0.209 and r < 0.219 and g > 0.209 and g < 0.219 and a == 1.0)
     # The same request is a cache hit; a change to the top layer is not, and
     # hiding it leaves the bottom-only tile at (1, 1) untouched.
     discard(try composer.tile(&document, 0, 0, 0))
@@ -823,7 +831,7 @@ test "composite flattens layers with opacity, caches by identity and scales leve
     let multiplied = try composer.tile(&document, 0, 0, 0)
     try multiplied.read(bytes, gpu.Region(20, 10, 1, 1))
     let red_left = from_half((u16)bytes[0] | ((u16)bytes[1] << 8))
-    assert(red_left > 0.49 and red_left < 0.51 and from_half((u16)bytes[2] | ((u16)bytes[3] << 8)) < 0.01)
+    assert(red_left > 0.209 and red_left < 0.219 and from_half((u16)bytes[2] | ((u16)bytes[3] << 8)) < 0.01)
     assert(from_half((u16)bytes[6] | ((u16)bytes[7] << 8)) == 1.0)
     # A mask painted black at the pixel hides the top layer there; clipping the
     # top layer to an empty layer below hides it everywhere.
@@ -854,9 +862,16 @@ test "composite flattens layers with opacity, caches by identity and scales leve
     let alone = try composer.tile(&document, 0, 0, 0)
     try alone.read(bytes, gpu.Region(20, 10, 1, 1))
     # The top (unclipped, green at half alpha) still shows; the clipped copy in
-    # the group has no base and adds nothing: red 0.5 as before.
+    # the group has no base and adds nothing: red half encoded as before.
     let clipped_red = from_half((u16)bytes[0] | ((u16)bytes[1] << 8))
-    assert(clipped_red > 0.49 and clipped_red < 0.51)
+    assert(clipped_red > 0.209 and clipped_red < 0.219)
+    # Blending with gamma 1.0 mixes linear light: half of each, and a new key.
+    document.linear_blend = true
+    let linear = try composer.tile(&document, 0, 0, 0)
+    try linear.read(bytes, gpu.Region(20, 10, 1, 1))
+    let linear_red = from_half((u16)bytes[0] | ((u16)bytes[1] << 8))
+    assert(linear_red > 0.49 and linear_red < 0.51)
+    document.linear_blend = false
     var rejected = false
     discard(composer.tile(&document, 4, 0, 0) catch failure:
         assert(failure.code == invalid)

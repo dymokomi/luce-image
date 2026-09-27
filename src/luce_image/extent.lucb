@@ -9,6 +9,7 @@ import interop
 import math
 import memory
 from tiles import Tiles, CellRange, Bounds, tile_size, min_i64, max_i64
+from luce_image.blending import Transfer
 from raster_errors import invalid
 
 ## Texels `source` of `texture` (borrowed), their top-left at document pixel (`x`, `y`).
@@ -69,12 +70,28 @@ pub func pieces(tiles: const Tiles*) -> Pieces!:
 ## (`scale_x`, `scale_y`) about the document's origin and then moved by
 ## (`offset_x`, `offset_y`); what lands past `dest`'s canvas is kept past it.
 ## Where nothing lands reads as `empty`: no pixels, or a mask's white.
+## Resampled smoothly with `encoded`, the colors mix as sRGB-encoded values,
+## as Photoshop resamples: each piece is encoded before it is drawn and each
+## cell decoded after.
 pub func relocate(source: const Tiles*, dest: Tiles*, scale_x: f64, scale_y: f64, offset_x: f64, offset_y: f64, smooth: bool,
-                  empty: gpu.Color = gpu.Color(0.0, 0.0, 0.0, 0.0)) -> !:
+                  empty: gpu.Color = gpu.Color(0.0, 0.0, 0.0, 0.0), encoded: bool = false) -> !:
     var parts = try pieces(source)
     defer parts.destroy()
     if parts.count == 0:
         return
+    var transfer: Transfer? = none
+    defer:
+        if let pass = transfer:
+            var owned = pass
+            owned.destroy()
+    # The encoded pieces a cell draws from, kept until the cell is done.
+    var encoded_pieces: gpu.Texture[]
+    defer:
+        if encoded_pieces.length > 0:
+            free(encoded_pieces) in memory.heap
+    if encoded and smooth:
+        transfer = try Transfer.create(dest.device())
+        encoded_pieces = try alloc gpu.Texture[parts.count] in memory.heap
     # Where the pieces land, and so which cells to build.
     var left = 1.0e18
     var top = 1.0e18
@@ -102,6 +119,10 @@ pub func relocate(source: const Tiles*, dest: Tiles*, scale_x: f64, scale_y: f64
             var inside = false
             var beyond = false
             var holder: interop.Reference[gpu.Frame]? = none
+            var used: usize = 0
+            defer:
+                for at in 0..<used:
+                    encoded_pieces[at].destroy()
             for index in 0..<parts.count:
                 let piece = parts.at(index)
                 let x = offset_x + (f64)piece.x * scale_x - cell_x
@@ -113,17 +134,32 @@ pub func relocate(source: const Tiles*, dest: Tiles*, scale_x: f64, scale_y: f64
                 if not opened:
                     texture = try dest.blank()
                     opened = true
+                var drawn = piece.texture
+                if let pass = transfer:
+                    var copy = try gpu.Texture.create(dest.device(), try piece.texture.width(), try piece.texture.height(), gpu.Format.rgba16_float)
+                    errdefer copy.destroy()
+                    try pass.draw(&copy, piece.texture, false)
+                    encoded_pieces[used] = copy
+                    used += 1
+                    drawn = copy
                 let frame = holder else try texture.frame()
                 holder = frame
                 let target = try frame.value().target()
                 defer target.release()
-                try gpu.copy_image(target.value(), piece.texture, gpu.Rect(x, y, w, h), piece.source, filter)
+                try gpu.copy_image(target.value(), drawn, gpu.Rect(x, y, w, h), piece.source, filter)
                 inside = inside or (x < canvas.width and y < canvas.height)
                 beyond = beyond or reaches_past_part(x, y, w, h, canvas)
             if let frame = holder:
                 discard(try frame.value().present(empty))
                 frame.release()
             if opened:
+                if let pass = transfer:
+                    # Back to linear light (`empty` is linear already, and stays itself).
+                    var decoded = try dest.blank()
+                    errdefer decoded.destroy()
+                    try pass.draw(&decoded, texture, true)
+                    texture.destroy()
+                    texture = decoded
                 try dest.place(column, row, texture, inside, beyond)
     try dest.settle(empty.alpha > 0.5)
 

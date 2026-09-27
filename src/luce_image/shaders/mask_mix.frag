@@ -2,19 +2,29 @@
 // the edit, image 2 after it, image 3 the selection's tile (coverage in red);
 // all straight alpha. The two mix by coverage in premultiplied space, so a
 // soft selection edge blends colors, not their dark fringes. Drawn with
-// `replace`; the output is straight alpha.
+// `replace`; the output is straight alpha. With `srgb` the colors mix as
+// sRGB-encoded values (a mask's own values mix as they are).
 #version 450
+#extension GL_GOOGLE_include_directive : require
 layout(location = 0) in vec4 vertex_color;
 layout(location = 0) out vec4 fragment_color;
+layout(push_constant) uniform Params { float srgb; } params;
 layout(set = 0, binding = 1) uniform sampler2D before;
 layout(set = 0, binding = 2) uniform sampler2D after;
 layout(set = 0, binding = 3) uniform sampler2D selection;
+#include "srgb.glsl"
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     vec4 o = texelFetch(before, p, 0);
     vec4 n = texelFetch(after, p, 0);
     float cover = texelFetch(selection, p, 0).r;
+    bool encoded = params.srgb > 0.5;
+    if (encoded) {
+        o.rgb = srgb_encode(o.rgb);
+        n.rgb = srgb_encode(n.rgb);
+    }
     float a = mix(o.a, n.a, cover);
     vec3 rgb = mix(o.rgb * o.a, n.rgb * n.a, cover);
-    fragment_color = vec4(a > 0.0 ? rgb / a : vec3(0.0), a);
+    rgb = a > 0.0 ? rgb / a : vec3(0.0);
+    fragment_color = vec4(encoded ? srgb_decode(rgb) : rgb, a);
 }

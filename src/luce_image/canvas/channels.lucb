@@ -220,7 +220,10 @@ func warp_channels(canvas: Canvas*, warp: Warp) -> !:
 ## How channels.frag draws a tile: the pipeline (none: drawn as is), where
 ## the target lies in its frame and its pixels per point (gl_FragCoord counts
 ## frame pixels), which of red, green and blue it keeps, and whether as
-## grayscale (1) or opaque grayscale (2, an alpha channel alone).
+## grayscale (1) or opaque grayscale (2, an alpha channel alone). The
+## picture mixes with the checkerboard (`cell` points a square; 0: none, the
+## caller draws its own) and with the tints over it as the document blends
+## (`srgb` 1: as sRGB-encoded values), as Photoshop shows it.
 struct Shading:
     var pipeline: gpu.Pipeline? = none
     var x: f64
@@ -228,24 +231,68 @@ struct Shading:
     var scale: f64
     var keep: f32[4]
     var gray: f32
+    var srgb: f32 = 0.0
+    var cell: f64 = 0.0
+    ## Where the checkerboard's first square's top-left lands, in points.
+    var squares_x: f64 = 0.0
+    var squares_y: f64 = 0.0
+    var light: f32 = 0.0
+    var dark: f32 = 0.0
 
-## The shading for `target`, keeping `keep` as `gray` says.
+## Up to three tints laid over a cell of the composite in the same draw
+## (images 2..4 of channels.frag): alpha channels shown over the picture and
+## Quick Mask, each red at half where it leaves pixels out. Coverage in red,
+## over the view's cell, `covered_x` by `covered_y` texels.
+struct Tints:
+    var textures: gpu.Texture[3]
+    var count: usize
+    var covered_x: u32 = 0
+    var covered_y: u32 = 0
+
+func no_tints() -> Tints:
+    return Tints(textures = [gpu.Texture(), gpu.Texture(), gpu.Texture()], count = 0)
+
+## How many tints channels.frag lays in one draw.
+let tint_slots: usize = 3
+
+## The shading for `target`, keeping `keep` as `gray` says, over the
+## canvas's checkerboard when it has one.
 func shading_for(canvas: Canvas*, target: const gpu.RenderTarget*, keep: f32[4], gray: f32) -> Shading!:
     let size = try target.size()
     let placement = try target.placement()
+    var srgb: f32 = 0.0
+    if let document = canvas.document:
+        srgb = document.srgb_flag()
     return Shading(pipeline = try canvas.channels_pipeline(), x = placement.x, y = placement.y,
-                   scale = size.pixel_width / size.width if size.width > 0.0 else 1.0, keep = keep, gray = gray)
+                   scale = size.pixel_width / size.width if size.width > 0.0 else 1.0, keep = keep, gray = gray, srgb = srgb,
+                   cell = canvas.checker_cell, light = canvas.checker_light, dark = canvas.checker_dark)
 
-## Texels `region` of `texture` into `destination` through channels.frag.
-func shade_tile(area: const gpu.RenderTarget*, shading: const Shading*, texture: gpu.Texture, destination: gpu.Rect, region: gpu.Region, filter: gpu.Filter) -> !:
+## Texels `region` of `texture` into `destination` through channels.frag,
+## with `tints` over it.
+func shade_tile(area: const gpu.RenderTarget*, shading: const Shading*, texture: gpu.Texture, destination: gpu.Rect, region: gpu.Region, filter: gpu.Filter,
+                tints: const Tints*) -> !:
     if destination.width <= 0.0 or destination.height <= 0.0:
         return
     let pipeline = shading.pipeline else trap("a plain shading draws as is")
-    var params: f32[16] = [(f32)((shading.x + destination.x) * shading.scale), (f32)((shading.y + destination.y) * shading.scale),
-                           (f32)((f64)region.width / (destination.width * shading.scale)), (f32)((f64)region.height / (destination.height * shading.scale)),
+    let pixels_x = destination.width * shading.scale
+    let pixels_y = destination.height * shading.scale
+    # The tints cover the view's cell, whatever region of a coarser tile stands in.
+    let covered_x = (f64)tints.covered_x
+    let covered_y = (f64)tints.covered_y
+    var params: f32[32] = [(f32)((shading.x + destination.x) * shading.scale), (f32)((shading.y + destination.y) * shading.scale),
+                           (f32)((f64)region.width / pixels_x), (f32)((f64)region.height / pixels_y),
                            (f32)region.x, (f32)region.y, (f32)region.width, (f32)region.height,
-                           shading.keep[0], shading.keep[1], shading.keep[2], shading.keep[3], shading.gray, 0.0, 0.0, 0.0]
-    try gpu.shade(area, pipeline, destination, u8[]((u8*)&params[0], 64), [texture], filter)
+                           shading.keep[0], shading.keep[1], shading.keep[2], shading.keep[3],
+                           shading.gray, shading.srgb, (f32)(shading.cell * shading.scale), (f32)tints.count,
+                           (f32)((shading.x + shading.squares_x) * shading.scale), (f32)((shading.y + shading.squares_y) * shading.scale),
+                           (f32)(covered_x / pixels_x), (f32)(covered_y / pixels_y),
+                           shading.light, shading.light, shading.light, quick_opacity,
+                           shading.dark, shading.dark, shading.dark, 0.0,
+                           quick_red, 0.0, 0.0, 0.0]
+    let blank = texture
+    try gpu.shade(area, pipeline, destination, u8[]((u8*)&params[0], 128),
+                  [texture, tints.textures[0] if tints.count > 0 else blank, tints.textures[1] if tints.count > 1 else blank,
+                   tints.textures[2] if tints.count > 2 else blank], filter)
 
 ## What the composite's eyes keep, 1 or 0 each, and how many are on.
 func composite_keep(canvas: const Canvas*) -> f32[4]:
@@ -262,30 +309,82 @@ func composite_shown_count(canvas: const Canvas*) -> usize:
             shown += 1
     return shown
 
-## How `draw` shows the composite now: as is when every channel shows, else
+## How `draw` shows the composite now: as is when every channel shows and
+## nothing mixes with it in the view (no checkerboard, no tints), else
 ## through channels.frag keeping those shown, one alone as grayscale.
-func composite_shading(canvas: Canvas*, target: const gpu.RenderTarget*) -> Shading!:
+func composite_shading(canvas: Canvas*, target: const gpu.RenderTarget*, tinted: bool) -> Shading!:
     let shown = composite_shown_count(canvas)
-    if shown == 3:
+    if shown == 3 and canvas.checker_cell <= 0.0 and not tinted:
         return Shading(x = 0.0, y = 0.0, scale = 1.0, keep = [1.0, 1.0, 1.0, 0.0], gray = 0.0)
     return try shading_for(canvas, target, composite_keep(canvas), 1.0 if shown == 1 else 0.0)
 
-## A composite tile into `destination` as `shading` shows it.
-func draw_view_tile(area: const gpu.RenderTarget*, shading: const Shading*, texture: gpu.Texture, destination: gpu.Rect, region: gpu.Region, filter: gpu.Filter) -> !:
+## A composite tile into `destination` as `shading` shows it, `tints` over it.
+func draw_view_tile(area: const gpu.RenderTarget*, shading: const Shading*, texture: gpu.Texture, destination: gpu.Rect, region: gpu.Region, filter: gpu.Filter,
+                    tints: const Tints*) -> !:
     if shading.pipeline == none:
         try gpu.draw_image(area, texture, destination, region, 1.0, filter)
         return
-    try shade_tile(area, shading, texture, destination, region, filter)
+    try shade_tile(area, shading, texture, destination, region, filter, tints)
 
-## After the composite: every shown alpha channel as Quick Mask's red over it
-## or, with no composite channel shown, the first alone as grayscale, the
-## rest red over that.
-func draw_channel_view(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64) -> !:
+## The tints `draw` lays with the composite: Quick Mask's mask first, then the
+## alpha channels shown, as many as fit; the rest go over it afterwards
+## (`draw_channel_view`). None when no composite channel shows.
+struct TintSources:
+    var tiles: const Tiles*?[3]
+    var mask: bool[3]
+    var count: usize
+    ## How many shown channels were taken.
+    var channels: usize
+
+func tint_sources(canvas: Canvas*) -> TintSources!:
+    var sources = TintSources(tiles = [none, none, none], mask = [false, false, false], count = 0, channels = 0)
+    if composite_shown_count(canvas) == 0:
+        return sources
+    if let document = canvas.document:
+        if let quick = document.quick_layer():
+            sources.tiles[0] = quick.mask_tiles()
+            sources.mask[0] = true
+            sources.count = 1
+    let device = canvas.device else return sources
+    for index in 0..<canvas.channels.count:
+        if sources.count == tint_slots:
+            break
+        let channel = &canvas.channels.items[index]
+        if not channel.shown:
+            continue
+        sources.tiles[sources.count] = try channel.selection.gpu_tiles(device)
+        sources.mask[sources.count] = false
+        sources.count += 1
+        sources.channels += 1
+    return sources
+
+## Cell (`column`, `row`) of every tint source at `level`: a mask without a
+## tile there reveals (white), a channel selects nothing (clear).
+func tints_at(canvas: Canvas*, composer: Composer*, sources: const TintSources*, column: u32, row: u32, level: u32) -> Tints!:
+    var tints = Tints(textures = [gpu.Texture(), gpu.Texture(), gpu.Texture()], count = sources.count,
+                      covered_x = covered_at(canvas.extent_x, column, level), covered_y = covered_at(canvas.extent_y, row, level))
+    let painter = canvas.painter else trap("bound")
+    for index in 0..<sources.count:
+        var found: gpu.Texture? = none
+        if let tiles = sources.tiles[index]:
+            found = try composer.level_texture(tiles, column, row, level, sources.mask[index])
+        tints.textures[index] = found else (painter.white if sources.mask[index] else painter.black)
+    return tints
+
+## After the composite: with no composite channel shown, the first shown
+## alpha channel alone as grayscale, the rest red over it; with the
+## composite, the shown channels `draw` had no room to tint with it
+## (past the first `folded`), red over it.
+func draw_channel_view(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, folded: usize) -> !:
     let device = canvas.device else return
     var alone = composite_shown_count(canvas) == 0
+    var skipped: usize = 0
     for index in 0..<canvas.channels.count:
         let channel = &canvas.channels.items[index]
         if not channel.shown:
+            continue
+        if not alone and skipped < folded:
+            skipped += 1
             continue
         let tiles = try channel.selection.gpu_tiles(device)
         if alone:
@@ -304,7 +403,11 @@ func draw_channel_cells(canvas: Canvas*, target: interop.View[gpu.RenderTarget],
     let clipped = try checked.clipped(rectangle)
     defer clipped.release()
     let area = clipped.value()
-    let shading = try shading_for(canvas, checked, keep, gray)
+    var shading = try shading_for(canvas, checked, keep, gray)
+    # A channel's own gray draws opaque, and a red matte over the picture as before.
+    shading.cell = 0.0
+    shading.srgb = 0.0
+    let none_tinted = no_tints()
     let composer = canvas.composer else return
     composer.hold()
     let level = view_level(zoom)
@@ -323,7 +426,8 @@ func draw_channel_cells(canvas: Canvas*, target: interop.View[gpu.RenderTarget],
                 found = try composer.level_texture(coverage, column, row, level)
             # A cell without a tile selects nothing.
             let texture = found else composer_blank(canvas)
-            try shade_tile(area, &shading, texture, destination, gpu.Region(0, 0, covered_x, covered_y), gpu.Filter.nearest if zoom * step >= 1.0 else gpu.Filter.linear)
+            try shade_tile(area, &shading, texture, destination, gpu.Region(0, 0, covered_x, covered_y), gpu.Filter.nearest if zoom * step >= 1.0 else gpu.Filter.linear,
+                           &none_tinted)
 
 # mark: Thumbnails ==============================================================================
 
@@ -348,6 +452,8 @@ func draw_channel_thumbnail(canvas: Canvas*, target: interop.View[gpu.RenderTarg
         var keep: f32[4] = [0.0, 0.0, 0.0, 0.0]
         keep[(usize)channel - 1] = 1.0
         shading = try shading_for(canvas, checked, keep, 1.0)
+        # A thumbnail sits on the panel's own backing, without the view's checkerboard.
+        shading.cell = 0.0
     let scale_x = rectangle.width / (f64)canvas.extent_x
     let scale_y = rectangle.height / (f64)canvas.extent_y
     let level = view_level(math.min(scale_x, scale_y))
@@ -360,7 +466,8 @@ func draw_channel_thumbnail(canvas: Canvas*, target: interop.View[gpu.RenderTarg
             let texture = try composer.tile(document, column, row, level)
             let destination = gpu.Rect(rectangle.x + (f64)column * span * scale_x, rectangle.y + (f64)row * span * scale_y,
                                        (f64)covered_x * step * scale_x, (f64)covered_y * step * scale_y)
-            try draw_view_tile(checked, &shading, texture, destination, gpu.Region(0, 0, covered_x, covered_y), gpu.Filter.linear)
+            let none_tinted = no_tints()
+            try draw_view_tile(checked, &shading, texture, destination, gpu.Region(0, 0, covered_x, covered_y), gpu.Filter.linear, &none_tinted)
 
 ## An alpha channel's thumbnail: black, then white as far as each thumbnail
 ## pixel's 16 samples of the cells are selected.

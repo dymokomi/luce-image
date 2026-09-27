@@ -10,19 +10,23 @@
 //   place: the cell's first document pixel (x, y), document pixels a texel
 //   window: the window's first texel (x, y) at its level, its size
 //   field: document pixels a window texel, between field samples, samples a side
-// Past the window nothing shows; samples mix premultiplied.
+// Past the window nothing shows; samples mix premultiplied. With `options.x`
+// set they mix as sRGB-encoded values.
 #version 450
+#extension GL_GOOGLE_include_directive : require
 layout(location = 0) in vec4 vertex_color;
 layout(location = 0) out vec4 fragment_color;
-layout(push_constant) uniform Params { vec4 place; vec4 window; vec4 field; } params;
+layout(push_constant) uniform Params { vec4 place; vec4 window; vec4 field; vec4 options; } params;
 layout(set = 0, binding = 1) uniform sampler2D layer;
 layout(set = 0, binding = 2) uniform sampler2D field;
 layout(set = 0, binding = 3) uniform sampler2D coverage;
+#include "srgb.glsl"
 
 // One window texel, premultiplied; clear past the window.
 vec4 texel(ivec2 p) {
     if (p.x < 0 || p.y < 0 || p.x >= int(params.window.z) || p.y >= int(params.window.w)) return vec4(0.0);
     vec4 t = texelFetch(layer, p, 0);
+    if (params.options.x > 0.5) t.rgb = srgb_encode(t.rgb);
     return vec4(t.rgb * t.a, t.a);
 }
 
@@ -65,5 +69,6 @@ void main() {
     vec2 u = (centre - params.place.xy) / params.field.y;
     vec2 source = centre + displacement(u);
     vec4 sum = tap((source + 0.5) / params.field.x - params.window.xy) * coverage_at(u);
-    fragment_color = sum.a > 1e-6 ? vec4(sum.rgb / sum.a, sum.a) : vec4(0.0);
+    vec3 rgb = sum.rgb / max(sum.a, 1e-6);
+    fragment_color = sum.a > 1e-6 ? vec4(params.options.x > 0.5 ? srgb_decode(rgb) : rgb, sum.a) : vec4(0.0);
 }

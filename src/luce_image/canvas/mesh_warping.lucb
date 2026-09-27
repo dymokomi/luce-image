@@ -43,7 +43,8 @@ func begin_mesh_warp(canvas: Canvas*, id: u64, puppet: bool, density: i64) -> !:
     let box = Footprint(left = (f64)found.left - 1.0, top = (f64)found.top - 1.0, right = (f64)found.right + 1.0, bottom = (f64)found.bottom + 1.0)
     if canvas.mesher == none:
         canvas.mesher = try Mesher.create(device)
-    let mesher = canvas.mesher else trap("made")
+    var mesher = canvas.mesher else trap("made")
+    mesher.srgb = document.mixes_encoded()
     var original = try tiles.clone()
     errdefer original.destroy()
     var points: f64[32] = ---

@@ -1,0 +1,200 @@
+#==============================================================================================
+#
+#   canvas/blending_tests - Colors mix as Photoshop's do: as sRGB-encoded values
+#
+#   DESCRIPTION:
+#       Photoshop mixes an 8- or 16-bit RGB document's gamma-encoded values unless Color
+#       Settings' "Blend RGB Colors Using Gamma 1.0" is on; `Canvas.set_linear_blend` is
+#       that setting. These read the GPU's results back and hold them to Photoshop's
+#       numbers, as encoded bytes: the composite, a brush stroke, a gradient, and Quick
+#       Mask's tint in the view.
+#
+#==============================================================================================
+
+## The flattened document's encoded bytes (0..255, unrounded) at (`x`, `y`),
+## from the composite itself: its half floats, before any 8-bit target.
+func encoded_at(canvas: Canvas*, x: u32, y: u32) -> f64[4]!:
+    let document = canvas.document else trap("bound")
+    let composer = canvas.composer else trap("bound")
+    let tile = try composer.tile(document, x // tile_size, y // tile_size, 0)
+    var bytes: u8[8]
+    try tile.read(bytes, gpu.Region(x % tile_size, y % tile_size, 1, 1))
+    var values: f64[4]
+    for channel in 0..<(usize)3:
+        values[channel] = transfer.srgb_encode((f64)from_half((u16)bytes[channel * 2] | ((u16)bytes[channel * 2 + 1] << 8))) * 255.0
+    values[3] = (f64)from_half((u16)bytes[6] | ((u16)bytes[7] << 8)) * 255.0
+    return values
+
+## Whether `value` is `expected` within one step of 255.
+func within_step(value: f64, expected: f64) -> bool:
+    return math.abs(value - expected) <= 1.0
+
+## A layer of `canvas` filled with the encoded grey or color `red`, `green`, `blue`.
+func filled_layer(canvas: Canvas*, name: str, red: f64, green: f64, blue: f64) -> i64!:
+    let layer = try canvas.add_layer(name)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, transfer.srgb_decode(red), transfer.srgb_decode(green), transfer.srgb_decode(blue), false)
+    try canvas.fill(layer, false)
+    return layer
+
+test "layers mix as encoded values: half black over white is 128, 188 with gamma 1.0":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    assert(not canvas.linear_blend())
+    discard(try filled_layer(&canvas, "White", 1.0, 1.0, 1.0))
+    let black = try filled_layer(&canvas, "Black", 0.0, 0.0, 0.0)
+    try canvas.set_layer(black, true, 0.5)
+    let mixed = try encoded_at(&canvas, 10, 10)
+    assert(within_step(mixed[0], 128.0) and within_step(mixed[1], 128.0) and within_step(mixed[2], 128.0) and mixed[3] == 255.0)
+    # The setting is a step of its own, undone like any other.
+    try canvas.set_linear_blend(true)
+    assert(canvas.linear_blend() and canvas.undo_name() == "Blend RGB Colors Using Gamma 1.0")
+    let linear = try encoded_at(&canvas, 10, 10)
+    assert(within_step(linear[0], 188.0) and within_step(linear[1], 188.0) and within_step(linear[2], 188.0))
+    print(f"blending: half black layer over white {mixed[0]}, gamma 1.0 {linear[0]}")
+    try canvas.undo()
+    assert(not canvas.linear_blend() and within_step((try encoded_at(&canvas, 10, 10))[0], 128.0))
+    try canvas.redo()
+    assert(canvas.linear_blend())
+
+test "normal red over green at half is 128, 128, 0; multiplied greys are Photoshop's 64":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    let green = try filled_layer(&canvas, "Green", 0.0, 1.0, 0.0)
+    let red = try filled_layer(&canvas, "Red", 1.0, 0.0, 0.0)
+    try canvas.set_layer(red, true, 0.5)
+    let mixed = try encoded_at(&canvas, 10, 10)
+    assert(within_step(mixed[0], 128.0) and within_step(mixed[1], 128.0) and mixed[2] < 0.5)
+    try canvas.remove_layer(red)
+    try canvas.remove_layer(green)
+    # Two greys of 128 multiplied: 128 × 128 / 255 = 64.25, as Photoshop has it.
+    discard(try filled_layer(&canvas, "Grey", 128.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0))
+    let top = try filled_layer(&canvas, "Multiply", 128.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0)
+    try canvas.set_layer(top, true, 1.0, 2)
+    let multiplied = try encoded_at(&canvas, 10, 10)
+    assert(within_step(multiplied[0], 64.25) and within_step(multiplied[1], 64.25) and within_step(multiplied[2], 64.25))
+    print(f"blending: red over green at half {mixed[0]} {mixed[1]} {mixed[2]}; greys of 128 multiplied {multiplied[0]}")
+    # In linear light the product is darker: 62.
+    try canvas.set_linear_blend(true)
+    assert(within_step((try encoded_at(&canvas, 10, 10))[0], 61.8))
+
+test "a half-opacity black brush stroke on white is 128, and 188 with gamma 1.0":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    let paper = try filled_layer(&canvas, "Paper", 1.0, 1.0, 1.0)
+    # A hard round brush at half opacity, full flow: its middle is covered once, capped at half.
+    try canvas.set_brush(20.0, 1.0, 0.5, 1.0, 0.0, 0.0, 0.0, false)
+    try canvas.begin_stroke(paper, 16.0, 16.0)
+    try canvas.extend_stroke(48.0, 16.0)
+    try canvas.end_stroke()
+    let stroke = try encoded_at(&canvas, 32, 16)
+    assert(within_step(stroke[0], 128.0) and within_step(stroke[1], 128.0) and within_step(stroke[2], 128.0) and stroke[3] == 255.0)
+    # Flow builds up beneath the opacity, never past it.
+    try canvas.set_brush(20.0, 1.0, 0.5, 0.25, 0.0, 0.0, 0.0, false)
+    try canvas.begin_stroke(paper, 16.0, 40.0)
+    for step in 0..<(usize)8:
+        try canvas.extend_stroke(16.0 + (f64)step * 4.0, 40.0)
+    try canvas.end_stroke()
+    let built = try encoded_at(&canvas, 24, 40)
+    assert(built[0] >= 127.0 and built[0] < 200.0)
+    # A second layer's worth of the same stroke in linear light.
+    try canvas.set_linear_blend(true)
+    try canvas.set_brush(20.0, 1.0, 0.5, 1.0, 0.0, 0.0, 0.0, false)
+    try canvas.begin_stroke(paper, 16.0, 56.0)
+    try canvas.extend_stroke(48.0, 56.0)
+    try canvas.end_stroke()
+    assert(within_step((try encoded_at(&canvas, 32, 56))[0], 188.0))
+    print(f"blending: half black stroke on white {stroke[0]}, gamma 1.0 {(try encoded_at(&canvas, 32, 56))[0]}")
+    # The stroke made before the switch keeps its pixels: only mixing changes.
+    assert(within_step((try encoded_at(&canvas, 32, 16))[0], 128.0))
+
+test "a black to white gradient's midpoint is 128, and a feathered fill mixes as encoded values":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(256, 64)
+    defer canvas.close()
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    let layer = try canvas.add_layer("Ramp")
+    # Pixel centres at x + 0.5: pixel 127 sits exactly halfway from 0 to 255.
+    try canvas.fill_gradient(layer, 0.5, 0.0, 255.5, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    let middle = try encoded_at(&canvas, 128, 10)
+    assert(within_step(middle[0], 128.0) and within_step(middle[1], 128.0) and within_step(middle[2], 128.0))
+    let quarter = try encoded_at(&canvas, 64, 10)
+    assert(within_step(quarter[0], 64.0))
+    print(f"blending: black to white gradient at its middle {middle[0]}, a quarter {quarter[0]}")
+    # White filled into a feathered selection over black: along the soft
+    # edge each pixel's encoded value is its coverage (in linear light it
+    # would be far lighter).
+    try canvas.remove_layer(layer)
+    let black = try filled_layer(&canvas, "Black", 0.0, 0.0, 0.0)
+    try canvas.set_selection_shape(8, true)
+    try canvas.select_rectangle(0, 0, 128, 64, 0)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, false)
+    try canvas.fill(black, false)
+    var soft: u32 = 0
+    for x in 116..<(u32)140:
+        let coverage = (f64)canvas.selected_at((i64)x, 32)
+        if coverage > 20.0 and coverage < 235.0:
+            assert(within_step((try encoded_at(&canvas, x, 32))[0], coverage))
+            soft += 1
+    assert(soft >= 4)
+
+test "Quick Mask's half red over black shows as 128, 0, 0 in the view, 188 with gamma 1.0":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    # An sRGB target: it stores encoded bytes, as a window does.
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8)
+    defer target.destroy()
+    canvas.view_format = gpu.Format.rgba8
+    discard(try shown_at(&canvas, &target, 0, 0))
+    discard(try filled_layer(&canvas, "Black", 0.0, 0.0, 0.0))
+    try canvas.select_rectangle(0, 0, 32, 64, 0)
+    try canvas.enter_quick_mask()
+    let masked = try shown_at(&canvas, &target, 48, 10)
+    assert(masked[0] >= 127 and masked[0] <= 129 and masked[1] == 0 and masked[2] == 0)
+    let selected = try shown_at(&canvas, &target, 10, 10)
+    assert(selected[0] == 0 and selected[1] == 0 and selected[2] == 0)
+    try canvas.set_linear_blend(true)
+    let linear = try shown_at(&canvas, &target, 48, 10)
+    assert(linear[0] >= 187 and linear[0] <= 189 and linear[1] == 0)
+    print(f"blending: Quick Mask over black {masked[0]} {masked[1]} {masked[2]}, gamma 1.0 {linear[0]} {linear[1]} {linear[2]}")
+    try canvas.undo()
+    try canvas.exit_quick_mask()
+    # The checkerboard under a transparent half: 50% white over its light grey
+    # squares, mixed as encoded values.
+    let clear = try filled_layer(&canvas, "Half", 1.0, 1.0, 1.0)
+    try canvas.set_layer(clear, true, 0.5)
+    try canvas.set_layer(try canvas.layer_id(0), false, 1.0)
+    try canvas.set_checker(8.0, transfer.srgb_decode(70.0 / 255.0), transfer.srgb_decode(56.0 / 255.0))
+    let light = try shown_at(&canvas, &target, 2, 2)
+    let dark_square = try shown_at(&canvas, &target, 10, 2)
+    # Halfway from 70 to 255 is 162.5; from 56, 155.5.
+    assert(light[0] >= 161 and light[0] <= 164 and dark_square[0] >= 154 and dark_square[0] <= 157)

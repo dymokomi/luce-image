@@ -207,10 +207,11 @@ test "canvas strokes paint the selected layer and undo restores it":
     defer shown.release()
     try restored.value().draw(shown, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
     discard(try ninth.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
-    # The blurred, moved stroke over the red fill, as it was before saving
-    # (sRGB 170, 203, 0 in the file; the linear target stores about 102, 153, 0).
+    # The blurred, moved stroke over the red fill, as it was before saving,
+    # mixed as sRGB-encoded values (about 102, 152, 0 in the file; the linear
+    # target stores about 34, 80, 0).
     try target.read(pixel, gpu.Region(32, 32, 1, 1))
-    assert(pixel[0] > 85 and pixel[0] < 120 and pixel[1] > 135 and pixel[1] < 170 and pixel[2] == 0)
+    assert(pixel[0] > 25 and pixel[0] < 45 and pixel[1] > 70 and pixel[1] < 90 and pixel[2] == 0)
     try target.read(pixel, gpu.Region(12, 32, 1, 1))
     assert(pixel[0] == 255 and pixel[1] == 0)
     try canvas.set_mask(layer, false)
@@ -603,10 +604,11 @@ test "adjustment layers change what is below them live, leave the pixels alone, 
     assert(shown[2] > 250 and shown[0] < 5)
     try canvas.set_layer(turn, false, 1.0)
     assert((try shown_at(&canvas, &target, 12, 12))[0] > 250)
-    # Half opacity mixes halfway; a mask hiding all takes it away.
+    # Half opacity mixes halfway, as encoded values (128 each; the linear
+    # target stores about 55); a mask hiding all takes it away.
     try canvas.set_layer(turn, true, 0.5)
     shown = try shown_at(&canvas, &target, 12, 12)
-    assert(shown[0] > 110 and shown[0] < 145 and shown[2] > 110 and shown[2] < 145)
+    assert(shown[0] > 45 and shown[0] < 65 and shown[2] > 45 and shown[2] < 65)
     try canvas.set_mask(turn, true, 1)
     assert((try shown_at(&canvas, &target, 12, 12))[0] > 250)
     try canvas.set_mask(turn, false)
@@ -850,11 +852,19 @@ test "streamed exports keep alpha in PNG, blend over the matte in JPEG, and reac
     try canvas.save("build/canvas-bands.jpg", 95, 1.0, 1.0, 1.0)
     let matted = try Image.open("build/canvas-bands.jpg")
     defer matted.release()
-    # Half red over white: red stays full, green and blue are half in linear light (sRGB 188).
+    # Half red over white, mixed as encoded values: red stays full, green and
+    # blue are half of 255.
     let pink = try matted.value().getpixel(550, 100)
-    assert(pink.r > 247.0 and math.abs(pink.g - 188.0) < 6.0 and math.abs(pink.b - 188.0) < 6.0)
+    assert(pink.r > 247.0 and math.abs(pink.g - 128.0) < 6.0 and math.abs(pink.b - 128.0) < 6.0)
     let white = try matted.value().getpixel(100, 100)
     assert(white.r > 247.0 and white.g > 247.0 and white.b > 247.0)
+    # Blending with gamma 1.0: half in linear light, sRGB 188.
+    try canvas.set_linear_blend(true)
+    try canvas.save("build/canvas-bands-linear.jpg", 95, 1.0, 1.0, 1.0)
+    let linear = try Image.open("build/canvas-bands-linear.jpg")
+    defer linear.release()
+    let light_pink = try linear.value().getpixel(550, 100)
+    assert(light_pink.r > 247.0 and math.abs(light_pink.g - 188.0) < 6.0 and math.abs(light_pink.b - 188.0) < 6.0)
 
 test "an export wider than one read-back strip keeps pixels either side of the join":
     var device = gpu.Device.open() catch failure:

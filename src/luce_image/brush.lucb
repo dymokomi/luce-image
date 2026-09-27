@@ -16,6 +16,7 @@ import memory
 import math
 from tiles import Tiles, tile_size, tile_texture
 from luce_image.document import Document, Layer
+from luce_image.blending import Mixing
 from luce_image.selection_cells import Mode
 from luce_image.dynamics import Dynamic, Control, Pen, Inputs, response, angle_turn, blend_pens, velocity_value, dynamic_size, dynamic_flow, dynamic_opacity, dynamic_angle, dynamic_roundness, dynamic_scatter, dynamic_texture_depth, dynamic_hue, dynamic_saturation, dynamic_brightness
 from luce_image.brush_images import BrushImages, Sampled
@@ -236,6 +237,9 @@ pub struct Stroke:
     ## have been asked for already.
     var source: EffectSource? = none
     var tried: bool[]
+    ## How the stroke mixes (as its document blends); its brush's color is
+    ## held as its shaders take it (encoded when they mix encoded values).
+    var mixing: Mixing = Mixing(srgb = false, mask = false)
 
     ## Begin at a point on `layer`'s pixels, or on its mask, painting the first
     ## dab there. A mask's missing cells count as white (revealing).
@@ -251,6 +255,8 @@ pub struct Stroke:
         var stroke = Stroke(layer = layer, brush = brush, last_x = x, last_y = y, before = try tiles.clone(), empty = none, fill = fill, active = true, on_mask = on_mask,
                             selection = try document.selection_tiles(), last_pen = pen, pen = pen)
         errdefer stroke.destroy()
+        stroke.mixing = document.mixing(on_mask)
+        stroke.brush.color = stroke.mixing.color(brush.color)
         if let held = images:
             stroke.tip = try held.tip_for(painter.owner, brush.diameter)
             let aspect = held.tip_aspect()
@@ -561,7 +567,7 @@ pub struct Stroke:
     mutating func paint_tile(painter: Painter*, tiles: Tiles*, entry: Touched, texture: gpu.Texture*) -> !:
         var params: f32[16] = [(f32)self.brush.color.red, (f32)self.brush.color.green, (f32)self.brush.color.blue, 1.0,
                                (f32)(1.0 if self.capped() else self.brush.opacity), 1.0 if self.brush.erase else 0.0, 0.0, 0.0,
-                               (f32)(entry.column * tile_size), (f32)(entry.row * tile_size), 0.0, 0.0,
+                               (f32)(entry.column * tile_size), (f32)(entry.row * tile_size), self.mixing.flag(), 0.0,
                                0.0, (f32)self.effect_mode, 0.0, 0.0]
         let effect_tile = (try self.effect_at(entry.column, entry.row)) else painter.clear
         var clip = painter.white
@@ -715,7 +721,8 @@ func overlap(a: Dab, b: Dab) -> bool:
     return dx * dx + dy * dy < reach * reach
 
 ## `color` shifted by `hue` degrees and by `saturation` and `brightness`
-## fractions (each -1..1), through HSV over the linear components.
+## fractions (each -1..1), through HSV over its components as the stroke
+## paints them (encoded where it mixes encoded values).
 func jitter_color(color: gpu.Color, hue: f64, saturation: f64, brightness: f64) -> gpu.Color:
     let top = math.max(color.red, math.max(color.green, color.blue))
     let bottom = math.min(color.red, math.min(color.green, color.blue))
@@ -769,6 +776,8 @@ pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brus
     errdefer restore_layer(document, layer, on_mask, before)
     let selection = try document.selection_tiles()
     let fill = gpu.Color(1.0, 1.0, 1.0, 1.0) if on_mask else gpu.Color(0.0, 0.0, 0.0, 0.0)
+    let mixing = document.mixing(on_mask)
+    let color = mixing.color(brush.color)
     # A destroyed zero-value texture is a no-op, so the stand-in can always be dropped.
     var empty = gpu.Texture()
     var have_empty = false
@@ -791,8 +800,8 @@ pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brus
     for row in 0..<tiles.rows():
         for column in 0..<tiles.columns():
             var clip = painter.white
-            var params: f32[16] = [(f32)brush.color.red, (f32)brush.color.green, (f32)brush.color.blue, 1.0, (f32)brush.opacity, 1.0 if brush.erase else 0.0, 1.0, 0.0,
-                                   0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+            var params: f32[16] = [(f32)color.red, (f32)color.green, (f32)color.blue, 1.0, (f32)brush.opacity, 1.0 if brush.erase else 0.0, 1.0, 0.0,
+                                   0.0, 0.0, mixing.flag(), 1.0, 0.0, 0.0, 0.0, 0.0]
             var full = true
             if let selected = selection:
                 # A selection cell with no tile selects nothing there.
@@ -917,7 +926,8 @@ pub func fill_gradient(painter: Painter*, document: Document*, layer: u64, x0: f
                 source = empty
             var fresh = try tiles.blank()
             errdefer fresh.destroy()
-            try gradient_tile(painter, &fresh, source, clip, selected, (f64)(column * tile_size), (f64)(row * tile_size), x0, y0, x1, y1, from_color, to_color, radial)
+            try gradient_tile(painter, &fresh, source, clip, selected, (f64)(column * tile_size), (f64)(row * tile_size), x0, y0, x1, y1, from_color, to_color, radial,
+                              document.mixing(on_mask))
             try tiles.set(column, row, fresh)
             if kind >= 0:
                 made_cells[(usize)kind] = (i64)row * (i64)tiles.columns() + (i64)column
@@ -973,17 +983,22 @@ func uniform_gradient_kind(column: u32, row: u32, x0: f64, y0: f64, x1: f64, y1:
 ## Draw one cell of a gradient into `fresh`: `source` under it (what shows
 ## where `clip`, a selection's coverage when `selected`, leaves it), the cell's
 ## first texel at (`origin_x`, `origin_y`) and the ends in the same texels (a
-## coarser pyramid level passes them divided by its scale).
+## coarser pyramid level passes them divided by its scale). The colors are in
+## linear light; they mix as `mixing` says, so the stops blend as sRGB-encoded
+## values where the document blends in sRGB, as Photoshop's do.
 pub func gradient_tile(painter: const Painter*, fresh: gpu.Texture*, source: gpu.Texture, clip: gpu.Texture, selected: bool, origin_x: f64, origin_y: f64,
-                       x0: f64, y0: f64, x1: f64, y1: f64, from_color: gpu.Color, to_color: gpu.Color, radial: bool) -> !:
-    var params: f32[16] = [(f32)from_color.red, (f32)from_color.green, (f32)from_color.blue, (f32)from_color.alpha,
-                           (f32)to_color.red, (f32)to_color.green, (f32)to_color.blue, (f32)to_color.alpha,
-                           (f32)origin_x, (f32)origin_y, (f32)x0, (f32)y0, (f32)x1, (f32)y1, 1.0 if selected else 0.0, 1.0 if radial else 0.0]
+                       x0: f64, y0: f64, x1: f64, y1: f64, from_color: gpu.Color, to_color: gpu.Color, radial: bool, mixing: Mixing) -> !:
+    let first = mixing.color(from_color)
+    let last = mixing.color(to_color)
+    var params: f32[20] = [(f32)first.red, (f32)first.green, (f32)first.blue, (f32)first.alpha,
+                           (f32)last.red, (f32)last.green, (f32)last.blue, (f32)last.alpha,
+                           (f32)origin_x, (f32)origin_y, (f32)x0, (f32)y0, (f32)x1, (f32)y1, 1.0 if selected else 0.0, 1.0 if radial else 0.0,
+                           mixing.flag(), 0.0, 0.0, 0.0]
     let frame = try fresh.frame()
     defer frame.release()
     let area = try frame.value().target()
     defer area.release()
-    try gpu.shade(area.value(), painter.gradient, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 64),
+    try gpu.shade(area.value(), painter.gradient, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 80),
                   [source, clip], gpu.Filter.nearest)
     discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
 
@@ -995,7 +1010,7 @@ pub func begin_boxed(painter: Painter*, document: Document*, layer: u64, brush: 
                           count = stroke.count, before = stroke.before, empty = stroke.empty, fill = stroke.fill, active = stroke.active, on_mask = stroke.on_mask,
                           selection = stroke.selection, last_pen = stroke.last_pen, pen = stroke.pen, direction = stroke.direction, velocity = stroke.velocity,
                           untimed = stroke.untimed, steps = stroke.steps, tip = stroke.tip, tip_x = stroke.tip_x, tip_y = stroke.tip_y, pattern = stroke.pattern,
-                          debt = stroke.debt, random = stroke.random, dabs = stroke.dabs, dab_count = 0) in memory.heap
+                          debt = stroke.debt, random = stroke.random, dabs = stroke.dabs, dab_count = 0, mixing = stroke.mixing) in memory.heap
 
 ## End a boxed stroke and free the box.
 pub func finish_boxed(stroke: Stroke*):

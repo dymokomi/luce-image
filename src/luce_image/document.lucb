@@ -11,6 +11,7 @@ from tiles import Tiles, CellRange, box, unbox
 from luce_image.extent import relocate
 from luce_image.selection import Selection
 from luce_image.curves import Curves
+from luce_image.blending import Mixing
 from raster_errors import invalid, limit
 
 pub let blend_mode_count: u32 = 26
@@ -315,6 +316,8 @@ pub struct TreeState:
     var selection: Selection
     ## Quick Mask's layer, when it was on: undo and redo take the mode with them.
     var quick: Layer*? = none
+    ## Whether colors mixed in linear light then (`Document.linear_blend`).
+    var linear_blend: bool = false
 
     pub mutating func destroy():
         layer_destroy(self.root)
@@ -376,6 +379,24 @@ pub struct Document:
     var quick: Layer*? = none
     ## While Quick Mask is on the selection clips nothing.
     pub var selection_suspended: bool = false
+    ## Photoshop's "Blend RGB Colors Using Gamma 1.0": colors mix in linear
+    ## light. Off (the default), every place colors mix — compositing, painting,
+    ## fills, gradients, filters, resampling — mixes their sRGB-encoded values,
+    ## as Photoshop does, while the tiles keep holding linear light.
+    pub var linear_blend: bool = false
+
+    ## Whether an edit mixes sRGB-encoded values: colors do unless the document
+    ## blends in linear light; a mask's values (coverage) mix as they are.
+    pub func mixes_encoded(on_mask: bool = false) -> bool:
+        return not on_mask and not self.linear_blend
+
+    ## `mixes_encoded` as the mixing shaders take it: 1 or 0.
+    pub func srgb_flag(on_mask: bool = false) -> f32:
+        return 1.0 if self.mixes_encoded(on_mask) else 0.0
+
+    ## How an edit of this document (on a mask with `on_mask`) mixes (blending.lucb).
+    pub func mixing(on_mask: bool = false) -> Mixing:
+        return Mixing(srgb = self.mixes_encoded(on_mask), mask = on_mask)
 
     ## An empty `width` by `height` document with no layers.
     pub static func create(device: gpu.Device, width: u32, height: u32) -> Document!:
@@ -736,7 +757,8 @@ pub struct Document:
         var quick: Layer*? = none
         if let layer = self.quick:
             quick = try clone_layer(layer)
-        return TreeState(root = root, next_id = self.next_id, extent_x = self.extent_x, extent_y = self.extent_y, selection = selection, quick = quick)
+        return TreeState(root = root, next_id = self.next_id, extent_x = self.extent_x, extent_y = self.extent_y, selection = selection, quick = quick,
+                         linear_blend = self.linear_blend)
 
     ## The document as it is now, on the heap, sharing its tiles: what a
     ## stroke reads while it paints (a Clone Stamp sampling every layer).
@@ -747,7 +769,8 @@ pub struct Document:
         var selection = try self.selection.copy()
         errdefer selection.destroy()
         return try new Document(owner = self.owner, extent_x = self.extent_x, extent_y = self.extent_y, selection = selection,
-                                root = root, next_id = self.next_id, revision = self.revision, generation = self.generation) in memory.heap
+                                root = root, next_id = self.next_id, revision = self.revision, generation = self.generation,
+                                linear_blend = self.linear_blend) in memory.heap
 
     ## Take `state` as the document and leave what was in its place: undo and
     ## redo swap, never copy.
@@ -772,6 +795,9 @@ pub struct Document:
         self.quick = state.quick
         state.quick = quick
         self.selection_suspended = self.quick != none
+        let linear_blend = self.linear_blend
+        self.linear_blend = state.linear_blend
+        state.linear_blend = linear_blend
         # History keeps the cells alone, not their GPU tiles.
         state.selection.drop_gpu_tiles()
         self.revision += 1
@@ -865,7 +891,8 @@ func release_tiles(holder: Tiles*?*):
 pub func box_document(document: Document) -> Document*!:
     # Not zeroable, so field by field: a new field must be added here too.
     return try new Document(owner = document.owner, extent_x = document.extent_x, extent_y = document.extent_y, selection = document.selection,
-                            root = document.root, next_id = document.next_id, revision = document.revision, generation = document.generation) in memory.heap
+                            root = document.root, next_id = document.next_id, revision = document.revision, generation = document.generation,
+                            linear_blend = document.linear_blend) in memory.heap
 
 ## Destroy a boxed document and free the box.
 pub func unbox_document(document: Document*):

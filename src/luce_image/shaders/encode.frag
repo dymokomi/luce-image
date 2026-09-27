@@ -4,14 +4,15 @@
 // floats), image 2 the table of 4097 sRGB bytes for 0..1 in 4096 steps: the
 // same table and rounding the CPU used, so opaque pixels come out byte for byte
 // as before. `over` blends onto `matte` (linear) and writes alpha one; without
-// it the alpha is kept, rounded to the nearest byte.
+// it the alpha is kept, rounded to the nearest byte. With `srgb` the matte
+// mixes with the encoded values, as the document's colors do.
 #version 450
 layout(location = 0) in vec4 vertex_color;
 layout(location = 0) out vec4 fragment_color;
 layout(push_constant) uniform Params {
     vec2 origin;    // the tile's top-left in the strip
     float over;     // 1 over the matte
-    float unused;
+    float srgb;     // 1: over the matte as encoded values
     vec4 matte;     // linear RGB
 } params;
 layout(set = 0, binding = 1) uniform sampler2D tile;
@@ -27,6 +28,13 @@ void main() {
     if (params.over < 0.5 || t.a == 1.0) {
         float alpha = params.over < 0.5 ? floor(a * 255.0 + 0.5) / 255.0 : 1.0;
         fragment_color = vec4(encoded(t.r), encoded(t.g), encoded(t.b), alpha);
+        return;
+    }
+    if (params.srgb > 0.5) {
+        // The table's encoding of each, mixed, then rounded to a byte.
+        vec3 tile_bytes = vec3(encoded(t.r), encoded(t.g), encoded(t.b));
+        vec3 matte_bytes = vec3(encoded(params.matte.r), encoded(params.matte.g), encoded(params.matte.b));
+        fragment_color = vec4(floor(mix(matte_bytes, tile_bytes, a) * 255.0 + 0.5) / 255.0, 1.0);
         return;
     }
     vec3 blended = t.rgb * a + params.matte.rgb * (1.0 - a);

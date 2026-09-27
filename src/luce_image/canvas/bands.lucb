@@ -116,7 +116,8 @@ struct Bands:
             while x < width:
                 let texture = try composer.tile(document, (left + x) // tile_size, row, 0)
                 let columns = min_u32(tile_size, width - x)
-                var params: f32[8] = [(f32)x, 0.0, over, 0.0, (f32)self.matte[0], (f32)self.matte[1], (f32)self.matte[2], 0.0]
+                # Over the matte, the colors mix as the document blends them.
+                var params: f32[8] = [(f32)x, 0.0, over, document.srgb_flag(), (f32)self.matte[0], (f32)self.matte[1], (f32)self.matte[2], 0.0]
                 try gpu.shade(target.value(), self.pipeline, gpu.Rect((f64)x, 0.0, (f64)columns, (f64)rows), u8[]((u8*)&params[0], 32), [texture, self.table], gpu.Filter.nearest)
                 x += columns
             discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))

@@ -8,7 +8,7 @@
 #           header    16 bytes: "LUCED2D1", format version (u32), reserved (u32)
 #           tiles     one record per stored tile, back to back (see below)
 #           preview   a small flattened PNG of the document, for quick looks
-#           manifest  the document as Prism text: size, resolution, profile, every
+#           manifest  the document as Prism text: size, resolution, profile, blending, every
 #                     layer's settings, text, vector elements and node graphs, styles, guides, and the
 #                     alpha channels' names
 #           index     where every tile is and which cells use it
@@ -58,7 +58,7 @@ struct PackageCell:
 
 let package_magic: str = "LUCED2D1"
 let package_trailer_magic: str = "L2DINDEX"
-let package_version: u32 = 4
+let package_version: u32 = 5
 let package_header_bytes: usize = 16
 let package_trailer_bytes: usize = 64
 let package_blob_bytes: usize = 16

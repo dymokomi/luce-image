@@ -115,18 +115,21 @@ struct BlurSource:
     var tiles: Tiles
     var filters: Filters
     var radius: f64
+    ## Whether it blurs the encoded values, as the document mixes its colors.
+    var srgb: bool
 
 func blur_source(canvas: Canvas*, tiles: const Tiles*, radius: f64) -> EffectSource!:
     let filters = canvas.filters else trap("blurring without filters")
+    let document = canvas.document else trap("blurring without a document")
     var copy = try tiles.clone()
-    let boxed = new BlurSource(tiles = copy, filters = filters, radius = radius) in memory.heap catch failure:
+    let boxed = new BlurSource(tiles = copy, filters = filters, radius = radius, srgb = document.mixes_encoded()) in memory.heap catch failure:
         copy.destroy()
         error(failure.code, failure.message)
     return EffectSource(context = (void*)boxed, produce = blur_cell, release = release_blur)
 
 func blur_cell(context: void*?, column: u32, row: u32) -> gpu.Texture?!:
     let source = (BlurSource*)(context else trap("a blur without its source"))
-    return try source.filters.blur_cell(&source.tiles, column, row, source.radius)
+    return try source.filters.blur_cell(&source.tiles, column, row, source.radius, source.srgb)
 
 func release_blur(context: void*?):
     let source = (BlurSource*)(context else return)
@@ -204,14 +207,17 @@ func finish_heal(canvas: Canvas*, stroke: Stroke*) -> !:
     defer free(pixels) in memory.heap
     let painted = try alloc u8[width * height] in memory.heap
     defer free(painted) in memory.heap
-    try gather_spot(device, stroke, original, window, pixels, painted)
+    # The patch mixes the picture's colors as the document blends them.
+    let encoded = document.mixes_encoded()
+    try gather_spot(device, stroke, original, window, pixels, painted, encoded)
     if not (try heal(pixels, width, height, painted)):
         return
-    # Back to straight alpha for the effect tiles.
+    # Back to straight alpha (and linear light) for the effect tiles.
     for at in 0..<width * height:
         let alpha = pixels[at * 4 + 3]
         for channel in 0..<(usize)3:
-            pixels[at * 4 + channel] = pixels[at * 4 + channel] / alpha if alpha > 0.0 else 0.0
+            let straight = pixels[at * 4 + channel] / alpha if alpha > 0.0 else 0.0
+            pixels[at * 4 + channel] = (f32)transfer.srgb_decode((f64)straight) if encoded else straight
     # The effect: in each cell the stroke reached, the layer as it was with the window's part healed.
     var healed = try Tiles.create(device, canvas.extent_x, canvas.extent_y)
     errdefer healed.destroy()
@@ -281,14 +287,15 @@ func heal_window(hole: Bounds, extent_x: i64, extent_y: i64) -> Bounds:
     return Bounds(left = math.imax(0, hole.left - reach), top = math.imax(0, hole.top - reach),
                   right = math.imin(extent_x, hole.right + reach), bottom = math.imin(extent_y, hole.bottom + reach))
 
-## The window's pixels (premultiplied) from the layer as it was, and where the stroke painted.
-func gather_spot(device: gpu.Device, stroke: Stroke*, original: const Tiles*, window: Bounds, pixels: f32[], painted: u8[]) -> !:
+## The window's pixels (premultiplied, their colors sRGB-encoded with
+## `encoded`) from the layer as it was, and where the stroke painted.
+func gather_spot(device: gpu.Device, stroke: Stroke*, original: const Tiles*, window: Bounds, pixels: f32[], painted: u8[], encoded: bool) -> !:
     for index in 0..<pixels.length:
         pixels[index] = 0.0
     for index in 0..<painted.length:
         painted[index] = 0
     let size = (i64)tile_size
-    var read = WindowRead(stroke = stroke, original = original, window = window, pixels = pixels, painted = painted,
+    var read = WindowRead(stroke = stroke, original = original, window = window, pixels = pixels, painted = painted, encoded = encoded,
                           first_column = window.left // size, first_row = window.top // size,
                           columns = (window.right - 1) // size + 1 - window.left // size)
     let rows = (window.bottom - 1) // size + 1 - window.top // size
@@ -302,6 +309,7 @@ struct WindowRead:
     var window: Bounds
     var pixels: f32[]
     var painted: u8[]
+    var encoded: bool
     var first_column: i64
     var first_row: i64
     var columns: i64
@@ -337,7 +345,8 @@ func window_visit(context: void*?, index: usize, bytes: const u8[]) -> !:
                 let target = ((usize)(y - window.top) * width + (usize)(x - window.left)) * 4
                 let alpha = from_half((u16)bytes[source + 6] | ((u16)bytes[source + 7] << 8))
                 for channel in 0..<(usize)3:
-                    read.pixels[target + channel] = from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8)) * alpha
+                    let value = from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8))
+                    read.pixels[target + channel] = ((f32)transfer.srgb_encode((f64)value) if read.encoded else value) * alpha
                 read.pixels[target + 3] = alpha
         return
     for y in y0..<y1:

@@ -182,12 +182,18 @@ test "the channel view shows channels alone as grayscale, hides them, and tints 
     let inside = try view_at(&canvas, &target, 10, 10)
     let outside = try view_at(&canvas, &target, 50, 10)
     assert(inside[0] == 255 and inside[1] == 255 and inside[2] == 255 and outside[0] == 0 and outside[1] == 0 and outside[2] == 0)
-    # Over the picture: Quick Mask's red at half where it selects nothing.
+    # Over the picture: Quick Mask's red at half where it selects nothing,
+    # mixed as encoded values (blue's 0.74 halved, 0.11 in linear light).
     canvas.set_composite_view(true, true, true)
     let clear = try view_at(&canvas, &target, 10, 10)
     let tinted = try view_at(&canvas, &target, 50, 10)
     assert(clear[0] == 255 and clear[1] == 0 and clear[2] >= 127)
-    assert(tinted[0] == 255 and tinted[1] == 0 and tinted[2] >= 63 and tinted[2] <= 64)
+    assert(tinted[0] == 255 and tinted[1] == 0 and tinted[2] >= 27 and tinted[2] <= 29)
+    # Blending with gamma 1.0 mixes it in linear light: a quarter.
+    try canvas.set_linear_blend(true)
+    let linear = try view_at(&canvas, &target, 50, 10)
+    assert(linear[0] == 255 and linear[1] == 0 and linear[2] >= 63 and linear[2] <= 64)
+    try canvas.undo()
     try canvas.set_channel_shown(0, false)
     assert((try view_at(&canvas, &target, 50, 10))[2] >= 127)
     # Thumbnails: the red channel as gray, the alpha channel white where it selects.

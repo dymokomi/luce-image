@@ -2,6 +2,8 @@
 ## the GPU's Gaussian (filter.lucb): Bloom, where bright parts glow into their
 ## surroundings, and Tonal Contrast, where the detail against a wide blur is
 ## pushed, strongest in the midtones — the look of Nik's and Luminar's.
+## Both mix a document's colors as it blends them: as sRGB-encoded values
+## unless it blends in linear light (a mask's values as they are).
 import gpu
 import memory
 import math
@@ -18,7 +20,7 @@ pub func bloom(filters: const Filters*, document: Document*, layer: u64, thresho
         error(invalid, "bloom takes a threshold in 0..1 and a strength in 0..2")
     let target = document.find(layer) else error(invalid, "no such layer")
     let tiles = try target.edited_tiles(on_mask)
-    var copy = try Copy.of(tiles)
+    var copy = try Copy.of(tiles, document.mixes_encoded(on_mask))
     defer copy.destroy()
     # The bright parts alone, faded in over a tenth above the threshold.
     for at in 0..<copy.count:
@@ -36,7 +38,7 @@ pub func bloom(filters: const Filters*, document: Document*, layer: u64, thresho
             let glow = (f64)copy.glow[at * 4 + channel] * glow_alpha
             copy.pixels[at * 4 + channel] = (f32)math.clamp((base + (out_alpha - base) * glow / math.max(out_alpha, 1e-6)) / out_alpha, 0.0, 1.0)
         copy.pixels[at * 4 + 3] = (f32)out_alpha
-    try tiles.write(copy.pixels)
+    try copy.store(tiles)
     target.revision += 1
 
 ## Filter › Other › Tonal Contrast: the difference between `layer` and its blur
@@ -47,22 +49,26 @@ pub func tonal_contrast(filters: const Filters*, document: Document*, layer: u64
         error(invalid, "tonal contrast takes an amount in 0..2")
     let target = document.find(layer) else error(invalid, "no such layer")
     let tiles = try target.edited_tiles(on_mask)
-    var copy = try Copy.of(tiles)
+    var copy = try Copy.of(tiles, document.mixes_encoded(on_mask))
     defer copy.destroy()
     try copy.blurred(filters, radius)
+    # The detail is pushed on encoded values; a copy blurred in linear light is encoded first.
+    let linear = not copy.encoded
     for at in 0..<copy.count:
         if copy.pixels[at * 4 + 3] <= 0.0:
             continue
-        let tone = encode(luma(copy.pixels, at))
+        let tone = encode(luma(copy.pixels, at)) if linear else luma(copy.pixels, at)
         let weight = 0.35 + 0.65 * (1.0 - (2.0 * tone - 1.0) * (2.0 * tone - 1.0))
         for channel in 0..<(usize)3:
-            let value = encode((f64)copy.pixels[at * 4 + channel])
-            let around = encode((f64)copy.glow[at * 4 + channel])
-            copy.pixels[at * 4 + channel] = (f32)decode(math.clamp(value + (value - around) * amount * weight, 0.0, 1.0))
-    try tiles.write(copy.pixels)
+            let value = encode((f64)copy.pixels[at * 4 + channel]) if linear else (f64)copy.pixels[at * 4 + channel]
+            let around = encode((f64)copy.glow[at * 4 + channel]) if linear else (f64)copy.glow[at * 4 + channel]
+            let pushed = math.clamp(value + (value - around) * amount * weight, 0.0, 1.0)
+            copy.pixels[at * 4 + channel] = (f32)(decode(pushed) if linear else pushed)
+    try copy.store(tiles)
     target.revision += 1
 
-## A layer's pixels and a second copy to blur, read once.
+## A layer's pixels and a second copy to blur, read once: as sRGB-encoded
+## values when `encoded`, so everything done with them mixes those.
 struct Copy:
     var pixels: f32[]
     var glow: f32[]
@@ -70,24 +76,38 @@ struct Copy:
     var width: u32
     var height: u32
     var device: gpu.Device
+    var encoded: bool
 
-    static func of(tiles: const Tiles*) -> Copy!:
+    static func of(tiles: const Tiles*, encoded: bool) -> Copy!:
         let count = (usize)tiles.width() * (usize)tiles.height()
         let pixels = try alloc f32[count * 4] in memory.heap
         errdefer free(pixels) in memory.heap
         try tiles.read(pixels)
+        if encoded:
+            for at in 0..<count:
+                for channel in 0..<(usize)3:
+                    pixels[at * 4 + channel] = (f32)encode((f64)pixels[at * 4 + channel])
         let glow = try alloc f32[count * 4] in memory.heap
         memory.copy(glow, pixels, count * 4)
-        return Copy(pixels = pixels, glow = glow, count = count, width = tiles.width(), height = tiles.height(), device = tiles.device())
+        return Copy(pixels = pixels, glow = glow, count = count, width = tiles.width(), height = tiles.height(), device = tiles.device(), encoded = encoded)
 
-    ## `glow` blurred `radius` pixels on the device.
+    ## The pixels written back to `tiles`, in linear light again.
+    mutating func store(tiles: Tiles*) -> !:
+        if self.encoded:
+            for at in 0..<self.count:
+                for channel in 0..<(usize)3:
+                    self.pixels[at * 4 + channel] = (f32)decode((f64)self.pixels[at * 4 + channel])
+        try tiles.write(self.pixels)
+
+    ## `glow` blurred `radius` pixels on the device, mixing its values as they
+    ## are (already encoded when the copy is).
     mutating func blurred(filters: const Filters*, radius: f64) -> !:
         if not math.is_finite(radius) or radius < 1.0 or radius > 250.0:
             error(invalid, "the radius must be 1..250 pixels")
         var tiles = try Tiles.create(self.device, self.width, self.height)
         defer tiles.destroy()
         try tiles.write(self.glow)
-        try filters.blur_tiles(&tiles, radius)
+        try filters.blur_tiles(&tiles, radius, false)
         try tiles.read(self.glow)
 
     mutating func destroy():
@@ -135,8 +155,9 @@ test "bloom spreads a bright spot's light around it; tonal contrast pushes an ed
     try bloom(&filters, &document, layer, 0.8, 6.0, 1.0)
     let current = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
     try current.read(pixels)
-    # Just outside the square it glows; far away it is as dark as it was.
-    assert(pixels[(32 * 64 + 38) * 4] > 0.1 and math.abs((f64)pixels[(2 * 64 + 2) * 4] - 0.02) < 0.005 and pixels[(32 * 64 + 38) * 4 + 3] == 1.0)
+    # Just outside the square it glows (screened as encoded values: 0.06 in
+    # linear light over 0.02); far away it is as dark as it was.
+    assert(pixels[(32 * 64 + 38) * 4] > 0.05 and math.abs((f64)pixels[(2 * 64 + 2) * 4] - 0.02) < 0.005 and pixels[(32 * 64 + 38) * 4 + 3] == 1.0)
     # Tonal contrast: the dark side of an edge gets darker, the light side lighter.
     for y in 0..<(usize)64:
         for x in 0..<(usize)64:

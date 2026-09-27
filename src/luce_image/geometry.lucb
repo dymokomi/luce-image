@@ -14,21 +14,25 @@ from raster_errors import invalid
 
 ## `tiles` drawn into a `width` by `height` layer with its pixels scaled by
 ## (`scale_x`, `scale_y`) and its origin at (`offset_x`, `offset_y`); what
-## falls past the new canvas stays past it.
+## falls past the new canvas stays past it. `encoded` resamples the colors as
+## sRGB-encoded values.
 func rebuilt(device: gpu.Device, tiles: Tiles*, width: u32, height: u32, scale_x: f64, scale_y: f64, offset_x: f64, offset_y: f64, smooth: bool,
-             empty: gpu.Color) -> Tiles!:
+             empty: gpu.Color, encoded: bool = false) -> Tiles!:
     var fresh = try Tiles.create(device, width, height)
     errdefer fresh.destroy()
-    try relocate(tiles, &fresh, scale_x, scale_y, offset_x, offset_y, smooth, empty)
+    try relocate(tiles, &fresh, scale_x, scale_y, offset_x, offset_y, smooth, empty, encoded)
     return fresh
 
-func rebuild_layers(device: gpu.Device, layers: Layer*[], width: u32, height: u32, scale_x: f64, scale_y: f64, offset_x: f64, offset_y: f64, smooth: bool) -> !:
+## Every layer and mask rebuilt; colors resample as sRGB-encoded values with
+## `encoded` (the document's blending), masks as they are.
+func rebuild_layers(device: gpu.Device, layers: Layer*[], width: u32, height: u32, scale_x: f64, scale_y: f64, offset_x: f64, offset_y: f64, smooth: bool,
+                    encoded: bool) -> !:
     for layer in layers:
         if layer.group:
-            try rebuild_layers(device, layer.layers(), width, height, scale_x, scale_y, offset_x, offset_y, smooth)
+            try rebuild_layers(device, layer.layers(), width, height, scale_x, scale_y, offset_x, offset_y, smooth, encoded)
             continue
         if let tiles = layer.tiles():
-            let replaced = try rebuilt(device, tiles, width, height, scale_x, scale_y, offset_x, offset_y, smooth, gpu.Color(0.0, 0.0, 0.0, 0.0))
+            let replaced = try rebuilt(device, tiles, width, height, scale_x, scale_y, offset_x, offset_y, smooth, gpu.Color(0.0, 0.0, 0.0, 0.0), encoded)
             try layer.replace_tiles(replaced)
         if let mask = layer.mask_tiles():
             let replaced = try rebuilt(device, mask, width, height, scale_x, scale_y, offset_x, offset_y, smooth, gpu.Color(1.0, 1.0, 1.0, 1.0))
@@ -39,17 +43,17 @@ func rebuild_layers(device: gpu.Device, layers: Layer*[], width: u32, height: u3
 pub func resize_canvas(document: Document*, width: u32, height: u32, offset_x: i64, offset_y: i64) -> !:
     if width == 0 or height == 0 or width > 65536 or height > 65536:
         error(invalid, "canvas dimensions must be in 1..65536")
-    try rebuild_layers(document.device(), document.layers(), width, height, 1.0, 1.0, (f64)offset_x, (f64)offset_y, false)
+    try rebuild_layers(document.device(), document.layers(), width, height, 1.0, 1.0, (f64)offset_x, (f64)offset_y, false, false)
     try document.set_extent(width, height)
 
-## Resample the whole image to `width` by `height`, smoothly (bilinear) or
-## to the nearest pixel.
+## Resample the whole image to `width` by `height`, smoothly (bilinear, the
+## colors mixed as the document blends them) or to the nearest pixel.
 pub func resize_image(document: Document*, width: u32, height: u32, smooth: bool = true) -> !:
     if width == 0 or height == 0 or width > 65536 or height > 65536:
         error(invalid, "image dimensions must be in 1..65536")
     let scale_x = (f64)width / (f64)document.width()
     let scale_y = (f64)height / (f64)document.height()
-    try rebuild_layers(document.device(), document.layers(), width, height, scale_x, scale_y, 0.0, 0.0, smooth)
+    try rebuild_layers(document.device(), document.layers(), width, height, scale_x, scale_y, 0.0, 0.0, smooth, document.mixes_encoded())
     try document.set_extent(width, height)
 
 test "canvas and image resizing keep pixels in place, scale them, and keep what the canvas no longer reaches":

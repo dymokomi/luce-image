@@ -44,6 +44,7 @@ import strings
 import svg
 import os
 import time
+import transfer
 import thread
 import sync
 from luce_image.image import Image, Pixel
@@ -304,6 +305,16 @@ pub struct Canvas:
     var opening: Opening*? = none
     ## Why the load failed, kept for the error that reports it.
     var open_failure: u8[256]
+    ## "Blend RGB Colors Using Gamma 1.0" until the document is bound, which
+    ## then keeps it (`Document.linear_blend`).
+    var cold_linear_blend: bool = false
+    ## The view's checkerboard under transparent pixels (`set_checker`): its
+    ## squares in points (0: the caller draws its own), their linear greys.
+    var checker_cell: f64 = 0.0
+    var checker_light: f32 = 0.0
+    var checker_dark: f32 = 0.0
+    ## Whether the last `draw` tinted what Quick Mask masks itself.
+    var quick_drawn: bool = false
 
     # mark: Lifecycle and document settings =======================================================
 
@@ -426,6 +437,37 @@ pub struct Canvas:
         if not math.is_finite(dpi) or dpi < 1.0 or dpi > 100000.0:
             error(invalid, "a resolution must be 1..100000 pixels per inch")
         self.dpi = dpi
+
+    ## Photoshop's Color Settings › "Blend RGB Colors Using Gamma 1.0": whether
+    ## colors mix in linear light. Off by default: they mix as sRGB-encoded
+    ## values wherever they mix, as Photoshop's 8- and 16-bit documents do.
+    pub func linear_blend() -> bool:
+        if let document = self.document:
+            return document.linear_blend
+        return self.cold_linear_blend
+
+    ## Turn linear blending on or off for the whole document, one undo step.
+    pub mutating func set_linear_blend(on: bool) -> !:
+        if on == self.linear_blend():
+            return
+        if let document = self.document:
+            try self.require_idle()
+            try self.remember_state("Blend RGB Colors Using Gamma 1.0")
+            document.linear_blend = on
+            document.revision += 1
+            return
+        self.cold_linear_blend = on
+
+    ## Draw the view's checkerboard under transparent pixels with the picture,
+    ## in squares of `cell` points of linear greys `light_grey` and `dark_grey`,
+    ## aligned to the document's corner: the picture mixes with it as its
+    ## colors mix. A `cell` of 0 leaves it to the caller, who draws it first.
+    pub mutating func set_checker(cell: f64, light_grey: f64, dark_grey: f64) -> !:
+        if not math.is_finite(cell) or cell < 0.0 or not math.is_finite(light_grey) or not math.is_finite(dark_grey):
+            error(invalid, "a checkerboard needs a square size of 0 or more and finite greys")
+        self.checker_cell = cell
+        self.checker_light = (f32)math.clamp(light_grey, 0.0, 1.0)
+        self.checker_dark = (f32)math.clamp(dark_grey, 0.0, 1.0)
 
     ## The color profile the document's pixels are in, as luce-color names spaces
     ## ("sRGB", "Display P3", "Adobe RGB (1998)", …). sRGB unless set.
@@ -630,6 +672,7 @@ pub struct Canvas:
         let device = binding.device else trap("bound")
         var document = try Document.create(device, self.extent_x, self.extent_y)
         errdefer document.destroy()
+        document.linear_blend = self.cold_linear_blend
         try configure_memory(device)
         # Everything at the top level first, so the ids come out as the records'...
         for index in 0..<self.count:
@@ -770,22 +813,7 @@ pub struct Canvas:
             var owned = shader
             owned.destroy()
             self.ants_shader = none
-        if let pipeline = self.quick_overlay:
-            var owned = pipeline
-            owned.destroy()
-            self.quick_overlay = none
-        if let shader = self.quick_shader:
-            var owned = shader
-            owned.destroy()
-            self.quick_shader = none
-        if let pipeline = self.channels_view:
-            var owned = pipeline
-            owned.destroy()
-            self.channels_view = none
-        if let shader = self.channels_shader:
-            var owned = shader
-            owned.destroy()
-            self.channels_shader = none
+        self.drop_view_pipelines()
         self.channels.destroy()
         if let liquifier = self.liquifier:
             var owned = liquifier
@@ -916,7 +944,7 @@ pub struct Canvas:
         with memory.heap:
             copied = try strings.copy(name)
         errdefer strings.release(copied)
-        let id = self.next_id
+        var id = self.next_id
         if let document = self.document:
             var created: u64 = 0
             if group:
@@ -927,13 +955,15 @@ pub struct Canvas:
                     try document.set_curves(created, self.curves)
             else:
                 created = try document.add_layer(name)
-            assert(created == id)
+            # The document's id: Quick Mask's hidden layer took one of its own.
+            assert(created >= id)
+            id = created
         self.records[self.count] = Record(id = id, name = copied, group = group, adjustment = adjustment, visible = true, opacity = 1.0, blend = 0, masked = false, clipped = false, picture = none, mask_picture = none)
         if adjustment >= 0:
             self.records[self.count].adjustment_values = self.adjustment
             self.records[self.count].curves = self.curves
         self.count += 1
-        self.next_id += 1
+        self.next_id = id + 1
         return (i64)id
 
     ## Room for one more record.
@@ -1848,7 +1878,8 @@ pub struct Canvas:
 
     ## Draw the selection's marching ants over the document as drawn by `draw`
     ## with the same rectangle, zoom and offset; `phase` animates the dashes.
-    ## While Quick Mask is on, the masked part is tinted instead.
+    ## While Quick Mask is on, the masked part is tinted instead (`draw` tints
+    ## it itself when it shows the composite).
     pub mutating func draw_selection(target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, phase: f64) -> !:
         if try draw_refine_view(&self, target, rectangle, zoom, offset_x, offset_y, phase):
             return
@@ -1858,7 +1889,8 @@ pub struct Canvas:
             try self.require_open()
             if not math.is_finite(zoom) or zoom <= 0.0:
                 error(invalid, "zoom must be positive")
-            try draw_quick_overlay(&self, target, rectangle, zoom, offset_x, offset_y)
+            if not self.quick_drawn:
+                try draw_quick_overlay(&self, target, rectangle, zoom, offset_x, offset_y)
             return
         try draw_canvas_selection(&self, target, rectangle, zoom, offset_x, offset_y, phase)
 
@@ -1949,6 +1981,32 @@ pub struct Canvas:
         if self.quick_mask():
             return true
         return self.mask_editing and self.records[try self.index((u64)id)].masked
+
+    ## Draw the view into textures of `texel_format` rather than a window's surface
+    ## (none): what the view's own pipelines (the checkerboard and tints, the
+    ## channel view, mattes) are made for. For headless renderers and benchmarks.
+    pub mutating func set_view_format(texel_format: gpu.Format?):
+        self.drop_view_pipelines()
+        self.view_format = texel_format
+
+    ## Let the view's own pipelines go, to be made again when next drawn.
+    mutating func drop_view_pipelines():
+        if let pipeline = self.quick_overlay:
+            var owned = pipeline
+            owned.destroy()
+            self.quick_overlay = none
+        if let shader = self.quick_shader:
+            var owned = shader
+            owned.destroy()
+            self.quick_shader = none
+        if let pipeline = self.channels_view:
+            var owned = pipeline
+            owned.destroy()
+            self.channels_view = none
+        if let shader = self.channels_shader:
+            var owned = shader
+            owned.destroy()
+            self.channels_shader = none
 
     mutating func quick_pipeline() -> gpu.Pipeline!:
         if let existing = self.quick_overlay:

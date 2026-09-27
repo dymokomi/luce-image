@@ -132,6 +132,7 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
     let profile_value = try doc.get("/document", "profile")
     defer profile_value.release()
     native.set_profile(try profile_value.value().text_at())
+    try native.set_linear_blend(try get_integer(doc, "/document", "linear_blend") != 0)
     let total = doc.child_count("/layers")
     # The ids the file's layers get, for groups named by their place in it.
     let ids = try alloc i64[total if total > 0 else 1] in memory.heap

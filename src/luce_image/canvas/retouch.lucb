@@ -39,7 +39,8 @@ func begin_retouch(canvas: Canvas*, id: u64, x: f64, y: f64, pen: Pen) -> !:
         try begin_liquify(canvas, id, tiles, x, y)
         return
     if kind == retouch_smudge:
-        var warp = try WarpStroke.begin(tiles, x, y, canvas.brush.diameter, canvas.brush.hardness, canvas.brush.opacity, spacing = canvas.smudge_spacing)
+        var warp = try WarpStroke.begin(tiles, x, y, canvas.brush.diameter, canvas.brush.hardness, canvas.brush.opacity, spacing = canvas.smudge_spacing,
+                                        srgb = document.mixes_encoded())
         errdefer warp.destroy()
         let boxed = try new WarpStroke in memory.heap
         *boxed = warp

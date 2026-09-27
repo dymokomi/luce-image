@@ -102,6 +102,8 @@ test "quick mask paints the selection with the painting tools and turns back int
     let layer = try canvas.add_layer("Paint")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
+    # The view's pipelines draw into the test's texture, not a window.
+    canvas.view_format = gpu.Format.rgba8_linear
     # A white layer, so the tint shows against it.
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, false)
     discard(try shown_at(&canvas, &target, 0, 0))
@@ -110,8 +112,15 @@ test "quick mask paints the selection with the painting tools and turns back int
     let steps = canvas.history_steps()
     try canvas.enter_quick_mask()
     assert(canvas.quick_mask() and canvas.undo_name() == "Quick Mask" and canvas.history_steps() == steps + 1)
-    # The document shows as it was: the red tint is the view's alone.
-    assert((try shown_at(&canvas, &target, 50, 10))[1] == 255)
+    # The layer is as it was: the red tint is the view's alone, at half over
+    # white as encoded values (green and blue 128; the linear target stores 55).
+    let tinted = try shown_at(&canvas, &target, 50, 10)
+    assert(tinted[0] == 255 and tinted[1] >= 54 and tinted[1] <= 56 and tinted[2] == tinted[1])
+    assert((try shown_at(&canvas, &target, 10, 10))[1] == 255)
+    let white = try alloc f32[300 * 300 * 4] in memory.heap
+    defer free(white) in memory.heap
+    try layer_tiles(&canvas, layer).read(white)
+    assert(white[(10 * 300 + 50) * 4 + 1] == 1.0)
     # Black masks, white selects: a gradient masking the top third and
     # selecting the rest, then a black stroke down the lower selected band.
     try canvas.fill_gradient(layer, 0.0, 100.0, 0.0, 101.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0)

@@ -269,8 +269,9 @@ test "a gradient's one-color cells share a tile at each end; the ramp between is
     # Within the ramp (cell 2 starts at x 512, the ramp at 600): still red at its left.
     try tiles.read_cell(2, 0, samples)
     assert(samples[0] == 1.0)
+    # Its middle is half of each as encoded values, 0.214 in linear light.
     let middle = ((0 * 256) + (700 - 512)) * 4
-    assert(math.abs((f64)samples[middle] - 0.5) < 0.02 and math.abs((f64)samples[middle + 2] - 0.5) < 0.02)
+    assert(math.abs((f64)samples[middle] - 0.214) < 0.02 and math.abs((f64)samples[middle + 2] - 0.214) < 0.02)
 
 ## Rows gathered from `linear_rgba_bands` into one buffer, checking the order.
 struct StreamedRows:

@@ -118,3 +118,47 @@ Whole times move within run-to-run noise (about ±5%), except progressive JPEG,
 about 8–14% longer whole: its coefficients are now an allocation an MCU row (so
 they can go as rows render) and it renders a coarse picture first. Reproduce with
 `open_benchmark PICTURE [--background] [--place]`.
+
+## Blending in sRGB — 2026-09-26
+
+luce-image 0.39.0 mixes colors as sRGB-encoded values by default, as Photoshop
+does ([BLENDING.md](BLENDING.md)). Every mixing shader encodes what it reads and
+decodes what it writes. `src/luce_image/view_benchmark.lucb` times the view of a
+generated 15000×24000 (360 MP) JPEG, opened whole, with a Multiply layer over it
+at half opacity (`--stacked`: seven more layers in between, one pass each), in a
+1600×1000 view. It measures:
+
+- a zoom sweep from fit to 100%: the five levels' first frames, then again;
+- a pan at 100% that brings a new column of cells into view every frame;
+- an opacity drag, where every cell in view is composited again each frame;
+- a soft 120 px brush stroke at half opacity: 400 points, a frame every four.
+
+Each frame reads a texel back, so its time runs to the GPU's end. The figures are
+the median of three runs on an Apple M4 Max, in milliseconds. Before is 0.38.2,
+which mixed in linear light and whose view drew no checkerboard.
+
+| Two layers | 0.38.2 | 0.39 sRGB, checkerboard | 0.39 sRGB, no checkerboard | 0.39 gamma 1.0 |
+| --- | ---: | ---: | ---: | ---: |
+| Zoom sweep, first frames (sum of 5) | 24.2 | 24.2 | 23.4 | 23.6 |
+| Zoom sweep, again (sum of 5) | 1.57 | 1.64 | 1.64 | 1.62 |
+| Pan at 100%, a frame | 0.53 | 0.54 | 0.52 | 0.53 |
+| Opacity drag at fit, a frame | 0.88 | 0.88 | 0.89 | 0.91 |
+| Opacity drag at 25%, a frame | 0.80 | 0.87 | 0.83 | 0.80 |
+| Opacity drag at 100%, a frame | 0.78 | 0.80 | 0.80 | 0.80 |
+| Brush stroke, 101 frames | 44.6 | 46.7 | 43.5 | 45.1 |
+
+| Nine layers (`--stacked`) | 0.38.2 | 0.39 sRGB, checkerboard | 0.39 gamma 1.0 |
+| --- | ---: | ---: | ---: |
+| Zoom sweep, first frames (sum of 5) | 127.5 | 127.2 | 127.9 |
+| Zoom sweep, again (sum of 5) | 2.95 | 3.06 | 3.03 |
+| Pan at 100%, a frame | 1.40 | 1.46 | 1.41 |
+| Opacity drag at fit, a frame | 3.19 | 3.29 | 3.31 |
+| Opacity drag at 25%, a frame | 3.06 | 2.98 | 3.01 |
+| Opacity drag at 100%, a frame | 2.88 | 3.00 | 2.91 |
+| Brush stroke, 101 frames | 81.1 | 82.7 | 82.0 |
+
+Every difference is within run-to-run spread, which is about ±5% (single runs
+of the same build vary that much). Compositing is bound by reading and writing
+half-float tiles, not by the few power functions per texel. Reproduce with
+`luce-base build src/luce_image/view_benchmark.lucb --native --release -o build/view_benchmark`,
+then `build/view_benchmark PICTURE [--linear] [--plain] [--stacked]`.
