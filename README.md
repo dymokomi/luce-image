@@ -65,7 +65,7 @@ Luce-facing `Canvas` object:
 - Per-pixel selections (rectangle, ellipse, polygon/lasso, magic wand; add,
   subtract, intersect, invert, expand, contract, feather) that painting, fills
   and crops respect, drawn as marching ants.
-- GPU brush and eraser strokes as spaced dabs with Photoshop's controls — tip angle and roundness, spacing, smoothing, size/angle/roundness/flow/color jitter with pressure, scattering, procedural tip textures (`set_brush_shape`, `set_brush_dynamics`, `set_brush_texture`); destructive adjustments
+- GPU brush and eraser strokes as spaced dabs with Photoshop's controls — tip angle and roundness, spacing, smoothing, size/angle/roundness/flow/color jitter, scattering, and dynamics that drive size, flow, opacity, angle, roundness, scatter, texture depth and color jitter from the pen's pressure, tilt, azimuth, barrel rotation and airbrush wheel, the stroke's direction and velocity, or a fade, each with a minimum and a response curve (`set_brush_dynamics`, `set_brush_dynamic`, strokes taking the pen per point); sampled grayscale tips up to 1024 px and texture images tiled in document space, built-in or the brush's own, multiplied or subtracted per dab on the GPU (`set_brush_tip`, `set_brush_texture_image`, `set_brush_texture`); `BrushMask` (`import brush_mask`) to paint, invert, load, save and preview tips and textures, and `selection_image` for Define Brush Preset; destructive adjustments
   (brightness/contrast, hue/saturation/lightness, invert, levels, curves,
   desaturate, threshold, posterize), Gaussian blur, free transform, move,
   canvas and image resize, text from `std.fonts`; each undoable, and each

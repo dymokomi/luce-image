@@ -20,12 +20,39 @@ var copied_height: u32 = 0
 ## document when `merged`, to the clipboard; with `cut` they also leave the layer.
 ## Without a selection the whole layer (or document) goes.
 func copy_to_clipboard(canvas: Canvas*, id: i64, merged: bool, cut: bool) -> !:
+    if cut and (merged or canvas.current().is_empty()):
+        error(invalid, "cut takes a selection of one layer")
+    var selected = try read_selected(canvas, id, merged)
+    defer free(selected.rgba) in memory.heap
+    let picture = try Image.from_rgba8(selected.width, selected.height, selected.rgba)
+    defer picture.release()
+    let encoded_png = try picture.value().encode("png")
+    defer free(encoded_png) in memory.heap
+    try clipboard.write_image(encoded_png, (u32)selected.width, (u32)selected.height, selected.rgba)
+    copied_left = selected.left
+    copied_top = selected.top
+    copied_width = (u32)selected.width
+    copied_height = (u32)selected.height
+    if cut:
+        try erase_selected(canvas, (u64)id)
+
+## The selected pixels, straight 8-bit sRGB RGBA (on the heap, the caller's),
+## and the box they came from.
+struct Selected:
+    var rgba: u8[]
+    var left: i64
+    var top: i64
+    var width: usize
+    var height: usize
+
+## The selected pixels of layer `id`, or of the flattened document when
+## `merged`, cropped to the selection and faded by its coverage; the whole
+## layer (or document) without a selection.
+func read_selected(canvas: Canvas*, id: i64, merged: bool) -> Selected!:
     try canvas.require_open()
     try canvas.require_idle()
     let document = canvas.document else error(invalid, "draw the document once before copying")
     let selection = canvas.current()
-    if cut and (merged or selection.is_empty()):
-        error(invalid, "cut takes a selection of one layer")
     let whole = selection.is_empty()
     let left = 0 if whole else selection.left
     let top = 0 if whole else selection.top
@@ -36,7 +63,7 @@ func copy_to_clipboard(canvas: Canvas*, id: i64, merged: bool, cut: bool) -> !:
     # Only the selection's box is read, straight to 8-bit sRGB: nothing the size
     # of the document, and no float copy of the box either.
     let rgba = try alloc u8[width * height * 4] in memory.heap
-    defer free(rgba) in memory.heap
+    errdefer free(rgba) in memory.heap
     if merged:
         try copy_merged_window(canvas, rgba, left, top, width, height)
     else:
@@ -50,17 +77,7 @@ func copy_to_clipboard(canvas: Canvas*, id: i64, merged: bool, cut: bool) -> !:
                 let at = (y * width + x) * 4 + 3
                 let cover = (u32)selection.at(left + (i64)x, top + (i64)y)
                 rgba[at] = (u8)(((u32)rgba[at] * cover + 127) // 255)
-    let picture = try Image.from_rgba8(width, height, rgba)
-    defer picture.release()
-    let encoded_png = try picture.value().encode("png")
-    defer free(encoded_png) in memory.heap
-    try clipboard.write_image(encoded_png, (u32)width, (u32)height, rgba)
-    copied_left = left
-    copied_top = top
-    copied_width = (u32)width
-    copied_height = (u32)height
-    if cut:
-        try erase_selected(canvas, (u64)id)
+    return Selected(rgba = rgba, left = left, top = top, width = width, height = height)
 
 ## `Canvas.paste`: the clipboard's image on a new top layer named "Pasted",
 ## centred on a document point — or, `in_place`, where it was copied from when

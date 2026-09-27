@@ -25,7 +25,7 @@ let retouch_burn: i64 = 7
 
 ## `Canvas.begin_stroke` with a retouching tool: the stroke for it, begun at
 ## (`x`, `y`) on layer `id`, with its original remembered for undo.
-func begin_retouch(canvas: Canvas*, id: u64, x: f64, y: f64, pressure: f64) -> !:
+func begin_retouch(canvas: Canvas*, id: u64, x: f64, y: f64, pen: Pen) -> !:
     let document = canvas.document else error(invalid, "draw the document once before retouching")
     var painter = canvas.painter else error(invalid, "draw the document once before retouching")
     let index = try canvas.index(id)
@@ -74,7 +74,7 @@ func begin_retouch(canvas: Canvas*, id: u64, x: f64, y: f64, pressure: f64) -> !
         canvas.heal_opacity = brush.opacity
         brush.color = gpu.Color(0.12, 0.12, 0.12, 1.0)
         brush.opacity = 0.45
-    let stroke = begin_boxed(&painter, document, id, brush, x, y, false, pressure) catch failure:
+    let stroke = begin_boxed(&painter, document, id, brush, x, y, false, pen, &canvas.brush_images) catch failure:
         if let unused = source:
             unused.release(unused.context)
         error(failure.code, failure.message)

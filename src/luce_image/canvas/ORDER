@@ -50,6 +50,7 @@ history.lucb
 memory.lucb
 support.lucb
 tests.lucb
+brush_tip_tests.lucb
 preview_tests.lucb
 warp_tests.lucb
 liquify_tests.lucb

@@ -1,7 +1,7 @@
 #prisma 4.0
 def package "luce-image" {
     str owner = "dymokomi"
-    str version = "0.37.0"
+    str version = "0.38.0"
     str kind = "package"
     str language = "luce-base"
     str description = "JPEG, PNG, TIFF and OpenEXR image I/O for Luce, implemented in Luce Base, with a Pillow-inspired owning Image API and Cryptomatte 1.2 reading and authoring."
@@ -17,6 +17,10 @@ def package "luce-image" {
 
     def export "canvas" {
         str module = "luce_image.canvas"
+    }
+
+    def export "brush_mask" {
+        str module = "luce_image.brush_mask"
     }
 
     def dependency "luce-prism" {

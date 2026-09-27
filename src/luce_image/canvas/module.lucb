@@ -62,6 +62,8 @@ from luce_image.puppet import Puppet
 from luce_image.document import Style, Document, Layer, TreeState, release_snapshot, box_document, unbox_document, blend_mode_count, style_field_count, style_field_names
 from luce_image.composite import Composer, box_composer, unbox_composer
 from luce_image.brush import Brush, Painter, Stroke, EffectSource, begin_boxed, finish_boxed, fill_selection, fill_gradient, gradient_tile, simulate_fill_failure
+from luce_image.brush_images import BrushImages
+from luce_image.dynamics import Dynamic, Control, Pen, dynamic_count
 from luce_image.adjust import Adjuster, adjustment_count, parameter_count, curves, levels, replace_color
 from luce_image.curves import Curves, lut_size
 from luce_image.filter import Filters
@@ -166,6 +168,8 @@ pub struct Canvas:
     var transformer: Transformer?
     var passes: SelectionPasses?
     var brush: Brush
+    ## The brush's sampled tip and texture image (set_brush_tip, set_brush_texture_image).
+    var brush_images: BrushImages
     var stroke: Stroke*?
     var preview: Snapshot?
     var curves: Curves
@@ -323,6 +327,7 @@ pub struct Canvas:
         self.transformer = none
         self.passes = none
         self.brush = Brush()
+        self.brush_images = BrushImages()
         self.stroke = none
         self.preview = none
         self.curves = Curves.identity()
@@ -748,6 +753,7 @@ pub struct Canvas:
         if let stroke = self.stroke:
             self.stroke = none
             finish_boxed(stroke)
+        self.brush_images.destroy()
         if let preview = self.preview:
             var owned = preview.tiles
             owned.destroy()
@@ -2057,12 +2063,11 @@ pub struct Canvas:
         try brush.check()
         self.brush = brush
 
-    ## The brush's dynamics, each jitter 0..1: size, angle and roundness
-    ## (shape), scatter as a fraction of the diameter with the dabs per step,
-    ## flow (transfer), hue, saturation and brightness (color), and whether
-    ## stylus pressure drives size and flow.
+    ## The brush's jitters, each 0..1: size, angle and roundness (shape),
+    ## scatter as a fraction of the diameter with the dabs per step, flow
+    ## (transfer), hue, saturation and brightness (color).
     pub mutating func set_brush_dynamics(size_jitter: f64, angle_jitter: f64, roundness_jitter: f64, scatter: f64, scatter_count: i64,
-                                         flow_jitter: f64, hue_jitter: f64, saturation_jitter: f64, brightness_jitter: f64, pressure_size: bool, pressure_flow: bool) -> !:
+                                         flow_jitter: f64, hue_jitter: f64, saturation_jitter: f64, brightness_jitter: f64) -> !:
         var brush = self.brush
         brush.size_jitter = size_jitter
         brush.angle_jitter = angle_jitter
@@ -2073,25 +2078,56 @@ pub struct Canvas:
         brush.hue_jitter = hue_jitter
         brush.saturation_jitter = saturation_jitter
         brush.brightness_jitter = brightness_jitter
-        brush.pressure_size = pressure_size
-        brush.pressure_flow = pressure_flow
         try brush.check()
         self.brush = brush
 
-    ## The tip's texture: 0 none, 1 grain, 2 canvas weave, 3 dots, at `scale`
-    ## (0.1..10) and `depth` 0..1 (how much of it shows through).
-    pub mutating func set_brush_texture(kind: i64, scale: f64, depth: f64) -> !:
+    ## What drives brush parameter `parameter` (dynamics.lucb: 0 size, 1 flow,
+    ## 2 opacity, 3 angle, 4 roundness, 5 scatter, 6 texture depth, 7 hue,
+    ## 8 saturation, 9 brightness): control 0 off, 1 pen pressure, 2 pen
+    ## tilt, 3 azimuth, 4 barrel rotation, 5 airbrush wheel, 6 stroke
+    ## direction, 7 velocity, 8 fade over `steps` dabs; from `minimum` (0..1)
+    ## through `curve` (-1 firm .. 1 soft).
+    pub mutating func set_brush_dynamic(parameter: i64, control: i64, minimum: f64 = 0.0, curve: f64 = 0.0, steps: i64 = 25) -> !:
+        if parameter < 0 or parameter >= (i64)dynamic_count or control < 0 or control > (i64)Control.fade:
+            error(invalid, "brush dynamics are parameters 0..9 and controls 0..8")
+        let dynamic = Dynamic(control = (Control)(u8)control, minimum = minimum, curve = curve, steps = steps)
+        try dynamic.check()
+        self.brush.dynamics[(usize)parameter] = dynamic
+
+    ## The brush's texture: 0 none, 1 grain, 2 canvas weave, 3 dots, 4 the
+    ## image set by `set_brush_texture_image`, at `scale` (0.1..10) and `depth`
+    ## 0..1 (how much of it shows), multiplied (mode 0) or subtracted (1),
+    ## its values `invert`ed or not.
+    pub mutating func set_brush_texture(kind: i64, scale: f64, depth: f64, mode: i64 = 0, invert: bool = false) -> !:
         var brush = self.brush
         brush.texture = kind
         brush.texture_scale = scale
         brush.texture_depth = depth
+        brush.texture_mode = mode
+        brush.texture_invert = invert
         try brush.check()
         self.brush = brush
+
+    ## The brush's sampled tip: `width` × `height` grayscale coverage bytes
+    ## (255 paints), up to 1024 a side; no bytes paint with the round tip.
+    pub mutating func set_brush_tip(pixels: const u8[], width: i64, height: i64) -> !:
+        if self.stroke != none:
+            error(invalid, "finish the stroke first")
+        try self.brush_images.set_tip(pixels, (usize)math.max(0.0, (f64)width), (usize)math.max(0.0, (f64)height))
+
+    ## The brush's texture image (texture kind 4), as `set_brush_tip`'s bytes.
+    pub mutating func set_brush_texture_image(pixels: const u8[], width: i64, height: i64) -> !:
+        if self.stroke != none:
+            error(invalid, "finish the stroke first")
+        try self.brush_images.set_pattern(pixels, (usize)math.max(0.0, (f64)width), (usize)math.max(0.0, (f64)height))
 
     ## Start painting on `layer` at a document point. The document must have
     ## been drawn once, so its pixels are on a device. The layer's pixels before
     ## the stroke go on the history.
-    pub mutating func begin_stroke(layer: i64, x: f64, y: f64, pressure: f64 = 1.0) -> !:
+    ## The pen: `pressure` 0..1 (a mouse's 0 or 1 presses fully), its lean's
+    ## `azimuth` and `altitude` in degrees, barrel `rotation`, airbrush wheel
+    ## `tangential` and the time `at_ms` in milliseconds, for the brush's dynamics.
+    pub mutating func begin_stroke(layer: i64, x: f64, y: f64, pressure: f64 = 1.0, azimuth: f64 = 0.0, altitude: f64 = 90.0, rotation: f64 = 0.0, tangential: f64 = 0.0, at_ms: f64 = 0.0) -> !:
         try self.require_open()
         try require_loaded(&self)
         try self.wait_idle()
@@ -2100,19 +2136,20 @@ pub struct Canvas:
         if self.preview != none:
             error(invalid, "finish the preview first")
         if self.retouch != retouch_paint:
-            try begin_retouch(&self, (u64)layer, x, y, pressure)
+            try begin_retouch(&self, (u64)layer, x, y, Pen(pressure = pressure, azimuth = azimuth, altitude = altitude, rotation = rotation, tangential = tangential, time = at_ms))
             return
         let document = self.document else error(invalid, "draw the document once before painting")
         var painter = self.painter else error(invalid, "draw the document once before painting")
         let target = self.paint_target(layer)
         let on_mask = try self.paints_mask(target)
-        let stroke = try begin_boxed(&painter, document, (u64)target, self.brush, x, y, on_mask, pressure)
+        let pen = Pen(pressure = pressure, azimuth = azimuth, altitude = altitude, rotation = rotation, tangential = tangential, time = at_ms)
+        let stroke = try begin_boxed(&painter, document, (u64)target, self.brush, x, y, on_mask, pen, &self.brush_images)
         errdefer finish_boxed(stroke)
         try self.remember((u64)target, try stroke.original().clone(), on_mask, name = "Eraser" if self.brush.erase else "Brush Stroke")
         self.stroke = stroke
 
-    ## Continue the stroke to a document point.
-    pub mutating func extend_stroke(x: f64, y: f64, pressure: f64 = 1.0) -> !:
+    ## Continue the stroke to a document point, with the pen as `begin_stroke` takes it.
+    pub mutating func extend_stroke(x: f64, y: f64, pressure: f64 = 1.0, azimuth: f64 = 0.0, altitude: f64 = 90.0, rotation: f64 = 0.0, tangential: f64 = 0.0, at_ms: f64 = 0.0) -> !:
         try self.require_open()
         if self.warp_finishing:
             error(invalid, "no stroke is in progress")
@@ -2125,7 +2162,7 @@ pub struct Canvas:
         let stroke = self.stroke else error(invalid, "no stroke is in progress")
         let document = self.document else trap("stroke without a document")
         var painter = self.painter else trap("stroke without a painter")
-        try stroke.extend(&painter, document, x, y, pressure)
+        try stroke.extend(&painter, document, x, y, Pen(pressure = pressure, azimuth = azimuth, altitude = altitude, rotation = rotation, tangential = tangential, time = at_ms))
 
     ## End the stroke, keeping what it painted.
     pub mutating func end_stroke() -> !:
@@ -3341,6 +3378,14 @@ pub struct Canvas:
     ## whole layer (or document) is copied.
     pub mutating func copy_selection(id: i64, merged: bool = false, cut: bool = false) -> !:
         try copy_to_clipboard(&self, id, merged, cut)
+
+    ## The selected pixels of layer `id` (of the flattened document when
+    ## `merged`) as an RGBA image cropped to the selection and faded by its
+    ## coverage, as Copy takes them: Define Brush Preset's source.
+    pub mutating func selection_image(id: i64, merged: bool = false) -> interop.Reference[Image]!:
+        var selected = try read_selected(&self, id, merged)
+        defer free(selected.rgba) in memory.heap
+        return try Image.from_rgba8(selected.width, selected.height, selected.rgba)
 
     ## The clipboard's image on a new top layer, centred on a document point; its id.
     pub mutating func paste(center_x: i64, center_y: i64) -> i64!:
