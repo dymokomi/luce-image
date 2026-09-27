@@ -4,9 +4,10 @@
 #
 #   DESCRIPTION:
 #       Photoshop's Edit menu pixel commands: the selected pixels of a layer (or of the
-#       flattened document, Copy Merged) go to the system clipboard as PNG, cropped to the
-#       selection and faded by its coverage; a pasted image becomes a new layer. Layer via
-#       Copy and via Cut make that layer directly, without the clipboard.
+#       flattened document, Copy Merged) as a picture, cropped to the selection and faded by
+#       its coverage, for the app to put on the system clipboard; a picture the app pasted
+#       becomes a new layer. Layer via Copy and via Cut make that layer directly. The engine
+#       never touches the system clipboard itself.
 #
 #==============================================================================================
 
@@ -17,24 +18,22 @@ var copied_width: u32 = 0
 var copied_height: u32 = 0
 
 ## `Canvas.copy_selection`: the selected pixels of layer `id`, or of the flattened
-## document when `merged`, to the clipboard; with `cut` they also leave the layer.
-## Without a selection the whole layer (or document) goes.
-func copy_to_clipboard(canvas: Canvas*, id: i64, merged: bool, cut: bool) -> !:
+## document when `merged`, as a picture for the clipboard; with `cut` they also
+## leave the layer. Without a selection the whole layer (or document) goes.
+func copy_picture(canvas: Canvas*, id: i64, merged: bool, cut: bool) -> interop.Reference[Image]!:
     if cut and (merged or canvas.current().is_empty()):
         error(invalid, "cut takes a selection of one layer")
     var selected = try read_selected(canvas, id, merged)
     defer free(selected.rgba) in memory.heap
     let picture = try Image.from_rgba8(selected.width, selected.height, selected.rgba)
-    defer picture.release()
-    let encoded_png = try picture.value().encode("png")
-    defer free(encoded_png) in memory.heap
-    try clipboard.write_image(encoded_png, (u32)selected.width, (u32)selected.height, selected.rgba)
+    errdefer picture.release()
     copied_left = selected.left
     copied_top = selected.top
     copied_width = (u32)selected.width
     copied_height = (u32)selected.height
     if cut:
         try erase_selected(canvas, (u64)id)
+    return picture
 
 ## The selected pixels, straight 8-bit sRGB RGBA (on the heap, the caller's),
 ## and the box they came from.
@@ -79,24 +78,21 @@ func read_selected(canvas: Canvas*, id: i64, merged: bool) -> Selected!:
                 rgba[at] = (u8)(((u32)rgba[at] * cover + 127) // 255)
     return Selected(rgba = rgba, left = left, top = top, width = width, height = height)
 
-## `Canvas.paste`: the clipboard's image on a new top layer named "Pasted",
-## centred on a document point — or, `in_place`, where it was copied from when
-## it is what this process copied last, else on the canvas's centre; the new
-## layer's id.
-func paste_from_clipboard(canvas: Canvas*, center_x: i64, center_y: i64, in_place: bool = false) -> i64!:
+## `Canvas.paste`: `picture` (the clipboard's) on a new top layer named
+## "Pasted", centred on a document point — or, `in_place`, where it was copied
+## from when it is the size this process copied last, else on the canvas's
+## centre; the new layer's id.
+func paste_picture(canvas: Canvas*, picture: interop.Reference[Image], center_x: i64, center_y: i64, in_place: bool = false) -> i64!:
     try canvas.require_open()
     try canvas.require_idle()
-    let found = try clipboard.read_image() else error(invalid, "the clipboard holds no image")
-    var image = found
-    defer image.destroy()
-    let picture = try Image.open_bytes(image.encoded) if image.encoded.length > 0 else try Image.from_rgba8((usize)image.width, (usize)image.height, image.rgba)
-    defer picture.release()
+    let width = (u32)(try picture.value().width())
+    let height = (u32)(try picture.value().height())
     var x = center_x
     var y = center_y
     if in_place:
         x = (i64)canvas.extent_x // 2
         y = (i64)canvas.extent_y // 2
-        if image.width == copied_width and image.height == copied_height:
+        if width == copied_width and height == copied_height:
             x = copied_left + (i64)(copied_width // 2)
             y = copied_top + (i64)(copied_height // 2)
     let id = try canvas.add_layer("Pasted")

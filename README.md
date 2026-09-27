@@ -26,7 +26,7 @@ Depend on it from the application's `package.prisma`:
 ```
 def dependency "luce-image" {
     str owner = "dymokomi"
-    str version = "^0.39.0"
+    str version = "^0.40.0"
 }
 ```
 

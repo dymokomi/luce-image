@@ -4,7 +4,6 @@
 ## kept as PNG, dark where it paints, as Photoshop shows a brush. Its
 ## `coverage` is what `Canvas.set_brush_tip` and `set_brush_texture_image`
 ## take; `preview` and `stroke_preview` are RGBA to show it.
-import clipboard
 import interop
 import math
 import memory
@@ -51,20 +50,6 @@ pub struct BrushMask:
         errdefer mask.release()
         try mask.value().draw_image(image)
         return mask
-
-    ## A mask of the image on the system clipboard; failing when it holds none.
-    pub static func from_clipboard() -> interop.Reference[BrushMask]!:
-        let found = try clipboard.read_image() else error(invalid, "the clipboard holds no image")
-        var image = found
-        defer image.destroy()
-        return try BrushMask.from_clipboard_image(image)
-
-    ## A mask of a clipboard image: its encoded file when it has one, else
-    ## its raw RGBA (a test hands one in without the system clipboard).
-    static func from_clipboard_image(image: const clipboard.ClipboardImage) -> interop.Reference[BrushMask]!:
-        let picture = try Image.open_bytes(image.encoded) if image.encoded.length > 0 else try Image.from_rgba8((usize)image.width, (usize)image.height, image.rgba)
-        defer picture.release()
-        return try BrushMask.from_image(picture)
 
     ## A mask from a picture file (a PNG saved by `save` included).
     pub static func open(path: str) -> interop.Reference[BrushMask]!:
@@ -469,21 +454,16 @@ test "a picture becomes coverage, dark and opaque painting, fitted with its aspe
     let fitted = try square.value().coverage()
     assert(fitted[0] == 0 and fitted[2 * 8 + 0] == 255 and fitted[7 * 8] == 0)
 
-test "a clipboard image becomes a mask, from its PNG or its raw pixels":
+test "a pasted picture becomes a mask, from its PNG or its raw pixels":
     var rgba: u8[16] = [0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 255]
-    let picture = try Image.from_rgba8(2, 2, rgba[..<16])
-    defer picture.release()
-    let png = try picture.value().encode("png")
-    var raw = try alloc u8[16] in memory.heap
-    for index in 0..<16:
-        raw[index] = rgba[index]
-    var empty: u8[]
-    var encoded = clipboard.ClipboardImage(encoded = png, rgba = empty, width = 2, height = 2)
-    defer encoded.destroy()
-    var plain = clipboard.ClipboardImage(encoded = empty, rgba = raw, width = 2, height = 2)
-    defer plain.destroy()
+    let plain = try Image.from_rgba8(2, 2, rgba[..<16])
+    defer plain.release()
+    let png = try plain.value().encode("png")
+    defer free(png) in memory.heap
+    let encoded = try Image.open_bytes(png)
+    defer encoded.release()
     for source in [encoded, plain]:
-        let mask = try BrushMask.from_clipboard_image(source)
+        let mask = try BrushMask.from_image(source)
         defer mask.release()
         let pixels = try mask.value().coverage()
         assert(pixels.length == 4 and pixels[0] == 255 and pixels[1] == 0 and pixels[2] == 0 and pixels[3] == 255)

@@ -8,10 +8,10 @@
 #       Photoshop's Copy and Paste with layers selected and its drag of a layer onto
 #       another document. The layers are snapshots whose tiles are shared, so copying costs
 #       little; they live for the process beside the system clipboard's pixels, and pasting
-#       gives every layer a new id in the document it lands in. The system clipboard gets
-#       their pixels (the workspace copies those after) or, for layers without any, their
-#       names: Paste takes the layers while the clipboard still holds what copying them put
-#       there, and anything another program copies since wins.
+#       gives every layer a new id in the document it lands in. The app puts their pixels
+#       (it copies those after) or, for layers without any, their names on the system
+#       clipboard: Paste takes the layers while the clipboard still holds what copying them
+#       put there (`copied_layers_held`), and anything another program copies since wins.
 #
 #==============================================================================================
 
@@ -25,7 +25,7 @@ struct LayerClip:
     ## The canvas they came from, to centre them on one of another size.
     var width: u32
     var height: u32
-    ## Their names, a line each, as put on the system clipboard.
+    ## Their names, a line each, as the app puts them on the system clipboard.
     var names: str
 
 var layer_clip: LayerClip*? = none
@@ -43,9 +43,8 @@ func clear_layer_clip():
     free(clip) in memory.heap
 
 ## `Canvas.copy_layer`: layer `id` of `canvas`, with all it holds, added on top
-## of the copied layers; copying from another canvas starts afresh. With
-## `announce` their names go on the system clipboard.
-func copy_layer_to_clip(canvas: Canvas*, id: i64, announce: bool) -> !:
+## of the copied layers; copying from another canvas starts afresh.
+func copy_layer_to_clip(canvas: Canvas*, id: i64) -> !:
     try canvas.require_open()
     try canvas.require_idle()
     let document = canvas.document else error(invalid, "draw the document once before copying layers")
@@ -84,26 +83,6 @@ func copy_layer_to_clip(canvas: Canvas*, id: i64, announce: bool) -> !:
             names = try strings.copy(snapshot.name)
     strings.release(clip.names)
     clip.names = names
-    if not announce:
-        return
-    clipboard.write_text(names) catch _:
-        # A clipboard without text (Linux, for now): the layers still paste here.
-        return
-
-## `Canvas.layers_on_clipboard`: whether some layers are copied and the system
-## clipboard still holds what copying them put there — their pixels or their names.
-func clip_on_clipboard() -> bool!:
-    let clip = layer_clip else return false
-    let found = clipboard.read_image() catch _:
-        return true
-    if let held = found:
-        var image = held
-        defer image.destroy()
-        return copied_width != 0 and image.width == copied_width and image.height == copied_height
-    let text = clipboard.read_text() catch _:
-        return true
-    defer text.release()
-    return text.value == clip.names
 
 ## The records of `layer` and all it holds, copied into `clip`.
 func keep_records(canvas: Canvas*, clip: LayerClip*, layer: const Layer*) -> !:

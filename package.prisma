@@ -1,7 +1,7 @@
 #prisma 4.0
 def package "luce-image" {
     str owner = "dymokomi"
-    str version = "0.39.0"
+    str version = "0.40.0"
     str kind = "package"
     str language = "luce-base"
     str description = "The layered-document engine behind luced-2d: layers, GPU compositing, selections, painting, filters, transforms and history over shared GPU tiles, with a Pillow-inspired Image API and Cryptomatte 1.2."
@@ -77,11 +77,6 @@ def package "luce-image" {
         str path = "../luce-std"
     }
 
-    def dependency "luce-clipboard" {
-        str owner = "dymokomi"
-        str version = "^0.2.0"
-        str path = "../luce-clipboard"
-    }
 
     def dependency "luce-color" {
         str owner = "dymokomi"
@@ -109,7 +104,7 @@ def package "luce-image" {
 
     def dependency "luce-canvas" {
         str owner = "dymokomi"
-        str version = "^0.1.18"
+        str version = "^0.1.21"
         str path = "../luce-canvas"
     }
 
@@ -125,9 +120,4 @@ def package "luce-image" {
         str path = "../luce-fonts"
     }
 
-    def dependency "luce-window" {
-        str owner = "dymokomi"
-        str version = "^0.1.6"
-        str path = "../luce-window"
-    }
 }
