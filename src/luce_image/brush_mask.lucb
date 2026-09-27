@@ -152,6 +152,28 @@ pub struct BrushMask:
                 column += 1
             row += 1
 
+    ## The round tip as the brush paints it, filling the mask: an ellipse of
+    ## `roundness` (minor over major axis) turned by `angle` degrees, with the
+    ## dab shader's hard core of `hardness` and soft edge. Shows a brush with no
+    ## sampled tip, and is where painting one starts from.
+    pub mutating func draw_round(hardness: f64, angle: f64, roundness: f64) -> !:
+        try self.require_open()
+        let radius = (f64)(self.columns if self.columns < self.rows else self.rows) * 0.5 - 1.0
+        let core = radius * math.clamp(hardness, 0.0, 1.0)
+        let edge = math.max(radius, core + 0.5)
+        let radians = (angle if math.is_finite(angle) else 0.0) * math.pi / 180.0
+        let cosine = math.cos(radians)
+        let sine = math.sin(radians)
+        let round = math.clamp(roundness, 0.05, 1.0)
+        for y in 0..<self.rows:
+            for x in 0..<self.columns:
+                let px = (f64)x + 0.5 - (f64)self.columns * 0.5
+                let py = (f64)y + 0.5 - (f64)self.rows * 0.5
+                let qx = px * cosine + py * sine
+                let qy = (-px * sine + py * cosine) / round
+                let cover = 1.0 - smooth(core, edge, math.sqrt(qx * qx + qy * qy))
+                self.pixels[y * self.columns + x] = (u8)math.round(cover * 255.0)
+
     ## Dabs from (`x0`, `y0`) to (`x1`, `y1`), a quarter radius apart, the
     ## first included: a drag's segment.
     pub mutating func line(x0: f64, y0: f64, x1: f64, y1: f64, radius: f64, hardness: f64, value: f64) -> !:
@@ -465,6 +487,16 @@ test "a clipboard image becomes a mask, from its PNG or its raw pixels":
         defer mask.release()
         let pixels = try mask.value().coverage()
         assert(pixels.length == 4 and pixels[0] == 255 and pixels[1] == 0 and pixels[2] == 0 and pixels[3] == 255)
+
+test "the round tip fills the mask as the brush paints it":
+    let mask = try BrushMask.create(64, 64)
+    defer mask.release()
+    try mask.value().draw_round(1.0, 90.0, 0.25)
+    let pixels = try mask.value().coverage()
+    # Turned upright and a quarter as wide: tall and thin.
+    assert(pixels[10 * 64 + 32] == 255 and pixels[32 * 64 + 10] == 0 and pixels[32 * 64 + 32] == 255)
+    try mask.value().draw_round(0.0, 0.0, 1.0)
+    assert(pixels[32 * 64 + 32] > 250 and pixels[32 * 64 + 50] < pixels[32 * 64 + 40] and pixels[0] == 0)
 
 test "a mask kept as PNG comes back the same":
     let mask = try BrushMask.create(24, 16)

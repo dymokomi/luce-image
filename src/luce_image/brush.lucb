@@ -17,7 +17,7 @@ import math
 from tiles import Tiles, tile_size, tile_texture
 from luce_image.document import Document, Layer
 from luce_image.selection_cells import Mode
-from luce_image.dynamics import Dynamic, Pen, Inputs, response, angle_turn, blend_pens, velocity_value, dynamic_size, dynamic_flow, dynamic_opacity, dynamic_angle, dynamic_roundness, dynamic_scatter, dynamic_texture_depth, dynamic_hue, dynamic_saturation, dynamic_brightness
+from luce_image.dynamics import Dynamic, Control, Pen, Inputs, response, angle_turn, blend_pens, velocity_value, dynamic_size, dynamic_flow, dynamic_opacity, dynamic_angle, dynamic_roundness, dynamic_scatter, dynamic_texture_depth, dynamic_hue, dynamic_saturation, dynamic_brightness
 from luce_image.brush_images import BrushImages, Sampled
 from luce_image.shaders import dab_frag_words, dab_frag_msl, paint_frag_words, paint_frag_msl, gradient_frag_words, gradient_frag_msl
 from raster_errors import invalid, limit
@@ -91,6 +91,8 @@ pub struct Painter:
     var dab_shader: gpu.Shader
     var paint_shader: gpu.Shader
     var dab: gpu.Pipeline
+    ## The same shader drawn with `replace`: capped dabs darken towards their opacity.
+    var capped_dab: gpu.Pipeline
     var paint: gpu.Pipeline
     var gradient_shader: gpu.Shader
     var gradient: gpu.Pipeline
@@ -107,6 +109,8 @@ pub struct Painter:
         errdefer paint_shader.destroy()
         var dab = try gpu.Pipeline.create(device, dab_shader, gpu.Blend.over, gpu.Format.rgba16_float)
         errdefer dab.destroy()
+        var capped_dab = try gpu.Pipeline.create(device, dab_shader, gpu.Blend.replace, gpu.Format.rgba16_float)
+        errdefer capped_dab.destroy()
         var paint = try gpu.Pipeline.create(device, paint_shader, gpu.Blend.replace, gpu.Format.rgba16_float)
         errdefer paint.destroy()
         var gradient_shader = try gpu.Shader.create(device, gradient_frag_words, gradient_frag_msl)
@@ -122,7 +126,7 @@ pub struct Painter:
         var clear = try gpu.Texture.create(device, 1, 1, gpu.Format.rgba8_linear)
         errdefer clear.destroy()
         try clear.upload([(u8)0, (u8)0, (u8)0, (u8)0])
-        return Painter(owner = device, dab_shader = dab_shader, paint_shader = paint_shader, dab = dab, paint = paint, white = white, black = black, clear = clear,
+        return Painter(owner = device, dab_shader = dab_shader, paint_shader = paint_shader, dab = dab, capped_dab = capped_dab, paint = paint, white = white, black = black, clear = clear,
                        gradient_shader = gradient_shader, gradient = gradient)
 
     pub mutating func destroy():
@@ -133,6 +137,7 @@ pub struct Painter:
         self.gradient.destroy()
         self.gradient_shader.destroy()
         self.dab.destroy()
+        self.capped_dab.destroy()
         self.paint_shader.destroy()
         self.dab_shader.destroy()
 
@@ -160,6 +165,11 @@ struct Dab:
     var seed: f64
     ## How much of the texture this dab shows.
     var depth: f64
+    ## The dab's opacity, the ceiling its coverage reaches (a capped stroke's).
+    var opacity: f64
+    ## How far from its centre it can reach: the radius, or a sampled tip's
+    ## corners, which may lie past it.
+    var extent: f64
 
 ## The most dabs one segment stamps before the rest wait for the next; a
 ## segment longer than that is unusual at any sane spacing.
@@ -205,6 +215,8 @@ pub struct Stroke:
     var tip_x: f64 = 1.0
     var tip_y: f64 = 1.0
     var pattern: Sampled? = none
+    ## Which pass each queued dab of a capped stroke goes in, while a cell is touched.
+    var groups: u16[]
     var active: bool
     var on_mask: bool
     ## The document's selection tiles when the stroke began; painting stays inside it.
@@ -343,7 +355,8 @@ pub struct Stroke:
         let brush = self.brush
         let inputs = self.inputs(pen)
         let size = math.max(0.05, response(brush.dynamics[dynamic_size], inputs))
-        let strength = response(brush.dynamics[dynamic_flow], inputs) * response(brush.dynamics[dynamic_opacity], inputs)
+        let strength = response(brush.dynamics[dynamic_flow], inputs)
+        let ceiling = brush.opacity * response(brush.dynamics[dynamic_opacity], inputs)
         let turn = angle_turn(brush.dynamics[dynamic_angle], inputs)
         let round = response(brush.dynamics[dynamic_roundness], inputs)
         let scatter = response(brush.dynamics[dynamic_scatter], inputs)
@@ -365,8 +378,10 @@ pub struct Stroke:
             var color = brush.color
             if hue > 0.0 or saturation > 0.0 or brightness > 0.0:
                 color = jitter_color(color, hue * 180.0 * self.next_signed(), saturation * self.next_signed(), brightness * self.next_signed())
-            self.dabs[self.dab_count] = Dab(x = sx, y = sy, radius = math.max(0.5, radius), angle = angle, roundness = roundness, flow = math.clamp(flow, 0.0, 1.0), color = color,
-                                            seed = self.next_random() * 1000.0, depth = math.clamp(depth, 0.0, 1.0))
+            let kept = math.max(0.5, radius)
+            let extent = kept * math.sqrt(self.tip_x * self.tip_x + self.tip_y * self.tip_y) if self.tip != none else kept
+            self.dabs[self.dab_count] = Dab(x = sx, y = sy, radius = kept, angle = angle, roundness = roundness, flow = math.clamp(flow, 0.0, 1.0), color = color,
+                                            seed = self.next_random() * 1000.0, depth = math.clamp(depth, 0.0, 1.0), opacity = math.clamp(ceiling, 0.0, 1.0), extent = extent)
             self.dab_count += 1
 
     ## The tiles touched so far, for callers that track damage.
@@ -393,10 +408,10 @@ pub struct Stroke:
         var max_y = -1.0e18
         for index in 0..<self.dab_count:
             let dab = self.dabs[index]
-            min_x = math.min(min_x, dab.x - dab.radius - 1.0)
-            min_y = math.min(min_y, dab.y - dab.radius - 1.0)
-            max_x = math.max(max_x, dab.x + dab.radius + 1.0)
-            max_y = math.max(max_y, dab.y + dab.radius + 1.0)
+            min_x = math.min(min_x, dab.x - dab.extent - 1.0)
+            min_y = math.min(min_y, dab.y - dab.extent - 1.0)
+            max_x = math.max(max_x, dab.x + dab.extent + 1.0)
+            max_y = math.max(max_y, dab.y + dab.extent + 1.0)
         let left = math.max(0.0, math.floor(min_x / (f64)tile_size))
         let top = math.max(0.0, math.floor(min_y / (f64)tile_size))
         let right = math.min((f64)(tiles.columns() - 1), math.floor(max_x / (f64)tile_size))
@@ -419,21 +434,59 @@ pub struct Stroke:
 
     ## Add the queued dabs that reach one tile to its paint and rebuild that
     ## tile. A texture frame clears its target, so the paint grows by ping-pong:
-    ## the new paint is the old one drawn back plus the dabs over it.
+    ## the new paint is the old one drawn back plus the dabs over it. A capped
+    ## stroke's dabs read the paint below them, so they go in passes of dabs
+    ## that do not overlap, each pass over the last one's result.
     mutating func touch(painter: Painter*, tiles: Tiles*, column: u32, row: u32) -> !:
         let origin_x = (f64)(column * tile_size)
         let origin_y = (f64)(row * tile_size)
         var reaching = false
         for index in 0..<self.dab_count:
-            let dab = self.dabs[index]
-            if dab.x + dab.radius + 1.0 >= origin_x and dab.x - dab.radius - 1.0 < origin_x + (f64)tile_size and dab.y + dab.radius + 1.0 >= origin_y and dab.y - dab.radius - 1.0 < origin_y + (f64)tile_size:
+            if self.reaches(self.dabs[index], origin_x, origin_y):
                 reaching = true
         if not reaching:
             return
         let index = try self.reach(painter, column, row)
+        if not self.capped():
+            try self.pass(painter, index, origin_x, origin_y, 0, painter.dab)
+        else:
+            # Pass `group` takes the dabs its greedy grouping gave it: each goes
+            # in the first pass with none of its dabs in reach of it.
+            var groups = try alloc u16[self.dab_count] in memory.heap
+            defer free(groups) in memory.heap
+            var count: u16 = 0
+            for which in 0..<self.dab_count:
+                groups[which] = 0xFFFF
+                if not self.reaches(self.dabs[which], origin_x, origin_y):
+                    continue
+                var group: u16 = 0
+                while group < count:
+                    var clear = true
+                    for other in 0..<which:
+                        if groups[other] == group and overlap(self.dabs[other], self.dabs[which]):
+                            clear = false
+                            break
+                    if clear:
+                        break
+                    group += 1
+                if group == count:
+                    count += 1
+                groups[which] = group
+            self.groups = groups
+            for group in 0..<count:
+                try self.pass(painter, index, origin_x, origin_y, group + 1, painter.capped_dab)
+            var none_grouped: u16[]
+            self.groups = none_grouped
+        try self.rebuild(painter, tiles, index)
+
+    ## One pass over touched cell `index`: its paint copied into the spare
+    ## texture, then the dabs of pass `group` (0: every dab reaching the cell)
+    ## drawn through `pipeline`; the spare becomes the paint.
+    mutating func pass(painter: Painter*, index: usize, origin_x: f64, origin_y: f64, group: u16, pipeline: gpu.Pipeline) -> !:
         var grown = self.touched[index].spare else try tile_texture(painter.owner)
         self.touched[index].spare = none
         errdefer grown.destroy()
+        let before = self.touched[index].coverage
         let frame = try grown.frame()
         defer frame.release()
         let target = try frame.value().target()
@@ -442,23 +495,34 @@ pub struct Stroke:
         # The paint so far, copied as stored: it is premultiplied, and draw_image
         # would premultiply it again, darkening every partially covered texel a
         # little more with each flush of dabs (a dark rim around light strokes).
-        try gpu.copy_image(target.value(), self.touched[index].coverage, whole)
+        try gpu.copy_image(target.value(), before, whole)
         let tip_texture = (self.tip else Sampled(texture = painter.white, width = 1, height = 1)).texture
         let pattern_texture = (self.pattern else Sampled(texture = painter.white, width = 1, height = 1)).texture
         for which in 0..<self.dab_count:
             let dab = self.dabs[which]
-            if not (dab.x + dab.radius + 1.0 >= origin_x and dab.x - dab.radius - 1.0 < origin_x + (f64)tile_size and dab.y + dab.radius + 1.0 >= origin_y and dab.y - dab.radius - 1.0 < origin_y + (f64)tile_size):
+            if group == 0:
+                if not self.reaches(dab, origin_x, origin_y):
+                    continue
+            elif self.groups[which] != group - 1:
                 continue
             var params = self.dab_params(dab, origin_x, origin_y)
-            let bounds = gpu.Rect(math.max(0.0, dab.x - origin_x - dab.radius - 1.0), math.max(0.0, dab.y - origin_y - dab.radius - 1.0), 0.0, 0.0)
-            let right = math.min((f64)tile_size, dab.x - origin_x + dab.radius + 1.0)
-            let bottom = math.min((f64)tile_size, dab.y - origin_y + dab.radius + 1.0)
-            try gpu.shade(target.value(), painter.dab, gpu.Rect(bounds.x, bounds.y, right - bounds.x, bottom - bounds.y), u8[]((u8*)&params[0], 112),
-                          [tip_texture, pattern_texture], gpu.Filter.nearest)
+            let bounds = gpu.Rect(math.max(0.0, dab.x - origin_x - dab.extent - 1.0), math.max(0.0, dab.y - origin_y - dab.extent - 1.0), 0.0, 0.0)
+            let right = math.min((f64)tile_size, dab.x - origin_x + dab.extent + 1.0)
+            let bottom = math.min((f64)tile_size, dab.y - origin_y + dab.extent + 1.0)
+            try gpu.shade(target.value(), pipeline, gpu.Rect(bounds.x, bounds.y, right - bounds.x, bottom - bounds.y), u8[]((u8*)&params[0], 112),
+                          [tip_texture, pattern_texture, before], gpu.Filter.nearest)
         discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
-        self.touched[index].spare = self.touched[index].coverage
+        self.touched[index].spare = before
         self.touched[index].coverage = grown
-        try self.rebuild(painter, tiles, index)
+
+    ## Whether `dab` reaches the cell whose top-left is (`origin_x`, `origin_y`).
+    func reaches(dab: Dab, origin_x: f64, origin_y: f64) -> bool:
+        return dab.x + dab.extent + 1.0 >= origin_x and dab.x - dab.extent - 1.0 < origin_x + (f64)tile_size and dab.y + dab.extent + 1.0 >= origin_y and dab.y - dab.extent - 1.0 < origin_y + (f64)tile_size
+
+    ## Whether dabs set their own ceilings (opacity dynamics): then the
+    ## coverage carries the opacity and dabs darken towards it.
+    func capped() -> bool:
+        return self.brush.dynamics[dynamic_opacity].control != Control.off
 
     ## The dab shader's parameters for `dab` on the tile at (`origin_x`,
     ## `origin_y`): its place, tip and color, and the texture it shows.
@@ -474,7 +538,7 @@ pub struct Stroke:
                 (f32)dab.color.red, (f32)dab.color.green, (f32)dab.color.blue, 1.0 if self.brush.aliased else 0.0,
                 1.0 if self.tip != none else 0.0, (f32)self.tip_x, (f32)self.tip_y,
                 1.0 if self.pattern != none else 0.0, (f32)period_x, (f32)period_y, (f32)dab.depth, (f32)self.brush.texture_mode,
-                1.0 if self.brush.texture_invert else 0.0, 0.0, 0.0, 0.0]
+                1.0 if self.brush.texture_invert else 0.0, 1.0 if self.capped() else 0.0, (f32)dab.opacity, 0.0]
 
     ## Rebuild the layer tile from the tile before the stroke and the coverage:
     ## into a new tile the first time, then again into that one in place (the
@@ -496,7 +560,7 @@ pub struct Stroke:
     ## coverage (and the selection), in the brush's color or its effect.
     mutating func paint_tile(painter: Painter*, tiles: Tiles*, entry: Touched, texture: gpu.Texture*) -> !:
         var params: f32[16] = [(f32)self.brush.color.red, (f32)self.brush.color.green, (f32)self.brush.color.blue, 1.0,
-                               (f32)self.brush.opacity, 1.0 if self.brush.erase else 0.0, 0.0, 0.0,
+                               (f32)(1.0 if self.capped() else self.brush.opacity), 1.0 if self.brush.erase else 0.0, 0.0, 0.0,
                                (f32)(entry.column * tile_size), (f32)(entry.row * tile_size), 0.0, 0.0,
                                0.0, (f32)self.effect_mode, 0.0, 0.0]
         let effect_tile = (try self.effect_at(entry.column, entry.row)) else painter.clear
@@ -642,6 +706,13 @@ pub struct Stroke:
             if self.touched[index].column == column and self.touched[index].row == row:
                 return self.touched[index].coverage
         return none
+
+## Whether two dabs' reaches touch.
+func overlap(a: Dab, b: Dab) -> bool:
+    let dx = a.x - b.x
+    let dy = a.y - b.y
+    let reach = a.extent + b.extent + 2.0
+    return dx * dx + dy * dy < reach * reach
 
 ## `color` shifted by `hue` degrees and by `saturation` and `brightness`
 ## fractions (each -1..1), through HSV over the linear components.

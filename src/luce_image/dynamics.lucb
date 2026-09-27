@@ -55,7 +55,8 @@ pub struct Dynamic:
         if (u8)self.control > (u8)Control.fade or not (self.minimum >= 0.0 and self.minimum <= 1.0) or not (self.curve >= -1.0 and self.curve <= 1.0) or self.steps < 0 or self.steps > 10000:
             error(invalid, "a dynamic's minimum must be 0..1, its curve -1..1 and its fade 0..10000 steps")
 
-## A pen sample, as a stroke point carries it: pressure 0..1 (1 for a mouse),
+## A pen sample, as a stroke point carries it: pressure 0..1 (1 for a mouse:
+## the caller decides from the pointer, not from a zero),
 ## the lean's azimuth (degrees clockwise from the right) and altitude (90
 ## upright), barrel rotation in degrees, the airbrush wheel -1..1, and the
 ## time in milliseconds (0 when unknown).
@@ -77,11 +78,13 @@ pub struct Inputs:
     ## Which step of the stroke this is, from 0.
     pub var step: i64 = 0
 
-## A pressure as a stroke keeps it: unknown (zero, negative, not finite) reads as a full press.
+## A pressure as a stroke keeps it, 0..1. Zero is a pen touching lightly (its
+## first and last samples), the control's minimum; a mouse's stroke carries
+## 1, as `Pen()` does. Only a value that is not a number reads as a full press.
 pub func pen_pressure(pressure: f64) -> f64:
-    if not math.is_finite(pressure) or pressure <= 0.0:
+    if not math.is_finite(pressure):
         return 1.0
-    return math.min(pressure, 1.0)
+    return math.clamp(pressure, 0.0, 1.0)
 
 ## What `control` reads for these inputs, 0..1.
 pub func control_value(control: Control, inputs: Inputs, steps: i64) -> f64:
@@ -173,7 +176,10 @@ test "an off dynamic leaves the parameter whole and the angle unturned":
 test "pressure scales from the minimum to full, a mouse pressing fully":
     let size = Dynamic(control = Control.pressure, minimum = 0.2)
     assert(near(response(size, Inputs(pen = Pen(pressure = 0.5))), 0.6))
-    assert(near(response(size, Inputs(pen = Pen(pressure = 0.0))), 1.0))
+    # A pen touching with no pressure is at the minimum, not full.
+    assert(near(response(size, Inputs(pen = Pen(pressure = 0.0))), 0.2))
+    assert(near(response(size, Inputs(pen = Pen())), 1.0))
+    assert(near(response(size, Inputs(pen = Pen(pressure = math.nan))), 1.0))
     assert(near(response(size, Inputs(pen = Pen(pressure = 1.0))), 1.0))
     assert(near(response(size, Inputs(pen = Pen(pressure = 0.25))), 0.4))
 

@@ -6,7 +6,7 @@ import math
 from luce_image.document import Document
 from luce_image.brush import Brush, Painter, Stroke
 from luce_image.brush_images import BrushImages, texture_image
-from luce_image.dynamics import Dynamic, Control, Pen, dynamic_size, dynamic_angle, dynamic_flow
+from luce_image.dynamics import Dynamic, Control, Pen, dynamic_size, dynamic_angle, dynamic_flow, dynamic_opacity
 
 ## A 128 × 128 document with one layer, its painter, and pixels to read into.
 struct Bench:
@@ -73,8 +73,17 @@ test "a mouse's pressure paints the full size, and off leaves the size alone":
     defer bench.close()
     var brush = Brush(diameter = 40.0, hardness = 1.0)
     brush.dynamics[dynamic_size] = Dynamic(control = Control.pressure, minimum = 0.0)
-    try bench.dab(brush, 64.0, 64.0, pen = Pen(pressure = 0.0))
+    try bench.dab(brush, 64.0, 64.0)
     assert(bench.alpha(82, 64) > 0.99)
+
+test "a pen touching at zero pressure paints its minimum, not a full dab":
+    var bench = (try Bench.open()) else return
+    defer bench.close()
+    var brush = Brush(diameter = 40.0, hardness = 1.0)
+    brush.dynamics[dynamic_size] = Dynamic(control = Control.pressure, minimum = 0.25)
+    try bench.dab(brush, 64.0, 64.0, pen = Pen(pressure = 0.0))
+    # A 10 pixel dab: 4 pixels out is inside, 8 is outside.
+    assert(bench.alpha(68, 64) > 0.99 and bench.alpha(72, 64) == 0.0)
 
 test "the angle follows the pen's azimuth":
     var bench = (try Bench.open()) else return
@@ -172,3 +181,61 @@ test "a stroke's pressure eases from one point to the next":
         if bench.alpha(100, (usize)y) > 0.5:
             end_rows += 1
     assert(start_rows > 0 and end_rows > start_rows * 2)
+
+## The highest alpha along row `y`.
+func row_peak(bench: Bench, y: usize) -> f32:
+    var peak: f32 = 0.0
+    for x in 0..<(usize)128:
+        let alpha = bench.alpha(x, y)
+        peak = alpha if alpha > peak else peak
+    return peak
+
+## Stroke back and forth along row 64 `passes` times, each point a flush.
+func scrub(bench: Bench*, brush: Brush, passes: i64, pen: Pen = Pen()) -> !:
+    var stroke = try Stroke.begin(&bench.painter, &bench.document, bench.layer, brush, 20.0, 64.0, pen = pen)
+    for pass in 0..<passes:
+        for step in 0..<(i64)22:
+            let x = 20.0 + (f64)step * 4.0 if pass % 2 == 0 else 104.0 - (f64)step * 4.0
+            try stroke.extend(&bench.painter, &bench.document, x, 64.0, pen = pen)
+            try stroke.flush(&bench.painter, &bench.document)
+    stroke.finish()
+    try bench.read()
+
+test "opacity is the stroke's ceiling: overlapping dabs never pass it, while flow builds up beneath":
+    var bench = (try Bench.open()) else return
+    defer bench.close()
+    let brush = Brush(diameter = 24.0, hardness = 1.0, opacity = 0.5, flow = 1.0, spacing = 0.1)
+    try scrub(&bench, brush, 6)
+    let peak = row_peak(bench, 64)
+    assert(peak > 0.49 and peak < 0.51)
+    # Low flow: one dab leaves a little, many build up to the ceiling, never past it.
+    var light = (try Bench.open()) else return
+    defer light.close()
+    let thin = Brush(diameter = 24.0, hardness = 1.0, opacity = 0.5, flow = 0.05, spacing = 0.5)
+    var once = try Stroke.begin(&light.painter, &light.document, light.layer, thin, 64.0, 64.0)
+    once.finish()
+    try light.read()
+    let first = light.alpha(64, 64)
+    assert(first > 0.01 and first < 0.05)
+    try scrub(&light, thin, 20)
+    let built = light.alpha(64, 64)
+    assert(built > first * 3.0 and built <= 0.505)
+
+test "opacity driven per dab is each dab's ceiling, however many overlap":
+    var bench = (try Bench.open()) else return
+    defer bench.close()
+    var brush = Brush(diameter = 24.0, hardness = 1.0, opacity = 1.0, flow = 1.0, spacing = 0.1)
+    brush.dynamics[dynamic_opacity] = Dynamic(control = Control.pressure)
+    try scrub(&bench, brush, 6, pen = Pen(pressure = 0.4))
+    let peak = row_peak(bench, 64)
+    assert(peak > 0.39 and peak < 0.41)
+    # A harder press raises the ceiling; flow below 1 approaches it.
+    var second = (try Bench.open()) else return
+    defer second.close()
+    var soft = brush
+    soft.flow = 0.3
+    try scrub(&second, soft, 1, pen = Pen(pressure = 0.8))
+    let reached = second.alpha(64, 64)
+    assert(reached > 0.5 and reached <= 0.805)
+    # The color stays the brush's where it is capped.
+    assert(second.pixels[(64 * 128 + 64) * 4] < 0.01)

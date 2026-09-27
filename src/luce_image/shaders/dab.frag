@@ -5,6 +5,10 @@
 // the same ellipse. A textured brush multiplies (or subtracts) its texture
 // (image 2), tiled in document space, into each dab by the dab's depth.
 // An aliased dab (the Pencil) covers a whole pixel or none, by its centre.
+// A capped dab (opacity driven per dab) is drawn with `replace` instead: it
+// reads the paint so far (image 3) and brings its alpha towards the dab's
+// opacity by its coverage, never past it — Krita's "alpha darken", so a
+// stroke's opacity is a ceiling however many dabs overlap.
 // Images are read texel by texel and blended here: the tip clamps at its
 // edge and the texture wraps, whatever the sampler's addressing.
 #version 450
@@ -32,12 +36,13 @@ layout(push_constant) uniform Params {
     float depth;      // 0..1: how much of the texture shows
     float mode;       // 0 multiply, 1 subtract
     float invert;     // 1: the texture's values inverted
-    float unused1;
-    float unused2;
+    float capped;     // 1: alpha darken towards `opacity` over image 3
+    float opacity;    // the dab's ceiling, 0..1
     float unused3;
 } params;
 layout(set = 0, binding = 1) uniform sampler2D tip;
 layout(set = 0, binding = 2) uniform sampler2D pattern;
+layout(set = 0, binding = 3) uniform sampler2D previous;
 
 // Bilinear at `uv` (0..1 across the image), texels past the edge clamped.
 float clamped(sampler2D image, vec2 uv) {
@@ -89,6 +94,15 @@ void main() {
         if (params.invert > 0.5) t = 1.0 - t;
         c = params.mode > 0.5 ? max(0.0, c - (1.0 - t) * params.depth) : c * mix(1.0, t, params.depth);
     }
+    vec3 color = vec3(params.red, params.green, params.blue);
+    if (params.capped > 0.5) {
+        vec4 before = texelFetch(previous, ivec2(gl_FragCoord.xy - params.origin), 0);
+        float k = clamp(c * params.flow * vertex_color.a, 0.0, 1.0);
+        float alpha = before.a < params.opacity ? before.a + (params.opacity - before.a) * k : before.a;
+        vec3 straight = before.a > 0.0 ? before.rgb / before.a : color;
+        fragment_color = vec4(mix(straight, color, k) * alpha, alpha);
+        return;
+    }
     float a = c * params.flow * vertex_color.a;
-    fragment_color = vec4(vec3(params.red, params.green, params.blue) * a, a);
+    fragment_color = vec4(color * a, a);
 }
