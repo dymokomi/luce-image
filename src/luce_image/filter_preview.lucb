@@ -17,14 +17,13 @@ import gpu
 import math
 from tiles import Tiles, tile_size
 from pyramid import Pyramid, covered_at, cell_exists
-from luce_image.extent import Pieces
 from luce_image.filter import Filters, resample_reads
 from luce_image.transform_window import Footprint, gather
 
 ## Cell (`column`, `row`) of level `level` of `tiles` through resample.frag's
 ## `kind` (0 motion blur: `a` radians, `b` pixels; 1 lens correction), read
 ## from a window of the level holding every place it reaches.
-pub func resample_level_cell(filters: const Filters*, tiles: const Tiles*, parts: const Pieces*, pyramid: Pyramid*, kind: f64, a: f64, b: f64, c: f64,
+pub func resample_level_cell(filters: const Filters*, tiles: const Tiles*, pyramid: Pyramid*, kind: f64, a: f64, b: f64, c: f64,
                              column: u32, row: u32, level: u32, on_mask: bool) -> gpu.Texture!:
     let scale = (f64)(1u32 << level)
     # The layer's size and the cell's first texel, in the level's texels.
@@ -37,7 +36,7 @@ pub func resample_level_cell(filters: const Filters*, tiles: const Tiles*, parts
     # `gather` takes document pixels.
     let box = Footprint(left = reads.left * scale, top = reads.top * scale, right = reads.right * scale, bottom = reads.bottom * scale)
     let empty = 1.0 if on_mask else 0.0
-    var window = try gather(filters.device(), tiles, parts, pyramid, box, level, on_mask, gpu.Color(empty, empty, empty, empty))
+    var window = try gather(filters.device(), tiles, pyramid, box, level, on_mask, gpu.Color(empty, empty, empty, empty))
     defer window.destroy()
     var params: f32[12] = [(f32)kind, (f32)a, (f32)distance, (f32)c, (f32)x0, (f32)y0, (f32)width, (f32)height,
                            (f32)window.left, (f32)window.top, (f32)(try window.texture.width()), (f32)(try window.texture.height())]

@@ -170,14 +170,22 @@ func delete_channel(canvas: Canvas*, index: i64) -> !:
     try canvas.remember_state("Delete Channel")
     canvas.channels.remove((usize)index)
 
-## `Canvas.load_channel`: channel `index` combined into the selection by `mode`.
-func load_channel(canvas: Canvas*, index: i64, mode: i64) -> !:
+## `Canvas.load_channel`: channel `index` (inverted with `invert`) combined
+## into the selection by `mode`.
+func load_channel(canvas: Canvas*, index: i64, mode: i64, invert: bool) -> !:
     try canvas.require_open()
     let how = try selection_mode(mode)
     discard(try channel_at(canvas, index))
     try canvas.remember_state("Load Selection")
     let channel = try channel_at(canvas, index)
-    try canvas.live().merge(&channel.selection, how)
+    if not invert:
+        try canvas.live().merge(&channel.selection, how)
+        return
+    # Invert: what the channel leaves out, as Photoshop's Load Selection offers.
+    var inverted = try channel.selection.copy()
+    defer inverted.destroy()
+    inverted.invert()
+    try canvas.live().merge(&inverted, how)
 
 # mark: Following the canvas ====================================================================
 

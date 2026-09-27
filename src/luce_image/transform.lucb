@@ -7,7 +7,7 @@ import interop
 import math
 import memory
 from tiles import Tiles, tile_size, tile_texture
-from luce_image.extent import relocate, pieces, landing_cells, canvas_part, reaches_past_part
+from luce_image.extent import relocate, landing_cells, canvas_part, reaches_past_part
 from luce_image.transform_window import Footprint, Window, footprint, level_for, gather, window_map
 from pyramid import Pyramid, tile_bytes
 from luce_image.projective import Warp, affine_warp, multiply
@@ -92,8 +92,6 @@ pub struct Transformer:
             try fresh.cover(range)
         # Each output cell reads only the source pixels its map reaches, gathered
         # into a small window (at a coarser level where it shrinks a lot).
-        var parts = try pieces(tiles)
-        defer parts.destroy()
         var pyramid = try Pyramid.create(self.owner, 256 * tile_bytes)
         defer pyramid.destroy()
         let reachable = Footprint(left = math.max(limit.left, box.left - 2.0), top = math.max(limit.top, box.top - 2.0),
@@ -102,7 +100,7 @@ pub struct Transformer:
             for column in range.left..<range.right:
                 let reads = footprint(warp, column, row, reachable) else continue
                 pyramid.hold()
-                var window = try gather(self.owner, tiles, &parts, &pyramid, reads, level_for(reads), on_mask, empty)
+                var window = try gather(self.owner, tiles, &pyramid, reads, level_for(reads), on_mask, empty)
                 let width = (f64)(try window.texture.width())
                 let height = (f64)(try window.texture.height())
                 var params = shader_params(window_map(warp, &window), width, height, outside, false, sampling)
@@ -136,10 +134,6 @@ pub struct Transformer:
         # Cells are replaced as they are made, so every window reads the layer as it was.
         var before = try tiles.clone()
         defer before.destroy()
-        var layer_parts = try pieces(&before)
-        defer layer_parts.destroy()
-        var mask_parts = try pieces(selection)
-        defer mask_parts.destroy()
         var pyramid = try Pyramid.create(self.owner, tile_bytes)
         defer pyramid.destroy()
         let lifted = Footprint(left = (f64)left, top = (f64)top, right = (f64)right, bottom = (f64)bottom)
@@ -161,9 +155,9 @@ pub struct Transformer:
                 if let far = footprint(warp, (i64)column, (i64)row, lifted):
                     reads = Footprint(left = math.min(reads.left, far.left), top = math.min(reads.top, far.top),
                                       right = math.max(reads.right, far.right), bottom = math.max(reads.bottom, far.bottom))
-                var pixels = try gather(self.owner, &before, &layer_parts, &pyramid, reads, 0, false, clear)
+                var pixels = try gather(self.owner, &before, &pyramid, reads, 0, false, clear)
                 defer pixels.destroy()
-                var coverage = try gather(self.owner, selection, &mask_parts, &pyramid, reads, 0, false, clear)
+                var coverage = try gather(self.owner, selection, &pyramid, reads, 0, false, clear)
                 defer coverage.destroy()
                 # The output pixel, and where it reads, both in the window's texels.
                 let back = Warp(m = [1.0, 0.0, (f64)pixels.left, 0.0, 1.0, (f64)pixels.top, 0.0, 0.0, 1.0])

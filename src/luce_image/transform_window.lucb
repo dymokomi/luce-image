@@ -16,7 +16,6 @@ import gpu
 import math
 from tiles import Tiles, tile_size, min_i64, max_i64
 from pyramid import Pyramid, covered_at, cell_exists
-from luce_image.extent import Pieces
 from luce_image.projective import Warp, multiply
 from raster_errors import invalid
 
@@ -83,15 +82,14 @@ pub func level_for(box: Footprint) -> u32:
     return level
 
 ## `box` of `tiles` gathered at `level` into a window texture, `empty` where
-## the layer has nothing (a mask's white). Level 0 takes the layer's pieces,
+## the layer has nothing (a mask's white). Level 0 takes the layer's cells,
 ## past the canvas too; coarser levels the canvas's pyramid.
-pub func gather(device: gpu.Device, tiles: const Tiles*, parts: const Pieces*, pyramid: Pyramid*, box: Footprint, level: u32, mask: bool, empty: gpu.Color) -> Window!:
+pub func gather(device: gpu.Device, tiles: const Tiles*, pyramid: Pyramid*, box: Footprint, level: u32, mask: bool, empty: gpu.Color) -> Window!:
     if level == 0:
-        return try gather_pieces(device, parts, box, empty)
+        return try gather_layer(device, tiles, box, empty)
     return try gather_level(device, tiles, pyramid, box, level, mask, empty)
 
-## As `gather`, reading full-size pixels from `tiles` themselves (on the
-## canvas) rather than a list of pieces made earlier.
+## As `gather`, reading full-size pixels from the canvas's grid only.
 pub func gather_tiles(device: gpu.Device, tiles: const Tiles*, pyramid: Pyramid*, box: Footprint, level: u32, mask: bool, empty: gpu.Color) -> Window!:
     if level == 0:
         return try gather_cells(device, tiles, box, empty)
@@ -125,10 +123,19 @@ func gather_level(device: gpu.Device, tiles: const Tiles*, pyramid: Pyramid*, bo
     return Window(texture = texture, left = left, top = top, level = level)
 
 ## `box` of `tiles` on the canvas gathered at full size into a window texture,
-## `empty` where the layer has nothing. Each cell's texture is asked for as it
-## is copied, so a tile the memory tiers moved off the GPU comes back for it;
-## a list of pieces made earlier may name textures since let go.
+## `empty` where the layer has nothing.
 pub func gather_cells(device: gpu.Device, tiles: const Tiles*, box: Footprint, empty: gpu.Color) -> Window!:
+    return try gather_full(device, tiles, box, empty, false)
+
+## `box` of `tiles` (past the canvas too) gathered at full size into a window
+## texture, `empty` where the layer has nothing.
+pub func gather_layer(device: gpu.Device, tiles: const Tiles*, box: Footprint, empty: gpu.Color) -> Window!:
+    return try gather_full(device, tiles, box, empty, true)
+
+## `gather_cells`, and with `outside` `gather_layer`. Every texture is asked
+## for as it is copied, never kept from an earlier frame: the memory tiers may
+## have moved a tile off the GPU since, releasing the texture it had then.
+func gather_full(device: gpu.Device, tiles: const Tiles*, box: Footprint, empty: gpu.Color, outside: bool) -> Window!:
     let left = (i64)math.floor(box.left)
     let top = (i64)math.floor(box.top)
     let right = (i64)math.ceil(box.right)
@@ -147,31 +154,38 @@ pub func gather_cells(device: gpu.Device, tiles: const Tiles*, box: Footprint, e
             let cell = (try tiles.texture((u32)column, (u32)row)) else continue
             let area = tiles.region((u32)column, (u32)row)
             try gpu.copy_image(whole.value(), cell, gpu.Rect((f64)(column * span - left), (f64)(row * span - top), (f64)area.width, (f64)area.height), area)
+    if outside:
+        if let range = tiles.outside_range():
+            for row in max_i64(range.top, floor_div(top, span))..<min_i64(range.bottom, floor_div(bottom + span - 1, span)):
+                for column in max_i64(range.left, floor_div(left, span))..<min_i64(range.right, floor_div(right + span - 1, span)):
+                    try copy_outside(whole.value(), tiles, column, row, left, top)
     discard(try frame.value().present(empty))
     return Window(texture = texture, left = left, top = top, level = 0)
 
-## `box` of a layer's `parts` (past the canvas too) gathered at full size into
-## a window texture, `empty` where the layer has nothing.
-pub func gather_pieces(device: gpu.Device, parts: const Pieces*, box: Footprint, empty: gpu.Color) -> Window!:
-    let left = (i64)math.floor(box.left)
-    let top = (i64)math.floor(box.top)
-    let right = (i64)math.ceil(box.right)
-    let bottom = (i64)math.ceil(box.bottom)
-    if right - left > 16384 or bottom - top > 16384:
-        error(invalid, "a transform window cannot exceed 16384 texels")
-    var texture = try gpu.Texture.create(device, (u32)(right - left), (u32)(bottom - top), gpu.Format.rgba16_float)
-    errdefer texture.destroy()
-    let frame = try texture.frame()
-    defer frame.release()
-    let whole = try frame.value().target()
-    defer whole.release()
-    for index in 0..<parts.count:
-        let piece = parts.at(index)
-        if piece.x >= right or piece.y >= bottom or piece.x + (i64)piece.source.width <= left or piece.y + (i64)piece.source.height <= top:
-            continue
-        try gpu.copy_image(whole.value(), piece.texture, gpu.Rect((f64)(piece.x - left), (f64)(piece.y - top), (f64)piece.source.width, (f64)piece.source.height), piece.source)
-    discard(try frame.value().present(empty))
-    return Window(texture = texture, left = left, top = top, level = 0)
+## The part of outside cell (`column`, `row`) of `tiles` past the canvas into
+## `whole`, a window whose texel (0, 0) is document pixel (`left`, `top`).
+func copy_outside(whole: const gpu.RenderTarget*, tiles: const Tiles*, column: i64, row: i64, left: i64, top: i64) -> !:
+    let texture = (try tiles.outside_texture(column, row)) else return
+    let span = (i64)tile_size
+    let x = column * span - left
+    let y = row * span - top
+    if not tiles.on_canvas(column, row):
+        try gpu.copy_image(whole, texture, gpu.Rect((f64)x, (f64)y, (f64)span, (f64)span), gpu.Region(0, 0, tile_size, tile_size))
+        return
+    # On the canvas's edge: only the strips the canvas does not reach.
+    let area = tiles.region((u32)column, (u32)row)
+    if area.width < tile_size:
+        try gpu.copy_image(whole, texture, gpu.Rect((f64)(x + (i64)area.width), (f64)y, (f64)(tile_size - area.width), (f64)span),
+                           gpu.Region(area.width, 0, tile_size - area.width, tile_size))
+    if area.height < tile_size:
+        try gpu.copy_image(whole, texture, gpu.Rect((f64)x, (f64)(y + (i64)area.height), (f64)area.width, (f64)(tile_size - area.height)),
+                           gpu.Region(0, area.height, area.width, tile_size - area.height))
+
+## `value` divided by `span`, rounded down (cells past the canvas are negative).
+func floor_div(value: i64, span: i64) -> i64:
+    if value >= 0:
+        return value // span
+    return -((-value + span - 1) // span)
 
 ## `warp` read into `window`'s texels: document pixels scaled to its level and
 ## moved to its corner.

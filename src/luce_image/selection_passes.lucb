@@ -6,7 +6,6 @@ import gpu
 import math
 from tiles import Tiles, tile_size, tile_texture
 from luce_image.document import Document
-from luce_image.extent import pieces
 from luce_image.transform_window import Footprint, gather
 from pyramid import Pyramid, tile_bytes
 from luce_image.shaders import lift_frag_words, lift_frag_msl, mask_mix_frag_words, mask_mix_frag_msl
@@ -44,10 +43,6 @@ pub struct SelectionPasses:
         # Cells are replaced as they are made, so every window reads the layer as it was.
         var before = try tiles.clone()
         defer before.destroy()
-        var layer_parts = try pieces(&before)
-        defer layer_parts.destroy()
-        var mask_parts = try pieces(selection)
-        defer mask_parts.destroy()
         var pyramid = try Pyramid.create(self.owner, tile_bytes)
         defer pyramid.destroy()
         let clear = gpu.Color(0.0, 0.0, 0.0, 0.0)
@@ -64,9 +59,9 @@ pub struct SelectionPasses:
                 # A window holding the cell and where its moved pixels come from, within the document.
                 let reads = Footprint(left = (f64)math.imax(0, math.imin(x0, x0 - dx)), top = (f64)math.imax(0, math.imin(y0, y0 - dy)),
                                       right = (f64)math.imin((i64)tiles.width(), math.imax(x1, x1 - dx)), bottom = (f64)math.imin((i64)tiles.height(), math.imax(y1, y1 - dy)))
-                var pixels = try gather(self.owner, &before, &layer_parts, &pyramid, reads, 0, false, clear)
+                var pixels = try gather(self.owner, &before, &pyramid, reads, 0, false, clear)
                 defer pixels.destroy()
-                var coverage = try gather(self.owner, selection, &mask_parts, &pyramid, reads, 0, false, clear)
+                var coverage = try gather(self.owner, selection, &pyramid, reads, 0, false, clear)
                 defer coverage.destroy()
                 # The lift shader reads the window as its whole document.
                 var params: f32[8] = [(f32)(x0 - pixels.left), (f32)(y0 - pixels.top), (f32)dx, (f32)dy,

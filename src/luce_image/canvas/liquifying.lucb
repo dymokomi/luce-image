@@ -13,12 +13,11 @@
 #==============================================================================================
 
 ## A push under way on layer `layer`: the stroke, and the layer's pixels as it
-## began with their pieces, which every made cell reads.
+## began, which every made cell reads (their textures asked for each frame).
 struct Liquifying:
     var stroke: LiquifyStroke
     var layer: u64
     var original: Tiles
-    var parts: Pieces
     var liquifier: Liquifier
     var generation: u64
 
@@ -33,10 +32,8 @@ func begin_liquify(canvas: Canvas*, id: u64, tiles: const Tiles*, x: f64, y: f64
     errdefer stroke.destroy()
     var original = try tiles.clone()
     errdefer original.destroy()
-    var parts = try pieces(&original)
-    errdefer parts.destroy()
     try canvas.remember(id, try tiles.clone(), name = "Liquify")
-    canvas.liquify = try new Liquifying(stroke = stroke, layer = id, original = original, parts = parts, liquifier = liquifier, generation = 0) in memory.heap
+    canvas.liquify = try new Liquifying(stroke = stroke, layer = id, original = original, liquifier = liquifier, generation = 0) in memory.heap
 
 ## Continue a push to (`x`, `y`): its grid moves; the next frame shows it.
 func extend_liquify(shown: Liquifying*, x: f64, y: f64) -> !:
@@ -56,7 +53,7 @@ func settle_liquify(canvas: Canvas*, shown: Liquifying*) -> !:
 func liquify_cell(context: void*?, layer_levels: Pyramid*, layer: u64, mask: bool, column: u32, row: u32, level: u32) -> Made!:
     let shown = (Liquifying*)(context else return made_original())
     var original = false
-    let made = try shown.liquifier.cell(&shown.stroke.grid, &shown.original, &shown.parts, layer_levels, column, row, level, &original)
+    let made = try shown.liquifier.cell(&shown.stroke.grid, &shown.original, layer_levels, column, row, level, &original)
     if original:
         return made_original()
     let texture = made else return made_nothing()
@@ -83,7 +80,7 @@ func finish_liquify(canvas: Canvas*, shown: Liquifying*) -> !:
     for row in first_row..<last_row + 1:
         for column in first_column..<last_column + 1:
             var original = false
-            let made = try shown.liquifier.cell(&shown.stroke.grid, &shown.original, &shown.parts, composer.levels(), column, row, 0, &original)
+            let made = try shown.liquifier.cell(&shown.stroke.grid, &shown.original, composer.levels(), column, row, 0, &original)
             if original:
                 continue
             if let texture = made:
@@ -104,5 +101,4 @@ func drop_liquify(canvas: Canvas*):
 func drop_liquifying(shown: Liquifying*):
     shown.stroke.destroy()
     shown.original.destroy()
-    shown.parts.destroy()
     free(shown) in memory.heap

@@ -1646,11 +1646,27 @@ pub struct Canvas:
         try ask_refine(&self, Refinement(radius = radius, smooth = smooth, feather = feather, contrast = contrast, shift = shift))
 
     ## OK (`keep`): the whole selection refined so at full size, one step;
-    ## Cancel: as it was.
-    pub mutating func end_refine(keep: bool, radius: i64 = 0, smooth: i64 = 0, feather: i64 = 0, contrast: f64 = 0.0, shift: f64 = 0.0) -> !:
-        if keep and self.select_mask != none:
+    ## Cancel: as it was. With `background` OK returns at once: the work runs
+    ## on the previews' thread, edits are refused (`refine_keeping`) until
+    ## a frame or `continue_refine` finds it done and records the step.
+    pub mutating func end_refine(keep: bool, radius: i64 = 0, smooth: i64 = 0, feather: i64 = 0, contrast: f64 = 0.0, shift: f64 = 0.0,
+                                 background: bool = false) -> !:
+        if keep and self.select_mask != none and not refine_keeping(&self):
             try ask_refine(&self, Refinement(radius = radius, smooth = smooth, feather = feather, contrast = contrast, shift = shift))
-        try end_refine(&self, keep)
+        try end_refine(&self, keep, background)
+
+    ## Keep OK's refinement once it is done (at once with `wait`): the
+    ## editor calls it each frame; drawing the selection does too.
+    pub mutating func continue_refine(wait: bool = false) -> !:
+        try continue_refine(&self, wait)
+
+    ## Whether OK's refinement is still working: edits are refused meanwhile.
+    pub func refine_keeping() -> bool:
+        return refine_keeping(&self)
+
+    ## How far OK's refinement has come, 0..100.
+    pub func refine_percent() -> i64:
+        return refine_progress(&self)
 
     ## How the view shows the selection while refining: 0 marching ants,
     ## 1 a red overlay, 2 on black, 3 on white.
@@ -1888,9 +1904,10 @@ pub struct Canvas:
         try delete_channel(&self, index)
 
     ## Select › Load Selection: channel `index` combined into the selection by
-    ## `mode` (0 replace, 1 add, 2 subtract, 3 intersect). Undoable.
-    pub mutating func load_channel(index: i64, mode: i64 = 0) -> !:
-        try load_channel(&self, index, mode)
+    ## `mode` (0 replace, 1 add, 2 subtract, 3 intersect); with `invert`, what
+    ## the channel leaves out. Undoable.
+    pub mutating func load_channel(index: i64, mode: i64 = 0, invert: bool = false) -> !:
+        try load_channel(&self, index, mode, invert)
 
     ## Coverage 0..255 of alpha channel `index` at a document pixel.
     pub func channel_at_pixel(index: i64, x: i64, y: i64) -> i64!:
@@ -2190,7 +2207,13 @@ pub struct Canvas:
     ## tiles coming back in the background while coarser ones stand in): the
     ## view keeps drawing until it is done.
     pub func busy() -> bool:
-        return self.warp != none or self.coarse_shown or prefetch_pending() or refine_busy(&self) or self.opening != none
+        return self.warp != none or self.coarse_shown or prefetch_pending() or refine_busy(&self) or self.opening != none or self.selection_behind()
+
+    ## Whether the selection's GPU tiles still lag it (a huge new selection
+    ## reaches the GPU a few cells a frame beyond those the view shows).
+    func selection_behind() -> bool:
+        let document = self.document else return false
+        return document.selection_behind()
 
     ## Whether the picture the document was opened from is still loading
     ## (canvas/opening): it draws as far as it has come; edits and saves wait.

@@ -312,7 +312,10 @@ func opening_progress(canvas: const Canvas*) -> i64:
     let rows = (u64)opening.rows.load(.acquire)
     return (i64)(rows * 100 // (u64)opening.extent_y)
 
-## Refuse what changes or saves the document while its picture is still opening.
+## Refuse what changes or saves the document while its picture is still
+## opening, or while Select and Mask's OK refines the selection.
 func require_loaded(canvas: const Canvas*) -> !:
     if canvas.opening != none:
         error(invalid, "the picture is still opening")
+    if refine_keeping(canvas):
+        error(invalid, "the selection is still being refined")

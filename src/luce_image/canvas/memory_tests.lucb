@@ -183,3 +183,70 @@ test "past the RAM budget six layers move to the scratch file, and undo and expo
 test "the scratch folder can be chosen before the first spill":
     try Canvas.set_scratch_folder("build")
     try Canvas.set_scratch_folder("")
+
+## Session previews at 100% at two places, over black, into views `at` and
+## `at` + 1 of `views` (each `size` bytes): (-900, -600) then (-200, -100).
+func session_views(canvas: Canvas*, target: gpu.Texture*, views: u8[], size: usize, at: usize) -> !:
+    try drawn(canvas, target, 1.0, -900.0, -600.0, views[at * size..<(at + 1) * size])
+    # Frames between the two, each settling: what the first pinned may leave the GPU.
+    try canvas.settle_memory()
+    try drawn(canvas, target, 0.125, 0.0, 0.0, views[(at + 1) * size..<(at + 2) * size])
+    try canvas.settle_memory()
+    try drawn(canvas, target, 1.0, -200.0, -100.0, views[(at + 1) * size..<(at + 2) * size])
+
+## A transform (whole layer, then a floating selection), a filter preview and a
+## liquify push on `layer`, each drawn at two places into eight `views`;
+## `budget` GPU bytes (0 for none).
+func previews_under(canvas: Canvas*, layer: i64, target: gpu.Texture*, budget: i64, views: u8[], size: usize) -> !:
+    try canvas.set_memory_budgets(budget, 0)
+    try canvas.begin_transform(layer)
+    try canvas.preview_transform(0.9, 0.9, 12.0, 60.0, -40.0, 1024.0, 1024.0)
+    try session_views(canvas, target, views, size, 0)
+    try canvas.end_transform(false)
+    try canvas.select_rectangle(700, 250, 1000, 900, 0)
+    try canvas.begin_transform(layer)
+    try canvas.preview_transform(0.8, 0.8, -10.0, -150.0, 120.0, 1200.0, 700.0)
+    try session_views(canvas, target, views, size, 2)
+    try canvas.end_transform(false)
+    try canvas.deselect()
+    try canvas.begin_preview(layer)
+    try canvas.preview_filter(0, 20.0, 60.0, 0.0)
+    try session_views(canvas, target, views, size, 4)
+    try canvas.end_preview(false)
+    try canvas.set_retouch(5)
+    try canvas.set_brush(300.0, 0.5, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.begin_stroke(layer, 250.0, 400.0)
+    try canvas.extend_stroke(1000.0, 800.0)
+    try canvas.settle_memory()
+    try canvas.extend_stroke(1200.0, 700.0)
+    try session_views(canvas, target, views, size, 6)
+    try canvas.end_stroke()
+    try canvas.undo()
+
+test "previews that last many frames draw from tiles the memory tiers moved off the GPU meanwhile":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(2048, 2048)
+    defer canvas.close()
+    defer residency_budgets(0, 0)
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 256, 256, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    let size = (usize)256 * 256 * 4
+    let expected = try alloc u8[size * 8] in memory.heap
+    defer free(expected) in memory.heap
+    let seen = try alloc u8[size * 8] in memory.heap
+    defer free(seen) in memory.heap
+    try drawn(&canvas, &target, 0.125, 0.0, 0.0, expected[0..<size])
+    try canvas.fill_gradient(layer, 0.0, 0.0, 2048.0, 2048.0, 1.0, 0.2, 0.1, 1.0, 0.1, 0.3, 0.9, 1.0)
+    try paint_rectangles(&canvas, layer)
+    try previews_under(&canvas, layer, &target, 0, expected, size)
+    # Two tiles of GPU: every frame moves what the last one pinned to RAM,
+    # releasing the textures the session saw when it began.
+    let demoted = canvas.memory_demotions()
+    try previews_under(&canvas, layer, &target, 1048576, seen, size)
+    assert(canvas.memory_demotions() > demoted)
+    for at in 0..<(usize)8:
+        assert(same_bytes(seen[at * size..<(at + 1) * size], expected[at * size..<(at + 1) * size]))

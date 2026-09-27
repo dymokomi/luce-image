@@ -12,7 +12,10 @@
 #       changes meanwhile cancels it, and once it has stopped the latest is started, so a
 #       drag's changes come down to one recompute at a time and the newest wins.
 #       Keeping it refines the whole selection at full size once, as one undo step, taking
-#       the cells a preview at full size already worked out for the same setting.
+#       the cells a preview at full size already worked out for the same setting. From the
+#       editor that runs on the same thread as the previews (a worst-case selection takes
+#       seconds): edits are refused meanwhile, as while a picture opens, and the step is
+#       recorded when a later frame finds the work done (`continue_refine`).
 #
 #==============================================================================================
 
@@ -43,6 +46,10 @@ struct SelectMask:
     var shown: Shown
     var shown_setting: Refinement
     var shown_box: CellBox
+    ## OK was pressed: the lightness it needs is read a frame at a time
+    ## (`keep_read` cells so far), then `task` refines the whole selection.
+    var keeping: bool
+    var keep_read: usize
 
 ## A preview's refinement on its own thread: the setting at `level` over `box`.
 struct RefineTask:
@@ -63,7 +70,7 @@ func begin_refine(canvas: Canvas*) -> !:
     let origin = try canvas.live().copy()
     canvas.select_mask = try new SelectMask(origin = origin, view = refine_ants, setting = Refinement(), asked = false, levels = LevelOrigin(selection = none, level = 0),
                                             luma = none, lit = none, luma_level = 0, task = none, shown = Shown(selection = none, level = 0),
-                                            shown_setting = Refinement(), shown_box = CellBox()) in memory.heap
+                                            shown_setting = Refinement(), shown_box = CellBox(), keeping = false, keep_read = 0) in memory.heap
 
 ## `Canvas.preview_refine`: the setting the next frames show.
 func ask_refine(canvas: Canvas*, refinement: Refinement) -> !:
@@ -77,6 +84,8 @@ func ask_refine(canvas: Canvas*, refinement: Refinement) -> !:
 ## start the next. Never waits.
 func prepare_refine_preview(canvas: Canvas*, scope: Scope) -> !:
     let session = canvas.select_mask else return
+    if session.keeping:
+        return
     try collect_refine(session)
     let changes = session.asked and session.setting.changes()
     let wanted = session.setting.at_level(scope.level)
@@ -113,6 +122,8 @@ func run_refine_task(context: void*?):
 ## Take in the refinement under way if it has finished: shown when it ran to
 ## the end, let go when it was cancelled. With `wait`, wait for it.
 func collect_refine(session: SelectMask*, wait: bool = false) -> !:
+    if session.keeping:
+        return
     let task = session.task else return
     if not wait and not background_done(task.background):
         return
@@ -130,8 +141,10 @@ func collect_refine(session: SelectMask*, wait: bool = false) -> !:
     session.shown_box = task.box
 
 ## The picture's lightness at `level`, read (on this thread: the GPU's) for
-## every cell refining `source` over `box` needs that has not been read yet.
-func lightness_at(canvas: Canvas*, session: SelectMask*, source: const Cells*, refinement: Refinement, box: CellBox, level: u32) -> Cells*!:
+## every cell refining `source` over `box` needs that has not been read yet;
+## with `most`, for at most that many of them, `unread` set when some wait.
+func lightness_at(canvas: Canvas*, session: SelectMask*, source: const Cells*, refinement: Refinement, box: CellBox, level: u32,
+                  most: usize = 0, unread: bool*? = none) -> Cells*!:
     let document = canvas.document else error(invalid, "draw the document once before refining the selection")
     let composer = canvas.composer else error(invalid, "draw the document once before refining the selection")
     let device = canvas.device else error(invalid, "draw the document once before refining the selection")
@@ -153,14 +166,22 @@ func lightness_at(canvas: Canvas*, session: SelectMask*, source: const Cells*, r
     var needed = try Cells.create(source.extent_x, source.extent_y)
     defer needed.destroy()
     needed_cells(source, values, refinement.apron(), &needed)
-    var wanted = false
+    var wanted: usize = 0
+    var waiting = false
     for index in 0..<needed.count():
-        if needed.uniform(index) != 0 and lit.uniform(index) != 0:
+        if needed.uniform(index) == 0:
+            continue
+        if lit.uniform(index) != 0:
             needed.fill(index, 0)
-        elif needed.uniform(index) != 0:
-            wanted = true
+        elif most > 0 and wanted == most:
+            needed.fill(index, 0)
+            waiting = true
+        else:
+            wanted += 1
             lit.fill(index, 255)
-    if wanted:
+    if let flag = unread:
+        *flag = waiting
+    if wanted > 0:
         var picture = PictureSource(composer = composer, document = document, extent_y = canvas.extent_y, level = level)
         try selection_sources.luma(luma, selection_sources.gpu_reader((void*)&picture, device, picture_cell_texture), &needed)
     return luma
@@ -177,23 +198,127 @@ func drop_lightness(session: SelectMask*):
 
 ## `Canvas.end_refine`: refine all of it at full size and keep that as one
 ## step, recorded against the selection it began from, or leave that one.
-func end_refine(canvas: Canvas*, keep: bool) -> !:
+## With `background` OK returns at once: the frames that follow read the
+## picture's lightness a slice at a time, then the refinement runs on the
+## previews' thread, and it is kept when `continue_refine` finds it done.
+## Edits wait meanwhile.
+func end_refine(canvas: Canvas*, keep: bool, background: bool) -> !:
     let session = canvas.select_mask else return
+    if session.keeping:
+        error(invalid, "the selection is still being refined")
     if let task = session.task:
         task.work.cancel()
         collect_refine(session, true) catch failure:
             discard(failure)
-    if keep and session.asked and session.setting.changes():
-        let refined = try refine_whole(canvas, session)
-        try canvas.remember_state("Select and Mask")
-        var live = canvas.live()
-        live.destroy()
-        *live = refined
+    if not keep or not session.asked or not session.setting.changes():
+        drop_refine(canvas)
+        return
+    if background:
+        session.keeping = true
+        return
+    let work = try refine_whole(canvas, session)
+    defer RefineWork.destroy(work)
+    if not work.run():
+        error(memory.exhausted, "out of memory refining the selection")
+    try keep_refined(canvas, Selection.adopt(try work.take()))
+
+## How long a frame spends reading lightness for OK, and how many cells a read takes.
+let keep_read_ns: u64 = 12000000
+let keep_read_cells: usize = 48
+
+## `Canvas.continue_refine`: move OK's refinement on (at once, to the end,
+## with `wait`): read more of the lightness it needs, start it on the
+## previews' thread once that is in, and when it is done keep it as one step
+## and close Select and Mask.
+func continue_refine(canvas: Canvas*, wait: bool) -> !:
+    let session = canvas.select_mask else return
+    if not session.keeping:
+        return
+    if session.task == none:
+        if not (try read_keep_lightness(canvas, session, wait)):
+            return
+        let work = refine_whole(canvas, session) catch failure:
+            drop_refine(canvas)
+            error(failure.code, failure.message)
+        let started = start_background(run_refine_task, (void*)work, "select-and-mask") catch failure:
+            RefineWork.destroy(work)
+            drop_refine(canvas)
+            error(failure.code, failure.message)
+        session.task = new RefineTask(work = work, setting = session.setting, level = 0, box = CellBox(), background = started) in memory.heap catch failure:
+            work.cancel()
+            join_background(started)
+            RefineWork.destroy(work)
+            drop_refine(canvas)
+            error(failure.code, failure.message)
+    let task = session.task else trap("started above")
+    if not wait and not background_done(task.background):
+        return
+    join_background(task.background)
+    session.task = none
+    session.keeping = false
+    defer:
+        RefineWork.destroy(task.work)
+        free(task) in memory.heap
+    if task.work.out_of_memory():
+        drop_refine(canvas)
+        error(memory.exhausted, "out of memory refining the selection")
+    try keep_refined(canvas, Selection.adopt(try task.work.take()))
+
+## Read the full-size lightness OK's refinement needs, for about a frame's
+## share of time (all of it with `wait`): true once all is in.
+func read_keep_lightness(canvas: Canvas*, session: SelectMask*, wait: bool) -> bool!:
+    if session.setting.radius <= 0:
+        return true
+    let started = time.now()
+    var unread = true
+    while unread:
+        let luma = lightness_at(canvas, session, session.origin.coverage(), session.setting, CellBox(), 0, keep_read_cells, &unread) catch failure:
+            drop_refine(canvas)
+            error(failure.code, failure.message)
+        discard(luma)
+        if not wait and time.now() - started > keep_read_ns:
+            break
+    session.keep_read = lit_count(session)
+    return not unread
+
+## Cells whose lightness has been read.
+func lit_count(session: const SelectMask*) -> usize:
+    let lit = session.lit else return 0
+    var count: usize = 0
+    for index in 0..<lit.count():
+        if lit.uniform(index) != 0:
+            count += 1
+    return count
+
+## Keep `refined` (handed over) as the selection, one step, and close.
+func keep_refined(canvas: Canvas*, refined: Selection) -> !:
+    var kept = refined
+    canvas.remember_state("Select and Mask") catch failure:
+        kept.destroy()
+        error(failure.code, failure.message)
+    var live = canvas.live()
+    live.destroy()
+    *live = kept
     drop_refine(canvas)
 
-## The selection it began from refined at full size, sharing the cells a
-## full-size preview of the same setting already worked out.
-func refine_whole(canvas: Canvas*, session: SelectMask*) -> Selection!:
+## Whether OK's refinement is still working: edits wait for it.
+func refine_keeping(canvas: const Canvas*) -> bool:
+    let session = canvas.select_mask else return false
+    return session.keeping
+
+## How far OK's refinement has come, 0..100 (reading the lightness the first
+## tenth); 100 when none is working.
+func refine_progress(canvas: const Canvas*) -> i64:
+    let session = canvas.select_mask else return 100
+    if not session.keeping:
+        return 100
+    let task = session.task else return (i64)(session.keep_read * 10 // session.origin.coverage().count())
+    return 10 + task.work.percent() * 90 // 100
+
+## The work that refines the selection it began from at full size, sharing
+## the cells a full-size preview of the same setting already worked out.
+## The picture's lightness is read here, on the GPU's thread, where not yet.
+func refine_whole(canvas: Canvas*, session: SelectMask*) -> RefineWork*!:
     let source = session.origin.coverage()
     let setting = session.setting
     var reuse: const Cells*? = none
@@ -205,11 +330,7 @@ func refine_whole(canvas: Canvas*, session: SelectMask*) -> Selection!:
     var luma: Cells*? = none
     if setting.radius > 0:
         luma = try lightness_at(canvas, session, source, setting, CellBox(), 0)
-    let work = try RefineWork.prepare(source, luma, setting, CellBox(), reuse, reused)
-    defer RefineWork.destroy(work)
-    if not work.run():
-        error(memory.exhausted, "out of memory refining the selection")
-    return Selection.adopt(try work.take())
+    return try RefineWork.prepare(source, luma, setting, CellBox(), reuse, reused)
 
 ## Close Select and Mask, letting everything it holds go (the dialog closed,
 ## or the canvas).
@@ -237,6 +358,7 @@ func refine_busy(canvas: const Canvas*) -> bool:
 ## marching ants, a red overlay, or the picture on black or white. False
 ## when Select and Mask is not open.
 func draw_refine_view(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, phase: f64) -> bool!:
+    try continue_refine(canvas, false)
     let session = canvas.select_mask else return false
     try prepare_refine_preview(canvas, view_scope(canvas, rectangle, zoom, offset_x, offset_y))
     if let shown = session.shown.selection:

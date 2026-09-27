@@ -160,6 +160,8 @@ pub struct RefineWork:
     var curve: u8[256]
     var cancelled: @bool
     var failed: @bool
+    ## Units worked out so far, for a progress readout from another thread.
+    var finished: @usize
 
     ## `source` refined as `refinement` says in the cells `limit` holds, the
     ## edge detection guided by `luma` (none skips it); the edge cells outside
@@ -213,6 +215,7 @@ pub struct RefineWork:
                                       refinement = refinement, curve = curve) in memory.heap
         work.cancelled.store(false, .relaxed)
         work.failed.store(false, .relaxed)
+        work.finished.store(0, .relaxed)
         return work
 
     ## How many cells `run` works out.
@@ -228,6 +231,12 @@ pub struct RefineWork:
     ## Stop `run` at the next cell (or pass) it reaches, from any thread.
     pub mutating func cancel():
         self.cancelled.store(true, .release)
+
+    ## How far `run` has come, 0..100, from any thread.
+    pub func percent() -> i64:
+        if self.units.length == 0:
+            return 100
+        return (i64)(self.finished.load(.relaxed) * 100 // self.units.length)
 
     pub func out_of_memory() -> bool:
         return self.failed.load(.acquire)
@@ -380,6 +389,7 @@ func refine_item(context: void*?, item: usize):
             let index = (usize)(row * columns + column)
             if work.marks[index] == 1:
                 keep_cell(work, index, a, &window)
+    discard(work.finished.add(1, .relaxed))
 
 ## Cell `index`'s part of the window, through the curve, into its block.
 func keep_cell(work: RefineWork*, index: usize, current: const u8[], window: const Window*):

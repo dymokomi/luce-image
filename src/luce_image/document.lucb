@@ -7,7 +7,7 @@ import gpu
 import math
 import memory
 import strings
-from tiles import Tiles, box, unbox
+from tiles import Tiles, CellRange, box, unbox
 from luce_image.extent import relocate
 from luce_image.selection import Selection
 from luce_image.curves import Curves
@@ -794,6 +794,17 @@ pub struct Document:
         if self.selection_suspended:
             return none
         return try self.selection.gpu_tiles(self.owner)
+
+    ## As `selection_tiles`, catching up only the cells in `wanted` and `extra`
+    ## more (see `Selection.gpu_tiles_within`): for drawing the ants.
+    pub mutating func selection_tiles_within(wanted: CellRange, extra: usize) -> Tiles*?!:
+        if self.selection_suspended:
+            return none
+        return try self.selection.gpu_tiles_within(self.owner, wanted, extra)
+
+    ## Whether the selection's GPU tiles still lag it somewhere.
+    pub func selection_behind() -> bool:
+        return self.selection.gpu_behind()
 
     ## Give a layer or a group an empty mask (revealing everything) or take it away.
     pub mutating func set_mask(id: u64, present: bool) -> !:

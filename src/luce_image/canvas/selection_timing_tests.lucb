@@ -29,6 +29,13 @@ func select_blobs(canvas: Canvas*) -> !:
             coverage[y * width + x] = (u8)math.imin(255, math.imax(0, value))
     try canvas.live().from_coverage(coverage, Mode.replace)
 
+## One frame of a 64-point view at 100% from the document's corner, and the
+## selection tiles its ants draw with (a window's frame draws them in its own format).
+func ants_frame(canvas: Canvas*, target: gpu.Texture*) -> !:
+    discard(try shown_at(canvas, target, 0, 0))
+    let document = canvas.document else trap("drawn")
+    discard(try document.selection_tiles_within(shown_cells(canvas, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0), ants_extra_cells))
+
 test "select and mask and transform selection keep up with a 15000 by 24000 selection edged everywhere":
     var device = gpu.Device.open() catch failure:
         assert(failure.code == gpu.unavailable)
@@ -59,9 +66,44 @@ test "select and mask and transform selection keep up with a 15000 by 24000 sele
                 try collect_refine(session, true)
                 assert(paced_under(started, 3000.0, pace) and session.shown.level == scope.level)
     var started = time.now()
-    try canvas.end_refine(true, 50, 5, 20, 30.0, 20.0)
+    try canvas.end_refine(true, 50, 5, 20, 30.0, 20.0, background = true)
+    # OK returns while the refine thread works (it took 3.2 s on the calling thread).
+    let returned = since(started)
+    assert(paced_under(started, 1000.0, pace) and canvas.refine_keeping())
+    # Edits are refused meanwhile, as while a picture opens; progress shows.
+    var refused = false
+    canvas.select_rectangle(0, 0, 10, 10) catch _:
+        refused = true
+    assert(refused and canvas.refine_percent() < 100)
+    # Each frame moves it on without holding the frame up.
+    var percent = canvas.refine_percent()
+    var slowest: u64 = 0
+    while canvas.refine_keeping():
+        let now = canvas.refine_percent()
+        assert(now >= percent and now <= 100)
+        percent = now
+        let frame = time.now()
+        try canvas.continue_refine()
+        let spent = since(frame)
+        slowest = spent if spent > slowest else slowest
+        thread.sleep(5)
+    assert((f64)slowest < 60.0 * pace)
     # Every cell worked out at full size (it was 13.6 s before windows were shared).
-    assert(paced_under(started, 20000.0, pace) and canvas.undo_name() == "Select and Mask")
+    let refined = since(started)
+    assert(paced_under(started, 20000.0, pace) and canvas.undo_name() == "Select and Mask" and not canvas.refining())
+    # The kept selection's edge reaches the GPU the cells a view shows first
+    # (at 100%, a few), the rest a few a frame while the view keeps drawing.
+    discard(try shown_at(&canvas, &target, 0, 0))
+    started = time.now()
+    try ants_frame(&canvas, &target)
+    let ants = since(started)
+    assert(paced_under(started, 150.0, pace) and canvas.busy())
+    var frames: usize = 1
+    while canvas.busy() and frames < 1000:
+        try ants_frame(&canvas, &target)
+        frames += 1
+    assert(not canvas.busy())
+    print(f"select and mask OK: returned {returned} ms, slowest frame {slowest} ms, refined {refined} ms, first ants {ants} ms, all edge cells in after {frames} frames")
     try canvas.begin_selection_transform()
     let warping = canvas.selection_warping else trap("a transform is under way")
     for step in 1..<(i64)4:

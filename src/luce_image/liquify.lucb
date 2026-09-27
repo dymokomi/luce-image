@@ -17,8 +17,7 @@ import math
 import memory
 from tiles import Tiles, tile_size, tile_texture
 from pyramid import Pyramid
-from luce_image.extent import Pieces
-from luce_image.transform_window import Footprint, gather, gather_pieces, level_for, Window
+from luce_image.transform_window import Footprint, gather, gather_layer, level_for, Window
 from luce_image.liquify_grid import Grid, Reach, step_for
 from luce_image.shaders import liquify_frag_words, liquify_frag_msl
 from raster_errors import invalid
@@ -59,10 +58,9 @@ pub struct Liquifier:
         return fresh
 
     ## Cell (`column`, `row`) of pyramid `level` of the layer `grid` pushes,
-    ## made from `tiles` as the stroke began (`parts` their pieces, `pyramid`
-    ## their levels). `original` when nothing moves over the cell; none where
+    ## made from `tiles` as the stroke began (`pyramid` their levels). `original` when nothing moves over the cell; none where
     ## nothing lands. At level 0 it is the kept pixels.
-    pub func cell(grid: const Grid*, tiles: const Tiles*, parts: const Pieces*, pyramid: Pyramid*, column: u32, row: u32, level: u32, original: bool*) -> gpu.Texture?!:
+    pub func cell(grid: const Grid*, tiles: const Tiles*, pyramid: Pyramid*, column: u32, row: u32, level: u32, original: bool*) -> gpu.Texture?!:
         *original = false
         let scale = (f64)(1u32 << level)
         let side = (f64)tile_size * scale
@@ -94,9 +92,9 @@ pub struct Liquifier:
         let clear = gpu.Color(0.0, 0.0, 0.0, 0.0)
         var window: Window = ---
         if at == 0:
-            window = try gather_pieces(self.owner, parts, box, clear)
+            window = try gather_layer(self.owner, tiles, box, clear)
         else:
-            window = try gather(self.owner, tiles, parts, pyramid, box, at, false, clear)
+            window = try gather(self.owner, tiles, pyramid, box, at, false, clear)
         defer window.destroy()
         var field = try gpu.Texture.create(self.owner, (u32)n, (u32)n, gpu.Format.rgba16_float)
         defer field.destroy()

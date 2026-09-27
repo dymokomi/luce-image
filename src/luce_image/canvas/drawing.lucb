@@ -182,8 +182,24 @@ func draw_canvas_selection(canvas: Canvas*, target: interop.View[gpu.RenderTarge
     if not math.is_finite(zoom) or zoom <= 0.0 or not math.is_finite(phase):
         error(invalid, "zoom must be positive and the phase finite")
     let document = canvas.document else return
-    let tiles = (try document.selection_tiles()) else return
+    # The cells the view shows go to the GPU first, the rest a few a frame.
+    let tiles = (try document.selection_tiles_within(shown_cells(canvas, rectangle, zoom, offset_x, offset_y), ants_extra_cells)) else return
     try draw_ants(canvas, target, rectangle, zoom, offset_x, offset_y, phase, tiles, 0)
+
+## Selection cells caught up each frame beyond those shown: about 10 ms of uploads.
+let ants_extra_cells: usize = 96
+
+## The document cells a view (as `draw_ants` draws it) reads: whole cells of
+## its level, and the cell right of and below each for the edge between.
+func shown_cells(canvas: const Canvas*, rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64) -> CellRange:
+    let level = view_level(zoom)
+    let span = (f64)((u64)tile_size << level)
+    let left = math.max(0.0, math.floor(-offset_x / zoom / span))
+    let top = math.max(0.0, math.floor(-offset_y / zoom / span))
+    let right = math.max(0.0, math.floor((rectangle.width - offset_x) / zoom / span) + 2.0)
+    let bottom = math.max(0.0, math.floor((rectangle.height - offset_y) / zoom / span) + 2.0)
+    let step = (i64)1 << (i64)level
+    return CellRange(left = (i64)left * step, top = (i64)top * step, right = (i64)right * step, bottom = (i64)bottom * step)
 
 ## Marching ants along the edge of the selection `coverage` holds (its tiles
 ## `coverage_level` pyramid levels down: a preview's), over the document as

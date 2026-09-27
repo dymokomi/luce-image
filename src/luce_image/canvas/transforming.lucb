@@ -26,9 +26,6 @@ struct Transformed:
     ## Where the pixels (and the mask) have anything, past the canvas too; none when nothing.
     var pixels_limit: Footprint?
     var mask_limit: Footprint?
-    ## Their pieces, for previews at full size; made when first needed.
-    var pixels_parts: Pieces?
-    var mask_parts: Pieces?
 
 struct TransformSession:
     var entries: Transformed[]
@@ -47,8 +44,6 @@ struct TransformSession:
     var document: Document*
     var transformer: Transformer
     var generation: u64
-    ## The selection's pieces, for a floating selection's previews at full size.
-    var selection_parts: Pieces?
 
 ## The most layers one transform takes.
 let transform_limit: usize = 64
@@ -80,8 +75,7 @@ func begin_transform_session(canvas: Canvas*, id: u64, float_selection: bool) ->
     errdefer free(entries) in memory.heap
     let session = try new TransformSession(entries = entries, count = 0, floating = floating,
                                            warp = Warp(m = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]), shown = false, name = "Free Transform", box = none,
-                                           sampling = sampling_smooth, document = document, transformer = transformer, generation = 0,
-                                           selection_parts = none) in memory.heap
+                                           sampling = sampling_smooth, document = document, transformer = transformer, generation = 0) in memory.heap
     canvas.transform_session = session
     add_to_session(canvas, document, session, id) catch failure:
         canvas.transform_session = none
@@ -100,8 +94,7 @@ func add_to_session(canvas: Canvas*, document: Document*, session: TransformSess
         error(limit, "a transform takes at most 64 layers")
     let layer = document.find(id) else error(invalid, "no such layer")
     let tiles = layer.tiles() else error(invalid, "a group has no pixels to transform")
-    var entry = Transformed(id = id, pixels = try tiles.clone(), mask = Tiles(), masked = false, pixels_limit = occupied_limit(tiles), mask_limit = none,
-                            pixels_parts = none, mask_parts = none)
+    var entry = Transformed(id = id, pixels = try tiles.clone(), mask = Tiles(), masked = false, pixels_limit = occupied_limit(tiles), mask_limit = none)
     errdefer entry.pixels.destroy()
     # A linked mask goes with the pixels; while editing a mask, the mask alone
     # moves; an unlinked mask stays unless it is the one being edited.
@@ -150,14 +143,8 @@ func session_cell(context: void*?, layer_levels: Pyramid*, layer: u64, mask: boo
         let lifted = Footprint(left = (f64)outline.left, top = (f64)outline.top, right = (f64)outline.right, bottom = (f64)outline.bottom)
         if lifted.right <= lifted.left or lifted.bottom <= lifted.top:
             return made_original()
-        if entry.pixels_parts == none:
-            entry.pixels_parts = try pieces(&entry.pixels)
-        if session.selection_parts == none:
-            session.selection_parts = try pieces(selection)
-        let parts = entry.pixels_parts else trap("made")
-        let selection_parts = session.selection_parts else trap("made")
         var original = false
-        let texture = try lifted_preview_cell(transformer, &entry.pixels, &parts, selection, &selection_parts, layer_levels, session.warp, lifted,
+        let texture = try lifted_preview_cell(transformer, &entry.pixels, selection, layer_levels, session.warp, lifted,
                                               column, row, level, session.sampling, &original)
         if original:
             return made_original()
@@ -165,12 +152,7 @@ func session_cell(context: void*?, layer_levels: Pyramid*, layer: u64, mask: boo
     let box = try preview_box(session, entry, mask, session.warp, session.box) else return made_nothing()
     let reach = (entry.mask_limit if mask else entry.pixels_limit) else return made_nothing()
     let tiles = &entry.mask if mask else &entry.pixels
-    if mask and entry.mask_parts == none:
-        entry.mask_parts = try pieces(&entry.mask)
-    if not mask and entry.pixels_parts == none:
-        entry.pixels_parts = try pieces(&entry.pixels)
-    let parts = (entry.mask_parts if mask else entry.pixels_parts) else trap("made")
-    let texture = try warp_preview_cell(transformer, tiles, &parts, layer_levels, session.warp, box, reach, column, row, level, mask, session.sampling)
+    let texture = try warp_preview_cell(transformer, tiles, layer_levels, session.warp, box, reach, column, row, level, mask, session.sampling)
     return made_texture(texture else return made_nothing())
 
 ## The box a preview's pixels come from: a distortion's, or where the layer
@@ -248,18 +230,9 @@ func end_session(canvas: Canvas*, keep: bool) -> !:
 
 func drop_session(session: TransformSession*):
     for at in 0..<session.count:
-        if let parts = session.entries[at].pixels_parts:
-            var owned = parts
-            owned.destroy()
-        if let parts = session.entries[at].mask_parts:
-            var owned = parts
-            owned.destroy()
         session.entries[at].pixels.destroy()
         if session.entries[at].masked:
             session.entries[at].mask.destroy()
-    if let parts = session.selection_parts:
-        var owned = parts
-        owned.destroy()
     free(session.entries) in memory.heap
     free(session) in memory.heap
 

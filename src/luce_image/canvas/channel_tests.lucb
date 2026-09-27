@@ -28,6 +28,12 @@ test "alpha channels save the selection, load it in every mode, and every change
     try canvas.select_rectangle(250, 150, 300, 200, 0)
     try canvas.load_channel(0, 3)
     assert(canvas.selected_at(280, 180) == 255 and canvas.selected_at(500, 300) == 0 and canvas.selected_at(50, 50) == 0)
+    # Invert: what the channel leaves out, combined the same way.
+    try canvas.load_channel(0, 0, invert = true)
+    assert(canvas.undo_name() == "Load Selection" and canvas.selected_at(50, 50) == 0 and canvas.selected_at(400, 300) == 255)
+    try canvas.select_rectangle(0, 0, 100, 100, 0)
+    try canvas.load_channel(0, 1, invert = true)
+    assert(canvas.selected_at(50, 50) == 255 and canvas.selected_at(200, 150) == 0 and canvas.selected_at(400, 300) == 255)
     # A new channel selects nothing: loading it deselects.
     assert((try canvas.new_channel("Alpha 2")) == 1 and (try canvas.channel_at_pixel(1, 50, 50)) == 0)
     try canvas.load_channel(1, 0)

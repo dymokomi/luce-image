@@ -8,7 +8,7 @@
 import gpu
 import math
 import memory
-from tiles import Tiles, tile_size
+from tiles import Tiles, CellRange, tile_size
 from luce_image.projective import Warp, affine_warp
 from luce_image.selection_cells import Cells, Covered, Mode, block_bytes, each
 from luce_image.selection_mirror import Mirror
@@ -304,6 +304,19 @@ pub struct Selection:
             self.mirror.destroy()
             return none
         return try self.mirror.update(device, &self.cells)
+
+    ## As `gpu_tiles`, catching up only the cells in `wanted` and `extra` more:
+    ## what a frame showing only those draws with. Others may show an older
+    ## selection until `gpu_tiles`, or later calls, catch them up.
+    pub mutating func gpu_tiles_within(device: gpu.Device, wanted: CellRange, extra: usize) -> Tiles*?!:
+        if self.empty:
+            self.mirror.destroy()
+            return none
+        return try self.mirror.update(device, &self.cells, wanted, extra)
+
+    ## Whether the GPU tiles still lag the selection somewhere.
+    pub func gpu_behind() -> bool:
+        return not self.empty and self.mirror.behind
 
     ## Whether cell (`column`, `row`) is selected throughout: a fill there
     ## does not depend on what was under it.
