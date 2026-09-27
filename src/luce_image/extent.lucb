@@ -9,7 +9,7 @@ import interop
 import math
 import memory
 from tiles import Tiles, CellRange, Bounds, tile_size, min_i64, max_i64
-from luce_image.blending import Transfer
+from luce_image.shaders import transfer_frag_words, transfer_frag_msl
 from raster_errors import invalid
 
 ## Texels `source` of `texture` (borrowed), their top-left at document pixel (`x`, `y`).
@@ -302,3 +302,33 @@ pub func full_bounds(tiles: const Tiles*) -> Bounds?!:
                     bounds.right = max_i64(bounds.right, px + 1)
                     bounds.bottom = max_i64(bounds.bottom, py + 1)
     return bounds if found else none
+
+## transfer.frag's pass: a tile's colors through sRGB's curve texel for
+## texel, for work that mixes through the GPU's own filtering (Image Size's
+## resampling), which then runs on encoded tiles.
+pub struct Transfer:
+    var shader: gpu.Shader
+    var pipeline: gpu.Pipeline
+
+    pub static func create(device: gpu.Device) -> Transfer!:
+        var shader = try gpu.Shader.create(device, transfer_frag_words, transfer_frag_msl)
+        errdefer shader.destroy()
+        let pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.replace, gpu.Format.rgba16_float)
+        return Transfer(shader = shader, pipeline = pipeline)
+
+    ## `source` encoded (or, `decode`, back to linear light) into `into`, a
+    ## texture of the same size; alpha kept.
+    pub func draw(into: gpu.Texture*, source: gpu.Texture, decode: bool) -> !:
+        var params: f32[1] = [1.0 if decode else 0.0]
+        let frame = try into.frame()
+        defer frame.release()
+        let area = try frame.value().target()
+        defer area.release()
+        let width = (f64)(try source.width())
+        let height = (f64)(try source.height())
+        try gpu.shade(area.value(), self.pipeline, gpu.Rect(width = width, height = height), u8[]((u8*)&params[0], 4), [source], gpu.Filter.nearest)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+
+    pub mutating func destroy():
+        self.pipeline.destroy()
+        self.shader.destroy()

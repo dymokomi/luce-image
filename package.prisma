@@ -1,7 +1,7 @@
 #prisma 4.0
 def package "luce-image" {
     str owner = "dymokomi"
-    str version = "0.40.0"
+    str version = "0.41.0"
     str kind = "package"
     str language = "luce-base"
     str description = "The layered-document engine behind luced-2d: layers, GPU compositing, selections, painting, filters, transforms and history over shared GPU tiles, with a Pillow-inspired Image API and Cryptomatte 1.2."
@@ -11,16 +11,12 @@ def package "luce-image" {
         str module = "luce_image.image"
     }
 
-    def export "cryptomatte" {
-        str module = "luce_image.cryptomatte"
-    }
-
     def export "canvas" {
         str module = "luce_image.canvas"
     }
 
-    def export "brush_mask" {
-        str module = "luce_image.brush_mask"
+    def export "brush_files" {
+        str module = "luce_image.brush_files"
     }
 
     def dependency "luce-prism" {
@@ -55,13 +51,13 @@ def package "luce-image" {
 
     def dependency "luce-tiff" {
         str owner = "dymokomi"
-        str version = "^0.1.3"
+        str version = "^0.1.4"
         str path = "../luce-tiff"
     }
 
     def dependency "luce-exr" {
         str owner = "dymokomi"
-        str version = "^0.1.3"
+        str version = "^0.2.0"
         str path = "../luce-exr"
     }
 
@@ -80,7 +76,7 @@ def package "luce-image" {
 
     def dependency "luce-color" {
         str owner = "dymokomi"
-        str version = "^0.2.2"
+        str version = "^0.2.3"
         str path = "../luce-color"
     }
 
@@ -98,13 +94,25 @@ def package "luce-image" {
 
     def dependency "luce-svg" {
         str owner = "dymokomi"
-        str version = "^0.4.4"
+        str version = "^0.4.6"
         str path = "../luce-svg"
+    }
+
+    def dependency "luce-vector" {
+        str owner = "dymokomi"
+        str version = "^0.1.0"
+        str path = "../luce-vector"
+    }
+
+    def dependency "luce-painting" {
+        str owner = "dymokomi"
+        str version = "^0.1.0"
+        str path = "../luce-painting"
     }
 
     def dependency "luce-canvas" {
         str owner = "dymokomi"
-        str version = "^0.1.21"
+        str version = "^0.1.22"
         str path = "../luce-canvas"
     }
 

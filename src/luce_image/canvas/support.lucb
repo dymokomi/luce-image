@@ -4,6 +4,307 @@
 #
 #==============================================================================================
 
+extend Canvas:
+    pub func is_bound() -> bool:
+        return self.document != none
+
+    ## Bind to a GPU device of the canvas's own, with no window or drawing:
+    ## what scripts and tests run headless use before editing. Nothing when
+    ## already bound; fails when there is no GPU.
+    pub mutating func bind_headless() -> !:
+        try self.require_open()
+        if self.document != none:
+            return
+        try self.bind_device(try gpu.Device.open())
+        # An .l2d's layers load their tiles from the file once the document is bound.
+        try load_package(&self)
+
+    ## Bind headless to the device `other` is bound to, so layers copy
+    ## between them: several documents open at once without a window.
+    pub mutating func bind_beside(other: interop.Reference[Canvas]) -> !:
+        try self.bind_sharing(try other.get())
+
+    mutating func bind_sharing(other: const Canvas*) -> !:
+        try self.require_open()
+        if self.document != none:
+            return
+        let device = other.device else error(invalid, "bind the other canvas first")
+        try self.bind_device(try device.share())
+        # An .l2d's layers load their tiles from the file once the document is bound.
+        try load_package(&self)
+
+    ## Bind to `acquired`, which the canvas owns from here (on failure too).
+    mutating func bind_device(acquired: gpu.Device) -> !:
+        try self.attach_device(acquired)
+        try self.load_pictures()
+
+    ## The GPU document on `acquired`, its layers as the records say, empty.
+    mutating func attach_device(acquired: gpu.Device) -> !:
+        var binding = Binding(device = acquired)
+        errdefer unwind(&binding)
+        let device = binding.device else trap("bound")
+        var document = try Document.create(device, self.extent_x, self.extent_y)
+        errdefer document.destroy()
+        document.linear_blend = self.cold_linear_blend
+        try configure_memory(device)
+        # Everything at the top level first, so the ids come out as the records'...
+        for index in 0..<self.count:
+            let record = self.records[index]
+            if record.group:
+                discard(try document.add_group(record.name))
+            elif record.adjustment >= 0:
+                discard(try document.add_adjustment(record.name, record.adjustment, record.adjustment_values[..<parameter_count]))
+                if record.adjustment == (i64)curves:
+                    try document.set_curves(record.id, record.curves)
+            else:
+                discard(try document.add_layer(record.name))
+            try document.set_appearance(record.id, record.visible, record.opacity, (u32)record.blend)
+            if record.masked:
+                try document.set_mask(record.id, true)
+                if not record.mask_enabled:
+                    try document.enable_mask(record.id, false)
+            if record.style.any():
+                (document.find(record.id) else trap("bound layer")).style = record.style
+            if record.clipped:
+                try document.set_clipped(record.id, true)
+        # ...then into their groups, bottom to top, each on top of those before it.
+        for index in 0..<self.count:
+            let record = self.records[index]
+            if record.parent != 0:
+                try document.move_to(record.id, record.parent, (usize)self.count)
+        binding.document = try box_document(document)
+        var composer = try Composer.create(device)
+        errdefer composer.destroy()
+        binding.composer = try box_composer(composer)
+        binding.painter = try Painter.create(device)
+        binding.adjuster = try Adjuster.create(device)
+        binding.filters = try Filters.create(device)
+        binding.transformer = try Transformer.create(device)
+        binding.passes = try SelectionPasses.create(device)
+        self.device = binding.device
+        self.painter = binding.painter
+        self.adjuster = binding.adjuster
+        self.filters = binding.filters
+        self.transformer = binding.transformer
+        self.passes = binding.passes
+        # The cold selection moves into the boxed document; a fresh empty one takes its place here.
+        let bound = binding.document else trap("boxed")
+        bound.selection.destroy()
+        bound.selection = self.selection
+        self.selection = try Selection.create(self.extent_x, self.extent_y)
+        self.document = binding.document
+        self.composer = binding.composer
+        binding = Binding()
+
+    ## The pictures waiting in the records become their layers' tiles (or
+    ## masks), decoded a band at a time. The document stays bound whatever
+    ## happens: a picture that cannot be read leaves its layer empty, every
+    ## other still loads, and the first failure is returned, for the window to
+    ## report (a draw's bind is where a picture opened as a document loads).
+    mutating func load_pictures() -> !:
+        var failed: ErrorCode? = none
+        var message: str = ""
+        for index in 0..<self.count:
+            if let picture = self.records[index].picture:
+                self.records[index].picture = none
+                if opens_in_background(&self, picture):
+                    # The document's own picture fills in while frames go on.
+                    try begin_opening(&self, self.records[index].id, picture)
+                    continue
+                self.load_picture(index, picture, self.records[index].picture_x, self.records[index].picture_y, false) catch failure:
+                    if failed == none:
+                        failed = failure.code
+                        message = failure.message
+            if let picture = self.records[index].mask_picture:
+                self.records[index].mask_picture = none
+                self.load_picture(index, picture, self.records[index].mask_x, self.records[index].mask_y, true) catch failure:
+                    if failed == none:
+                        failed = failure.code
+                        message = failure.message
+        if let code = failed:
+            error(code, message)
+
+    mutating func load_picture(index: usize, picture: interop.Reference[Image], x: i64, y: i64, mask: bool) -> !:
+        defer picture.release()
+        let tiles = try self.tiles_of(picture, x, y, mask)
+        let document = self.document else trap("bound")
+        if not mask:
+            try document.set_tiles(self.records[index].id, tiles)
+            return
+        var old = try document.take_mask(self.records[index].id, tiles)
+        old.destroy()
+
+    func require_open() -> !:
+        if self.closed:
+            error(invalid, "the document is closed")
+
+    pub mutating func close():
+        if self.closed:
+            return
+        self.closed = true
+        cancel_opening(&self)
+        if let warp = self.warp:
+            # A worker still walking stops after its dab.
+            self.warp = none
+            self.warp_finishing = false
+            warp.destroy()
+            free(warp) in memory.heap
+        drop_liquify(&self)
+        drop_mesh_warp(&self)
+        drop_filter_preview(&self)
+        drop_gradient_preview(&self)
+        drop_selection_transform(&self)
+        self.cancel_magnetic()
+        drop_refine(&self)
+        drop_quick_mask(&self)
+        if let composer = self.composer:
+            composer.drop_stand_ins()
+        if let source = self.backing:
+            # Tiles still backed keep the file open until they go.
+            self.backing = none
+            release_tile_source(source)
+        if let session = self.transform_session:
+            self.transform_session = none
+            drop_session(session)
+        if let stroke = self.stroke:
+            self.stroke = none
+            finish_boxed(stroke)
+        self.brush_images.destroy()
+        if let preview = self.preview:
+            var owned = preview.tiles
+            owned.destroy()
+            self.preview = none
+        if let table = self.table:
+            var owned = table
+            owned.destroy()
+            self.table = none
+        if let pipeline = self.ants:
+            var owned = pipeline
+            owned.destroy()
+            self.ants = none
+        if let shader = self.ants_shader:
+            var owned = shader
+            owned.destroy()
+            self.ants_shader = none
+        self.drop_view_pipelines()
+        self.channels.destroy()
+        if let liquifier = self.liquifier:
+            var owned = liquifier
+            owned.destroy()
+            self.liquifier = none
+        if let mesher = self.mesher:
+            var owned = mesher
+            owned.destroy()
+            self.mesher = none
+        end_range(&self)
+        self.selection.destroy()
+        if self.polygon.length > 0:
+            free(self.polygon) in memory.heap
+        if self.outline.length > 0:
+            free(self.outline) in memory.heap
+        clear_snapshots(&self.history, &self.history_count)
+        clear_snapshots(&self.future, &self.future_count)
+        if self.history.length > 0:
+            free(self.history) in memory.heap
+        if self.future.length > 0:
+            free(self.future) in memory.heap
+        var binding = Binding(device = self.device, document = self.document, composer = self.composer, painter = self.painter, adjuster = self.adjuster, filters = self.filters, transformer = self.transformer, passes = self.passes)
+        self.device = none
+        self.document = none
+        self.composer = none
+        self.painter = none
+        self.adjuster = none
+        self.filters = none
+        self.transformer = none
+        self.passes = none
+        unwind(&binding)
+        for index in 0..<self.count:
+            strings.release(self.records[index].name)
+            release_type(&self.records[index])
+            release_elements(&self.records[index])
+            if let picture = self.records[index].picture:
+                picture.release()
+            if let picture = self.records[index].mask_picture:
+                picture.release()
+        if let source = self.package:
+            self.package = none
+            source.destroy()
+            free(source) in memory.heap
+        if let names = self.families:
+            self.families = none
+            names.close()
+            free(names) in memory.heap
+        if self.preview_bytes.length > 0:
+            free(self.preview_bytes) in memory.heap
+            var no_bytes: u8[]
+            self.preview_bytes = no_bytes
+        if self.records.length > 0:
+            free(self.records) in memory.heap
+        var empty: Record[]
+        self.records = empty
+        self.count = 0
+
+    func trace(visit: func(ownership.Object*, void*) -> unit, context: void*):
+        for index in 0..<self.count:
+            if let picture = self.records[index].picture:
+                picture.trace(visit, context)
+            if let picture = self.records[index].mask_picture:
+                picture.trace(visit, context)
+
+    ## Add a guide across the document at `position` pixels: a vertical one
+    ## at that x, a horizontal one at that y. Its index. Undoable.
+    pub mutating func add_guide(vertical: bool, position: f64) -> i64!:
+        try self.require_open()
+        if not math.is_finite(position):
+            error(invalid, "a guide's place must be finite")
+        if self.guides.count == guide_limit:
+            error(limit, "a document holds at most 128 guides")
+        try self.remember_state("New Guide")
+        self.guides.positions[self.guides.count] = position
+        self.guides.vertical[self.guides.count] = vertical
+        self.guides.count += 1
+        return (i64)self.guides.count - 1
+
+    ## Move guide `index` to `position`; a drag of one guide is one step. Undoable.
+    pub mutating func move_guide(index: i64, position: f64) -> !:
+        try self.require_open()
+        let at = try self.guide_index(index)
+        if not math.is_finite(position):
+            error(invalid, "a guide's place must be finite")
+        try self.remember_state("Move Guide", (u64)(1000000 + index))
+        self.guides.positions[at] = position
+
+    pub mutating func remove_guide(index: i64) -> !:
+        try self.require_open()
+        let at = try self.guide_index(index)
+        try self.remember_state("Delete Guide")
+        for later in at..<(self.guides.count - 1):
+            self.guides.positions[later] = self.guides.positions[later + 1]
+            self.guides.vertical[later] = self.guides.vertical[later + 1]
+        self.guides.count -= 1
+
+    ## View › Clear Guides. Undoable.
+    pub mutating func clear_guides() -> !:
+        try self.require_open()
+        if self.guides.count == 0:
+            return
+        try self.remember_state("Clear Guides")
+        self.guides.count = 0
+
+    pub func guide_count() -> i64:
+        return (i64)self.guides.count
+
+    pub func guide_vertical(index: i64) -> bool!:
+        return self.guides.vertical[try self.guide_index(index)]
+
+    pub func guide_position(index: i64) -> f64!:
+        return self.guides.positions[try self.guide_index(index)]
+
+    func guide_index(index: i64) -> usize!:
+        if index < 0 or index >= (i64)self.guides.count:
+            error(invalid, "no such guide")
+        return (usize)index
+
 ## Photoshop's blend modes, in the order the compositor numbers them.
 let blend_names: str[26] = ["Normal", "Darken", "Multiply", "Color Burn", "Linear Burn", "Lighten", "Screen", "Color Dodge", "Linear Dodge",
                             "Overlay", "Soft Light", "Hard Light", "Vivid Light", "Linear Light", "Pin Light", "Hard Mix", "Difference", "Exclusion",
@@ -74,7 +375,6 @@ func curve_channel(channel: i64) -> usize!:
     if channel < 0 or channel > 3:
         error(invalid, "curve channels are 0 (RGB), 1 (red), 2 (green) and 3 (blue)")
     return (usize)channel
-
 
 ## The layer tree read out for the records: ids and their groups, in order.
 struct Order:

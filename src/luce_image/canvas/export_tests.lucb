@@ -1,0 +1,122 @@
+#==============================================================================================
+#
+#   canvas/export_tests - Streamed exports and Trim
+#
+#==============================================================================================
+
+test "streamed exports keep alpha in PNG, blend over the matte in JPEG, and reach the last partial tile":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(600, 300)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.select_rectangle(300, 10, 290, 280)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    try canvas.set_layer(layer, true, 0.5)
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.save("build/canvas-bands.png")
+    let kept = try Image.open("build/canvas-bands.png")
+    defer kept.release()
+    let half = try kept.value().getpixel(550, 100)
+    assert(half.r == 255.0 and half.g == 0.0 and math.abs(half.a - 128.0) < 1.5)
+    assert((try kept.value().getpixel(100, 100)).a == 0.0)
+    try canvas.save("build/canvas-bands.jpg", 95, 1.0, 1.0, 1.0)
+    let matted = try Image.open("build/canvas-bands.jpg")
+    defer matted.release()
+    # Half red over white, mixed as encoded values: red stays full, green and
+    # blue are half of 255.
+    let pink = try matted.value().getpixel(550, 100)
+    assert(pink.r > 247.0 and math.abs(pink.g - 128.0) < 6.0 and math.abs(pink.b - 128.0) < 6.0)
+    let white = try matted.value().getpixel(100, 100)
+    assert(white.r > 247.0 and white.g > 247.0 and white.b > 247.0)
+    # Blending with gamma 1.0: half in linear light, sRGB 188.
+    try canvas.set_linear_blend(true)
+    try canvas.save("build/canvas-bands-linear.jpg", 95, 1.0, 1.0, 1.0)
+    let linear = try Image.open("build/canvas-bands-linear.jpg")
+    defer linear.release()
+    let light_pink = try linear.value().getpixel(550, 100)
+    assert(light_pink.r > 247.0 and math.abs(light_pink.g - 188.0) < 6.0 and math.abs(light_pink.b - 188.0) < 6.0)
+
+test "an export wider than one read-back strip keeps pixels either side of the join":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(16600, 40)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.select_rectangle(16380, 10, 8, 10)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.save("build/canvas-strips.png")
+    let saved = try Image.open("build/canvas-strips.png")
+    defer saved.release()
+    for x in [(usize)16380, 16383, 16384, 16387]:
+        let pixel = try saved.value().getpixel(x, 15)
+        assert(pixel.r == 255.0 and pixel.a == 255.0)
+    assert((try saved.value().getpixel(16379, 15)).a == 0.0 and (try saved.value().getpixel(16388, 15)).a == 0.0)
+    assert((try saved.value().getpixel(16599, 39)).a == 0.0)
+
+test "an export wider than a read batch holds is read in parts, whole on both sides of the join":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(33000, 20)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.select_rectangle(32760, 4, 20, 8)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, false)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.save("build/canvas-parts.png")
+    let saved = try Image.open("build/canvas-parts.png")
+    defer saved.release()
+    for x in [(usize)32760, 32767, 32768, 32779]:
+        let pixel = try saved.value().getpixel(x, 6)
+        assert(pixel.b == 255.0 and pixel.r == 0.0 and pixel.a == 255.0)
+    assert((try saved.value().getpixel(32759, 6)).a == 0.0 and (try saved.value().getpixel(32780, 6)).a == 0.0)
+    assert((try saved.value().getpixel(32999, 19)).a == 0.0 and (try saved.value().getpixel(0, 0)).a == 0.0)
+
+test "trim finds the picture's box by transparency or a corner's color":
+    var canvas = try Canvas(40, 30)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try canvas.select_rectangle(10, 5, 8, 6)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    assert((try canvas.measure_trim(0)) and canvas.content_left() == 10 and canvas.content_top() == 5 and canvas.content_width() == 8 and canvas.content_height() == 6)
+    # By the top-left color (transparent here) the same box; nothing when all is alike.
+    assert((try canvas.measure_trim(1)) and canvas.content_width() == 8)
+    try canvas.resize_canvas(canvas.content_width(), canvas.content_height(), -canvas.content_left(), -canvas.content_top())
+    assert(canvas.width() == 8 and not (try canvas.measure_trim(2)))
+    try canvas.resize_image(16, 12, false)
+    assert(canvas.width() == 16 and canvas.height() == 12)
+    # Pixels changed inside an edit are part of its one step.
+    try canvas.begin_edit("Size and Fill")
+    try canvas.resize_canvas(20, 12, 0, 0)
+    try canvas.fill(layer, true)
+    canvas.end_edit()
+    assert(canvas.undo_name() == "Size and Fill")
+    try canvas.undo()
+    assert(canvas.width() == 16 and canvas.undo_name() == "Image Size")

@@ -1,0 +1,533 @@
+#==============================================================================================
+#
+#   canvas/layer_tests - Layers, groups, masks, text and shape layers, guides and files that hold them
+#
+#==============================================================================================
+
+test "canvas builds cold, binds on draw, composes layers, saves and reopens":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    # A 40x30 red picture on disk.
+    let red = try Image.create("RGBA", 40, 30, Pixel(r = 255.0, g = 0.0, b = 0.0, a = 255.0))
+    defer red.release()
+    try red.value().save("build/canvas-test-red.png")
+    var canvas = try Canvas(40, 30)
+    defer canvas.close()
+    let background = try canvas.add_layer("Background")
+    try canvas.load_layer(background, "build/canvas-test-red.png")
+    let top = try canvas.add_layer("Top")
+    try canvas.set_layer(top, true, 0.5)
+    assert(canvas.layer_count() == 2 and (try canvas.layer_name(1)) == "Top" and (try canvas.layer_opacity(1)) == 0.5)
+    var rejected = false
+    canvas.save("build/canvas-test-out.png") catch failure:
+        assert(failure.code == invalid)
+        rejected = true
+    assert(rejected)
+    # Drawing onto a texture frame binds the device; a 2x zoom puts document
+    # pixel (0, 0) at points (4, 4) through (6, 6) inside the 64x64 target.
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    let frame = try target.frame()
+    defer frame.release()
+    let root = try frame.value().target()
+    defer root.release()
+    try canvas.draw(root, gpu.Rect(2.0, 2.0, 60.0, 60.0), 2.0, 2.0, 2.0)
+    discard(try frame.value().present(gpu.Color(0.0, 0.0, 1.0, 1.0)))
+    var pixel: u8[4]
+    try target.read(pixel, gpu.Region(5, 5, 1, 1))
+    assert(pixel[0] == 255 and pixel[1] == 0 and pixel[2] == 0 and pixel[3] == 255)
+    try target.read(pixel, gpu.Region(3, 3, 1, 1))
+    assert(pixel[0] == 0 and pixel[2] == 255)
+    # Pixels past the document (40 * 2 = 80 points from x 4, clipped at 62) stay blue.
+    try target.read(pixel, gpu.Region(1, 1, 1, 1))
+    assert(pixel[2] == 255)
+    # Layers added after binding go straight to the GPU document.
+    let third = try canvas.add_layer("Third")
+    try canvas.load_layer(third, "build/canvas-test-red.png")
+    try canvas.remove_layer(top)
+    assert(canvas.layer_count() == 2 and (try canvas.layer_id(1)) == third)
+    try canvas.save("build/canvas-test-out.png")
+    let reopened = try Canvas.open("build/canvas-test-out.png")
+    defer reopened.release()
+    assert(reopened.value().width() == 40 and reopened.value().layer_count() == 1)
+    let check = try Image.open("build/canvas-test-out.png")
+    defer check.release()
+    let sample = try check.value().getpixel(20, 15)
+    assert(sample.r == 255.0 and sample.g == 0.0 and sample.a == 255.0)
+
+test "a document keeps its resolution and color profile":
+    var canvas = try Canvas(40, 30)
+    defer canvas.close()
+    assert(canvas.resolution() == 72.0)
+    let initial = try canvas.profile()
+    defer initial.release()
+    assert(initial.value == "sRGB")
+    try canvas.set_resolution(300.0)
+    canvas.set_profile("Display P3")
+    let changed = try canvas.profile()
+    defer changed.release()
+    assert(canvas.resolution() == 300.0 and changed.value == "Display P3")
+    var rejected = false
+    canvas.set_resolution(0.0) catch failure:
+        assert(failure.code == invalid)
+        rejected = true
+    assert(rejected and canvas.resolution() == 300.0)
+
+test "the top layer with pixels is found at a point, and a mask moves with its layer in one undo":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    let lower = try canvas.add_layer("Red")
+    let upper = try canvas.add_layer("Green")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(8, 8, 16, 16, 0)
+    try canvas.fill(lower, false)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, false)
+    try canvas.select_rectangle(40, 40, 16, 16, 0)
+    try canvas.fill(upper, false)
+    assert((try canvas.layer_at(12, 12)) == 0 and (try canvas.layer_at(44, 44)) == 1 and (try canvas.layer_at(30, 30)) == -1)
+    # A mask hiding the red square's left half.
+    try canvas.set_mask(lower, true)
+    canvas.edit_mask(true)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(8, 8, 8, 16, 0)
+    try canvas.fill(lower, false)
+    canvas.edit_mask(false)
+    try canvas.deselect()
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 0 and (try shown_at(&canvas, &target, 20, 12))[0] == 255)
+    # Moved right by 24, the mask goes with the pixels: the hidden half stays hidden.
+    try canvas.move_layer(lower, 24, 0)
+    assert((try shown_at(&canvas, &target, 36, 12))[0] == 0 and (try shown_at(&canvas, &target, 44, 12))[0] == 255)
+    # One undo takes back both.
+    try canvas.undo()
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 0 and (try shown_at(&canvas, &target, 20, 12))[0] == 255)
+    assert((try shown_at(&canvas, &target, 44, 12))[0] == 0)
+    try canvas.redo()
+    assert((try shown_at(&canvas, &target, 36, 12))[0] == 0 and (try shown_at(&canvas, &target, 44, 12))[0] == 255)
+    # The red square's painted box is exact, whatever its mask hides.
+    assert(try canvas.measure_content(lower))
+    assert(canvas.content_left() == 32 and canvas.content_top() == 8 and canvas.content_width() == 16 and canvas.content_height() == 16)
+    # Flipped about its middle, the square stays put and its mask mirrors: the right half is hidden now.
+    try canvas.flip_layer(lower, true)
+    assert((try shown_at(&canvas, &target, 36, 12))[0] == 255 and (try shown_at(&canvas, &target, 44, 12))[0] == 0)
+    try canvas.undo()
+    assert((try shown_at(&canvas, &target, 36, 12))[0] == 0 and (try shown_at(&canvas, &target, 44, 12))[0] == 255)
+    # Flipping the canvas mirrors every layer and mask about its middle, undone in one step.
+    try canvas.flip_canvas(true)
+    assert((try shown_at(&canvas, &target, 20, 12))[0] == 255 and (try shown_at(&canvas, &target, 28, 12))[0] == 0)
+    assert((try canvas.layer_at(12, 44)) == 1 and (try canvas.layer_at(44, 44)) == -1)
+    try canvas.undo()
+    assert((try shown_at(&canvas, &target, 36, 12))[0] == 0 and (try shown_at(&canvas, &target, 44, 12))[0] == 255)
+    assert((try canvas.layer_at(44, 44)) == 1)
+
+test "groups hold layers, move and save with them; masks fill, disable and load as selections":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    let red = try canvas.add_layer("Red")
+    let green = try canvas.add_layer("Green")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(8, 8, 16, 16, 0)
+    try canvas.fill(red, false)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, false)
+    try canvas.select_rectangle(40, 40, 16, 16, 0)
+    try canvas.fill(green, false)
+    try canvas.deselect()
+    # The red square's 256 pixels count at full red and no green; transparency is not counted.
+    try canvas.measure_histogram(red)
+    assert((try canvas.histogram(1, 255)) == 256 and (try canvas.histogram(2, 0)) == 256 and (try canvas.histogram(1, 0)) == 0)
+    # Both go into a group: listed below it, one deep.
+    let folder = try canvas.add_group("Folder")
+    try canvas.move_into(red, folder, -1)
+    try canvas.move_into(green, folder, -1)
+    assert(canvas.layer_count() == 3 and (try canvas.layer_is_group(2)) and (try canvas.layer_id(2)) == folder)
+    assert((try canvas.layer_id(0)) == red and (try canvas.layer_depth(0)) == 1 and (try canvas.layer_parent(1)) == folder and (try canvas.layer_depth(2)) == 0)
+    # The group's visibility gates everything in it.
+    try canvas.set_layer(folder, false, 1.0)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 0)
+    try canvas.set_layer(folder, true, 1.0)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 255)
+    # Inside, layers reorder among themselves; a top-level layer steps past the whole group.
+    try canvas.reorder_layer(red, 1)
+    assert((try canvas.layer_id(0)) == green and (try canvas.layer_id(1)) == red)
+    let loose = try canvas.add_layer("Loose")
+    try canvas.reorder_layer(loose, -1)
+    assert((try canvas.layer_id(0)) == loose and (try canvas.layer_id(3)) == folder)
+    # A black mask hides the red square; disabled, it hides nothing.
+    try canvas.set_mask(red, true, 1)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 0)
+    try canvas.enable_mask(red, false)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 255 and not (try canvas.layer_mask_enabled(2)))
+    try canvas.enable_mask(red, true)
+    # The green square's pixels loaded as the selection; a mask from it hides the red.
+    try canvas.select_from_layer(green, false, 0)
+    assert(canvas.selected_at(44, 44) == 255 and canvas.selected_at(12, 12) == 0)
+    try canvas.set_mask(red, false)
+    try canvas.set_mask(red, true, 2)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 0)
+    try canvas.deselect()
+    try canvas.select_from_layer(red, true, 0)
+    assert(canvas.selected_at(12, 12) == 0 and canvas.selected_at(44, 44) == 255)
+    try canvas.deselect()
+    # Two layers moved as one edit undo together.
+    try canvas.move_layer(green, 4, 0)
+    canvas.join_next_edit()
+    try canvas.move_layer(loose, 4, 0)
+    assert((try shown_at(&canvas, &target, 41, 44))[1] == 0)
+    # One undo takes back the (invisible) loose move and the green one it joined...
+    try canvas.undo()
+    assert((try shown_at(&canvas, &target, 41, 44))[1] == 255)
+    # ...and one redo brings both back.
+    try canvas.redo()
+    assert((try shown_at(&canvas, &target, 41, 44))[1] == 0)
+    try canvas.undo()
+    # The package keeps the group, what is in it, and the mask's state.
+    try canvas.enable_mask(red, false)
+    try canvas.save_package("build/canvas-groups.l2d")
+    let restored = try Canvas.open("build/canvas-groups.l2d")
+    defer restored.release()
+    let copy = restored.value()
+    assert(copy.layer_count() == 4 and (try copy.layer_is_group(3)) and (try copy.layer_depth(1)) == 1 and (try copy.layer_depth(0)) == 0)
+    assert((try copy.layer_name(2)) == "Red" and (try copy.layer_masked(2)) and not (try copy.layer_mask_enabled(2)))
+    discard(try shown_at(copy, &target, 0, 0))
+    assert((try shown_at(copy, &target, 12, 12))[0] == 255 and (try shown_at(copy, &target, 44, 44))[1] == 255)
+    # Removing the group takes what it holds.
+    try canvas.remove_layer(folder)
+    assert(canvas.layer_count() == 1 and (try canvas.layer_id(0)) == loose)
+
+test "a canvas binds headless, without a window, and edits with history":
+    var canvas = try Canvas(40, 30)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try canvas.bind_headless()
+    try canvas.set_layer(layer, true, 0.5)
+    assert(canvas.modified() and canvas.can_undo())
+    try canvas.undo()
+    assert(not canvas.modified() and math.abs((try canvas.layer_opacity(0)) - 1.0) < 0.001)
+
+test "a layer moved past the canvas keeps its pixels there: bounds, undo, saving and moving back":
+    var canvas = try Canvas(64, 48)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Square")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try canvas.select_rectangle(40, 8, 16, 16)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    try canvas.move_layer(layer, 100, 0)
+    assert(try canvas.measure_content(layer))
+    assert(canvas.content_left() == 140 and canvas.content_width() == 16 and canvas.content_top() == 8)
+    try canvas.undo()
+    assert((try canvas.measure_content(layer)) and canvas.content_left() == 40)
+    try canvas.redo()
+    # Reveal All grows the canvas to hold it, and undoes.
+    assert(try canvas.reveal_all())
+    assert(canvas.width() == 156 and canvas.height() == 48 and not (try canvas.reveal_all()))
+    try canvas.undo()
+    assert(canvas.width() == 64)
+    try canvas.save("build/canvas-past-gone.png")
+    let gone = try Image.open("build/canvas-past-gone.png")
+    defer gone.release()
+    assert((try gone.value().getpixel(45, 10)).a == 0.0)
+    # The package keeps what is past the canvas, and it comes back.
+    try canvas.save_package("build/canvas-past.l2d")
+    let reopened = try Canvas.open("build/canvas-past.l2d")
+    defer reopened.release()
+    let copy = reopened.value()
+    try copy.bind_headless()
+    let moved = try copy.layer_id(0)
+    assert((try copy.measure_content(moved)) and copy.content_left() == 140)
+    try copy.move_layer(moved, -100, 0)
+    try copy.save("build/canvas-past-back.png")
+    let back = try Image.open("build/canvas-past-back.png")
+    defer back.release()
+    let pixel = try back.value().getpixel(45, 10)
+    assert(pixel.r == 255.0 and pixel.a == 255.0)
+
+test "dragging a layer shows what it had past the canvas coming back":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Square")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(40, 8, 16, 16, 0)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    try canvas.move_layer(layer, 100, 0)
+    assert((try shown_at(&canvas, &target, 45, 10))[0] == 0)
+    # Mid-drag 100 pixels back: the square shows where it was.
+    let frame = try target.frame()
+    defer frame.release()
+    let root = try frame.value().target()
+    defer root.release()
+    try canvas.draw_moving(root, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0, layer, -100.0, 0.0)
+    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    var pixel: u8[4]
+    try target.read(pixel, gpu.Region(45, 10, 1, 1))
+    assert(pixel[0] == 255 and pixel[1] == 0)
+
+test "guides are added, moved, removed and cleared undoably, and saved with the document":
+    var canvas = try Canvas(64, 48)
+    defer canvas.close()
+    discard(try canvas.add_layer("Paint"))
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    let across = try canvas.add_guide(false, 12.0)
+    let down = try canvas.add_guide(true, 30.5)
+    assert(canvas.guide_count() == 2 and not (try canvas.guide_vertical(across)) and (try canvas.guide_position(down)) == 30.5)
+    # A drag of one guide is one step.
+    try canvas.move_guide(down, 32.0)
+    try canvas.move_guide(down, 40.0)
+    assert(canvas.undo_name() == "Move Guide")
+    try canvas.undo()
+    assert((try canvas.guide_position(down)) == 30.5 and canvas.undo_name() == "New Guide")
+    try canvas.remove_guide(across)
+    assert(canvas.guide_count() == 1 and (try canvas.guide_vertical(0)))
+    try canvas.save_package("build/canvas-guides.l2d")
+    let reopened = try Canvas.open("build/canvas-guides.l2d")
+    defer reopened.release()
+    assert(reopened.value().guide_count() == 1 and (try reopened.value().guide_position(0)) == 30.5)
+    try canvas.clear_guides()
+    assert(canvas.guide_count() == 0)
+    try canvas.undo()
+    assert(canvas.guide_count() == 1)
+
+test "text layers stay text: set, typed into, moved, saved and rasterised by painting":
+    var canvas = try Canvas(120, 60)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Words")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    assert(not (try canvas.layer_typed(0)) and (try canvas.font_family_count()) > 0)
+    try canvas.set_type(layer, "Hi", "Helvetica", "Bold", 30.0, 1.0, 0.0, 0.0, 10.0, 10.0)
+    assert((try canvas.layer_typed(0)) and (try canvas.layer_text(0)) == "Hi" and (try canvas.layer_font_style(0)) == "Bold")
+    assert((try canvas.measure_content(layer)) and canvas.content_left() >= 10 and canvas.content_left() < 16 and canvas.content_top() >= 10)
+    # Typing into it is one step with the setting before.
+    try canvas.set_type(layer, "Hi!", "Helvetica", "Bold", 30.0, 1.0, 0.0, 0.0, 10.0, 10.0)
+    try canvas.set_type(layer, "Hi!!", "Helvetica", "Bold", 30.0, 1.0, 0.0, 0.0, 10.0, 10.0)
+    assert(canvas.undo_name() == "Type")
+    # A separate session of typing is its own step, taken back to its start.
+    let before = canvas.step_serial()
+    canvas.separate_next_step()
+    try canvas.set_type(layer, "Hello", "Helvetica", "Regular", 30.0, 1.0, 0.0, 0.0, 10.0, 10.0)
+    try canvas.set_type(layer, "Hello.", "Helvetica", "Regular", 30.0, 1.0, 0.0, 0.0, 10.0, 10.0)
+    assert(canvas.step_serial() == before + 1)
+    try canvas.undo()
+    assert(canvas.step_serial() == before and (try canvas.layer_text(0)) == "Hi!!" and (try canvas.layer_font_style(0)) == "Bold")
+    # Moved, it stays text and its place follows.
+    try canvas.move_layer(layer, 20, 5)
+    assert((try canvas.layer_typed(0)) and (try canvas.layer_type_value(0, 4)) == 30.0 and (try canvas.layer_type_value(0, 5)) == 15.0)
+    # Saved and opened again, it is still text.
+    try canvas.save_package("build/canvas-type.l2d")
+    let reopened = try Canvas.open("build/canvas-type.l2d")
+    defer reopened.release()
+    assert((try reopened.value().layer_typed(0)) and (try reopened.value().layer_text(0)) == "Hi!!" and (try reopened.value().layer_type_value(0, 0)) == 30.0)
+    # Undo gives the text back; painting makes it pixels.
+    try canvas.undo()
+    assert((try canvas.layer_type_value(0, 4)) == 10.0)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, false)
+    try canvas.fill(layer, false)
+    assert(not (try canvas.layer_typed(0)))
+    try canvas.undo()
+    assert(try canvas.layer_typed(0))
+
+test "masks: unlinked they stay when the layer moves, copy to another layer, and invert through a preview":
+    var canvas = try Canvas(64, 32)
+    defer canvas.close()
+    let first = try canvas.add_layer("First")
+    let second = try canvas.add_layer("Second")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    let document = canvas.document else trap("bound")
+    try canvas.set_brush(1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.fill(first, false)
+    # A mask hiding the left half.
+    try canvas.select_rectangle(0, 0, 32, 32)
+    try canvas.set_mask(first, true, 2)
+    try canvas.deselect()
+    let first_index = (i64)(try canvas.index((u64)first))
+    let second_index = (i64)(try canvas.index((u64)second))
+    assert(try canvas.layer_mask_linked(first_index))
+    # Unlinked, a move leaves the mask where it was.
+    try canvas.link_mask(first, false)
+    try canvas.move_layer(first, 8, 0)
+    let mask = (document.find((u64)first) else trap("layer")).mask_tiles() else trap("mask")
+    let pixels = try alloc f32[(usize)64 * 32 * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    try mask.read(pixels)
+    assert(pixels[(10 * 64 + 31) * 4] > 0.9 and pixels[(10 * 64 + 33) * 4] < 0.1)
+    try canvas.undo()
+    try canvas.undo()
+    assert(try canvas.layer_mask_linked(first_index))
+    # Copied to the second layer.
+    try canvas.copy_mask(first, second)
+    assert(try canvas.layer_masked(second_index))
+    let copied = (document.find((u64)second) else trap("layer")).mask_tiles() else trap("copied mask")
+    try copied.read(pixels)
+    assert(pixels[(10 * 64 + 5) * 4] > 0.9 and pixels[(10 * 64 + 60) * 4] < 0.1)
+    # Inverted through a preview of the mask; dropped, it is as it was.
+    try canvas.begin_preview(second, true)
+    try canvas.preview_adjust(2)
+    let shown = (document.find((u64)second) else trap("layer")).mask_tiles() else trap("mask")
+    try shown.read(pixels)
+    assert(pixels[(10 * 64 + 5) * 4] < 0.1 and pixels[(10 * 64 + 60) * 4] > 0.9)
+    try canvas.end_preview(false)
+    let kept = (document.find((u64)second) else trap("layer")).mask_tiles() else trap("mask")
+    try kept.read(pixels)
+    assert(pixels[(10 * 64 + 5) * 4] > 0.9)
+
+test "a group's mask hides what the group holds, the group flattened on its own":
+    var canvas = try Canvas(64, 32)
+    defer canvas.close()
+    let group = try canvas.add_group("Group")
+    let layer = try canvas.add_layer("Red")
+    try canvas.move_into(layer, group, 0)
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    let document = canvas.document else trap("bound")
+    try canvas.set_brush(1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.fill(layer, false)
+    # The group's mask reveals only the right half.
+    try canvas.select_rectangle(32, 0, 32, 32)
+    try canvas.set_mask(group, true, 2)
+    try canvas.deselect()
+    var composer = canvas.composer else trap("bound")
+    let flat = try composer.tile(document, 0, 0, 0)
+    var bytes: u8[8]
+    try flat.read(bytes, gpu.Region(10, 10, 1, 1))
+    assert(from_half((u16)bytes[6] | ((u16)bytes[7] << 8)) < 0.01)
+    try flat.read(bytes, gpu.Region(50, 10, 1, 1))
+    assert(from_half((u16)bytes[6] | ((u16)bytes[7] << 8)) > 0.99)
+
+test "a PSD opens with its groups and its layers' masks":
+    let bytes: u8[280] = [56, 66, 80, 83, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 2, 0, 8, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 242, 0, 0, 0, 238, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 56, 66, 73, 77, 110, 111, 114, 109, 255, 0, 0, 0, 0, 0, 0, 28, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 56, 66, 73, 77, 108, 115, 99, 116, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 4, 0, 0, 0, 0, 0, 6, 0, 1, 0, 0, 0, 6, 0, 2, 0, 0, 0, 6, 255, 254, 0, 0, 0, 4, 56, 66, 73, 77, 110, 111, 114, 109, 255, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 3, 75, 105, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 56, 66, 73, 77, 110, 111, 114, 109, 255, 0, 0, 0, 0, 0, 0, 28, 0, 0, 0, 0, 0, 0, 0, 0, 3, 71, 114, 112, 56, 66, 73, 77, 108, 115, 99, 116, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255]
+    try files.write("build/canvas-groups.psd", bytes[..<bytes.length])
+    let opened = try Canvas.open("build/canvas-groups.psd")
+    defer opened.release()
+    let canvas = opened.value()
+    assert(canvas.layer_count() == 2)
+    var group_index: i64 = -1
+    var kid_index: i64 = -1
+    for index in 0..<canvas.layer_count():
+        if try canvas.layer_is_group(index):
+            group_index = index
+        else:
+            kid_index = index
+    assert(group_index >= 0 and kid_index >= 0)
+    assert((try canvas.layer_parent(kid_index)) == (try canvas.layer_id(group_index)))
+    assert(try canvas.layer_masked(kid_index))
+
+test "whole layers copy and paste: a group with its masked, styled layer, here or centred on another document":
+    var first = try Canvas(64, 32)
+    defer first.close()
+    let group = try first.add_group("Group")
+    let red = try first.add_layer("Red")
+    try first.move_into(red, group, 0)
+    first.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try first.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, false)
+    try first.fill(red, false)
+    # The mask reveals the left half; the layer has a drop shadow.
+    try first.select_rectangle(0, 0, 32, 32, 0)
+    try first.set_mask(red, true, 2)
+    try first.deselect()
+    try first.set_style_value(red, 0, 1.0)
+    Canvas.forget_copied_layers()
+    try first.copy_layer(group)
+    assert(Canvas.copied_layers() == 1)
+    # Pasted on top of the same document: a second group holding a copy, one step.
+    let pasted = try first.paste_layers(0, -1)
+    assert(first.layer_count() == 4 and (try first.layer_id(3)) == pasted and (try first.layer_is_group(3)))
+    assert((try first.layer_parent(2)) == pasted and (try first.layer_name(2)) == "Red" and (try first.layer_masked(2)) and (try first.style_value(2, 0)) == 1.0)
+    try first.undo()
+    assert(first.layer_count() == 2)
+    # Into a document twice the size: centred, the mask moving with the pixels.
+    var second = try Canvas(128, 64)
+    defer second.close()
+    try second.bind_sharing(&first)
+    let landed = try second.paste_layers(0, -1)
+    assert(second.layer_count() == 2 and (try second.layer_id(1)) == landed)
+    let document = second.document else trap("bound")
+    let child = document.find((u64)(try second.layer_id(0))) else trap("pasted layer")
+    let pixels = try alloc f32[128 * 64 * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    try (child.tiles() else trap("pixels")).read(pixels)
+    assert(pixels[(20 * 128 + 40) * 4 + 3] > 0.99 and pixels[(20 * 128 + 10) * 4 + 3] < 0.01 and pixels[(10 * 128 + 40) * 4 + 3] < 0.01)
+    try (child.mask_tiles() else trap("mask")).read(pixels)
+    assert(pixels[(20 * 128 + 40) * 4] > 0.99 and pixels[(20 * 128 + 80) * 4] < 0.01 and pixels[(20 * 128 + 10) * 4] > 0.99)
+    Canvas.forget_copied_layers()
+    assert(Canvas.copied_layers() == 0)
+
+test "shape layers stay shapes: drawn, moved, scaled crisp, saved, and pixels once painted":
+    var canvas = try Canvas(64, 48)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Rectangle")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    let document = canvas.document else trap("bound")
+    let pixels = try alloc f32[64 * 48 * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    # A red square with a blue 2-pixel stroke.
+    try canvas.set_shape(layer, 0, 8.0, 8.0, 16.0, 16.0, 5, 0.0, true, 1.0, 0.0, 0.0, true, 0.0, 0.0, 1.0, 2.0)
+    assert((try canvas.layer_shaped(0)) and canvas.undo_name() == "Shape")
+    try ((document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")).read(pixels)
+    assert(pixels[(16 * 64 + 16) * 4] > 0.99 and pixels[(8 * 64 + 16) * 4 + 2] > 0.5 and pixels[(30 * 64 + 30) * 4 + 3] < 0.01)
+    # Moved 20 right: still a shape, drawn where it went.
+    try canvas.move_layer(layer, 20, 0)
+    assert((try canvas.layer_shaped(0)) and (try canvas.layer_shape_value(0, 20)) == 20.0)
+    try ((document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")).read(pixels)
+    assert(pixels[(16 * 64 + 36) * 4] > 0.99 and pixels[(16 * 64 + 16) * 4 + 3] < 0.01)
+    # Scaled 2× about its corner: the edge stays a hard two-pixel stroke, not a blur.
+    try canvas.begin_transform(layer)
+    try canvas.preview_transform(2.0, 2.0, 0.0, 0.0, 0.0, 28.0, 8.0)
+    try canvas.end_transform(true)
+    assert((try canvas.layer_shaped(0)) and math.abs((try canvas.layer_shape_value(0, 16)) - 2.0) < 1e-9 and math.abs((try canvas.layer_shape_value(0, 15)) - 4.0) < 1e-9)
+    try ((document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")).read(pixels)
+    assert(pixels[(30 * 64 + 45) * 4] > 0.99 and pixels[(30 * 64 + 45) * 4 + 3] > 0.99)
+    # Restyled: no stroke now, the place kept.
+    let offset = try canvas.layer_shape_value(0, 20)
+    try canvas.restyle_shape(layer, true, 0.0, 1.0, 0.0, false, 0.0, 0.0, 0.0, 1.0, 4.0, 5)
+    assert((try canvas.layer_shape_value(0, 11)) == 0.0 and (try canvas.layer_shape_value(0, 20)) == offset)
+    # Saved and opened again, it is still that shape.
+    try canvas.save_package("build/canvas-shape.l2d")
+    let reopened = try Canvas.open("build/canvas-shape.l2d")
+    defer reopened.release()
+    assert((try reopened.value().layer_shaped(0)) and (try reopened.value().layer_shape_value(0, 9)) == 1.0 and (try reopened.value().layer_shape_value(0, 20)) == offset)
+    # Painted on: pixels from then on.
+    try canvas.set_brush(4.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, false)
+    try canvas.begin_stroke(layer, 40.0, 20.0)
+    try canvas.end_stroke()
+    assert(not (try canvas.layer_shaped(0)))
+    try canvas.undo()
+    assert(try canvas.layer_shaped(0))

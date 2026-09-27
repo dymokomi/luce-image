@@ -8,10 +8,93 @@
 #       color: the picture shifted by the clone offset, a blurred copy, a lightened (dodge)
 #       or darkened (burn) copy, the healed spot (worked out when the stroke ends; a dark
 #       wash marks it meanwhile). retouch_effects.lucb makes those images, only where
-#       the stroke reaches. Smudge works on the CPU dab by dab (warp.lucb); Liquify's
+#       the stroke reaches. Smudge works on the CPU dab by dab (luce-painting's smudge); Liquify's
 #       push moves a displacement grid (canvas/liquifying.lucb). Each stroke is one undo step.
 #
 #==============================================================================================
+
+extend Canvas:
+    ## The tool strokes use: 0 paint (the brush), 1 clone stamp, 2 spot
+    ## healing, 3 blur, 4 smudge, 5 push (Liquify's forward warp). Retouching
+    ## takes the brush's diameter, hardness and opacity (strength).
+    pub mutating func set_retouch(kind: i64) -> !:
+        if kind < retouch_paint or kind > retouch_burn:
+            error(invalid, "retouching tools are 0 paint, 1 clone, 2 heal, 3 blur, 4 smudge, 5 push, 6 dodge, 7 burn")
+        self.retouch = kind
+
+    ## Dodge and Burn's range (0 shadows, 1 midtones, 2 highlights) and
+    ## exposure (0..1), as their header's.
+    pub mutating func set_tone(range: i64, exposure: f64) -> !:
+        if range < 0 or range > 2 or not math.is_finite(exposure):
+            error(invalid, "a tone range is 0..2 and its exposure finite")
+        self.tone_range = range
+        self.tone_exposure = math.clamp(exposure, 0.0, 1.0)
+
+    ## Where the clone stamp copies from (Alt-click): a new source starts a new alignment.
+    pub mutating func set_clone_source(x: f64, y: f64):
+        self.clone_x = x
+        self.clone_y = y
+        self.clone_set = true
+        self.clone_offset_set = false
+
+    ## Aligned: every stroke keeps the first one's offset; otherwise each
+    ## starts at the source again. `all_layers` samples everything shown.
+    pub mutating func set_clone_options(aligned: bool, all_layers: bool):
+        self.clone_aligned = aligned
+        self.clone_all = all_layers
+
+    pub func has_clone_source() -> bool:
+        return self.clone_set
+
+    ## What a Clone Stamp stroke on layer `id` at (`x`, `y`) would lay down:
+    ## the source under a brush `diameter` pixels wide, cut to its circle, as
+    ## RGBA8 (sRGB, straight alpha, faded by `opacity`), a square the
+    ## diameter rounded up — for the preview inside the brush. The source is the
+    ## layer's own pixels, or with All Layers the picture; only the cells under
+    ## the brush are read back.
+    pub mutating func clone_preview(id: i64, x: f64, y: f64, diameter: f64, opacity: f64 = 1.0) -> const u8[]!:
+        let document = self.document else error(invalid, "draw the document once before previewing a clone")
+        let side = (usize)math.max(1.0, math.min(1024.0, math.ceil(diameter)))
+        if self.preview_bytes.length != side * side * 4:
+            if self.preview_bytes.length > 0:
+                free(self.preview_bytes) in memory.heap
+            self.preview_bytes = try alloc u8[side * side * 4] in memory.heap
+        let out = self.preview_bytes
+        for index in 0..<out.length:
+            out[index] = 0
+        let left = (i64)math.floor(self.clone_sample_x(x) - (f64)side * 0.5)
+        let top = (i64)math.floor(self.clone_sample_y(y) - (f64)side * 0.5)
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let first_column = (i64)math.max(0.0, math.floor((f64)left / (f64)tile_size))
+        let first_row = (i64)math.max(0.0, math.floor((f64)top / (f64)tile_size))
+        let last_column = math.imin((i64)tile_columns(self.extent_x), (left + (i64)side + (i64)tile_size - 1) // (i64)tile_size)
+        let last_row = math.imin((i64)tile_columns(self.extent_y), (top + (i64)side + (i64)tile_size - 1) // (i64)tile_size)
+        if last_column > first_column and last_row > first_row:
+            let device = self.device else error(invalid, "draw the document once before previewing a clone")
+            # The cells under the brush, read back together.
+            var read = CloneRead(canvas = &self, layer = layer, out = out, side = side, left = left, top = top,
+                                 first_column = first_column, first_row = first_row, columns = last_column - first_column)
+            try read_pieces(device, (usize)((last_column - first_column) * (last_row - first_row)), (void*)&read, clone_piece, clone_visit)
+        # The brush's circle: nothing past it; inside, faded by `opacity`.
+        let radius = (f64)side * 0.5
+        let fade = math.clamp(opacity, 0.0, 1.0)
+        for py in 0..<side:
+            for px in 0..<side:
+                let dx = (f64)px + 0.5 - radius
+                let dy = (f64)py + 0.5 - radius
+                let at = (py * side + px) * 4 + 3
+                if dx * dx + dy * dy > radius * radius:
+                    out[at] = 0
+                else:
+                    out[at] = (u8)math.round((f64)out[at] * fade)
+        return out
+
+    ## Where a clone stroke through (`x`, `y`) takes its pixels from, for the source crosshair.
+    pub func clone_sample_x(x: f64) -> f64:
+        return x + (f64)self.clone_offset_x if self.clone_aligned and self.clone_offset_set else self.clone_x
+
+    pub func clone_sample_y(y: f64) -> f64:
+        return y + (f64)self.clone_offset_y if self.clone_aligned and self.clone_offset_set else self.clone_y
 
 ## The retouching tools `Canvas.set_retouch` picks for strokes: 0 is plain paint.
 let retouch_paint: i64 = 0
@@ -75,7 +158,11 @@ func begin_retouch(canvas: Canvas*, id: u64, x: f64, y: f64, pen: Pen) -> !:
         canvas.heal_opacity = brush.opacity
         brush.color = gpu.Color(0.12, 0.12, 0.12, 1.0)
         brush.opacity = 0.45
-    let stroke = begin_boxed(&painter, document, id, brush, x, y, false, pen, &canvas.brush_images) catch failure:
+    let begun = stroke_target(document, id, false, false) catch failure:
+        if let unused = source:
+            unused.release(unused.context)
+        error(failure.code, failure.message)
+    let stroke = begin_boxed(&painter, begun, brush, x, y, false, pen, &canvas.brush_images) catch failure:
         if let unused = source:
             unused.release(unused.context)
         error(failure.code, failure.message)
@@ -83,9 +170,10 @@ func begin_retouch(canvas: Canvas*, id: u64, x: f64, y: f64, pen: Pen) -> !:
     # A clone is stamped over what is there; a blur replaces it by coverage,
     # so softened edges thin out instead of piling up alpha with each pass.
     if let given = source:
-        try stroke.use_effect_source(&painter, document, given, 1.0 if kind == retouch_clone else 2.0, brush.opacity)
+        try stroke.use_effect_source(&painter, try stroke_target(document, id, false, true), given, 1.0 if kind == retouch_clone else 2.0, brush.opacity)
     try canvas.remember(id, try stroke.original().clone(), name = retouch_name(kind))
     canvas.stroke = stroke
+    canvas.stroke_layer = id
 
 ## Continue a smudge to (`x`, `y`): recorded for the worker, or
 ## walked here without one. The next frame shows it.
@@ -160,48 +248,6 @@ func retouch_name(kind: i64) -> str:
         return "Burn"
     return "Blur Tool"
 
-## `Canvas.clone_preview`: what a Clone Stamp stroke at (`x`, `y`) would lay
-## down, as the source under a brush `diameter` pixels wide — the layer's own
-## pixels, or with All Layers the picture — cut to the brush's circle, as
-## RGBA8 (sRGB, straight alpha), `side` × `side` with `side` the diameter
-## rounded up. Only the cells under it are read back.
-func clone_preview_pixels(canvas: Canvas*, id: u64, x: f64, y: f64, diameter: f64, opacity: f64) -> const u8[]!:
-    let document = canvas.document else error(invalid, "draw the document once before previewing a clone")
-    let side = (usize)math.max(1.0, math.min(1024.0, math.ceil(diameter)))
-    if canvas.preview_bytes.length != side * side * 4:
-        if canvas.preview_bytes.length > 0:
-            free(canvas.preview_bytes) in memory.heap
-        canvas.preview_bytes = try alloc u8[side * side * 4] in memory.heap
-    let out = canvas.preview_bytes
-    for index in 0..<out.length:
-        out[index] = 0
-    let left = (i64)math.floor(canvas.clone_sample_x(x) - (f64)side * 0.5)
-    let top = (i64)math.floor(canvas.clone_sample_y(y) - (f64)side * 0.5)
-    let layer = document.find(id) else error(invalid, "no such layer")
-    let first_column = (i64)math.max(0.0, math.floor((f64)left / (f64)tile_size))
-    let first_row = (i64)math.max(0.0, math.floor((f64)top / (f64)tile_size))
-    let last_column = math.imin((i64)tile_columns(canvas.extent_x), (left + (i64)side + (i64)tile_size - 1) // (i64)tile_size)
-    let last_row = math.imin((i64)tile_columns(canvas.extent_y), (top + (i64)side + (i64)tile_size - 1) // (i64)tile_size)
-    if last_column > first_column and last_row > first_row:
-        let device = canvas.device else error(invalid, "draw the document once before previewing a clone")
-        # The cells under the brush, read back together.
-        var read = CloneRead(canvas = canvas, layer = layer, out = out, side = side, left = left, top = top,
-                             first_column = first_column, first_row = first_row, columns = last_column - first_column)
-        try read_pieces(device, (usize)((last_column - first_column) * (last_row - first_row)), (void*)&read, clone_piece, clone_visit)
-    # The brush's circle: nothing past it; inside, faded by `opacity`.
-    let radius = (f64)side * 0.5
-    let fade = math.clamp(opacity, 0.0, 1.0)
-    for py in 0..<side:
-        for px in 0..<side:
-            let dx = (f64)px + 0.5 - radius
-            let dy = (f64)py + 0.5 - radius
-            let at = (py * side + px) * 4 + 3
-            if dx * dx + dy * dy > radius * radius:
-                out[at] = 0
-            else:
-                out[at] = (u8)math.round((f64)out[at] * fade)
-    return out
-
 ## A cell's half-float texels into the preview at (`at_x`, `at_y`), as sRGB bytes.
 func copy_cell(out: u8[], side: usize, bytes: const u8[], at_x: i64, at_y: i64):
     for ty in 0..<(i64)tile_size:
@@ -216,12 +262,9 @@ func copy_cell(out: u8[], side: usize, bytes: const u8[], at_x: i64, at_y: i64):
             let target = (usize)(py * (i64)side + px) * 4
             for channel in 0..<(usize)4:
                 let value = (f64)from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8))
-                let shown = value if channel == 3 else srgb_of(value)
+                let shown = value if channel == 3 else transfer.srgb_encode(math.clamp(value, 0.0, 1.0))
                 out[target + channel] = (u8)math.round(math.clamp(shown, 0.0, 1.0) * 255.0)
 
-func srgb_of(linear: f64) -> f64:
-    let v = math.clamp(linear, 0.0, 1.0)
-    return v * 12.92 if v <= 0.0031308 else 1.055 * math.pow(v, 1.0 / 2.4) - 0.055
 
 ## A clone preview's cells being read: from (`first_column`, `first_row`),
 ## `columns` wide, into `out` (`side` square at `left`, `top`).

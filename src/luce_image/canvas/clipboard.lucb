@@ -11,29 +11,61 @@
 #
 #==============================================================================================
 
+extend Canvas:
+    ## Copy the selected pixels of layer `id` as a picture for the app to put on
+    ## the system clipboard, cropped to the selection and faded by its coverage —
+    ## or of the flattened document when `merged` (Copy Merged). With `cut` they
+    ## also leave the layer, undoably; cutting takes a selection of one layer.
+    ## Without a selection the whole layer (or document) is copied.
+    pub mutating func copy_selection(id: i64, merged: bool = false, cut: bool = false) -> interop.Reference[Image]!:
+        if cut and (merged or self.current().is_empty()):
+            error(invalid, "cut takes a selection of one layer")
+        var selected = try read_selected(&self, id, merged)
+        defer free(selected.rgba) in memory.heap
+        let picture = try Image.from_rgba8(selected.width, selected.height, selected.rgba)
+        errdefer picture.release()
+        copied_left = selected.left
+        copied_top = selected.top
+        copied_width = (u32)selected.width
+        copied_height = (u32)selected.height
+        if cut:
+            try erase_selected(&self, (u64)id)
+        return picture
+
+    ## The selected pixels of layer `id` (of the flattened document when
+    ## `merged`) as an RGBA image cropped to the selection and faded by its
+    ## coverage, as Copy takes them: Define Brush Preset's source.
+    pub mutating func selection_image(id: i64, merged: bool = false) -> interop.Reference[Image]!:
+        var selected = try read_selected(&self, id, merged)
+        defer free(selected.rgba) in memory.heap
+        return try Image.from_rgba8(selected.width, selected.height, selected.rgba)
+
+    ## `picture` (the clipboard's) on a new top layer, centred on a document
+    ## point; its id.
+    pub mutating func paste(picture: interop.Reference[Image], center_x: i64, center_y: i64) -> i64!:
+        try self.begin_edit("Paste")
+        defer self.end_edit()
+        return try paste_picture(&self, picture, center_x, center_y)
+
+    ## Layer via Copy (via Cut with `cut`): a new layer above `id` holding its
+    ## selected pixels, or all of them without a selection; its id.
+    pub mutating func layer_via_copy(id: i64, cut: bool = false) -> i64!:
+        try self.begin_edit("Layer via Copy")
+        defer self.end_edit()
+        return try layer_from_selection(&self, id, cut)
+
+    ## `picture` (the clipboard's) where it was copied from when it is what
+    ## this process copied last, else centred; its layer's id.
+    pub mutating func paste_in_place(picture: interop.Reference[Image]) -> i64!:
+        try self.begin_edit("Paste in Place")
+        defer self.end_edit()
+        return try paste_picture(&self, picture, 0, 0, in_place = true)
+
 ## Where the last copy this process made came from, for Paste in Place.
 var copied_left: i64 = 0
 var copied_top: i64 = 0
 var copied_width: u32 = 0
 var copied_height: u32 = 0
-
-## `Canvas.copy_selection`: the selected pixels of layer `id`, or of the flattened
-## document when `merged`, as a picture for the clipboard; with `cut` they also
-## leave the layer. Without a selection the whole layer (or document) goes.
-func copy_picture(canvas: Canvas*, id: i64, merged: bool, cut: bool) -> interop.Reference[Image]!:
-    if cut and (merged or canvas.current().is_empty()):
-        error(invalid, "cut takes a selection of one layer")
-    var selected = try read_selected(canvas, id, merged)
-    defer free(selected.rgba) in memory.heap
-    let picture = try Image.from_rgba8(selected.width, selected.height, selected.rgba)
-    errdefer picture.release()
-    copied_left = selected.left
-    copied_top = selected.top
-    copied_width = (u32)selected.width
-    copied_height = (u32)selected.height
-    if cut:
-        try erase_selected(canvas, (u64)id)
-    return picture
 
 ## The selected pixels, straight 8-bit sRGB RGBA (on the heap, the caller's),
 ## and the box they came from.
@@ -153,8 +185,7 @@ func copy_layer_window(tiles: const Tiles*, rgba: u8[], left: i64, top: i64, wid
     let samples = try alloc f32[side * side * 4] in memory.heap
     defer free(samples) in memory.heap
     var steps: u8[4097] = ---
-    for step in 0..<(usize)4097:
-        steps[step] = srgb_byte((f64)step / 4096.0)
+    transfer.srgb_byte_table(steps)
     memory.set(rgba, 0)
     let first_column = (u32)(left // (i64)tile_size)
     let last_column = (u32)((left + (i64)width - 1) // (i64)tile_size)

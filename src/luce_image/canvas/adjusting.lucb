@@ -1,0 +1,188 @@
+#==============================================================================================
+#
+#   canvas/adjusting - Adjustments, Curves and their previews
+#
+#   DESCRIPTION:
+#       The adjustment parameters and Curves points the next adjustment takes, applying one
+#       to a layer, and the preview session a dialog shows until it is kept or dropped.
+#
+#==============================================================================================
+
+extend Canvas:
+    ## Stage parameter `index` (0..22) of the next adjustment, as adjust.frag
+    ## lists them for each kind; `clear_adjustments` sets them all to 0.
+    pub mutating func set_adjustment(index: i64, value: f64) -> !:
+        if index < 0 or index >= (i64)parameter_count:
+            error(invalid, "adjustments take parameters 0..22")
+        if not math.is_finite(value):
+            error(invalid, "adjustment parameters must be finite")
+        self.adjustment[(usize)index] = value
+
+    pub mutating func clear_adjustments():
+        for index in 0..<parameter_count:
+            self.adjustment[index] = 0.0
+
+    ## Rewrite a layer's pixels with destructive adjustment `kind` and the
+    ## staged parameters: 0 brightness/contrast, 1 hue/saturation/lightness,
+    ## 2 invert, 3 levels, 4 desaturate, 5 threshold, 6 posterize, 7 curves
+    ## (the curves set with `add_curve_point`), 8 exposure, 9 black & white,
+    ## 10 color balance, 11 gradient map, 12 vignette, 13 grain, 14 noise,
+    ## 16 camera raw, 17 replace color (adjust.frag lists their parameters). Undoable.
+    pub mutating func adjust_layer(id: i64, kind: i64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        if kind < 0 or kind >= (i64)adjustment_count:
+            error(invalid, "no such adjustment")
+        # Shown and kept at once: the mask when it is being edited, within the selection.
+        try self.begin_preview(id, try self.editing_mask_of(id))
+        self.preview_adjust(kind) catch failure:
+            discard(self.end_preview(false) catch: recover ())
+            error(failure.code, failure.message)
+        try self.end_preview(true)
+
+    pub static func adjustment_count() -> i64:
+        return (i64)adjustment_count
+
+    ## Add a control point to a curve for the `curves` adjustment (kind 7):
+    ## channel 0 is RGB, applied after 1 red, 2 green and 3 blue; x and y in
+    ## 0..1; a point at an existing x replaces it; at most 16 per channel.
+    pub mutating func add_curve_point(channel: i64, x: f64, y: f64) -> !:
+        try self.curves.add(try curve_channel(channel), x, y)
+
+    ## Empty a channel's curve before its points are added one by one.
+    pub mutating func clear_curve(channel: i64) -> !:
+        try self.curves.clear(try curve_channel(channel))
+
+    ## Reset a channel's curve to the identity.
+    pub mutating func reset_curve(channel: i64) -> !:
+        let index = try curve_channel(channel)
+        try self.curves.clear(index)
+        try self.curves.add(index, 0.0, 0.0)
+        try self.curves.add(index, 1.0, 1.0)
+
+    pub func curve_point_count(channel: i64) -> i64!:
+        return (i64)(try self.curves.channel(try curve_channel(channel))).length()
+
+    pub func curve_point_x(channel: i64, index: i64) -> f64!:
+        let curve = try self.curves.channel(try curve_channel(channel))
+        if index < 0 or index >= (i64)curve.length():
+            error(invalid, "no such curve point")
+        return curve.x((usize)index)
+
+    pub func curve_point_y(channel: i64, index: i64) -> f64!:
+        let curve = try self.curves.channel(try curve_channel(channel))
+        if index < 0 or index >= (i64)curve.length():
+            error(invalid, "no such curve point")
+        return curve.y((usize)index)
+
+    ## The curve's output for `x` on `channel`, for drawing it.
+    pub func curve_value(channel: i64, x: f64) -> f64!:
+        return (try self.curves.channel(try curve_channel(channel))).evaluate(x)
+
+    ## The 256×1 table the curves adjustment samples, refreshed from the
+    ## curves; none for other kinds.
+    mutating func curve_table(kind: u32) -> gpu.Texture?!:
+        if kind != curves:
+            return none
+        let device = self.device else error(invalid, "draw the document once before adjusting")
+        var table = self.table else try gpu.Texture.create(device, (u32)lut_size, 1, gpu.Format.rgba8_linear)
+        self.table = table
+        var bytes: u8[1024]
+        try self.curves.fill(bytes)
+        try table.upload(bytes)
+        return table
+
+    ## Start previewing edits to a layer: until `end_preview`, each
+    ## `preview_adjust`, `preview_blur` or `preview_transform` shows its effect on the layer's
+    ## pixels from before the preview began, not on the previous preview.
+    ## Start showing edits live on layer `id`'s pixels, or on its mask when
+    ## `mask` (a gradient there); `end_preview` keeps or drops them.
+    pub mutating func begin_preview(id: i64, mask: bool = false) -> !:
+        try self.require_open()
+        try self.require_idle()
+        let document = self.document else error(invalid, "draw the document once before previewing")
+        # While Quick Mask is on, filters and adjustments change its mask.
+        let on_mask = mask or self.quick_mask()
+        let target = self.paint_target(id)
+        let layer = document.find((u64)target) else error(invalid, "no such layer")
+        let tiles = ((layer.mask_tiles() else error(invalid, "the layer has no mask")) if on_mask else (layer.tiles() else error(invalid, "a group cannot be previewed")))
+        self.preview = Snapshot(layer = (u64)target, tiles = try tiles.clone(), mask = on_mask)
+
+    pub func previewing() -> bool:
+        return self.preview != none
+
+    ## Show adjustment `kind` (as `adjust_layer`) applied to the layer as it was when the preview began.
+    pub mutating func preview_adjust(kind: i64) -> !:
+        self.preview_name = adjustment_name(kind)
+        if kind < 0 or kind >= (i64)adjustment_count:
+            error(invalid, "no such adjustment")
+        let table = try self.curve_table((u32)kind)
+        let layer = try self.restore_preview()
+        let mask = try self.whiten_previewed_mask()
+        let document = self.document else trap("preview without a document")
+        let adjuster = self.adjuster else trap("preview without an adjuster")
+        try adjuster.apply(document, layer, (u32)kind, self.adjustment[..<parameter_count], table, mask)
+        try self.restrict_preview(layer)
+
+    ## Finish the preview: keep what it shows as one undoable edit, or put the
+    ## layer's pixels back as they were.
+    pub mutating func end_preview(keep: bool) -> !:
+        try self.require_open()
+        # A filter or gradient shown at the view's level is made at full size now.
+        if keep:
+            try apply_filter_preview(&self)
+            try apply_gradient_preview(&self)
+        drop_filter_preview(&self)
+        drop_gradient_preview(&self)
+        let preview = self.preview else error(invalid, "no preview is in progress")
+        self.preview = none
+        let document = self.document else trap("preview without a document")
+        if keep:
+            try self.remember(preview.layer, preview.tiles, preview.mask, name = self.preview_name)
+        elif preview.mask:
+            var shown = try document.take_mask(preview.layer, preview.tiles)
+            shown.destroy()
+        else:
+            var shown = try document.take_tiles(preview.layer, preview.tiles)
+            shown.destroy()
+
+    ## Show the previewed layer (or mask) as it was when the preview began, the
+    ## edit still under way: a dialog's Preview unchecked.
+    pub mutating func show_preview_original() -> !:
+        discard(try self.restore_preview())
+
+    ## When the preview is of a mask, fill its missing cells (which count as
+    ## white) with white tiles, so an adjustment or filter reaches them too;
+    ## whether it is a mask.
+    mutating func whiten_previewed_mask() -> bool!:
+        let preview = self.preview else return false
+        if not preview.mask:
+            return false
+        let document = self.document else trap("preview without a document")
+        let mask = (document.find(preview.layer) else trap("previewed layer")).mask_tiles() else trap("previewed mask")
+        for row in 0..<mask.rows():
+            for column in 0..<mask.columns():
+                if mask.tile(column, row) != none:
+                    continue
+                var white = try mask.blank()
+                errdefer white.destroy()
+                let frame = try white.frame()
+                defer frame.release()
+                discard(try frame.value().present(gpu.Color(1.0, 1.0, 1.0, 1.0)))
+                try mask.set(column, row, white)
+        return true
+
+    ## Put the previewed layer's original pixels back; the layer's id.
+    mutating func restore_preview() -> u64!:
+        try self.require_open()
+        drop_filter_preview(&self)
+        drop_gradient_preview(&self)
+        let preview = self.preview else error(invalid, "no preview is in progress")
+        let document = self.document else trap("preview without a document")
+        if preview.mask:
+            var shown = try document.take_mask(preview.layer, try preview.tiles.clone())
+            shown.destroy()
+        else:
+            try document.set_tiles(preview.layer, try preview.tiles.clone())
+        return preview.layer
+

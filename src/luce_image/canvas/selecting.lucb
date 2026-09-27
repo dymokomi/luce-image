@@ -1,12 +1,267 @@
 #==============================================================================================
 #
-#   canvas/selecting - Where Load Selection and the magic wand read their pixels
+#   canvas/selecting - Selections: shapes, the wand, modify, move, and the pixels they read
 #
 #   DESCRIPTION:
-#       Both read a cell's tile at a time (selection_sources.lucb): a layer's (or mask's), or
-#       the composited picture's, read back from the GPU in batches.
+#       The Canvas's selection: marquee, lasso and polygon shapes, the magic wand, Select All,
+#       Deselect and Inverse, Modify and Grow, and moving the selection or what it holds.
+#       Load Selection and the wand read a cell's tile at a time (selection_sources.lucb): a
+#       layer's (or mask's), or the composited picture's, read back from the GPU in batches.
 #
 #==============================================================================================
+
+extend Canvas:
+    ## Load a layer's transparency — or with `mask` its mask — as the
+    ## selection, combined by `mode` (0 replace, 1 add, 2 subtract, 3
+    ## intersect): Photoshop's Cmd-click on a thumbnail.
+    pub mutating func select_from_layer(id: i64, mask: bool, mode: i64) -> !:
+        try self.require_open()
+        try self.remember_state("Load Selection")
+        let document = self.document else error(invalid, "draw the document once before selecting from a layer")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = (layer.mask_tiles() else error(invalid, "the layer has no mask")) if mask else (layer.tiles() else error(invalid, "a group has no pixels to select"))
+        # A mask cell never painted reveals everything.
+        var source = TilesSource(tiles = tiles)
+        let device = self.device else error(invalid, "draw the document once before selecting from a layer")
+        let reader = selection_sources.gpu_reader((void*)&source, device, tiles_cell_texture)
+        try self.live().load(reader, 0 if mask else 3, 255 if mask else 0, try selection_mode(mode))
+
+    ## Select a rectangle, combined with the selection by `mode` (0 replace,
+    ## 1 add, 2 subtract, 3 intersect).
+    pub mutating func select_rectangle(x: i64, y: i64, width: i64, height: i64, mode: i64 = 0) -> !:
+        try self.require_open()
+        try self.remember_state("Select")
+        if not self.shaping():
+            self.live().rectangle(x, y, width, height, try selection_mode(mode))
+            return
+        var shape = try Selection.create(self.extent_x, self.extent_y)
+        defer shape.destroy()
+        shape.rectangle(x, y, width, height, Mode.replace)
+        try self.merge_shape(&shape, mode)
+
+    ## Select an ellipse inscribed in a rectangle, combined by `mode`.
+    pub mutating func select_ellipse(x: i64, y: i64, width: i64, height: i64, mode: i64 = 0) -> !:
+        try self.require_open()
+        try self.remember_state("Select")
+        if not self.shaping():
+            self.live().ellipse(x, y, width, height, try selection_mode(mode))
+            return
+        var shape = try Selection.create(self.extent_x, self.extent_y)
+        defer shape.destroy()
+        shape.ellipse(x, y, width, height, Mode.replace)
+        try self.merge_shape(&shape, mode)
+
+    ## The next marquee, lasso and wand shapes: feathered by `feather`
+    ## pixels (0..250) and anti-aliased or hard-edged, as the tool options say.
+    pub mutating func set_selection_shape(feather: i64, antialias: bool) -> !:
+        if feather < 0 or feather > 250:
+            error(invalid, "feather is 0..250 pixels")
+        self.shape_feather = feather
+        self.shape_hard = not antialias
+
+    ## Whether shapes are made alone first, to be feathered or hardened.
+    func shaping() -> bool:
+        return self.shape_feather > 0 or self.shape_hard
+
+    ## A shape made alone, hardened and feathered as set, then combined in by `mode`.
+    mutating func merge_shape(shape: Selection*, mode: i64) -> !:
+        if self.shape_hard:
+            shape.harden()
+        if self.shape_feather > 0:
+            try shape.adjust(0, self.shape_feather)
+        try self.live().merge(shape, try selection_mode(mode))
+
+    ## The magic wand on layer `id` (or, `all_layers`, the flattened picture):
+    ## select the pixels within `tolerance` (0..255, sRGB, alpha included) of
+    ## the color at (`x`, `y`) — averaged over a `sample` by `sample` square
+    ## (1, 3 or 5) — only those reachable through such pixels when
+    ## `contiguous`, combined by `mode`.
+    pub mutating func select_wand(id: i64, x: i64, y: i64, tolerance: f64, contiguous: bool, mode: i64 = 0, sample: i64 = 1, all_layers: bool = false) -> !:
+        try self.require_open()
+        try self.remember_state("Magic Wand")
+        let document = self.document else error(invalid, "draw the document once before using the wand")
+        let device = self.device else error(invalid, "draw the document once before using the wand")
+        if all_layers:
+            let composer = self.composer else error(invalid, "draw the document once before using the wand")
+            var picture = PictureSource(composer = composer, document = document, extent_y = self.extent_y)
+            try wand_from(&self, selection_sources.gpu_reader((void*)&picture, device, picture_cell_texture), x, y, sample, tolerance, contiguous, mode)
+            return
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        var source = TilesSource(tiles = layer.tiles() else error(invalid, "a group has no pixels to sample"))
+        try wand_from(&self, selection_sources.gpu_reader((void*)&source, device, tiles_cell_texture), x, y, sample, tolerance, contiguous, mode)
+
+    ## Collect a polygon point for `select_polygon`.
+    pub mutating func add_point(x: f64, y: f64) -> !:
+        try self.require_open()
+        if not math.is_finite(x) or not math.is_finite(y):
+            error(invalid, "polygon points must be finite")
+        if self.polygon_count + 2 > self.polygon.length:
+            let capacity = 64 if self.polygon.length == 0 else self.polygon.length * 2
+            let grown = try alloc f64[capacity] in memory.heap
+            if self.polygon_count > 0:
+                memory.copy(grown, self.polygon, self.polygon_count)
+            if self.polygon.length > 0:
+                free(self.polygon) in memory.heap
+            self.polygon = grown
+        self.polygon[self.polygon_count] = x
+        self.polygon[self.polygon_count + 1] = y
+        self.polygon_count += 2
+
+    pub mutating func clear_points():
+        self.polygon_count = 0
+
+    ## Select the polygon of the collected points, combined by `mode`, and forget them.
+    pub mutating func select_polygon(mode: i64 = 0) -> !:
+        try self.select_collected(mode, "Lasso")
+
+    ## `select_polygon`, the undo step named `name`.
+    mutating func select_collected(mode: i64, name: str) -> !:
+        try self.require_open()
+        try self.remember_state(name)
+        if self.polygon_count < 6:
+            self.polygon_count = 0
+            error(invalid, "a polygon needs at least three points")
+        # The points are used once: the buffer stays, the count starts again.
+        let points = self.polygon[..<self.polygon_count]
+        self.polygon_count = 0
+        if not self.shaping():
+            try self.live().polygon(points, try selection_mode(mode))
+            return
+        var shape = try Selection.create(self.extent_x, self.extent_y)
+        defer shape.destroy()
+        try shape.polygon(points, Mode.replace)
+        try self.merge_shape(&shape, mode)
+
+    pub func magnetic_x(index: i64) -> f64:
+        return magnetic_point(&self, index, false)
+
+    pub func magnetic_y(index: i64) -> f64:
+        return magnetic_point(&self, index, true)
+
+    pub mutating func select_all() -> !:
+        try self.require_open()
+        try self.remember_state("Select All")
+        self.live().select_all()
+
+    pub mutating func deselect() -> !:
+        try self.require_open()
+        try self.remember_state("Deselect")
+        self.live().clear()
+
+    pub mutating func invert_selection() -> !:
+        try self.require_open()
+        try self.remember_state("Inverse")
+        self.live().invert()
+
+    ## Grow (positive) or shrink (negative) the selection and feather its edge.
+    pub mutating func adjust_selection(pixels: i64, feather: i64) -> !:
+        try self.require_open()
+        try self.remember_state("Modify Selection")
+        try self.live().adjust(pixels, feather)
+
+    ## Select › Modify › Border: a band `width` pixels wide along the edge.
+    pub mutating func border_selection(width: i64) -> !:
+        try self.require_open()
+        try self.remember_state("Border")
+        try self.live().border(width)
+
+    ## Select › Modify › Smooth: corners rounded and specks dropped over `radius` pixels.
+    pub mutating func smooth_selection(radius: i64) -> !:
+        try self.require_open()
+        try self.remember_state("Smooth")
+        try self.live().smooth(radius)
+
+    ## Select › Grow (`contiguous`) and Similar: add the pixels of layer `id`
+    ## (or, `all_layers`, the picture) within `tolerance` of the colors the
+    ## selection covers, as the magic wand's options say.
+    pub mutating func grow_selection(id: i64, tolerance: f64, contiguous: bool, all_layers: bool = false) -> !:
+        try self.require_open()
+        if not self.has_selection():
+            return
+        try self.remember_state("Grow" if contiguous else "Similar")
+        let document = self.document else error(invalid, "draw the document once before growing the selection")
+        let device = self.device else error(invalid, "draw the document once before growing the selection")
+        if all_layers:
+            let composer = self.composer else error(invalid, "draw the document once before growing the selection")
+            var picture = PictureSource(composer = composer, document = document, extent_y = self.extent_y)
+            try self.live().grow(selection_sources.gpu_reader((void*)&picture, device, picture_cell_texture), tolerance, contiguous)
+            return
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        var source = TilesSource(tiles = layer.tiles() else error(invalid, "a group has no pixels to sample"))
+        try self.live().grow(selection_sources.gpu_reader((void*)&source, device, tiles_cell_texture), tolerance, contiguous)
+
+    ## The selection as it began, scaled, turned by `angle` degrees about the
+    ## pivot and moved, as Free Transform's box has it.
+    pub mutating func preview_selection_transform(scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64, pivot_x: f64, pivot_y: f64) -> !:
+        try show_selection_warp(&self, try affine_warp(scale_x, scale_y, angle * math.pi / 180.0, dx, dy, pivot_x, pivot_y))
+
+    pub func has_selection() -> bool:
+        return not self.current().is_empty()
+
+    ## The selection's bounding box, in document pixels.
+    pub func selection_left() -> i64:
+        return self.current().left if self.has_selection() else 0
+
+    pub func selection_top() -> i64:
+        return self.current().top if self.has_selection() else 0
+
+    pub func selection_width() -> i64:
+        return (self.current().right - self.current().left) if self.has_selection() else 0
+
+    pub func selection_height() -> i64:
+        return (self.current().bottom - self.current().top) if self.has_selection() else 0
+
+    ## Coverage 0..255 at a document pixel.
+    pub func selected_at(x: i64, y: i64) -> i64:
+        return (i64)self.current().at(x, y)
+
+    ## Move the selection's outline by (`dx`, `dy`) pixels, leaving the pixels.
+    pub mutating func move_selection(dx: i64, dy: i64) -> !:
+        try self.require_open()
+        try self.remember_state("Move Selection", 1)
+        try self.live().translate(dx, dy)
+
+    ## Move the pixels the selection covers on layer `id` by (`dx`, `dy`), and
+    ## the selection with them, as Photoshop's Move tool does with a selection;
+    ## with `copy` (Alt) the pixels also stay where they were. Undoable.
+    pub mutating func move_selected_pixels(id: i64, dx: i64, dy: i64, copy: bool) -> !:
+        try self.require_open()
+        try self.require_idle()
+        if dx == 0 and dy == 0:
+            return
+        let document = self.document else error(invalid, "draw the document once before moving pixels")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = layer.tiles() else error(invalid, "a group has no pixels to move")
+        try self.remember((u64)id, try tiles.clone(), name = "Move")
+        try self.lift_selected((u64)id, dx, dy, copy)
+        try document.selection.translate(dx, dy)
+
+    ## Show the selected pixels moved by (`dx`, `dy`) on the layer being
+    ## previewed, from its pixels when the preview began; `end_preview` keeps
+    ## or drops the move, and `move_selection` then moves the outline to match.
+    pub mutating func preview_move_selected(dx: i64, dy: i64, copy: bool) -> !:
+        self.preview_name = "Move"
+        let layer = try self.restore_preview()
+        try self.lift_selected(layer, dx, dy, copy)
+
+    mutating func lift_selected(layer: u64, dx: i64, dy: i64, copy: bool) -> !:
+        let document = self.document else error(invalid, "draw the document once before moving pixels")
+        let passes = self.passes else trap("bound without selection passes")
+        let selection = document.selection
+        let mask = try document.selection_tiles() else error(invalid, "nothing is selected")
+        try passes.move_selected(document, layer, mask, dx, dy, copy, selection.left, selection.top, selection.right, selection.bottom)
+
+    ## Keep the edit just made to `layer` only inside the selection, when there is one.
+    mutating func restrict_to_selection(layer: u64, before: const Tiles*, on_mask: bool = false) -> !:
+        let document = self.document else return
+        let passes = self.passes else return
+        let selection = try document.selection_tiles() else return
+        try passes.restrict(document, layer, before, selection, on_mask)
+
+    ## As `restrict_to_selection`, against the pixels (or mask) the preview began from.
+    mutating func restrict_preview(layer: u64) -> !:
+        let preview = self.preview else return
+        try self.restrict_to_selection(layer, &preview.tiles, preview.mask)
 
 ## A layer's or mask's tiles as a selection's pixels.
 struct TilesSource:

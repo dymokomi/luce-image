@@ -1,0 +1,159 @@
+#==============================================================================================
+#
+#   canvas/sizing - Canvas Size, Image Size, Crop, Trim and Reveal All
+#
+#   DESCRIPTION:
+#       The document's extent changed with every layer, channel, shape and text moved or
+#       resampled to match, and a layer's painted box measured for Trim.
+#
+#==============================================================================================
+
+extend Canvas:
+    ## Find layer `id`'s painted box, exactly, for `content_left` and the rest
+    ## (past the canvas too); false when it has nothing painted. It reads the
+    ## layer back from the GPU.
+    pub mutating func measure_content(id: i64) -> bool!:
+        try self.require_open()
+        let document = self.document else error(invalid, "draw the document once before measuring")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = layer.tiles() else error(invalid, "a group has no pixels of its own")
+        if let found = try full_bounds(tiles):
+            self.content = found
+            return true
+        self.content = Bounds(left = 0, top = 0, right = 0, bottom = 0)
+        return false
+
+    ## Image › Trim: find the box of the flattened picture that is not
+    ## `based_on` — 0 transparent pixels, 1 the top-left pixel's color, 2 the
+    ## bottom-right's — for `content_left` and the rest; false when nothing
+    ## is left. It reads the picture back from the GPU.
+    pub mutating func measure_trim(based_on: i64) -> bool!:
+        if based_on < 0 or based_on > 2:
+            error(invalid, "trim is based on 0 transparency, 1 the top-left color or 2 the bottom-right color")
+        # The flattened picture a band of 8-bit sRGB rows at a time: what Trim
+        # compares (a step of 8-bit color) without the document in floats.
+        var corner: u8[4] = [0, 0, 0, 0]
+        # Before the scan's bands open: each holds two of the device's three read slots.
+        if based_on == 2:
+            corner = try bottom_right_pixel(&self)
+        var bands = try Bands.begin(&self, [-1.0, -1.0, -1.0])
+        defer bands.close()
+        let width = (usize)self.extent_x
+        let band_count = tile_columns(self.extent_y)
+        var found = false
+        var bounds = Bounds(left = (i64)width, top = (i64)self.extent_y, right = 0, bottom = 0)
+        for row in 0..<band_count:
+            let rows = try bands.fill(&self, row)
+            if row == 0 and based_on == 1:
+                for channel in 0..<(usize)4:
+                    corner[channel] = bands.band[channel]
+            for y in 0..<rows:
+                let line = y * width * 4
+                # From the left to the first kept pixel, and from the right to the last.
+                var first = width
+                for x in 0..<width:
+                    if trim_kept(bands.band, line + x * 4, based_on, corner):
+                        first = x
+                        break
+                if first == width:
+                    continue
+                var last = first
+                var x = width
+                while x > first + 1:
+                    x -= 1
+                    if trim_kept(bands.band, line + x * 4, based_on, corner):
+                        last = x
+                        break
+                let document_y = (i64)(row * tile_size) + (i64)y
+                found = true
+                bounds.left = math.imin(bounds.left, (i64)first)
+                bounds.right = math.imax(bounds.right, (i64)last + 1)
+                bounds.top = math.imin(bounds.top, document_y)
+                bounds.bottom = math.imax(bounds.bottom, document_y + 1)
+        self.content = bounds if found else Bounds(left = 0, top = 0, right = 0, bottom = 0)
+        return found
+
+    ## The box `measure_content` found, in document pixels.
+    pub func content_left() -> i64:
+        return self.content.left
+
+    pub func content_top() -> i64:
+        return self.content.top
+
+    pub func content_width() -> i64:
+        return self.content.right - self.content.left
+
+    pub func content_height() -> i64:
+        return self.content.bottom - self.content.top
+
+    ## Change the canvas size, keeping the pixels with their top-left at the
+    ## offset. Not undoable: the history is dropped.
+    pub mutating func resize_canvas(width: i64, height: i64, offset_x: i64, offset_y: i64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        try self.remember_state("Canvas Size")
+        if width < 1 or height < 1 or width > 65536 or height > 65536:
+            error(invalid, "canvas dimensions must be in 1..65536")
+        let document = self.document else error(invalid, "draw the document once before resizing")
+        try resize_canvas(document, (u32)width, (u32)height, offset_x, offset_y)
+        try refit_channels(&self, (u32)width, (u32)height, 1.0, 1.0, (f64)offset_x, (f64)offset_y, false)
+        shift_type(&self, (f64)offset_x, (f64)offset_y)
+        shift_shapes(&self, (f64)offset_x, (f64)offset_y)
+        try self.adopt_extent((u32)width, (u32)height)
+
+    ## Crop the canvas to the selection's bounding box.
+    pub mutating func crop() -> !:
+        try self.begin_edit("Crop")
+        defer self.end_edit()
+        if not self.has_selection():
+            error(invalid, "nothing is selected")
+        try self.resize_canvas(self.selection_width(), self.selection_height(), -self.selection_left(), -self.selection_top())
+
+    ## Image › Reveal All: grow the canvas to hold every layer's pixels, those
+    ## moved past it included; false when nothing lies past it. Undoable.
+    pub mutating func reveal_all() -> bool!:
+        try self.require_open()
+        let document = self.document else error(invalid, "draw the document once before revealing")
+        var box = Bounds(left = 0, top = 0, right = (i64)self.extent_x, bottom = (i64)self.extent_y)
+        for index in 0..<self.count:
+            let layer = document.find(self.records[index].id) else continue
+            let tiles = layer.tiles() else continue
+            if not tiles.has_outside():
+                continue
+            let found = try full_bounds(tiles) else continue
+            box.left = math.imin(box.left, found.left)
+            box.top = math.imin(box.top, found.top)
+            box.right = math.imax(box.right, found.right)
+            box.bottom = math.imax(box.bottom, found.bottom)
+        if box.left == 0 and box.top == 0 and box.right == (i64)self.extent_x and box.bottom == (i64)self.extent_y:
+            return false
+        try self.begin_edit("Reveal All")
+        defer self.end_edit()
+        try self.resize_canvas(box.right - box.left, box.bottom - box.top, -box.left, -box.top)
+        return true
+
+    ## Resample the whole image to a new size. Not undoable: the history is dropped.
+    pub mutating func resize_image(width: i64, height: i64, smooth: bool = true) -> !:
+        try self.require_open()
+        try self.require_idle()
+        try self.remember_state("Image Size")
+        if width < 1 or height < 1 or width > 65536 or height > 65536:
+            error(invalid, "image dimensions must be in 1..65536")
+        let document = self.document else error(invalid, "draw the document once before resizing")
+        # Resampled text is pixels; shapes scale and are drawn again, crisp.
+        let scale_x = (f64)width / (f64)self.extent_x
+        let scale_y = (f64)height / (f64)self.extent_y
+        try resize_image(document, (u32)width, (u32)height, smooth)
+        try refit_channels(&self, (u32)width, (u32)height, scale_x, scale_y, 0.0, 0.0, smooth)
+        for index in 0..<self.count:
+            release_type(&self.records[index])
+        try self.adopt_extent((u32)width, (u32)height)
+        for index in 0..<self.count:
+            if self.records[index].shaped:
+                for element in 0..<self.records[index].elements.length:
+                    for at in [0, 2, 4]:
+                        self.records[index].elements[element].spec.matrix[(usize)at] *= scale_x
+                        self.records[index].elements[element].spec.matrix[(usize)at + 1] *= scale_y
+                place_graph(&self.records[index], [scale_x, 0.0, 0.0, scale_y, 0.0, 0.0])
+                try redraw_vector(&self, index)
+

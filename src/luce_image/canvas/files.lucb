@@ -4,6 +4,44 @@
 #
 #==============================================================================================
 
+extend Canvas:
+    ## Put the picture at `path`, of any size, on layer `id` centred on document
+    ## pixel (`center_x`, `center_y`): what falls outside the document is cut off
+    ## and the rest of the layer is transparent. Dropping a file on a document
+    ## does this. The document must have been drawn once.
+    pub mutating func place_layer(id: i64, path: str, center_x: i64, center_y: i64) -> !:
+        if is_svg(path):
+            if let found = try svg_vectors(path):
+                var imported = found
+                let left = (f64)(center_x - (i64)imported.width // 2)
+                let top = (f64)(center_y - (i64)imported.height // 2)
+                adopt_svg_vectors(&self, (u64)id, &imported, left, top) catch failure:
+                    imported.close()
+                    error(failure.code, failure.message)
+                return
+        let picture = try Image.open(path, max_bytes = picture_bytes, max_pixels = picture_pixels)
+        if places_in_background(picture) and self.document != none:
+            try place_in_background(&self, id, picture, center_x, center_y)
+            return
+        defer picture.release()
+        try place_image_at(&self, id, picture, center_x, center_y)
+
+    ## Write the document with all its layers to `path`, one `.l2d` file of
+    ## their half-float tiles, a manifest and a preview (docs/FORMATS.md).
+    ## Needs the document drawn once.
+    pub mutating func save_package(path: str) -> !:
+        try require_loaded(&self)
+        try self.wait_idle()
+        try save_canvas_package(&self, path)
+        self.mark_saved()
+
+    ## Write the flattened document to `path` as an 8-bit RGBA picture in the
+    ## format its extension names. Needs the document drawn at least once.
+    pub mutating func save(path: str, quality: i64 = 90, matte_red: f64 = -1.0, matte_green: f64 = 0.0, matte_blue: f64 = 0.0) -> !:
+        try require_loaded(&self)
+        try self.wait_idle()
+        try save_flattened(&self, path, quality, matte_red, matte_green, matte_blue)
+
 ## The most pixels a flattened save in a format without streaming takes (TIFF, OpenEXR).
 let whole_picture_save_limit: u64 = 64 * 1024 * 1024
 
@@ -150,55 +188,6 @@ func flat_visit(context: void*?, index: usize, bytes: const u8[]) -> !:
 func level_size(extent: u32, level: u32) -> u32:
     return (extent + (1u32 << level) - 1) >> level
 
-## `Canvas.measure_trim`: the box of the flattened picture unlike what
-## `based_on` names (0 transparent, 1 the top-left color, 2 the bottom-right),
-## into `canvas.content`.
-func measure_trim_bounds(canvas: Canvas*, based_on: i64) -> bool!:
-    if based_on < 0 or based_on > 2:
-        error(invalid, "trim is based on 0 transparency, 1 the top-left color or 2 the bottom-right color")
-    # The flattened picture a band of 8-bit sRGB rows at a time: what Trim
-    # compares (a step of 8-bit color) without the document in floats.
-    var corner: u8[4] = [0, 0, 0, 0]
-    # Before the scan's bands open: each holds two of the device's three read slots.
-    if based_on == 2:
-        corner = try bottom_right_pixel(canvas)
-    var bands = try Bands.begin(canvas, [-1.0, -1.0, -1.0])
-    defer bands.close()
-    let width = (usize)canvas.extent_x
-    let band_count = tile_columns(canvas.extent_y)
-    var found = false
-    var bounds = Bounds(left = (i64)width, top = (i64)canvas.extent_y, right = 0, bottom = 0)
-    for row in 0..<band_count:
-        let rows = try bands.fill(canvas, row)
-        if row == 0 and based_on == 1:
-            for channel in 0..<(usize)4:
-                corner[channel] = bands.band[channel]
-        for y in 0..<rows:
-            let line = y * width * 4
-            # From the left to the first kept pixel, and from the right to the last.
-            var first = width
-            for x in 0..<width:
-                if trim_kept(bands.band, line + x * 4, based_on, corner):
-                    first = x
-                    break
-            if first == width:
-                continue
-            var last = first
-            var x = width
-            while x > first + 1:
-                x -= 1
-                if trim_kept(bands.band, line + x * 4, based_on, corner):
-                    last = x
-                    break
-            let document_y = (i64)(row * tile_size) + (i64)y
-            found = true
-            bounds.left = math.imin(bounds.left, (i64)first)
-            bounds.right = math.imax(bounds.right, (i64)last + 1)
-            bounds.top = math.imin(bounds.top, document_y)
-            bounds.bottom = math.imax(bounds.bottom, document_y + 1)
-    canvas.content = bounds if found else Bounds(left = 0, top = 0, right = 0, bottom = 0)
-    return found
-
 ## The flattened picture's bottom-right pixel as 8-bit sRGB, from its last band
 ## on bands of their own (the scan that follows goes through them in order).
 func bottom_right_pixel(canvas: Canvas*) -> u8[4]!:
@@ -328,25 +317,6 @@ func picture_coded_band(context: void*?, first: usize, count: usize, samples: co
     try pack_band_coded(banding.tiles.width(), banding.tiles.height(), row, samples, deep, banding.color, banding.alpha, banding.band, banding.painted)
     try banding.tiles.write_packed(row, banding.band, banding.painted)
     try settle_job(banding.canvas)
-
-## `Canvas.place_layer`: the picture at `path` on layer `id`, centred on a document point.
-## An SVG comes in as vector elements (svg_vectors.lucb) unless it holds text.
-func place_picture(canvas: Canvas*, id: i64, path: str, center_x: i64, center_y: i64) -> !:
-    if is_svg(path):
-        if let found = try svg_vectors(path):
-            var imported = found
-            let left = (f64)(center_x - (i64)imported.width // 2)
-            let top = (f64)(center_y - (i64)imported.height // 2)
-            adopt_svg_vectors(canvas, (u64)id, &imported, left, top) catch failure:
-                imported.close()
-                error(failure.code, failure.message)
-            return
-    let picture = try Image.open(path, max_bytes = picture_bytes, max_pixels = picture_pixels)
-    if places_in_background(picture) and canvas.document != none:
-        try place_in_background(canvas, id, picture, center_x, center_y)
-        return
-    defer picture.release()
-    try place_image_at(canvas, id, picture, center_x, center_y)
 
 ## `place_image_at` while frames go on: the layer fills in as the picture
 ## decodes (canvas/opening), after any picture still opening is in. Takes

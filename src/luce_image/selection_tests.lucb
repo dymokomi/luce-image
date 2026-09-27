@@ -5,6 +5,7 @@
 ## selection_scale_tests.lucb.
 import gpu
 import math
+import transfer
 import memory
 from tiles import tile_size
 from luce_image.selection import Selection
@@ -455,11 +456,6 @@ func read_buffer(context: void*?, column: u32, row: u32, halves: u8[]) -> bool!:
                 halves[at + 1] = (u8)(bits >> 8)
     return painted
 
-## Tests' oracle: a linear-light sample as an 8-bit sRGB value.
-func srgb_byte(value: f32) -> u8:
-    let c = math.clamp((f64)value, 0.0, 1.0)
-    let encoded = c * 12.92 if c <= 0.0031308 else 1.055 * math.pow(c, 1.0 / 2.4) - 0.055
-    return (u8)(encoded * 255.0 + 0.5)
 
 ## Tests' oracle: whether pixel `b` of `bytes` is within `limit` of pixel `a`.
 func within(bytes: const u8[], a: usize, b: usize, limit: i64) -> bool:
@@ -495,7 +491,7 @@ func dense_wand(source: const f32[], width: usize, height: usize, x: i64, y: i64
     defer free(bytes) in memory.heap
     for index in 0..<(width * height):
         for channel in 0..<(usize)3:
-            bytes[index * 4 + channel] = srgb_byte(pixels[index * 4 + channel])
+            bytes[index * 4 + channel] = transfer.srgb_byte((f64)pixels[index * 4 + channel])
         bytes[index * 4 + 3] = (u8)(math.clamp((f64)pixels[index * 4 + 3], 0.0, 1.0) * 255.0 + 0.5)
     let seed = (usize)y * width + (usize)x
     let limit = (i64)math.floor(tolerance + 0.5)

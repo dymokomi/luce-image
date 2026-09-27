@@ -41,8 +41,6 @@ sources; they do not link native image libraries.
   UINT, mixed-type multipart/tiled files and nonzero data windows.
 - Real Luce `Image` ownership, operations and four-format I/O tests; transactional
   TIFF page/EXR part seek and retained limits.
-- Cryptomatte weighted samples/ranking/selection/roundtrip tests and five full-image
-  mask comparisons from upstream Psyop fixtures.
 - 605 truncated/random/mutated assets: subprocess timeout, bounded decoding,
   recoverable errors instead of crashes/traps. A mutation that remains valid may
   succeed. This is deterministic regression fuzzing, not exhaustive fuzz coverage.
@@ -74,7 +72,7 @@ The script creates deterministic float32 RGB TIFF/EXR fixtures using independent
 writers, compiles the Base benchmark with native opt 3, and reports median open
 and decode times from three fresh processes each at 1/2/4 threads. File I/O and
 decoding are reported separately. Run with no concurrent test/compiler jobs.
-`workers_used` verifies actual worker participation. Results are host/workload
+`workers_used` reports how many threads the decode was spread over. Results are host/workload
 observations, not promises of a fixed speedup.
 See [recorded measurements](BENCHMARK.md).
 

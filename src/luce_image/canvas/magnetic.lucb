@@ -1,6 +1,6 @@
 #==============================================================================================
 #
-#   canvas/magnetic - the Magnetic Lasso: a live wire snapping to edges as the pointer moves
+#   canvas/magnetic - The Magnetic Lasso: a live wire snapping to edges as the pointer moves
 #
 #   DESCRIPTION:
 #       The wire runs over one pyramid level (the view's, so a sample is about a screen
@@ -12,6 +12,112 @@
 #       Backspace takes the last back; closing selects the traced polygon, one undo step.
 #
 #==============================================================================================
+
+extend Canvas:
+    ## The Magnetic Lasso's first anchor at document point (`x`, `y`), its wire
+    ## traced over pyramid `level` (the view's): `width` pixels (1..256) round
+    ## the pointer are searched for an edge, edges under `contrast` percent
+    ## (1..100) are ignored, and `frequency` (0..100) sets how often anchors
+    ## fall on their own.
+    pub mutating func begin_magnetic(x: f64, y: f64, level: i64 = 0, width: f64 = 10.0, contrast: f64 = 10.0, frequency: i64 = 57) -> !:
+        try self.require_open()
+        if self.document == none or self.composer == none:
+            error(invalid, "draw the document once before using the Magnetic Lasso")
+        if not math.is_finite(x) or not math.is_finite(y) or x < 0.0 or y < 0.0 or x >= (f64)self.extent_x or y >= (f64)self.extent_y:
+            error(invalid, "the Magnetic Lasso starts inside the document")
+        if not math.is_finite(width) or width < 1.0 or width > 256.0:
+            error(invalid, "the Magnetic Lasso's width is 1 to 256 pixels")
+        if not math.is_finite(contrast) or contrast < 1.0 or contrast > 100.0:
+            error(invalid, "the Magnetic Lasso's contrast is 1 to 100 percent")
+        if frequency < 0 or frequency > 100:
+            error(invalid, "the Magnetic Lasso's frequency is 0 to 100")
+        self.cancel_magnetic()
+        # No coarser than the level the whole document fits one cell at.
+        var top: u32 = 0
+        while (self.extent_x >> top) > tile_size or (self.extent_y >> top) > tile_size:
+            top += 1
+        let chosen = (u32)math.imax(0, math.imin(level, (i64)top))
+        let span = 1u32 << chosen
+        let samples_x = (i64)((self.extent_x + span - 1) >> chosen)
+        let samples_y = (i64)((self.extent_y + span - 1) >> chosen)
+        let columns = (u32)((samples_x + (i64)tile_size - 1) // (i64)tile_size)
+        let rows = (u32)((samples_y + (i64)tile_size - 1) // (i64)tile_size)
+        let cells = try alloc LumaCell*?[(usize)columns * (usize)rows] in memory.heap
+        errdefer free(cells) in memory.heap
+        for index in 0..<cells.length:
+            cells[index] = none
+        let anchors = try alloc usize[64] in memory.heap
+        errdefer free(anchors) in memory.heap
+        let scale = (f64)span
+        let magnetic = try new Magnetic(level = chosen, scale = scale, samples_x = samples_x, samples_y = samples_y,
+                                        width = math.imax(1, (i64)math.round(width / scale)), contrast = contrast / 100.0,
+                                        spacing = 8.0 + (f64)(100 - frequency) * 1.2, columns = columns, cells = cells,
+                                        fixed = empty_points(), anchors = anchors, anchor_count = 0, live = empty_points()) in memory.heap
+        self.magnetic = magnetic
+        try magnetic.fixed.push(x, y)
+        try add_anchor(magnetic)
+
+    ## The live wire to the edge nearest the pointer at (`x`, `y`).
+    pub mutating func move_magnetic(x: f64, y: f64) -> !:
+        let magnetic = self.magnetic else error(invalid, "no Magnetic Lasso is under way")
+        if not math.is_finite(x) or not math.is_finite(y):
+            error(invalid, "the pointer must be finite")
+        # A fast pointer can cross several spacings: an anchor for each, a few at most.
+        for round in 0..<8:
+            try trace_live(&self, magnetic, x, y, true)
+            if not (try settle_anchor(magnetic)):
+                return
+
+    ## A click: the wire fixed to (`x`, `y`) with an anchor there.
+    pub mutating func anchor_magnetic(x: f64, y: f64) -> !:
+        let magnetic = self.magnetic else error(invalid, "no Magnetic Lasso is under way")
+        try self.move_magnetic(x, y)
+        var index: usize = 0
+        while index < magnetic.live.count:
+            try magnetic.fixed.push(magnetic.live.values[index], magnetic.live.values[index + 1])
+            index += 2
+        magnetic.live.count = 0
+        try add_anchor(magnetic)
+
+    ## Backspace: the last anchor taken back; false when only the first is left.
+    pub mutating func remove_magnetic_anchor() -> bool:
+        let magnetic = self.magnetic else return false
+        if magnetic.anchor_count <= 1:
+            return false
+        magnetic.anchor_count -= 1
+        magnetic.fixed.count = (magnetic.anchors[magnetic.anchor_count - 1] + 1) * 2
+        magnetic.live.count = 0
+        return true
+
+    ## Double-click or Enter: the shape closed along the edge back to the
+    ## start and selected, combined by `mode`, as one step.
+    pub mutating func close_magnetic(mode: i64 = 0) -> !:
+        try self.require_open()
+        try close_magnetic(&self, mode)
+
+    ## Esc: the Magnetic Lasso let go.
+    pub mutating func cancel_magnetic():
+        let magnetic = self.magnetic else return
+        self.magnetic = none
+        magnetic.destroy()
+        free(magnetic) in memory.heap
+
+    pub func magnetic_active() -> bool:
+        return self.magnetic != none
+
+    ## The path so far, fixed then live, for drawing: its points in document pixels.
+    pub func magnetic_count() -> i64:
+        let magnetic = self.magnetic else return 0
+        return (i64)(magnetic.fixed.points() + magnetic.live.points())
+
+    ## The anchors, as indices into the path.
+    pub func magnetic_anchors() -> i64:
+        let magnetic = self.magnetic else return 0
+        return (i64)magnetic.anchor_count
+
+    pub func magnetic_anchor(index: i64) -> i64:
+        let magnetic = self.magnetic else return 0
+        return (i64)magnetic.anchors[(usize)index]
 
 ## The widest window a trace runs over, in samples a side: farther than this
 ## from the last anchor the wire runs straight to the pointer.
@@ -91,45 +197,6 @@ struct Magnetic:
                 count += 1
         return count
 
-## `Canvas.begin_magnetic`: the first anchor at document point (`x`, `y`).
-func begin_magnetic(canvas: Canvas*, x: f64, y: f64, level: i64, width: f64, contrast: f64, frequency: i64) -> !:
-    try canvas.require_open()
-    if canvas.document == none or canvas.composer == none:
-        error(invalid, "draw the document once before using the Magnetic Lasso")
-    if not math.is_finite(x) or not math.is_finite(y) or x < 0.0 or y < 0.0 or x >= (f64)canvas.extent_x or y >= (f64)canvas.extent_y:
-        error(invalid, "the Magnetic Lasso starts inside the document")
-    if not math.is_finite(width) or width < 1.0 or width > 256.0:
-        error(invalid, "the Magnetic Lasso's width is 1 to 256 pixels")
-    if not math.is_finite(contrast) or contrast < 1.0 or contrast > 100.0:
-        error(invalid, "the Magnetic Lasso's contrast is 1 to 100 percent")
-    if frequency < 0 or frequency > 100:
-        error(invalid, "the Magnetic Lasso's frequency is 0 to 100")
-    cancel_magnetic(canvas)
-    # No coarser than the level the whole document fits one cell at.
-    var top: u32 = 0
-    while (canvas.extent_x >> top) > tile_size or (canvas.extent_y >> top) > tile_size:
-        top += 1
-    let chosen = (u32)math.imax(0, math.imin(level, (i64)top))
-    let span = 1u32 << chosen
-    let samples_x = (i64)((canvas.extent_x + span - 1) >> chosen)
-    let samples_y = (i64)((canvas.extent_y + span - 1) >> chosen)
-    let columns = (u32)((samples_x + (i64)tile_size - 1) // (i64)tile_size)
-    let rows = (u32)((samples_y + (i64)tile_size - 1) // (i64)tile_size)
-    let cells = try alloc LumaCell*?[(usize)columns * (usize)rows] in memory.heap
-    errdefer free(cells) in memory.heap
-    for index in 0..<cells.length:
-        cells[index] = none
-    let anchors = try alloc usize[64] in memory.heap
-    errdefer free(anchors) in memory.heap
-    let scale = (f64)span
-    let magnetic = try new Magnetic(level = chosen, scale = scale, samples_x = samples_x, samples_y = samples_y,
-                                    width = math.imax(1, (i64)math.round(width / scale)), contrast = contrast / 100.0,
-                                    spacing = 8.0 + (f64)(100 - frequency) * 1.2, columns = columns, cells = cells,
-                                    fixed = empty_points(), anchors = anchors, anchor_count = 0, live = empty_points()) in memory.heap
-    canvas.magnetic = magnetic
-    try magnetic.fixed.push(x, y)
-    try add_anchor(magnetic)
-
 func add_anchor(magnetic: Magnetic*) -> !:
     if magnetic.anchor_count == magnetic.anchors.length:
         let grown = try alloc usize[magnetic.anchors.length * 2] in memory.heap
@@ -138,19 +205,6 @@ func add_anchor(magnetic: Magnetic*) -> !:
         magnetic.anchors = grown
     magnetic.anchors[magnetic.anchor_count] = magnetic.fixed.points() - 1
     magnetic.anchor_count += 1
-
-## `Canvas.move_magnetic`: the live wire from the last anchor to the edge
-## nearest (`x`, `y`); past the spacing, the part of it behind the pointer is
-## fixed with an anchor at its end.
-func move_magnetic(canvas: Canvas*, x: f64, y: f64) -> !:
-    let magnetic = canvas.magnetic else error(invalid, "no Magnetic Lasso is under way")
-    if not math.is_finite(x) or not math.is_finite(y):
-        error(invalid, "the pointer must be finite")
-    # A fast pointer can cross several spacings: an anchor for each, a few at most.
-    for round in 0..<8:
-        try trace_live(canvas, magnetic, x, y, true)
-        if not (try settle_anchor(magnetic)):
-            return
 
 ## The live wire from the last fixed point to the edge nearest document
 ## point (`x`, `y`) (to the point itself when `snapping` is false).
@@ -273,28 +327,6 @@ func luma_cell(canvas: Canvas*, magnetic: Magnetic*, column: u32, row: u32) -> L
     magnetic.cells[index] = cell
     return cell
 
-## `Canvas.anchor_magnetic`: a click fixes the wire to (`x`, `y`) with an anchor there.
-func anchor_magnetic(canvas: Canvas*, x: f64, y: f64) -> !:
-    let magnetic = canvas.magnetic else error(invalid, "no Magnetic Lasso is under way")
-    try move_magnetic(canvas, x, y)
-    var index: usize = 0
-    while index < magnetic.live.count:
-        try magnetic.fixed.push(magnetic.live.values[index], magnetic.live.values[index + 1])
-        index += 2
-    magnetic.live.count = 0
-    try add_anchor(magnetic)
-
-## `Canvas.remove_magnetic_anchor`: the last anchor and the path after the one
-## before it taken back; false (and nothing done) when only the first is left.
-func remove_magnetic_anchor(canvas: Canvas*) -> bool:
-    let magnetic = canvas.magnetic else return false
-    if magnetic.anchor_count <= 1:
-        return false
-    magnetic.anchor_count -= 1
-    magnetic.fixed.count = (magnetic.anchors[magnetic.anchor_count - 1] + 1) * 2
-    magnetic.live.count = 0
-    return true
-
 ## `Canvas.close_magnetic`: the wire traced back to the first point closes the
 ## shape, which is selected, combined by `mode`, as one step.
 func close_magnetic(canvas: Canvas*, mode: i64) -> !:
@@ -312,22 +344,15 @@ func close_magnetic(canvas: Canvas*, mode: i64) -> !:
         try magnetic.fixed.push(magnetic.live.values[index], magnetic.live.values[index + 1])
         index += 2
     if magnetic.fixed.points() < 3:
-        cancel_magnetic(canvas)
+        canvas.cancel_magnetic()
         error(invalid, "a selection needs at least three points")
     canvas.clear_points()
     index = 0
     while index < magnetic.fixed.count:
         try canvas.add_point(magnetic.fixed.values[index], magnetic.fixed.values[index + 1])
         index += 2
-    cancel_magnetic(canvas)
+    canvas.cancel_magnetic()
     try canvas.select_collected(mode, "Magnetic Lasso")
-
-## `Canvas.cancel_magnetic`: the lasso let go, nothing selected.
-func cancel_magnetic(canvas: Canvas*):
-    let magnetic = canvas.magnetic else return
-    canvas.magnetic = none
-    magnetic.destroy()
-    free(magnetic) in memory.heap
 
 ## Point `index` of the path so far, fixed then live (document pixels).
 func magnetic_point(canvas: const Canvas*, index: i64, y: bool) -> f64:

@@ -1,14 +1,17 @@
 # luce-image
 
-JPEG, PNG, TIFF and OpenEXR image I/O for Luce, implemented in Luce Base, with a
-Pillow-inspired owning `Image` API and Cryptomatte 1.2 reading and authoring.
+The layered-document engine behind luced-2d, and the Pillow-inspired owning
+`Image` API it opens pictures through, implemented in Luce Base.
 
 **Every file format is its own package.** luce-image's `Image` opens and saves
 through `luce-png`, `luce-jpeg`, `luce-tiff` and `luce-exr` (and reads Photoshop
 documents through `luce-psd`), which share `luce-raster` (the pixel model, byte
 readers and error codes) and `luce-compress`; each depends only on the standard
-library and those two. luce-image adds the owning `Image` API, threaded decoding,
-Cryptomatte and the layered-document engine.
+library and those two. luce-image adds the owning `Image` API, threaded decoding
+and the layered-document engine. The brush engine is
+[luce-painting](https://github.com/dymokomi/luce-painting), vector layers are
+[luce-vector](https://github.com/dymokomi/luce-vector), Cryptomatte is luce-exr's
+and SVG rendering luce-svg's.
 
 **All runtime codec internals are Luce Base.** There are no libjpeg, libpng,
 libtiff, OpenEXR, zlib or Python bindings in the library. The Base standard
@@ -26,12 +29,12 @@ Depend on it from the application's `package.prisma`:
 ```
 def dependency "luce-image" {
     str owner = "dymokomi"
-    str version = "^0.40.0"
+    str version = "^0.41.0"
 }
 ```
 
-Its public imports are `image` (the `Image` API), `cryptomatte`, `canvas` (the
-layered-document engine) and `brush_mask`.
+Its public imports are `image` (the `Image` API), `canvas` (the layered-document
+engine) and `brush_files` (brush masks from pictures and files, kept as PNG).
 
 ```luce
 from image import Image
@@ -46,9 +49,9 @@ pub func main(arguments: list[str]) -> int!:
 
 `open` snapshots encoded bytes and reads the header; pixels decode lazily on
 `load`, pixel access, transformation or save. TIFF strips/tiles and EXR chunks
-decode across a bounded number of Base threads. JPEG/PNG decoding and all
-encoding are currently single-threaded. `workers_used()` reports how many workers
-actually completed chunks, not just how many were requested.
+decode on luce-canvas's worker pool, at most `threads` at once. JPEG/PNG decoding
+and all encoding are currently single-threaded. `workers_used()` reports how many
+threads the chunks were spread over.
 
 The managed Luce handle owns the Base image. `close()` is idempotent and closes
 all aliases; use `copy()` for independent pixels. No manual freeing is needed in
@@ -69,7 +72,7 @@ Luce-facing `Canvas` object:
 - Per-pixel selections (rectangle, ellipse, polygon/lasso, magic wand; add,
   subtract, intersect, invert, expand, contract, feather) that painting, fills
   and crops respect, drawn as marching ants.
-- GPU brush and eraser strokes as spaced dabs with Photoshop's controls — tip angle and roundness, spacing, smoothing, size/angle/roundness/flow/color jitter, scattering, and dynamics that drive size, flow, opacity, angle, roundness, scatter, texture depth and color jitter from the pen's pressure, tilt, azimuth, barrel rotation and airbrush wheel, the stroke's direction and velocity, or a fade, each with a minimum and a response curve (`set_brush_dynamics`, `set_brush_dynamic`, strokes taking the pen per point); sampled grayscale tips up to 1024 px and texture images tiled in document space, built-in or the brush's own, multiplied or subtracted per dab on the GPU (`set_brush_tip`, `set_brush_texture_image`, `set_brush_texture`); `BrushMask` (`import brush_mask`) to paint, invert, load, save and preview tips and textures, and `selection_image` for Define Brush Preset; destructive adjustments
+- GPU brush and eraser strokes as spaced dabs with Photoshop's controls — tip angle and roundness, spacing, smoothing, size/angle/roundness/flow/color jitter, scattering, and dynamics that drive size, flow, opacity, angle, roundness, scatter, texture depth and color jitter from the pen's pressure, tilt, azimuth, barrel rotation and airbrush wheel, the stroke's direction and velocity, or a fade, each with a minimum and a response curve (`set_brush_dynamics`, `set_brush_dynamic`, strokes taking the pen per point); sampled grayscale tips up to 1024 px and texture images tiled in document space, built-in or the brush's own, multiplied or subtracted per dab on the GPU (`set_brush_tip`, `set_brush_texture_image`, `set_brush_texture`); luce-painting's `BrushMask` to paint, invert and preview tips and textures, opened and kept as PNG through `brush_files`, and `selection_image` for Define Brush Preset; destructive adjustments
   (brightness/contrast, hue/saturation/lightness, invert, levels, curves,
   desaturate, threshold, posterize), Gaussian blur, free transform, move,
   canvas and image resize, text from `std.fonts`; each undoable, and each
@@ -80,25 +83,6 @@ Luce-facing `Canvas` object:
   layers' half-float tiles, a manifest and a preview; see
   [the .l2d format](docs/FORMATS.md#the-l2d-document)) and from Photoshop `.psd`
   files (through the luce-psd package); they save as `.l2d` or flatten to a picture.
-
-## Cryptomatte
-
-```luce
-from image import Image
-from cryptomatte import Cryptomatte
-
-pub func main(arguments: list[str]) -> int!:
-    let render = Image.open(arguments[0], threads = 8)
-    let objects = Cryptomatte(render, "CryptoObject")
-    let mask = objects.extract(["hero", "floor"])
-    mask.save(arguments[1])  # use .exr to preserve FLOAT coverage
-    return 0
-```
-
-Includes MurmurHash3 and float-ID conversion, embedded/sidecar manifests, Unicode
-JSON, layer discovery, all-rank extraction, picking, and a weighted-sample builder
-that aggregates IDs, sorts coverage and truncates ranks without renormalization.
-See [Cryptomatte API and semantics](docs/CRYPTOMATTE.md).
 
 ## Build and test
 
@@ -117,7 +101,8 @@ compiler versions instead. See [testing](docs/TESTING.md) for dependencies and C
 
 The GPU shaders are GLSL under `src/luce_image/shaders/`; after changing one, regenerate
 `src/luce_image/shaders.lucb` with luce-gpu's generator (needs `glslangValidator` and `spirv-cross`):
-`python3 ../luce-gpu/tools/embed_shaders.py --public src/luce_image/shaders.lucb src/luce_image/shaders/dab.frag src/luce_image/shaders/paint.frag src/luce_image/shaders/composite.frag src/luce_image/shaders/adjust.frag src/luce_image/shaders/blur.frag src/luce_image/shaders/ants.frag src/luce_image/shaders/warp.frag src/luce_image/shaders/spread.frag src/luce_image/shaders/style.frag src/luce_image/shaders/gradient.frag src/luce_image/shaders/lift.frag src/luce_image/shaders/mask_mix.frag src/luce_image/shaders/adjust_mix.frag src/luce_image/shaders/resample.frag src/luce_image/shaders/float.frag src/luce_image/shaders/encode.frag src/luce_image/shaders/liquify.frag src/luce_image/shaders/quickmask.frag src/luce_image/shaders/mesh.frag src/luce_image/shaders/channels.frag src/luce_image/shaders/transfer.frag` (this order keeps the generated file stable).
+`python3 ../luce-gpu/tools/embed_shaders.py --public -I ../luce-color/shaders src/luce_image/shaders.lucb src/luce_image/shaders/composite.frag src/luce_image/shaders/adjust.frag src/luce_image/shaders/blur.frag src/luce_image/shaders/ants.frag src/luce_image/shaders/warp.frag src/luce_image/shaders/spread.frag src/luce_image/shaders/style.frag src/luce_image/shaders/lift.frag src/luce_image/shaders/mask_mix.frag src/luce_image/shaders/adjust_mix.frag src/luce_image/shaders/resample.frag src/luce_image/shaders/float.frag src/luce_image/shaders/encode.frag src/luce_image/shaders/liquify.frag src/luce_image/shaders/quickmask.frag src/luce_image/shaders/mesh.frag src/luce_image/shaders/channels.frag src/luce_image/shaders/transfer.frag` (this order keeps the generated file stable). `srgb.glsl`, the sRGB curve the
+shaders mix through, is luce-color's.
 
 Documentation: [API](docs/API.md), [formats](docs/FORMATS.md),
 [design and limits](docs/DESIGN.md), [how colors blend](docs/BLENDING.md),
@@ -125,6 +110,4 @@ Documentation: [API](docs/API.md), [formats](docs/FORMATS.md),
 [Measured thread scaling](docs/BENCHMARK.md) records the initial benchmark.
 [Validation results](docs/VALIDATION.md) distinguish local checks from CI.
 
-Original package code is MIT licensed; ported OpenEXR algorithms and upstream
-Cryptomatte fixtures retain their BSD notices. See [LICENSE](LICENSE) and
-[LICENSES](LICENSES).
+MIT licensed; see [LICENSE](LICENSE).

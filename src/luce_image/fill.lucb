@@ -1,0 +1,273 @@
+#==============================================================================================
+#
+#   fill - Edit › Fill and the Gradient tool on a layer of the document
+#
+#   DESCRIPTION:
+#       A fill lays the brush's color (or clears) over the selection, or the whole layer when
+#       nothing is selected; a gradient lays one color running into another. Both go a cell at
+#       a time through luce-painting's paint and gradient passes, share one tile among cells
+#       that come out the same, and give back the layer's tiles from before for the history.
+#       Failing part way (out of GPU memory), the layer gets its tiles back whole.
+#
+#==============================================================================================
+
+import gpu
+import math
+import memory
+from tiles import Tiles, tile_size
+from paint import Brush, Painter, gradient_tile
+from stroke import Stroke, PaintTarget
+from mixing import Mixing
+from luce_image.document import Document
+from luce_image.selection_cells import Mode
+from raster_errors import invalid
+
+## Fill the selection on `layer`'s pixels (or its mask) with `brush`'s color at
+## its opacity, or erase it when the brush erases; the whole layer when nothing
+## is selected. Returns the tiles from before, for history.
+## `fault`, when given, is called before each tile the fill makes with how
+## many it has made; its error stops the fill there as running out of GPU
+## memory would (the tests' seam).
+pub func fill_selection(painter: Painter*, document: Document*, layer: u64, brush: Brush, on_mask: bool = false, fault: (func(usize) -> unit!)? = none) -> Tiles!:
+    try brush.check()
+    let target = document.find(layer) else error(invalid, "no such layer")
+    let tiles = (target.mask_tiles() else error(invalid, "the layer has no mask")) if on_mask else (target.tiles() else error(invalid, "a group cannot be filled"))
+    var before = try tiles.clone()
+    # Failing part way (out of GPU memory), the layer gets its tiles back whole.
+    errdefer restore_layer(document, layer, on_mask, before)
+    let selection = try document.selection_tiles()
+    let fill = gpu.Color(1.0, 1.0, 1.0, 1.0) if on_mask else gpu.Color(0.0, 0.0, 0.0, 0.0)
+    let mixing = document.mixing(on_mask)
+    let color = mixing.color(brush.color)
+    # A destroyed zero-value texture is a no-op, so the stand-in can always be dropped.
+    var empty = gpu.Texture()
+    var have_empty = false
+    defer empty.destroy()
+    var coverage = try gpu.Texture.create(painter.device(), 1, 1, gpu.Format.r8)
+    defer coverage.destroy()
+    try coverage.upload([(u8)255])
+    # Where a cell is selected throughout (or nothing is selected) and the fill
+    # is opaque, what was there does not matter: every such cell shares the one
+    # tile the first of them made, so filling a huge area costs its edge cells.
+    let solid = brush.opacity >= 1.0 and not brush.erase
+    var solid_made = false
+    var solid_cell: u32[2] = [0, 0]
+    # Otherwise a cell's result depends only on its source tile and selection
+    # tile. Only wholly selected cells are remembered: an edge cell's selection
+    # tile is its own, so its result is never wanted again.
+    var made_keys: u64[64]
+    var made_cells: u32[128]
+    var made_count: usize = 0
+    var tiles_made: usize = 0
+    for row in 0..<tiles.rows():
+        for column in 0..<tiles.columns():
+            var clip = painter.white
+            var params: f32[16] = [(f32)color.red, (f32)color.green, (f32)color.blue, 1.0, (f32)brush.opacity, 1.0 if brush.erase else 0.0, 1.0, 0.0,
+                                   0.0, 0.0, mixing.flag(), 1.0, 0.0, 0.0, 0.0, 0.0]
+            var full = true
+            if let selected = selection:
+                # A selection cell with no tile selects nothing there.
+                clip = (try selected.texture(column, row)) else continue
+                params[7] = 1.0
+                full = document.selection.cell_full(column, row)
+            if solid and full and solid_made:
+                try tiles.share(column, row, solid_cell[0], solid_cell[1])
+                continue
+            let source_stamp = before.stamp(column, row)
+            var clip_stamp: u64 = 1
+            if let selected = selection:
+                clip_stamp = selected.stamp(column, row)
+            let key = (source_stamp *% 1099511628211) ^ clip_stamp
+            var shared = false
+            if full and not solid:
+                for at in 0..<made_count:
+                    if made_keys[at] == key:
+                        try tiles.share(column, row, made_cells[at * 2], made_cells[at * 2 + 1])
+                        shared = true
+                        break
+            if shared:
+                continue
+            var source = gpu.Texture()
+            if let existing = (try before.texture(column, row)):
+                source = existing
+            else:
+                if not have_empty:
+                    empty = try tiles.blank()
+                    have_empty = true
+                    if fill.alpha > 0.0:
+                        let clear_frame = try empty.frame()
+                        defer clear_frame.release()
+                        discard(try clear_frame.value().present(fill))
+                source = empty
+            if let seam = fault:
+                try seam(tiles_made)
+            tiles_made += 1
+            var fresh = try tiles.blank()
+            errdefer fresh.destroy()
+            let frame = try fresh.frame()
+            defer frame.release()
+            let area = try frame.value().target()
+            defer area.release()
+            try gpu.shade(area.value(), painter.paint_pipeline(), gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 64),
+                          [source, coverage, clip], gpu.Filter.nearest)
+            discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+            try tiles.set(column, row, fresh)
+            if solid and full:
+                solid_made = true
+                solid_cell = [column, row]
+            elif full and made_count < made_keys.length:
+                made_keys[made_count] = key
+                made_cells[made_count * 2] = column
+                made_cells[made_count * 2 + 1] = row
+                made_count += 1
+    target.revision += 1
+    return before
+
+## Put `before` back as `layer`'s pixels (or mask) after a fill failed part
+## way, dropping what the fill had made. Nothing here can fail but a tiny box.
+func restore_layer(document: Document*, layer: u64, on_mask: bool, before: Tiles):
+    var owned = before
+    if on_mask:
+        var made = document.take_mask(layer, owned) catch _:
+            owned.destroy()
+            return
+        made.destroy()
+    else:
+        var made = document.take_tiles(layer, owned) catch _:
+            owned.destroy()
+            return
+        made.destroy()
+
+## Lay a linear gradient from `from_color` at (`x0`, `y0`) to `to_color` at
+## (`x1`, `y1`) over `layer`, within the selection; the tiles from before.
+pub func fill_gradient(painter: Painter*, document: Document*, layer: u64, x0: f64, y0: f64, x1: f64, y1: f64, from_color: gpu.Color, to_color: gpu.Color, radial: bool = false, on_mask: bool = false) -> Tiles!:
+    for value in [x0, y0, x1, y1]:
+        if not math.is_finite(value):
+            error(invalid, "gradient ends must be finite")
+    let target = document.find(layer) else error(invalid, "no such layer")
+    let tiles = (target.mask_tiles() else error(invalid, "the layer has no mask")) if on_mask else (target.tiles() else error(invalid, "a group cannot be filled"))
+    var before = try tiles.clone()
+    # Failing part way (out of GPU memory), the layer gets its tiles back whole.
+    errdefer restore_layer(document, layer, on_mask, before)
+    let selection = try document.selection_tiles()
+    var empty = gpu.Texture()
+    var have_empty = false
+    defer empty.destroy()
+    # Without a selection, a cell the gradient covers at one end throughout is one
+    # color: made once per end (and per empty-or-not source when that end is
+    # translucent), then shared. `made_cells` holds the cell each kind was made in.
+    var made_cells: i64[8] = [-1, -1, -1, -1, -1, -1, -1, -1]
+    for row in 0..<tiles.rows():
+        for column in 0..<tiles.columns():
+            var clip = painter.white
+            var selected = false
+            if let chosen = selection:
+                clip = (try chosen.texture(column, row)) else continue
+                selected = true
+            var kind: i64 = -1
+            if not selected:
+                kind = uniform_gradient_kind(column, row, x0, y0, x1, y1, radial, from_color, to_color, before.painted(column, row))
+                if kind >= 0 and made_cells[(usize)kind] >= 0:
+                    let cell = made_cells[(usize)kind]
+                    try tiles.share(column, row, (u32)(cell % (i64)tiles.columns()), (u32)(cell // (i64)tiles.columns()))
+                    continue
+            var source = gpu.Texture()
+            if let existing = (try before.texture(column, row)):
+                source = existing
+            else:
+                if not have_empty:
+                    empty = try tiles.blank()
+                    have_empty = true
+                    # A mask's missing cells reveal: they count as white.
+                    if on_mask:
+                        let frame = try empty.frame()
+                        defer frame.release()
+                        discard(try frame.value().present(gpu.Color(1.0, 1.0, 1.0, 1.0)))
+                source = empty
+            var fresh = try tiles.blank()
+            errdefer fresh.destroy()
+            try gradient_tile(painter, &fresh, source, clip, selected, (f64)(column * tile_size), (f64)(row * tile_size), x0, y0, x1, y1, from_color, to_color, radial,
+                              document.mixing(on_mask))
+            try tiles.set(column, row, fresh)
+            if kind >= 0:
+                made_cells[(usize)kind] = (i64)row * (i64)tiles.columns() + (i64)column
+    target.revision += 1
+    return before
+
+## Which kind of one-color cell (column, row) is under a gradient without a
+## selection, or -1 when it varies: 0 or 1 its from or to end reaching the
+## whole cell with that end opaque, 2 or 3 the same end translucent over an
+## empty cell (a translucent end over pixels depends on them).
+func uniform_gradient_kind(column: u32, row: u32, x0: f64, y0: f64, x1: f64, y1: f64, radial: bool, from_color: gpu.Color, to_color: gpu.Color, painted: bool) -> i64:
+    # The first and last pixel centres of the cell, as the shader samples them.
+    let left = (f64)(column * tile_size) + 0.5
+    let top = (f64)(row * tile_size) + 0.5
+    let right = left + (f64)tile_size - 1.0
+    let bottom = top + (f64)tile_size - 1.0
+    let dx = x1 - x0
+    let dy = y1 - y0
+    let length_squared = dx * dx + dy * dy
+    if length_squared < 1e-12:
+        return -1
+    var low = 0.0
+    var high = 0.0
+    if radial:
+        # Nearest and farthest points of the cell from the centre.
+        let near_x = math.clamp(x0, left, right) - x0
+        let near_y = math.clamp(y0, top, bottom) - y0
+        let far_x = math.max(math.abs(left - x0), math.abs(right - x0))
+        let far_y = math.max(math.abs(top - y0), math.abs(bottom - y0))
+        let radius = math.sqrt(length_squared)
+        low = math.sqrt(near_x * near_x + near_y * near_y) / radius
+        high = math.sqrt(far_x * far_x + far_y * far_y) / radius
+    else:
+        # Linear: the projection is extreme at two of the corners.
+        let t0 = ((left - x0) * dx + (top - y0) * dy) / length_squared
+        let t1 = ((right - x0) * dx + (top - y0) * dy) / length_squared
+        let t2 = ((left - x0) * dx + (bottom - y0) * dy) / length_squared
+        let t3 = ((right - x0) * dx + (bottom - y0) * dy) / length_squared
+        low = math.min(math.min(t0, t1), math.min(t2, t3))
+        high = math.max(math.max(t0, t1), math.max(t2, t3))
+    var end: i64 = -1
+    if high <= 0.0:
+        end = 0
+    elif low >= 1.0:
+        end = 1
+    else:
+        return -1
+    let alpha = from_color.alpha if end == 0 else to_color.alpha
+    if alpha >= 1.0:
+        return end
+    return end + 2 if not painted else -1
+
+test "a selection limits strokes and fills to its rectangle":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var document = try Document.create(device, 600, 300)
+    defer document.destroy()
+    let layer = try document.add_layer("Paint")
+    var painter = try Painter.create(device)
+    defer painter.destroy()
+    let tiles = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
+    let pixels = try alloc f32[(usize)600 * 300 * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    var brush = Brush(diameter = 40.0, hardness = 0.5, color = gpu.Color(1.0, 0.0, 0.0, 1.0))
+    # A selection limits both strokes and fills to its rectangle.
+    document.selection.rectangle(0, 0, 300, 100, Mode.replace)
+    brush.erase = false
+    brush.opacity = 1.0
+    brush.color = gpu.Color(0.0, 0.0, 1.0, 1.0)
+    let target = PaintTarget(tiles = tiles, selection = try document.selection_tiles(), mixing = document.mixing())
+    var inside = try Stroke.begin(&painter, target, brush, 250.0, 90.0)
+    try inside.extend(&painter, target, 250.0, 120.0)
+    inside.finish()
+    try tiles.read(pixels)
+    assert(pixels[(95 * 600 + 250) * 4 + 2] > 0.99 and pixels[(115 * 600 + 250) * 4 + 2] < 0.01)
+    var kept = try fill_selection(&painter, &document, layer, brush)
+    kept.destroy()
+    try tiles.read(pixels)
+    assert(pixels[(5 * 600 + 5) * 4 + 2] > 0.99 and pixels[(5 * 600 + 5) * 4 + 3] > 0.99 and pixels[(150 * 600 + 500) * 4 + 3] == 0.0)
+    assert(pixels[(5 * 600 + 299) * 4 + 2] > 0.99 and pixels[(5 * 600 + 301) * 4 + 3] == 0.0)
+

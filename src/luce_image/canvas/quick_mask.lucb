@@ -16,20 +16,48 @@
 #
 #==============================================================================================
 
+extend Canvas:
+    ## Select › Quick Mask on: the selection becomes a mask the painting tools
+    ## edit (white selects, black masks), one undo step.
+    pub mutating func enter_quick_mask() -> !:
+        try self.require_open()
+        try self.require_idle()
+        let document = self.document else error(invalid, "draw the document once before using Quick Mask")
+        if document.quick_layer() != none:
+            return
+        try self.remember_state("Quick Mask")
+        let tiles = try quick_tiles_from(&self, &document.selection)
+        discard(try document.begin_quick(tiles))
+
+    ## Quick Mask off: the mask painted becomes the selection, one undo step.
+    pub mutating func exit_quick_mask() -> !:
+        try self.require_open()
+        try self.require_idle()
+        let document = self.document else return
+        let quick = document.quick_layer() else return
+        let mask = quick.mask_tiles() else trap("Quick Mask's layer has a mask")
+        let device = self.device else trap("Quick Mask without a device")
+        let was_empty = document.selection.is_empty()
+        var found = try Selection.create(self.extent_x, self.extent_y)
+        errdefer found.destroy()
+        var source = TilesSource(tiles = mask)
+        # Where the mask has no tile it reveals: selected.
+        try found.load(selection_sources.gpu_reader((void*)&source, device, tiles_cell_texture), 0, 255, Mode.replace)
+        try self.remember_state("Exit Quick Mask")
+        document.end_quick()
+        # Nothing masked from nothing selected stays nothing selected.
+        if was_empty and full(&found):
+            found.clear()
+        document.selection.destroy()
+        document.selection = found
+
+    pub func quick_mask() -> bool:
+        let document = self.document else return false
+        return document.quick_layer() != none
+
 ## The overlay's tint and strength, as Photoshop's default: red at half.
 let quick_red: f32 = 1.0
 let quick_opacity: f32 = 0.5
-
-## `Canvas.enter_quick_mask`.
-func enter_quick_mask(canvas: Canvas*) -> !:
-    try canvas.require_open()
-    try canvas.require_idle()
-    let document = canvas.document else error(invalid, "draw the document once before using Quick Mask")
-    if document.quick_layer() != none:
-        return
-    try canvas.remember_state("Quick Mask")
-    let tiles = try quick_tiles_from(canvas, &document.selection)
-    discard(try document.begin_quick(tiles))
 
 ## The selection as a mask's tiles: a wholly selected cell has no tile (a mask
 ## reveals where it has none), a wholly masked one shares one black tile, the
@@ -79,28 +107,6 @@ func quick_tiles_from(canvas: Canvas*, selection: const Selection*) -> Tiles!:
                 black_column = (i64)column
                 black_row = row
     return tiles
-
-## `Canvas.exit_quick_mask`: the mask becomes the selection, one step.
-func exit_quick_mask(canvas: Canvas*) -> !:
-    try canvas.require_open()
-    try canvas.require_idle()
-    let document = canvas.document else return
-    let quick = document.quick_layer() else return
-    let mask = quick.mask_tiles() else trap("Quick Mask's layer has a mask")
-    let device = canvas.device else trap("Quick Mask without a device")
-    let was_empty = document.selection.is_empty()
-    var found = try Selection.create(canvas.extent_x, canvas.extent_y)
-    errdefer found.destroy()
-    var source = TilesSource(tiles = mask)
-    # Where the mask has no tile it reveals: selected.
-    try found.load(selection_sources.gpu_reader((void*)&source, device, tiles_cell_texture), 0, 255, Mode.replace)
-    try canvas.remember_state("Exit Quick Mask")
-    document.end_quick()
-    # Nothing masked from nothing selected stays nothing selected.
-    if was_empty and full(&found):
-        found.clear()
-    document.selection.destroy()
-    document.selection = found
 
 ## Take Quick Mask down without keeping it (the canvas closing).
 func drop_quick_mask(canvas: Canvas*):

@@ -128,8 +128,8 @@ test "the histogram counts a layer's cells and the picture's bands, transparency
     try canvas.deselect()
     discard(try shown_at(&canvas, &target, 0, 0))
     try canvas.measure_histogram(paint)
-    let red = (i64)srgb_byte(0.2)
-    let blue = (i64)srgb_byte(0.6)
+    let red = (i64)transfer.srgb_byte(0.2)
+    let blue = (i64)transfer.srgb_byte(0.6)
     assert((try canvas.histogram(1, red)) == 300 * 250 and (try canvas.histogram(3, blue)) == 300 * 250)
     var total: i64 = 0
     for slot in 0..<(i64)256:

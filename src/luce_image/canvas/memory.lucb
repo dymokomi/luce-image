@@ -12,6 +12,106 @@
 #
 #==============================================================================================
 
+extend Canvas:
+    ## Let the documents' tiles use `fraction` (0.1..0.95) of the GPU's and the
+    ## machine's memory, as Photoshop's Memory Usage: past it, the least wanted
+    ## tiles move from the GPU to RAM. One setting for every document.
+    pub mutating func set_memory_usage(fraction: f64) -> !:
+        if not (fraction >= 0.1 and fraction <= 0.95):
+            error(invalid, "memory usage must be 0.1..0.95 of what the machine has")
+        memory_usage = fraction
+        forced = false
+        if let device = self.device:
+            try configure_memory(device)
+
+    ## Keep tiles spilled past the RAM budget in `directory` (which must
+    ## exist); "" for the default, a disk-backed cache. Like Photoshop's
+    ## scratch disk; it applies before the first spill.
+    pub static func set_scratch_folder(directory: str) -> !:
+        try set_scratch_directory(directory)
+
+    ## Frames never wait for tiles to come back from compressed copies, the
+    ## scratch file or the document file: a cell lacking some draws from a
+    ## coarser level kept, while they decode in the background, and `busy`
+    ## says to draw again. Off by default (a frame shows everything at once).
+    pub static func set_progressive_loading(on: bool):
+        progressive_loading = on
+
+    ## Compress tiles past the RAM budget in RAM before they go to the scratch
+    ## file (off by default; see canvas/memory): for a slow or small scratch disk.
+    pub static func set_compressed_tier(on: bool):
+        compressed_tier = on
+        apply_compressed_tier()
+
+    ## On quitting, once every document is closed: the scratch file closes and
+    ## its folder goes (on Windows the folder would otherwise stay behind).
+    pub static func release_scratch_file():
+        release_scratch()
+
+    ## Set the GPU and RAM budgets in bytes directly (0 for none): tests, and
+    ## seeing the governor work on a small machine.
+    pub mutating func set_memory_budgets(gpu_bytes: i64, ram_bytes: i64) -> !:
+        if gpu_bytes < 0 or ram_bytes < 0:
+            error(invalid, "memory budgets are bytes, 0 for none")
+        force_memory_budgets((usize)gpu_bytes, (usize)ram_bytes)
+
+    ## Begin a new epoch and keep the tiers within their budgets now, as a
+    ## frame does: for headless work between steps.
+    pub mutating func settle_memory() -> !:
+        residency_advance()
+        try settle_tiers(&self)
+
+    ## Bytes of layer tiles on the GPU, their copies in RAM, derived tiles
+    ## (pyramids and composites) on the GPU, and the two budgets.
+    pub func memory_gpu_bytes() -> i64:
+        return (i64)residency_report().gpu_tiles
+
+    pub func memory_ram_bytes() -> i64:
+        return (i64)residency_report().ram_tiles
+
+    ## What the system says the process holds (macOS footprint, Windows private
+    ## bytes, Linux resident pages), which the RAM budget also holds to; 0 where
+    ## it cannot tell.
+    pub func memory_process_bytes() -> i64:
+        return (i64)residency_report().process
+
+    pub func memory_derived_bytes() -> i64:
+        return (i64)residency_report().derived
+
+    pub func memory_gpu_budget() -> i64:
+        return (i64)residency_report().gpu_budget
+
+    pub func memory_ram_budget() -> i64:
+        return (i64)residency_report().ram_budget
+
+    ## Tiles moved so far: uploads back to the GPU (promotions), moves to RAM
+    ## (demotions) and one-pass uploads for derived tiles (transient uploads).
+    pub func memory_promotions() -> i64:
+        return (i64)residency_report().promotions
+
+    pub func memory_demotions() -> i64:
+        return (i64)residency_report().demotions
+
+    pub func memory_transient_uploads() -> i64:
+        return (i64)residency_report().transient_uploads
+
+    ## Bytes of tiles in the scratch file, and tiles moved out to it and back.
+    pub func memory_disk_bytes() -> i64:
+        return (i64)residency_report().disk_tiles
+
+    pub func memory_spills() -> i64:
+        return (i64)residency_report().spills
+
+    ## Bytes of tiles held compressed in RAM, and tiles compressed so far.
+    pub func memory_packed_bytes() -> i64:
+        return (i64)residency_report().packed_tiles
+
+    pub func memory_packs() -> i64:
+        return (i64)residency_report().packs
+
+    pub func memory_loads() -> i64:
+        return (i64)residency_report().loads
+
 ## The share of the GPU's and the machine's memory tiles may use: Settings ›
 ## Memory usage, one setting for every open document.
 var memory_usage: f64 = 0.6
@@ -52,15 +152,6 @@ func force_memory_budgets(gpu_bytes: usize, ram_bytes: usize):
     forced_ram = ram_bytes
     residency_budgets(gpu_bytes, ram_bytes)
 
-## `Canvas.set_memory_usage`: a new share, applied at once when bound.
-func set_memory_usage(canvas: Canvas*, fraction: f64) -> !:
-    if not (fraction >= 0.1 and fraction <= 0.95):
-        error(invalid, "memory usage must be 0.1..0.95 of what the machine has")
-    memory_usage = fraction
-    forced = false
-    if let device = canvas.device:
-        try configure_memory(device)
-
 ## A draw into frame `serial`: whether it is the first into a new frame, which
 ## begins the frame's epoch. That draw settles the tiers once it has drawn
 ## (`settle_tiers`), so what it drew with (a new layer's tiles, making its
@@ -68,11 +159,6 @@ func set_memory_usage(canvas: Canvas*, fraction: f64) -> !:
 ## Navigator after the view) keep what the first pinned.
 func begin_frame(serial: u64) -> bool:
     return residency_frame(serial)
-
-## Begin an epoch outside any frame and settle: headless steps and tests.
-func settle_memory(canvas: Canvas*) -> !:
-    residency_advance()
-    try settle_tiers(canvas)
 
 ## A step of a job that runs outside frames (an export's band, a saved layer):
 ## what it has finished with may leave, so the tiers stay within their budgets

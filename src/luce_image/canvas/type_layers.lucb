@@ -12,6 +12,67 @@
 #
 #==============================================================================================
 
+extend Canvas:
+    ## Make layer `id` a text layer (or set it again): `text` in `family` and
+    ## `style` at `size` pixels, in linear (`red`, `green`, `blue`), its first
+    ## line's top-left at (`x`, `y`), wrapping in a box `box_width` wide (0:
+    ## point text), aligned 0 left, 1 center, 2 right or 3 justified, tracked
+    ## in thousandths of an em and led `leading` pixels (0: the face's). Its
+    ## pixels are set from these on every change. Undoable; typing coalesces.
+    pub mutating func set_type(id: i64, text: str, family: str, style: str, size: f64, red: f64, green: f64, blue: f64, x: f64, y: f64,
+                               box_width: f64 = 0.0, alignment: i64 = 0, tracking: f64 = 0.0, leading: f64 = 0.0) -> !:
+        try set_layer_type(&self, (u64)id, TypeSpec(text = text, family = family, style = style, size = size, red = red, green = green, blue = blue, x = x, y = y,
+                                                    box_width = box_width, alignment = alignment, tracking = tracking, leading = leading))
+
+    ## Whether the layer at `index` is a text layer, and what it is set from.
+    pub func layer_typed(index: i64) -> bool!:
+        return (try self.record(index)).typed
+
+    pub func layer_text(index: i64) -> str!:
+        return (try typed_record(&self, index)).typeset.text
+
+    pub func layer_font_family(index: i64) -> str!:
+        return (try typed_record(&self, index)).typeset.family
+
+    pub func layer_font_style(index: i64) -> str!:
+        return (try typed_record(&self, index)).typeset.style
+
+    ## A text layer's number setting: 0 size, 1..3 red, green, blue, 4 x, 5 y,
+    ## 6 box width, 7 alignment, 8 tracking, 9 leading.
+    pub func layer_type_value(index: i64, field: i64) -> f64!:
+        let spec = (try typed_record(&self, index)).typeset
+        let values: f64[10] = [spec.size, spec.red, spec.green, spec.blue, spec.x, spec.y, spec.box_width, (f64)spec.alignment, spec.tracking, spec.leading]
+        if field < 0 or field >= 10:
+            error(invalid, "type values are 0..9")
+        return values[(usize)field]
+
+    ## The installed font families, listed once: how many, and each by index.
+    pub mutating func font_family_count() -> i64!:
+        return (i64)(try family_names(&self)).length()
+
+    pub mutating func font_family(index: i64) -> str!:
+        if index < 0:
+            error(invalid, "no such family")
+        return try (try family_names(&self)).at((usize)index)
+
+    ## The styles `family` comes in, one by index (0: the count's call).
+    pub static func font_style_count(family: str) -> i64!:
+        var names = try fonts.styles(family)
+        defer names.close()
+        return (i64)names.length()
+
+    ## Style `index` of `family`; the caller copies it before the next call.
+    pub static func font_style(family: str, index: i64) -> str!:
+        var names = try fonts.styles(family)
+        defer names.close()
+        if index < 0:
+            error(invalid, "no such style")
+        let found = try names.at((usize)index)
+        var copied: str = ""
+        with memory.heap:
+            copied = try strings.copy(found)
+        return copied
+
 ## What a text layer is set from.
 struct TypeSpec:
     var text: str

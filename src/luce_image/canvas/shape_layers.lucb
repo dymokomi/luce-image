@@ -4,73 +4,127 @@
 #
 #   DESCRIPTION:
 #       A rectangle (with rounded corners), an ellipse, a line, a regular polygon or a pen
-#       path (path_layers.lucb) kept as what it is — its box, its fill and stroke, and a 2×3
+#       path kept as what it is — its box, its fill and stroke, and a 2×3
 #       transform — and drawn again from that, through luce-svg, on every change: moved,
 #       scaled or turned it stays crisp, as Photoshop's shape layers. A vector layer holds a
-#       list of them (vector_elements.lucb). Painting, filtering or distorting its pixels
+#       list of them (vector_elements.lucb; luce-vector draws them). Painting, filtering or distorting its pixels
 #       turns it into an ordinary layer, as with text.
 #
 #==============================================================================================
 
-## What a vector element is drawn from.
-struct ShapeSpec:
-    ## 0 rectangle, 1 ellipse, 2 line, 3 polygon, 4 path.
-    var kind: i64
-    ## The box in the shape's own space; a line runs from its top-left to its bottom-right.
-    var x: f64
-    var y: f64
-    var width: f64
-    var height: f64
-    ## A polygon's corners and a rectangle's corner radius.
-    var sides: i64 = 5
-    var radius: f64
-    ## The fill and the stroke, colors in linear light.
-    var filled: bool = true
-    var fill_red: f64
-    var fill_green: f64
-    var fill_blue: f64
-    var stroked: bool
-    var stroke_red: f64
-    var stroke_green: f64
-    var stroke_blue: f64
-    var stroke_width: f64 = 1.0
-    ## Shape space to document pixels: (a·x + c·y + e, b·x + d·y + f).
-    var matrix: f64[6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
-    ## A path's anchors in shape space, six values each: the point, the handle
-    ## coming in and the handle going out (a corner's handles sit on it). Heap
-    ## storage its element owns (path_layers.lucb); empty for the other kinds.
-    var path: f64[]
-    var closed: bool = false
-    ## Anchors in each run when the path has several (an SVG outline with a hole),
-    ## heap storage like `path`; empty for one run.
-    var subpaths: u32[]
+extend Canvas:
+    ## Make layer `id` a vector layer of one shape — `kind` 0 a rectangle
+    ## (corners rounded by `radius`), 1 an ellipse, 2 a line from (`x`, `y`) by
+    ## (`width`, `height`), 3 a regular polygon of `sides` — in the box (`x`,
+    ## `y`, `width`, `height`), filled and stroked as given (linear colors; a
+    ## line is its stroke). On a vector layer the shape replaces its target
+    ## element (the active one, else the topmost). It stays a shape, crisp
+    ## however it is moved, scaled or turned. One step.
+    pub mutating func set_shape(id: i64, kind: i64, x: f64, y: f64, width: f64, height: f64, sides: i64, radius: f64,
+                                filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
+                                stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64) -> !:
+        let values: f64[22] = [(f64)kind, x, y, width, height, (f64)sides, radius, 1.0 if filled else 0.0, fill_red, fill_green, fill_blue,
+                               1.0 if stroked else 0.0, stroke_red, stroke_green, stroke_blue, stroke_width, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+        try set_layer_shape(&self, (u64)id, try shape_from_values(values))
 
-## The number of a spec's values `layer_shape_value` reads, in `shape_values` order.
-let shape_value_count: i64 = 23
+    ## `set_shape`'s shape added on top of layer `id`'s elements instead, named
+    ## after its kind and active: a pixel layer with nothing painted becomes a
+    ## vector layer. One step.
+    pub mutating func add_shape(id: i64, kind: i64, x: f64, y: f64, width: f64, height: f64, sides: i64, radius: f64,
+                                filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
+                                stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64) -> !:
+        let values: f64[22] = [(f64)kind, x, y, width, height, (f64)sides, radius, 1.0 if filled else 0.0, fill_red, fill_green, fill_blue,
+                               1.0 if stroked else 0.0, stroke_red, stroke_green, stroke_blue, stroke_width, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+        try add_vector_element(&self, (u64)id, try shape_from_values(values), "", "Shape")
 
-## A spec's values by number: kind, x, y, width, height, sides, radius,
-## filled, the fill color, stroked, the stroke color, the stroke width, then
-## the six of the matrix.
-func shape_values(spec: ShapeSpec) -> f64[23]:
-    return [(f64)spec.kind, spec.x, spec.y, spec.width, spec.height, (f64)spec.sides, spec.radius,
-            1.0 if spec.filled else 0.0, spec.fill_red, spec.fill_green, spec.fill_blue,
-            1.0 if spec.stroked else 0.0, spec.stroke_red, spec.stroke_green, spec.stroke_blue, spec.stroke_width,
-            spec.matrix[0], spec.matrix[1], spec.matrix[2], spec.matrix[3], spec.matrix[4], spec.matrix[5], 0.0]
+    ## The target element's fill, stroke, corner radius and sides changed, its
+    ## geometry and transform kept. One step; a slider dragged coalesces.
+    pub mutating func restyle_shape(id: i64, filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
+                                    stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64, radius: f64, sides: i64) -> !:
+        let style: f64[11] = [(f64)sides, radius, 1.0 if filled else 0.0, fill_red, fill_green, fill_blue,
+                              1.0 if stroked else 0.0, stroke_red, stroke_green, stroke_blue, stroke_width]
+        try restyle_target(&self, (u64)id, style[..<11])
 
-## The spec from values in `shape_values` order.
-func shape_from_values(values: const f64[]) -> ShapeSpec!:
-    if values.length < 22:
-        error(invalid, "a shape takes 22 values")
-    for value in values:
-        if not math.is_finite(value):
-            error(invalid, "shape values must be finite")
-    let kind = (i64)values[0]
-    if kind < 0 or kind > 4:
-        error(invalid, "a shape is 0 a rectangle, 1 an ellipse, 2 a line, 3 a polygon or 4 a path")
-    return ShapeSpec(kind = kind, x = values[1], y = values[2], width = values[3], height = values[4], sides = (i64)math.max(3.0, math.min(64.0, values[5])),
-                     radius = math.max(0.0, values[6]), filled = values[7] != 0.0, fill_red = values[8], fill_green = values[9], fill_blue = values[10],
-                     stroked = values[11] != 0.0, stroke_red = values[12], stroke_green = values[13], stroke_blue = values[14], stroke_width = math.max(0.0, values[15]),
-                     matrix = [values[16], values[17], values[18], values[19], values[20], values[21]])
+    ## Layer `id` made a vector layer of a pen path (or, on a vector layer, its
+    ## target element drawn as one) from the points collected with `add_point`,
+    ## three an anchor in document pixels — the point, the handle coming in, the
+    ## handle going out — joined by cubic curves, closed back to the first when
+    ## `closed`; filled and stroked as `set_shape`. One step.
+    pub mutating func set_path(id: i64, closed: bool, filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
+                               stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64) -> !:
+        let style: f64[11] = [3.0, 0.0, 1.0 if filled else 0.0, fill_red, fill_green, fill_blue,
+                              1.0 if stroked else 0.0, stroke_red, stroke_green, stroke_blue, stroke_width]
+        try set_layer_shape(&self, (u64)id, try self.collected_path(closed, style[..<11]))
+
+    ## `set_path`'s path added on top of layer `id`'s elements instead, active. One step.
+    pub mutating func add_path(id: i64, closed: bool, filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
+                               stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64) -> !:
+        let style: f64[11] = [3.0, 0.0, 1.0 if filled else 0.0, fill_red, fill_green, fill_blue,
+                              1.0 if stroked else 0.0, stroke_red, stroke_green, stroke_blue, stroke_width]
+        try add_vector_element(&self, (u64)id, try self.collected_path(closed, style[..<11]), "", "Path")
+
+    ## The Vector panel's new path: an empty path element named `name` on top of
+    ## layer `id`, active, for the Pen to draw into. One step.
+    pub mutating func add_empty_path(id: i64, name: str) -> !:
+        var no_path: f64[]
+        try add_vector_element(&self, (u64)id, ShapeSpec(kind = 4, filled = false, stroked = true, stroke_width = 1.0, path = no_path), name, "New Path")
+
+    ## The collected points (`add_point`) as a path spec styled by `style`
+    ## (`restyle_shape`'s values from sides on), which the caller owns.
+    mutating func collected_path(closed: bool, style: const f64[]) -> ShapeSpec!:
+        let collected = self.polygon[..<self.polygon_count]
+        self.polygon_count = 0
+        if collected.length < 2 * anchor_values:
+            error(invalid, "a path needs at least two anchors")
+        var values: f64[22] = [4.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+        for at in 0..<(usize)11:
+            values[5 + at] = style[at]
+        var spec = try shape_from_values(values[..<22])
+        spec.closed = closed
+        spec.path = try owned_path(collected)
+        return spec
+
+    ## How many anchors the path the layer at `index` targets has; 0 for any
+    ## other layer or element, and for an outline of several runs.
+    pub func layer_path_count(index: i64) -> i64!:
+        let spec = target_spec(try self.record(index)) else return 0
+        if spec.kind != 4 or spec.subpaths.length > 0:
+            return 0
+        return (i64)(spec.path.length // anchor_values)
+
+    ## Whether the targeted path of the layer at `index` is closed.
+    pub func layer_path_closed(index: i64) -> bool!:
+        let spec = target_spec(try self.record(index)) else return false
+        return spec.closed
+
+    ## Value `field` of anchor `anchor` of the path the layer at `index`
+    ## targets, in document pixels: 0 and 1 the point, 2 and 3 the handle
+    ## coming in, 4 and 5 the handle going out.
+    pub func layer_path_value(index: i64, anchor: i64, field: i64) -> f64!:
+        let spec = target_spec(try self.record(index)) else error(invalid, "the layer is not a path")
+        if spec.kind != 4:
+            error(invalid, "the layer is not a path")
+        let count = (i64)(spec.path.length // anchor_values)
+        if anchor < 0 or anchor >= count or field < 0 or field > 5:
+            error(invalid, "no such path value")
+        let at = (usize)anchor * anchor_values + (usize)(field - field % 2)
+        let x = spec.path[at]
+        let y = spec.path[at + 1]
+        let m = spec.matrix
+        return m[0] * x + m[2] * y + m[4] if field % 2 == 0 else m[1] * x + m[3] * y + m[5]
+
+    ## Whether the layer at `index` is a vector layer.
+    pub func layer_shaped(index: i64) -> bool!:
+        return (try self.record(index)).shaped
+
+    ## Value `field` of the shape the layer at `index` targets: 0 kind, 1..4
+    ## the box, 5 sides, 6 radius, 7 filled, 8..10 the fill, 11 stroked,
+    ## 12..14 the stroke, 15 its width, 16..21 the transform.
+    pub func layer_shape_value(index: i64, field: i64) -> f64!:
+        let spec = target_spec(try self.record(index)) else error(invalid, "the layer is not a shape")
+        if field < 0 or field >= 22:
+            error(invalid, "a shape has values 0..21")
+        return shape_values(spec)[(usize)field]
 
 ## `Canvas.set_shape`: layer `id` made a vector layer of `spec` alone, or, when
 ## it is one already, its target element (vector_elements.lucb) drawn from
@@ -141,94 +195,3 @@ func affine_of(forward: Warp) -> f64[6]?:
     if math.abs(m[6]) > 1e-9 or math.abs(m[7]) > 1e-9 or math.abs(m[8]) < 1e-12:
         return none
     return [m[0] / m[8], m[3] / m[8], m[1] / m[8], m[4] / m[8], m[2] / m[8], m[5] / m[8]]
-
-## `spec` as a one-element SVG document whose viewBox is the `width` by `height`
-## window of the canvas from (`left`, `top`), a pixel a unit.
-func shape_svg(out: strings.Builder*, spec: ShapeSpec, left: u32, top: u32, width: u32, height: u32) -> !:
-    try svg_open(out, left, top, width, height)
-    try shape_group(out, spec)
-    try out.put("</svg>")
-
-## An SVG document's opening tag over the canvas window from (`left`, `top`).
-func svg_open(out: strings.Builder*, left: u32, top: u32, width: u32, height: u32) -> !:
-    var line: u8[256]
-    try out.put(try format(line, f"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{left} {top} {width} {height}\">"))
-
-## `spec` as one SVG element in a group carrying its transform: several of them,
-## one after another, make a vector layer's drawing in paint order.
-func shape_group(out: strings.Builder*, spec: ShapeSpec) -> !:
-    var line: u8[512]
-    let m = spec.matrix
-    try out.put(try format(line, f"<g transform=\"matrix({svg_fine(m[0])} {svg_fine(m[1])} {svg_fine(m[2])} {svg_fine(m[3])} {svg_brief(m[4])} {svg_brief(m[5])})\">"))
-    var fill_text: u8[16]
-    var stroke_text: u8[16]
-    let fill = try hex_color(fill_text, spec.fill_red, spec.fill_green, spec.fill_blue) if spec.filled and spec.kind != 2 else "none"
-    let stroked = spec.stroked or spec.kind == 2
-    let stroke = try hex_color(stroke_text, spec.stroke_red, spec.stroke_green, spec.stroke_blue) if stroked else "none"
-    # The stroke width is in document pixels; SVG scales it by the transform, so it is
-    # written in shape space.
-    let scale = math.sqrt(math.abs(m[0] * m[3] - m[1] * m[2]))
-    let width_in_shape = spec.stroke_width / scale if scale > 1e-9 else spec.stroke_width
-    var paint: u8[160]
-    let paints = try format(paint, f"fill=\"{fill}\" stroke=\"{stroke}\" stroke-width=\"{width_in_shape}\" stroke-linejoin=\"miter\"")
-    if spec.kind == 0:
-        let rounding = math.min(spec.radius, math.min(math.abs(spec.width), math.abs(spec.height)) * 0.5)
-        try out.put(try format(line, f"<rect x=\"{spec.x}\" y=\"{spec.y}\" width=\"{spec.width}\" height=\"{spec.height}\" rx=\"{rounding}\" {paints}/>"))
-    elif spec.kind == 1:
-        try out.put(try format(line, f"<ellipse cx=\"{spec.x + spec.width * 0.5}\" cy=\"{spec.y + spec.height * 0.5}\" rx=\"{spec.width * 0.5}\" ry=\"{spec.height * 0.5}\" {paints}/>"))
-    elif spec.kind == 2:
-        try out.put(try format(line, f"<line x1=\"{spec.x}\" y1=\"{spec.y}\" x2=\"{spec.x + spec.width}\" y2=\"{spec.y + spec.height}\" stroke-linecap=\"round\" {paints}/>"))
-    elif spec.kind == 4 and spec.subpaths.length == 0 and cornered(spec.path):
-        # Corners only (a star, a polygon drawn with the Pen): its points, which
-        # luce-svg reads and draws without flattening a curve per side.
-        try out.put("<polygon points=\"" if spec.closed else "<polyline points=\"")
-        for at in 0..<spec.path.length // anchor_values:
-            try out.put(try format(line, f"{svg_brief(spec.path[at * anchor_values])},{svg_brief(spec.path[at * anchor_values + 1])} "))
-        try out.put(try format(line, f"\" stroke-linecap=\"round\" {paints}/>"))
-    elif spec.kind == 4:
-        try out.put("<path d=\"")
-        try path_d(out, spec)
-        try out.put(try format(line, f"\" stroke-linecap=\"round\" {paints}/>"))
-    else:
-        try out.put("<polygon points=\"")
-        for corner in 0..<spec.sides:
-            let angle = -math.pi / 2.0 + (f64)corner * 2.0 * math.pi / (f64)spec.sides
-            let px = spec.x + spec.width * 0.5 + math.cos(angle) * spec.width * 0.5
-            let py = spec.y + spec.height * 0.5 + math.sin(angle) * spec.height * 0.5
-            try out.put(try format(line, f"{svg_brief(px)},{svg_brief(py)} "))
-        try out.put(try format(line, f"\" {paints}/>"))
-    try out.put("</g>")
-
-## A coordinate to a ten-thousandth of a pixel, and a matrix's turn and scale to
-## a hundred-millionth: the drawing is the same, and its text, which luce-svg
-## reads a character at a time, a third as long for a graph's thousands of shapes.
-func svg_brief(value: f64) -> f64:
-    return math.round(value * 10000.0) / 10000.0 if math.abs(value) < 1e11 else value
-
-func svg_fine(value: f64) -> f64:
-    return math.round(value * 100000000.0) / 100000000.0 if math.abs(value) < 1e7 else value
-
-## Whether every anchor of `path` is a corner, both its handles on it.
-func cornered(path: const f64[]) -> bool:
-    for at in 0..<path.length // anchor_values:
-        let base = at * anchor_values
-        for handle in [2, 4]:
-            if path[base + (usize)handle] != path[base] or path[base + (usize)handle + 1] != path[base + 1]:
-                return false
-    return true
-
-## A linear color as `#rrggbb` in sRGB, the way SVG reads it.
-func hex_color(buffer: u8[], red: f64, green: f64, blue: f64) -> str!:
-    let digits = "0123456789abcdef"
-    buffer[0] = '#'
-    var at: usize = 1
-    for value in [red, green, blue]:
-        let byte = (usize)math.round(encode_srgb(value) * 255.0)
-        buffer[at] = digits.bytes[byte // 16]
-        buffer[at + 1] = digits.bytes[byte % 16]
-        at += 2
-    return (str)buffer[..<7]
-
-func encode_srgb(linear: f64) -> f64:
-    let v = math.clamp(linear, 0.0, 1.0)
-    return v * 12.92 if v <= 0.0031308 else 1.055 * math.pow(v, 1.0 / 2.4) - 0.055

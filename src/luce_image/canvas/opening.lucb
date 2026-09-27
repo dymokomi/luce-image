@@ -27,6 +27,70 @@
 #
 #==============================================================================================
 
+extend Canvas:
+    ## Whether the picture the document was opened from is still loading
+    ## (canvas/opening): it draws as far as it has come; edits and saves wait.
+    pub func is_opening() -> bool:
+        return self.opening != none
+
+    ## How much of the picture has loaded, 0..100 (100 once it has).
+    pub func opening_percent() -> i64:
+        let opening = self.opening else return 100
+        let rows = (u64)opening.rows.load(.acquire)
+        return (i64)(rows * 100 // (u64)opening.extent_y)
+
+    ## Take in the bands decoded since the last call, as a draw does: for a
+    ## document not on screen, whose picture would otherwise wait for its next
+    ## frame. A failed load is reported here, once.
+    pub mutating func continue_opening() -> !:
+        let opening = self.opening else return
+        let document = self.document else return
+        let composer = self.composer else return
+        let layer = document.find(opening.layer) else trap("the opening layer is gone")
+        let tiles = layer.tiles() else trap("the opening layer has no tiles")
+        let started = time.now()
+        try show_coarse(opening, composer)
+        let before = opening.uploaded
+        while opening.uploaded < opening.packed.load(.acquire):
+            let slot = &opening.slots[opening.uploaded % opening_slots]
+            if opening.placed:
+                try opening.source.write_packed(slot.row, slot.band, slot.painted)
+                try land_opening(&self, composer, document, tiles, opening, slot.row)
+            else:
+                # What was made from this row so far is stale once it is in.
+                composer.forget_band(document, tiles, slot.row)
+                try tiles.write_packed(slot.row, slot.band, slot.painted)
+                try build_band_levels(&self, composer, tiles, slot.row)
+            opening.uploaded += 1
+            opening.free_slots.release()
+            try settle_job(&self)
+            if time.now() - started > opening_upload_budget_ns:
+                # The rest go in the next frame, which nothing else may ask for.
+                wake_frames()
+                break
+        if opening.uploaded != before:
+            try refresh_coarse(opening, composer)
+        if opening.finished.load(.acquire) == 0 or opening.uploaded < opening.packed.load(.acquire):
+            return
+        self.opening = none
+        hide_coarse(opening, composer)
+        let failed = opening.failed
+        let code = opening.failure_code
+        # The message outlives the opening: the canvas keeps it.
+        let length = opening.failure_length
+        memory.copy(self.open_failure, opening.failure_text, length)
+        free_opening(opening)
+        if failed:
+            error(code, (str)self.open_failure[..<length])
+
+    ## Wait for the picture opening, if any, to be in: before another is
+    ## placed, for one loads at a time.
+    pub mutating func finish_opening() -> !:
+        while self.opening != none:
+            try self.continue_opening()
+            if self.opening != none:
+                thread.sleep(1)
+
 ## Bands the worker may pack ahead of the uploads.
 let opening_slots: usize = 3
 
@@ -188,50 +252,6 @@ func band_packed(opening: Opening*, rows: usize):
     # Frames upload it; the window's loop may be asleep waiting for input.
     wake_frames()
 
-## Upload the bands packed since the last frame (for a frame's time at most),
-## each followed by the pyramid levels it completes, and once the worker is
-## done, finish: its failure, if any, is returned here, once.
-func collect_opening(canvas: Canvas*) -> !:
-    let opening = canvas.opening else return
-    let document = canvas.document else return
-    let composer = canvas.composer else return
-    let layer = document.find(opening.layer) else trap("the opening layer is gone")
-    let tiles = layer.tiles() else trap("the opening layer has no tiles")
-    let started = time.now()
-    try show_coarse(opening, composer)
-    let before = opening.uploaded
-    while opening.uploaded < opening.packed.load(.acquire):
-        let slot = &opening.slots[opening.uploaded % opening_slots]
-        if opening.placed:
-            try opening.source.write_packed(slot.row, slot.band, slot.painted)
-            try land_opening(canvas, composer, document, tiles, opening, slot.row)
-        else:
-            # What was made from this row so far is stale once it is in.
-            composer.forget_band(document, tiles, slot.row)
-            try tiles.write_packed(slot.row, slot.band, slot.painted)
-            try build_band_levels(canvas, composer, tiles, slot.row)
-        opening.uploaded += 1
-        opening.free_slots.release()
-        try settle_job(canvas)
-        if time.now() - started > opening_upload_budget_ns:
-            # The rest go in the next frame, which nothing else may ask for.
-            wake_frames()
-            break
-    if opening.uploaded != before:
-        try refresh_coarse(opening, composer)
-    if opening.finished.load(.acquire) == 0 or opening.uploaded < opening.packed.load(.acquire):
-        return
-    canvas.opening = none
-    hide_coarse(opening, composer)
-    let failed = opening.failed
-    let code = opening.failure_code
-    # The message outlives the opening: the canvas keeps it.
-    let length = opening.failure_length
-    memory.copy(canvas.open_failure, opening.failure_text, length)
-    free_opening(opening)
-    if failed:
-        error(code, (str)canvas.open_failure[..<length])
-
 ## A placed picture's cell row `row` is in: the rows of the layer's cells
 ## whose picture rows are all in now land, their levels made as a band's are,
 ## and the picture's cells no later row needs are let go.
@@ -306,16 +326,10 @@ func free_opening(opening: Opening*):
             free(opening.slots[slot].painted) in memory.heap
     free(opening) in memory.heap
 
-## How far the picture has come, 0..100; 100 when nothing is opening.
-func opening_progress(canvas: const Canvas*) -> i64:
-    let opening = canvas.opening else return 100
-    let rows = (u64)opening.rows.load(.acquire)
-    return (i64)(rows * 100 // (u64)opening.extent_y)
-
 ## Refuse what changes or saves the document while its picture is still
 ## opening, or while Select and Mask's OK refines the selection.
 func require_loaded(canvas: const Canvas*) -> !:
     if canvas.opening != none:
         error(invalid, "the picture is still opening")
-    if refine_keeping(canvas):
+    if canvas.refine_keeping():
         error(invalid, "the selection is still being refined")

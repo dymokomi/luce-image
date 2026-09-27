@@ -20,6 +20,138 @@
 #
 #==============================================================================================
 
+extend Canvas:
+    ## The alpha channels, saved selections by name, top first (channels.lucb).
+    pub func channel_count() -> i64:
+        return (i64)self.channels.count
+
+    pub func channel_name(index: i64) -> str!:
+        return (try channel_of(&self, index)).name
+
+    ## Select › Save Selection: the selection as a new alpha channel at the
+    ## end, named `name`; its index. Undoable.
+    pub mutating func save_selection_channel(name: str) -> i64!:
+        return try add_channel(&self, name, false, self.channels.count, "Save Selection")
+
+    ## The panel's New Channel: an alpha channel selecting nothing, at the end.
+    pub mutating func new_channel(name: str) -> i64!:
+        return try add_channel(&self, name, true, self.channels.count, "New Channel")
+
+    ## A copy of channel `index` named `name`, just after it; its index.
+    pub mutating func duplicate_channel(index: i64, name: str) -> i64!:
+        try self.require_open()
+        try check_channel_name(name)
+        let source = try channel_at(&self, index)
+        if self.channels.count >= channel_limit:
+            error(limit, "a document holds at most 53 alpha channels")
+        try self.remember_state("Duplicate Channel")
+        var selection = try source.selection.copy()
+        errdefer selection.destroy()
+        var copied: str = ""
+        with memory.heap:
+            copied = try strings.copy(name)
+        errdefer strings.release(copied)
+        try self.channels.insert((usize)index + 1, Channel(name = copied, selection = selection, shown = false))
+        return index + 1
+
+    ## Alpha channel `index` called `name`. One step.
+    pub mutating func rename_channel(index: i64, name: str) -> !:
+        try self.require_open()
+        try check_channel_name(name)
+        discard(try channel_at(&self, index))
+        try self.remember_state("Rename Channel")
+        var copied: str = ""
+        with memory.heap:
+            copied = try strings.copy(name)
+        let channel = try channel_at(&self, index)
+        strings.release(channel.name)
+        channel.name = copied
+
+    ## Alpha channel `index` taken away. One step.
+    pub mutating func delete_channel(index: i64) -> !:
+        try self.require_open()
+        discard(try channel_at(&self, index))
+        try self.remember_state("Delete Channel")
+        self.channels.remove((usize)index)
+
+    ## Select › Load Selection: channel `index` combined into the selection by
+    ## `mode` (0 replace, 1 add, 2 subtract, 3 intersect); with `invert`, what
+    ## the channel leaves out. Undoable.
+    pub mutating func load_channel(index: i64, mode: i64 = 0, invert: bool = false) -> !:
+        try self.require_open()
+        let how = try selection_mode(mode)
+        discard(try channel_at(&self, index))
+        try self.remember_state("Load Selection")
+        let channel = try channel_at(&self, index)
+        if not invert:
+            try self.live().merge(&channel.selection, how)
+            return
+        # Invert: what the channel leaves out, as Photoshop's Load Selection offers.
+        var inverted = try channel.selection.copy()
+        defer inverted.destroy()
+        inverted.invert()
+        try self.live().merge(&inverted, how)
+
+    ## Coverage 0..255 of alpha channel `index` at a document pixel.
+    pub func channel_at_pixel(index: i64, x: i64, y: i64) -> i64!:
+        let channel = try channel_of(&self, index)
+        return 0 if channel.selection.is_empty() else (i64)channel.selection.at(x, y)
+
+    ## Whether the view shows alpha channel `index` (red over the picture, or
+    ## alone as grayscale when no composite channel shows). Not a step.
+    pub func channel_shown(index: i64) -> bool!:
+        return (try channel_of(&self, index)).shown
+
+    pub mutating func set_channel_shown(index: i64, shown: bool) -> !:
+        let channel = try channel_at(&self, index)
+        channel.shown = shown
+        if not shown:
+            channel.selection.drop_gpu_tiles()
+
+    ## Which of the composite's red (0), green (1) and blue (2) the view
+    ## shows: all three the picture, one alone as grayscale. Not a step.
+    pub func composite_shown(channel: i64) -> bool:
+        return channel >= 0 and channel < 3 and self.view_channels[(usize)channel]
+
+    pub mutating func set_composite_view(red: bool, green: bool, blue: bool):
+        self.view_channels = [red, green, blue]
+
+    ## A Channels panel thumbnail scaled into `rectangle`: the composite (0),
+    ## its red, green or blue (1..3), or alpha channel `channel - 4`.
+    pub mutating func draw_channel(target: interop.View[gpu.RenderTarget], channel: i64, rectangle: gpu.Rect) -> !:
+        try self.require_open()
+        if channel < 0 or channel >= 4 + (i64)self.channels.count:
+            error(invalid, "no such channel")
+        if rectangle.width <= 0.0 or rectangle.height <= 0.0:
+            return
+        let checked = try target.get()
+        if channel >= 4:
+            try draw_alpha_thumbnail(&self, checked, &self.channels.items[(usize)(channel - 4)].selection, rectangle)
+            return
+        let document = self.document else return
+        let composer = self.composer else return
+        var shading = Shading(x = 0.0, y = 0.0, scale = 1.0, keep = [1.0, 1.0, 1.0, 0.0], gray = 0.0)
+        if channel > 0:
+            var keep: f32[4] = [0.0, 0.0, 0.0, 0.0]
+            keep[(usize)channel - 1] = 1.0
+            shading = try shading_for(&self, checked, keep, 1.0)
+            # A thumbnail sits on the panel's own backing, without the view's checkerboard.
+            shading.cell = 0.0
+        let scale_x = rectangle.width / (f64)self.extent_x
+        let scale_y = rectangle.height / (f64)self.extent_y
+        let level = view_level(math.min(scale_x, scale_y))
+        let span = (f64)((u64)tile_size << level)
+        let step = (f64)(1u64 << level)
+        for row in 0..<level_cells(self.extent_y, level):
+            for column in 0..<level_cells(self.extent_x, level):
+                let covered_x = covered_at(self.extent_x, column, level)
+                let covered_y = covered_at(self.extent_y, row, level)
+                let texture = try composer.tile(document, column, row, level)
+                let destination = gpu.Rect(rectangle.x + (f64)column * span * scale_x, rectangle.y + (f64)row * span * scale_y,
+                                           (f64)covered_x * step * scale_x, (f64)covered_y * step * scale_y)
+                let none_tinted = no_tints()
+                try draw_view_tile(checked, &shading, texture, destination, gpu.Region(0, 0, covered_x, covered_y), gpu.Filter.linear, &none_tinted)
+
 ## Photoshop's most channels a document holds, less the composite's three.
 let channel_limit: usize = 53
 
@@ -131,61 +263,6 @@ func channel_selection(canvas: Canvas*, empty: bool) -> Selection!:
     if empty:
         return try Selection.create(canvas.extent_x, canvas.extent_y)
     return try canvas.current().copy()
-
-## `Canvas.duplicate_channel`: a copy of channel `index` named `name` just
-## after it, sharing its cells; its index.
-func duplicate_channel(canvas: Canvas*, index: i64, name: str) -> i64!:
-    try canvas.require_open()
-    try check_channel_name(name)
-    let source = try channel_at(canvas, index)
-    if canvas.channels.count >= channel_limit:
-        error(limit, "a document holds at most 53 alpha channels")
-    try canvas.remember_state("Duplicate Channel")
-    var selection = try source.selection.copy()
-    errdefer selection.destroy()
-    var copied: str = ""
-    with memory.heap:
-        copied = try strings.copy(name)
-    errdefer strings.release(copied)
-    try canvas.channels.insert((usize)index + 1, Channel(name = copied, selection = selection, shown = false))
-    return index + 1
-
-## `Canvas.rename_channel`.
-func rename_channel(canvas: Canvas*, index: i64, name: str) -> !:
-    try canvas.require_open()
-    try check_channel_name(name)
-    discard(try channel_at(canvas, index))
-    try canvas.remember_state("Rename Channel")
-    var copied: str = ""
-    with memory.heap:
-        copied = try strings.copy(name)
-    let channel = try channel_at(canvas, index)
-    strings.release(channel.name)
-    channel.name = copied
-
-## `Canvas.delete_channel`.
-func delete_channel(canvas: Canvas*, index: i64) -> !:
-    try canvas.require_open()
-    discard(try channel_at(canvas, index))
-    try canvas.remember_state("Delete Channel")
-    canvas.channels.remove((usize)index)
-
-## `Canvas.load_channel`: channel `index` (inverted with `invert`) combined
-## into the selection by `mode`.
-func load_channel(canvas: Canvas*, index: i64, mode: i64, invert: bool) -> !:
-    try canvas.require_open()
-    let how = try selection_mode(mode)
-    discard(try channel_at(canvas, index))
-    try canvas.remember_state("Load Selection")
-    let channel = try channel_at(canvas, index)
-    if not invert:
-        try canvas.live().merge(&channel.selection, how)
-        return
-    # Invert: what the channel leaves out, as Photoshop's Load Selection offers.
-    var inverted = try channel.selection.copy()
-    defer inverted.destroy()
-    inverted.invert()
-    try canvas.live().merge(&inverted, how)
 
 # mark: Following the canvas ====================================================================
 
@@ -430,44 +507,6 @@ func draw_channel_cells(canvas: Canvas*, target: interop.View[gpu.RenderTarget],
                            &none_tinted)
 
 # mark: Thumbnails ==============================================================================
-
-## `Canvas.draw_channel`: the composite (0), its red, green or blue (1..3),
-## or alpha channel `channel - 4`, scaled into `rectangle`: the composite at
-## the pyramid level about a texel a point, an alpha channel sampled from its
-## cells (4 by 4 a thumbnail pixel), so a thumbnail never reads the canvas.
-func draw_channel_thumbnail(canvas: Canvas*, target: interop.View[gpu.RenderTarget], channel: i64, rectangle: gpu.Rect) -> !:
-    try canvas.require_open()
-    if channel < 0 or channel >= 4 + (i64)canvas.channels.count:
-        error(invalid, "no such channel")
-    if rectangle.width <= 0.0 or rectangle.height <= 0.0:
-        return
-    let checked = try target.get()
-    if channel >= 4:
-        try draw_alpha_thumbnail(canvas, checked, &canvas.channels.items[(usize)(channel - 4)].selection, rectangle)
-        return
-    let document = canvas.document else return
-    let composer = canvas.composer else return
-    var shading = Shading(x = 0.0, y = 0.0, scale = 1.0, keep = [1.0, 1.0, 1.0, 0.0], gray = 0.0)
-    if channel > 0:
-        var keep: f32[4] = [0.0, 0.0, 0.0, 0.0]
-        keep[(usize)channel - 1] = 1.0
-        shading = try shading_for(canvas, checked, keep, 1.0)
-        # A thumbnail sits on the panel's own backing, without the view's checkerboard.
-        shading.cell = 0.0
-    let scale_x = rectangle.width / (f64)canvas.extent_x
-    let scale_y = rectangle.height / (f64)canvas.extent_y
-    let level = view_level(math.min(scale_x, scale_y))
-    let span = (f64)((u64)tile_size << level)
-    let step = (f64)(1u64 << level)
-    for row in 0..<level_cells(canvas.extent_y, level):
-        for column in 0..<level_cells(canvas.extent_x, level):
-            let covered_x = covered_at(canvas.extent_x, column, level)
-            let covered_y = covered_at(canvas.extent_y, row, level)
-            let texture = try composer.tile(document, column, row, level)
-            let destination = gpu.Rect(rectangle.x + (f64)column * span * scale_x, rectangle.y + (f64)row * span * scale_y,
-                                       (f64)covered_x * step * scale_x, (f64)covered_y * step * scale_y)
-            let none_tinted = no_tints()
-            try draw_view_tile(checked, &shading, texture, destination, gpu.Region(0, 0, covered_x, covered_y), gpu.Filter.linear, &none_tinted)
 
 ## An alpha channel's thumbnail: black, then white as far as each thumbnail
 ## pixel's 16 samples of the cells are selected.

@@ -1,0 +1,128 @@
+#==============================================================================================
+#
+#   image/edit - New images from an image
+#
+#   DESCRIPTION:
+#       Pillow's copy, crop, getchannel, convert and resize: each a new owning image; the
+#       source is loaded first and left as it was.
+#
+#==============================================================================================
+
+extend Image:
+    ## A new image with the same channels, pixels and attributes.
+    pub mutating func copy() -> interop.Reference[Image]!:
+        return try self.crop(0, 0, try self.width(), try self.height())
+
+    ## The pixels from (`left`, `top`) up to but not including (`right`, `bottom`).
+    pub mutating func crop(left: usize, top: usize, right: usize, bottom: usize) -> interop.Reference[Image]!:
+        try self.load()
+        if left >= right or top >= bottom or right > self.raster.width or bottom > self.raster.height:
+            error(invalid, "crop rectangle is empty or outside the image")
+        var raster = model.Raster(width = right - left, height = bottom - top, xmin = self.raster.xmin + (i64)left, ymin = self.raster.ymin + (i64)top, max_bytes = self.raster.max_bytes)
+        errdefer raster.close()
+        for channel in self.raster.channels:
+            try raster.channel(channel.name, channel.kind)
+        for attr in self.raster.attributes:
+            try raster.attribute(attr.name, attr.type_name, attr.data)
+        try raster.allocate()
+        let nc = raster.channels.length
+        for y in 0..<raster.height:
+            for x in 0..<raster.width:
+                for c in 0..<nc:
+                    raster.pixels[(y * raster.width + x) * nc + c] = self.raster.pixels[((top + y) * self.raster.width + left + x) * nc + c]
+        return try Image.own(raster, self.threads)
+
+    ## Channel `name` alone, as a one-channel "Y" image.
+    pub mutating func get_channel(name: str) -> interop.Reference[Image]!:
+        try self.load()
+        let channel = try self.raster.find_channel(name)
+        var raster = model.Raster(width = self.raster.width, height = self.raster.height, xmin = self.raster.xmin, ymin = self.raster.ymin, max_bytes = self.raster.max_bytes)
+        errdefer raster.close()
+        try raster.channel("Y", self.raster.channels[channel].kind)
+        try raster.allocate()
+        for i in 0..<raster.pixels.length:
+            raster.pixels[i] = self.raster.pixels[i * self.raster.channels.length + channel]
+        return try Image.own(raster, self.threads)
+
+    ## The image in another Pillow mode; grey comes from Rec. 601 luma.
+    pub mutating func convert(mode: str) -> interop.Reference[Image]!:
+        try self.load()
+        let out = try Image.create(mode, self.raster.width, self.raster.height, max_bytes = self.raster.max_bytes)
+        errdefer out.release()
+        let target = out.value()
+        let source_max = model.maximum(self.raster.channels[0].kind)
+        let target_max = model.maximum(target.raster.channels[0].kind)
+        let integer = (i64)target.raster.channels[0].kind <= 3
+        # Which source sample feeds each color, worked out once as `getpixel` reads them.
+        var red: i64 = -1
+        var green: i64 = -1
+        var blue: i64 = -1
+        var alpha: i64 = -1
+        for c in 0..<self.raster.channels.length:
+            let name = self.raster.channels[c].name
+            if name == "Y":
+                red = (i64)c
+                green = (i64)c
+                blue = (i64)c
+            elif name == "R":
+                red = (i64)c
+            elif name == "G":
+                green = (i64)c
+            elif name == "B":
+                blue = (i64)c
+            elif name == "A":
+                alpha = (i64)c
+        # And what each target channel is: 0 red, 1 green, 2 blue, 3 alpha, 4 luma.
+        var wanted: u8[16]
+        let channels = target.raster.channels.length
+        for c in 0..<channels:
+            let name = target.raster.channels[c].name
+            wanted[c] = 3 if name == "A" else 1 if name == "G" else 2 if name == "B" else 4 if name == "Y" else 0
+        let source_stride = self.raster.channels.length
+        let scale = target_max / source_max
+        for index in 0..<self.raster.width * self.raster.height:
+            let at = index * source_stride
+            let r = self.raster.pixels[at + (usize)red] if red >= 0 else 0.0
+            let g = self.raster.pixels[at + (usize)green] if green >= 0 else 0.0
+            let b = self.raster.pixels[at + (usize)blue] if blue >= 0 else 0.0
+            let a = self.raster.pixels[at + (usize)alpha] if alpha >= 0 else source_max
+            for c in 0..<channels:
+                let kind = wanted[c]
+                let source = r if kind == 0 else g if kind == 1 else b if kind == 2 else a if kind == 3 else 0.299 * r + 0.587 * g + 0.114 * b
+                let value = source * scale
+                target.raster.pixels[index * channels + c] = math.floor(math.clamp(value, 0.0, target_max) + 0.5) if integer else value
+        return out
+
+    ## Nearest is appropriate for discrete IDs. Bilinear must never filter IDs.
+    pub mutating func resize(width: usize, height: usize, resample: str = "nearest") -> interop.Reference[Image]!:
+        try self.load()
+        if resample != "nearest" and resample != "bilinear":
+            error(invalid, "resample must be nearest or bilinear")
+        var raster = model.Raster(width = width, height = height, max_bytes = self.raster.max_bytes)
+        errdefer raster.close()
+        for channel in self.raster.channels:
+            try raster.channel(channel.name, channel.kind)
+        try raster.allocate()
+        let nc = raster.channels.length
+        for y in 0..<height:
+            for x in 0..<width:
+                let sx = math.clamp(((f64)x + 0.5) * (f64)self.raster.width / (f64)width - 0.5, 0.0, (f64)(self.raster.width - 1))
+                let sy = math.clamp(((f64)y + 0.5) * (f64)self.raster.height / (f64)height - 0.5, 0.0, (f64)(self.raster.height - 1))
+                for c in 0..<nc:
+                    var value: f64 = 0.0
+                    if resample == "nearest":
+                        value = self.raster.pixels[((usize)math.floor(sy + 0.5) * self.raster.width + (usize)math.floor(sx + 0.5)) * nc + c]
+                    else:
+                        let x0 = (usize)math.floor(sx)
+                        let y0 = (usize)math.floor(sy)
+                        let x1 = x0 + 1 if x0 + 1 < self.raster.width else x0
+                        let y1 = y0 + 1 if y0 + 1 < self.raster.height else y0
+                        let fx = sx - (f64)x0
+                        let fy = sy - (f64)y0
+                        let top = self.raster.pixels[(y0 * self.raster.width + x0) * nc + c] * (1.0 - fx) + self.raster.pixels[(y0 * self.raster.width + x1) * nc + c] * fx
+                        let bottom = self.raster.pixels[(y1 * self.raster.width + x0) * nc + c] * (1.0 - fx) + self.raster.pixels[(y1 * self.raster.width + x1) * nc + c] * fx
+                        value = top * (1.0 - fy) + bottom * fy
+                        if (i64)raster.channels[c].kind <= 3:
+                            value = math.floor(value + 0.5)
+                    raster.pixels[(y * width + x) * nc + c] = value
+        return try Image.own(raster, self.threads)

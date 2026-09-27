@@ -1,0 +1,200 @@
+#==============================================================================================
+#
+#   document/layer - A layer and the tree it hangs in
+#
+#   DESCRIPTION:
+#       A layer (raster, group or adjustment) with its tiles and mask, the helpers that walk
+#       and edit the tree, and TreeState: the tree at one moment, sharing its tiles, for undo.
+#
+#==============================================================================================
+
+
+pub struct Layer:
+    pub var id: u64
+    pub var name: str
+    pub var visible: bool = true
+    pub var opacity: f64 = 1.0
+    ## Photoshop's blend modes by number: 0 normal, 1 darken, 2 multiply, 3 color
+    ## burn, 4 linear burn, 5 lighten, 6 screen, 7 color dodge, 8 linear dodge,
+    ## 9 overlay, 10 soft light, 11 hard light, 12 vivid light, 13 linear light,
+    ## 14 pin light, 15 hard mix, 16 difference, 17 exclusion, 18 subtract,
+    ## 19 divide, 20 hue, 21 saturation, 22 color, 23 luminosity, 24 darker
+    ## color, 25 lighter color.
+    pub var blend: u32
+    ## Take alpha from the nearest unclipped layer below, like Photoshop's
+    ## clipping mask.
+    pub var clipped: bool
+    pub var group: bool
+    pub var style: Style = Style()
+    var pixels: Tiles*?
+    ## The layer mask: red reveals, a missing tile reveals fully.
+    var mask: Tiles*?
+    ## A disabled mask is kept but hides nothing, as Photoshop's Shift-click.
+    pub var mask_enabled: bool = true
+    ## An adjustment layer's kind (adjust.lucb's numbers) and parameters, or -1:
+    ## it has no pixels and adjusts what is below it, live, through its mask.
+    pub var adjustment: i64 = -1
+    pub var adjustment_values: f64[23]
+    ## A Curves adjustment layer's curves (no points: values pass through).
+    pub var curves: Curves
+    var children: Layer*[]
+    var child_count: usize
+    ## Bumps whenever the pixels are replaced.
+    pub var revision: u64
+
+    ## The layer's tiles, borrowed; `none` for a group.
+    pub func tiles() -> Tiles*?:
+        return self.pixels
+
+    ## The layer's mask tiles, borrowed; `none` without a mask.
+    pub func mask_tiles() -> Tiles*?:
+        return self.mask
+
+    ## The mask as it hides pixels: `none` without one or while it is disabled.
+    ## What an edit works on: the pixels, or with `mask` the mask.
+    pub func edited_tiles(mask: bool) -> Tiles*!:
+        if mask:
+            return self.mask_tiles() else error(invalid, "the layer has no mask")
+        return self.tiles() else error(invalid, "a group has no pixels of its own")
+
+    pub func active_mask() -> Tiles*?:
+        return self.mask if self.mask_enabled else none
+
+    ## The children of a group, bottom to top.
+    pub func layers() -> Layer*[]:
+        return self.children[..<self.child_count]
+
+    ## Replace the pixels outright (geometry changes), destroying the old ones.
+    pub mutating func replace_tiles(tiles: Tiles) -> !:
+        let holder = try box(tiles)
+        if let previous = self.pixels:
+            unbox(previous)
+        self.pixels = holder
+        self.revision += 1
+
+    pub mutating func replace_mask(tiles: Tiles) -> !:
+        let holder = try box(tiles)
+        if let previous = self.mask:
+            unbox(previous)
+        self.mask = holder
+        self.revision += 1
+
+## `layer` and all it holds given revisions in band `generation`, clear of
+## every revision an earlier band handed out.
+func restamp(layer: Layer*, generation: u64):
+    layer.revision = (generation << 40) | (layer.revision & 0xFFFFFFFFFF)
+    for child in layer.children[..<layer.child_count]:
+        restamp(child, generation)
+
+func layer_destroy(layer: Layer*):
+    for child in layer.children[..<layer.child_count]:
+        layer_destroy(child)
+    if layer.children.length > 0:
+        free(layer.children) in memory.heap
+    if let tiles = layer.pixels:
+        unbox(tiles)
+    if let tiles = layer.mask:
+        unbox(tiles)
+    strings.release(layer.name)
+    free(layer) in memory.heap
+
+## The layer tree, extent and selection at one moment, for undo: a copy of
+## the tree sharing its tiles, so taking one costs little.
+pub struct TreeState:
+    var root: Layer*
+    var next_id: u64
+    var extent_x: u32
+    var extent_y: u32
+    var selection: Selection
+    ## Quick Mask's layer, when it was on: undo and redo take the mode with them.
+    var quick: Layer*? = none
+    ## Whether colors mixed in linear light then (`Document.linear_blend`).
+    var linear_blend: bool = false
+
+    pub mutating func destroy():
+        layer_destroy(self.root)
+        self.selection.destroy()
+        if let quick = self.quick:
+            layer_destroy(quick)
+            self.quick = none
+
+## Free a `Document.snapshot`.
+pub func release_snapshot(layer: Layer*):
+    layer_destroy(layer)
+
+## A copy of `layer` and all it holds, sharing their tiles.
+func clone_layer(layer: const Layer*) -> Layer*!:
+    var copied: str = ""
+    with memory.heap:
+        copied = try strings.copy(layer.name)
+    errdefer strings.release(copied)
+    var pixels: Tiles*? = none
+    if let tiles = layer.pixels:
+        pixels = try box(try tiles.clone())
+    errdefer release_tiles(&pixels)
+    let copy = try new Layer(id = layer.id, name = copied, group = layer.group, pixels = pixels, revision = layer.revision) in memory.heap
+    errdefer layer_destroy(copy)
+    copy.visible = layer.visible
+    copy.opacity = layer.opacity
+    copy.blend = layer.blend
+    copy.clipped = layer.clipped
+    copy.style = layer.style
+    copy.mask_enabled = layer.mask_enabled
+    copy.adjustment = layer.adjustment
+    copy.adjustment_values = layer.adjustment_values
+    copy.curves = layer.curves
+    if let mask = layer.mask:
+        copy.mask = try box(try mask.clone())
+    if layer.child_count > 0:
+        copy.children = try alloc Layer*[layer.child_count] in memory.heap
+        for index in 0..<layer.child_count:
+            copy.children[index] = try clone_layer(layer.children[index])
+            copy.child_count += 1
+    return copy
+
+
+func release_tiles(holder: Tiles*?*):
+    if let owned = *holder:
+        unbox(owned)
+        *holder = none
+
+## Grow a group's children so one more fits.
+func make_room(layer: Layer*) -> !:
+    if layer.child_count < layer.children.length:
+        return
+    let capacity = 8 if layer.children.length == 0 else layer.children.length * 2
+    let grown = try alloc Layer*[capacity] in memory.heap
+    if layer.child_count > 0:
+        memory.copy(grown, layer.children, layer.child_count)
+    if layer.children.length > 0:
+        free(layer.children) in memory.heap
+    layer.children = grown
+
+func parent_of(layer: Layer*, id: u64) -> Layer*?:
+    for child in layer.children[..<layer.child_count]:
+        if child.id == id:
+            return layer
+        if let found = parent_of(child, id):
+            return found
+    return none
+
+func find_in(layer: Layer*, id: u64) -> Layer*?:
+    for child in layer.children[..<layer.child_count]:
+        if child.id == id:
+            return child
+        if let found = find_in(child, id):
+            return found
+    return none
+
+func remove_in(layer: Layer*, id: u64) -> bool:
+    for index in 0..<layer.child_count:
+        let child = layer.children[index]
+        if child.id == id:
+            layer_destroy(child)
+            for shift in index..<(layer.child_count - 1):
+                layer.children[shift] = layer.children[shift + 1]
+            layer.child_count -= 1
+            return true
+        if remove_in(child, id):
+            return true
+    return false

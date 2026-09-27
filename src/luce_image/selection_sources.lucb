@@ -14,6 +14,7 @@
 ## once and only mixed cells being walked pixel by pixel.
 import gpu
 import math
+import transfer
 import memory
 from tiles import tile_size
 from half import from_half
@@ -158,7 +159,7 @@ pub func wand(found: Cells*, reader: Reader, x: i64, y: i64, sample: i64, tolera
     defer free(table) in memory.heap
     for bits in 0..<(usize)65536:
         let value = from_half((u16)bits)
-        table[bits] = srgb_byte(value)
+        table[bits] = transfer.srgb_byte((f64)value)
         table[65536 + bits] = coverage_byte(value)
     var no_indices: usize[]
     var no_halves: u8[]
@@ -199,7 +200,7 @@ pub func grow(found: Cells*, selection: const Cells*, reader: Reader, tolerance:
     defer free(table) in memory.heap
     for bits in 0..<(usize)65536:
         let value = from_half((u16)bits)
-        table[bits] = srgb_byte(value)
+        table[bits] = transfer.srgb_byte((f64)value)
         table[65536 + bits] = coverage_byte(value)
     let count = found.count()
     # Per cell: lows and highs at half coverage, then at any coverage.
@@ -337,7 +338,7 @@ func seed_color(cells: const Cells*, reader: Reader, x: i64, y: i64, reach: i64)
                 sum[channel] += (f64)from_half((u16)halves[at + channel * 2] | ((u16)halves[at + channel * 2 + 1] << 8))
     var seed: u8[4] = [0, 0, 0, 0]
     for channel in 0..<(usize)3:
-        seed[channel] = srgb_byte((f32)(sum[channel] / count))
+        seed[channel] = transfer.srgb_byte((f64)(f32)(sum[channel] / count))
     seed[3] = coverage_byte((f32)(sum[3] / count))
     return seed
 
@@ -672,11 +673,6 @@ func spill(near: const Cells*, found: const Cells*, places: Places*, index: usiz
 
 # mark: Conversions =============================================================================
 
-## A linear-light sample as an 8-bit sRGB value.
-pub func srgb_byte(value: f32) -> u8:
-    let c = math.clamp((f64)value, 0.0, 1.0)
-    let encoded = c * 12.92 if c <= 0.0031308 else 1.055 * math.pow(c, 1.0 / 2.4) - 0.055
-    return (u8)(encoded * 255.0 + 0.5)
 
 ## A sample 0..1 as coverage 0..255, rounded.
 pub func coverage_byte(value: f32) -> u8:

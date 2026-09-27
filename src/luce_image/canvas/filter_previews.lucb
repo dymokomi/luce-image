@@ -12,6 +12,92 @@
 #
 #==============================================================================================
 
+extend Canvas:
+    ## Show a Gaussian blur of `radius` applied to the layer as it was when the
+    ## preview began: drawn at the view's level until kept (filter_previews.lucb).
+    pub mutating func preview_blur(radius: f64) -> !:
+        if not math.is_finite(radius) or radius < 0.5 or radius > 250.0:
+            error(invalid, "blur radius must be 0.5..250 pixels")
+        try show_filter(&self, filter_gaussian, radius, 0.0, 0.0, "Gaussian Blur")
+
+    ## Blur a layer's pixels with a Gaussian of `radius` pixels (0.5..250). Undoable.
+    ## Filter › Noise › Add Noise, made once: Gaussian grain of deviation
+    ## `amount` (0..1), alike in every channel when `monochrome`; the same
+    ## `seed` makes the same grain. Undoable.
+    pub mutating func add_noise(id: i64, amount: f64, monochrome: bool, seed: i64, uniform: bool = false) -> !:
+        try self.require_open()
+        try self.require_idle()
+        try self.begin_preview(id, try self.editing_mask_of(id))
+        self.preview_noise(amount, monochrome, seed, uniform) catch failure:
+            discard(self.end_preview(false) catch: recover ())
+            error(failure.code, failure.message)
+        try self.end_preview(true)
+
+    ## Show the noise `add_noise` would make on the layer as it was when the preview began.
+    pub mutating func preview_noise(amount: f64, monochrome: bool, seed: i64, uniform: bool = false) -> !:
+        self.preview_name = "Add Noise"
+        let layer = try self.restore_preview()
+        let mask = try self.whiten_previewed_mask()
+        let document = self.document else trap("preview without a document")
+        # A mask's grain is grey: one value for all three channels.
+        try filtering.add_noise(document, layer, amount, monochrome or mask, (u64)seed, mask, uniform)
+        try self.restrict_preview(layer)
+
+    pub mutating func blur_layer(id: i64, radius: f64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        try self.begin_preview(id, try self.editing_mask_of(id))
+        self.preview_blur(radius) catch failure:
+            discard(self.end_preview(false) catch: recover ())
+            error(failure.code, failure.message)
+        try self.end_preview(true)
+
+    ## Filter kinds for `filter_layer` and `preview_filter`, with what `a`, `b`
+    ## and `c` are: 0 Motion Blur (angle in degrees, distance in pixels), 1
+    ## Lens Correction (distortion, red-cyan, blue-yellow; -1..1 each), 2 Bloom
+    ## (threshold 0..1, radius, strength 0..2), 3 Tonal Contrast (amount 0..2,
+    ## radius).
+    pub static func filter_count() -> i64:
+        return 4
+
+    ## Filter `kind` on layer `id` (or its mask while editing it), as one step.
+    pub mutating func filter_layer(id: i64, kind: i64, a: f64, b: f64, c: f64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        try self.begin_preview(id, try self.editing_mask_of(id))
+        self.preview_filter(kind, a, b, c) catch failure:
+            discard(self.end_preview(false) catch: recover ())
+            error(failure.code, failure.message)
+        try self.end_preview(true)
+
+    ## Show filter `kind` on the layer as it was when the preview began.
+    pub mutating func preview_filter(kind: i64, a: f64, b: f64, c: f64) -> !:
+        let names: str[4] = ["Motion Blur", "Lens Correction", "Bloom", "Tonal Contrast"]
+        if kind < 0 or kind >= 4:
+            error(invalid, "no such filter")
+        # Motion Blur and Lens Correction are drawn at the view's level until kept.
+        if kind == 0:
+            if not math.is_finite(a) or not math.is_finite(b) or b < 1.0 or b > 999.0:
+                error(invalid, "a motion blur goes 1..999 pixels at a finite angle")
+            try show_filter(&self, filter_motion, a, b, c, names[0])
+            return
+        if kind == 1:
+            for amount in [a, b, c]:
+                if not math.is_finite(amount) or amount < -1.0 or amount > 1.0:
+                    error(invalid, "lens corrections are -1..1")
+            try show_filter(&self, filter_lens, a, b, c, names[1])
+            return
+        self.preview_name = names[(usize)kind]
+        let layer = try self.restore_preview()
+        let mask = try self.whiten_previewed_mask()
+        let document = self.document else trap("preview without a document")
+        let filters = self.filters else trap("preview without filters")
+        if kind == 2:
+            try light_filters.bloom(&filters, document, layer, a, b, c, mask)
+        else:
+            try light_filters.tonal_contrast(&filters, document, layer, a, b, mask)
+        try self.restrict_preview(layer)
+
 ## The filters shown this way.
 let filter_motion: i64 = 0
 let filter_lens: i64 = 1

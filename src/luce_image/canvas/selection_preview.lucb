@@ -13,6 +13,25 @@
 #
 #==============================================================================================
 
+extend Canvas:
+    ## Draw the selection's marching ants over the document as drawn by `draw`
+    ## with the same rectangle, zoom and offset; `phase` animates the dashes.
+    ## While Quick Mask is on, the masked part is tinted instead (`draw` tints
+    ## it itself when it shows the composite).
+    pub mutating func draw_selection(target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, phase: f64) -> !:
+        if try draw_refine_view(&self, target, rectangle, zoom, offset_x, offset_y, phase):
+            return
+        if try draw_selection_warp(&self, target, rectangle, zoom, offset_x, offset_y, phase):
+            return
+        if self.quick_mask():
+            try self.require_open()
+            if not math.is_finite(zoom) or zoom <= 0.0:
+                error(invalid, "zoom must be positive")
+            if not self.quick_drawn:
+                try draw_quick_overlay(&self, target, rectangle, zoom, offset_x, offset_y)
+            return
+        try draw_canvas_selection(&self, target, rectangle, zoom, offset_x, offset_y, phase)
+
 ## What a preview covers: the level the view draws at and, in that level's
 ## pixels, the box of it on screen, widened by a quarter of the view each way
 ## and out to whole cells, so a small pan needs nothing new.

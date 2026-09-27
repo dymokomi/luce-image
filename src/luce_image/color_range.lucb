@@ -5,12 +5,12 @@
 ## fades with the distance, so the edge of a range is soft, as Photoshop's.
 import math
 import memory
+import pool
 import color
 import space
 import lab
 import hsl
 import transfer
-import thread
 import os
 from raster_errors import invalid
 
@@ -56,23 +56,12 @@ pub func range_coverage(pixels: const f32[], samples: const RangeSample[], range
         cover_band(&job)
         return
     var bands: RangeJob[16]
-    var handles: thread.Handle[16]
-    var started: usize = 0
     let per = (coverage.length + (usize)workers - 1) // (usize)workers
     for band in 0..<(usize)workers:
         bands[band] = job
         bands[band].first = band * per
         bands[band].last = coverage.length if band * per + per > coverage.length else band * per + per
-    for band in 1..<(usize)workers:
-        handles[started] = thread.spawn(cover_entry, (void*)&bands[band], name = "color-range") catch failure:
-            # Fewer threads: this one does the rest.
-            for other in band..<(usize)workers:
-                cover_band(&bands[other])
-            break
-        started += 1
-    cover_band(&bands[0])
-    for index in 0..<started:
-        try handles[index].join()
+    pool.run((usize)workers, cover_entry, (void*)&bands[0])
 
 ## One band of `range_coverage`'s pixels.
 struct RangeJob:
@@ -86,8 +75,9 @@ struct RangeJob:
     var first: usize
     var last: usize
 
-func cover_entry(context: void*?):
-    cover_band((RangeJob*)(context else return))
+func cover_entry(context: void*?, index: usize):
+    let bands = (RangeJob*)(context else return)
+    cover_band(&bands[index])
 
 func cover_band(job: RangeJob*):
     let pixels = job.pixels

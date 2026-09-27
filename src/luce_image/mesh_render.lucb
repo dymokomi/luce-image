@@ -15,7 +15,7 @@
 import gpu
 import math
 import memory
-import thread
+import pool
 from raster_errors import limit
 from tiles import Tiles, tile_size, tile_texture
 from pyramid import Pyramid
@@ -181,33 +181,19 @@ struct Batch:
     var row: u32
     var first: u32
     var fields: CellField[]
-    var next: @usize
     var failed: @bool
 
-func prepare_some(raw: void*?):
+func prepare_one(raw: void*?, index: usize):
     let batch = (Batch*)(raw else return)
-    while not batch.failed.load(.acquire):
-        let index = batch.next.add(1, .relaxed)
-        if index >= batch.fields.length:
-            return
-        batch.fields[index] = prepare(batch.mesh, batch.first + (u32)index, batch.row, 0, 1) catch failure:
-            batch.failed.store(true, .release)
-            return
+    if batch.failed.load(.acquire):
+        return
+    batch.fields[index] = prepare(batch.mesh, batch.first + (u32)index, batch.row, 0, 1) catch failure:
+        batch.failed.store(true, .release)
+        return
 
-## Every field of `batch`, on up to `threads` threads (this one among them).
+## Every field of `batch`, on the worker pool with up to `threads` threads (this one among them).
 func prepare_all(batch: Batch*, threads: usize) -> !:
-    var handles: thread.Handle[16]
-    var started: usize = 0
-    var wanted = threads if threads < 16 else 16
-    if wanted > batch.fields.length:
-        wanted = batch.fields.length
-    for index in 1..<(wanted if wanted > 1 else 1):
-        handles[started] = thread.spawn(prepare_some, (void*)batch, name = "luce-image mesh") catch failure:
-            break
-        started += 1
-    prepare_some((void*)batch)
-    for index in 0..<started:
-        try handles[index].join()
+    pool.run(batch.fields.length, prepare_one, (void*)batch, limit = threads if threads < 16 else 16)
     if batch.failed.load(.acquire):
         error(limit, "out of memory making a warp's cells")
 

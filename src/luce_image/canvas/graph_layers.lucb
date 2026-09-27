@@ -3,8 +3,8 @@
 #   canvas/graph_layers - A vector layer's node graph on the canvas: edits, steps and cells
 #
 #   DESCRIPTION:
-#       A vector layer draws its hand-made elements and then its graph's output
-#       (graph_eval.lucb), both through the same cell renderer (vector_render.lucb). Every
+#       A vector layer draws its hand-made elements and then its graph's output (luce-vector's
+#       graph), both through the same cell renderer (luce-vector's vector). Every
 #       change to either goes through `commit_layer`: the new elements and graph are
 #       evaluated and drawn beside the old, the step recorded, and only then swapped in, so
 #       an edit that cannot be made changes nothing. The cells drawn again are those the
@@ -16,23 +16,144 @@
 #
 #==============================================================================================
 
-## The elements a vector layer draws: `list`, then `generated`, as elements that
-## borrow their specs. Only the array is the caller's to free (`free_view`).
-func drawn_elements(list: const VectorElement[], generated: const ShapeList*) -> VectorElement[]!:
-    var none_yet: VectorElement[]
-    let total = list.length + generated.count
-    if total == 0:
-        return none_yet
-    let view = try alloc VectorElement[total] in memory.heap
-    for at in 0..<list.length:
-        view[at] = list[at]
-    for at in 0..<generated.count:
-        view[list.length + at] = VectorElement(name = "", visible = true, spec = generated.specs[at])
-    return view
+extend Canvas:
+    ## A new vector layer named `name` on top, its graph a Star cloned round a
+    ## circle into the Output, drawn; selected nowhere, its id returned. One step.
+    pub mutating func add_vector_layer(name: str) -> i64!:
+        try self.require_idle()
+        try self.begin_edit("New Vector Layer")
+        defer self.end_edit()
+        let id = try self.add_layer(name)
+        let index = try self.index((u64)id)
+        self.records[index].shaped = true
+        let graph = try default_graph(self.extent_x, self.extent_y)
+        var no_list: VectorElement[]
+        if self.document == none:
+            self.records[index].graph = graph
+            return id
+        try commit_layer(&self, index, no_list, graph, none, -1, "New Vector Layer", -1, false)
+        return id
 
-func free_view(view: VectorElement[]):
-    if view.length > 0:
-        free(view) in memory.heap
+    pub func graph_node_count(index: i64) -> i64!:
+        return (i64)(try self.record(index)).graph.nodes.length
+
+    ## Value `field` of node `node` (its place, 0 the first): 0 its id, 1 its
+    ## kind, 2 and 3 where the editor shows it, 4.. its values from slot 0.
+    pub func graph_node_value(index: i64, node: i64, field: i64) -> f64!:
+        let record = try self.record(index)
+        if node < 0 or node >= (i64)record.graph.nodes.length or field < 0 or field >= 4 + (i64)node_slots:
+            error(invalid, "no such node value")
+        let entry = record.graph.nodes[(usize)node]
+        if field == 0:
+            return (f64)entry.id
+        if field == 1:
+            return (f64)entry.kind
+        if field == 2:
+            return entry.x
+        if field == 3:
+            return entry.y
+        return entry.values[(usize)(field - 4)]
+
+    pub func graph_link_count(index: i64) -> i64!:
+        return (i64)(try self.record(index)).graph.links.length
+
+    ## Value `field` of link `link`: 0 the id of the node it leaves, 1 the id
+    ## of the node it enters, 2 that node's input.
+    pub func graph_link_value(index: i64, link: i64, field: i64) -> i64!:
+        let record = try self.record(index)
+        if link < 0 or link >= (i64)record.graph.links.length:
+            error(invalid, "no such link")
+        let entry = record.graph.links[(usize)link]
+        return (i64)entry.source_id if field == 0 else ((i64)entry.to if field == 1 else (i64)entry.port)
+
+    ## A node of `kind` at (`x`, `y`) in layer `id`'s graph, with its defaults; its id.
+    pub mutating func add_graph_node(id: i64, kind: i64, x: f64, y: f64) -> i64!:
+        let index = try graph_index(&self, (u64)id)
+        var made: u32 = 0
+        try commit_graph(&self, index, try graph_with_node(&self.records[index].graph, kind, x, y, &made), "Add Node", false)
+        return (i64)made
+
+    ## Node `node` of layer `id`'s graph taken away with its wires.
+    pub mutating func delete_graph_node(id: i64, node: i64) -> !:
+        let index = try graph_index(&self, (u64)id)
+        let ids: u32[1] = [(u32)node]
+        try commit_graph(&self, index, try graph_without_nodes(&self.records[index].graph, ids[..<1]), "Delete Node", false)
+
+    ## Node `from`'s output wired into input `port` of node `to`, replacing what
+    ## fed it; refused across types or round a loop.
+    pub mutating func link_graph(id: i64, source_id: i64, to: i64, port: i64) -> !:
+        let index = try graph_index(&self, (u64)id)
+        try commit_graph(&self, index, try graph_with_link(&self.records[index].graph, (u32)source_id, (u32)to, (u32)port), "Connect", false)
+
+    ## The wire into input `port` of node `to` taken away.
+    pub mutating func unlink_graph(id: i64, to: i64, port: i64) -> !:
+        let index = try graph_index(&self, (u64)id)
+        try commit_graph(&self, index, try graph_without_link(&self.records[index].graph, (u32)to, (u32)port), "Disconnect", false)
+
+    ## Value `slot` of node `node` set (held to its parameter's range); a drag coalesces.
+    pub mutating func set_graph_value(id: i64, node: i64, slot: i64, value: f64) -> !:
+        let index = try graph_index(&self, (u64)id)
+        if slot < 0:
+            error(invalid, "a node has values 0..23")
+        try commit_graph(&self, index, try graph_with_value(&self.records[index].graph, (u32)node, (usize)slot, value), "Node Setting", true)
+
+    ## Node `node` shown at (`x`, `y`) in the editor; nothing is drawn. A drag coalesces.
+    pub mutating func move_graph_node(id: i64, node: i64, x: f64, y: f64) -> !:
+        let index = try graph_index(&self, (u64)id)
+        try commit_graph(&self, index, try graph_with_position(&self.records[index].graph, (u32)node, x, y), "Move Node", true)
+
+    ## How many shapes the layer at `index`'s graph puts out, evaluating it if it must.
+    pub mutating func generated_count(index: i64) -> i64!:
+        discard(try self.record(index))
+        try fresh_output(&self.records[(usize)index])
+        return (i64)self.records[(usize)index].generated.count
+
+    ## How many nodes the layer's last graph evaluation computed rather than reused.
+    pub func graph_computed(index: i64) -> i64!:
+        return (i64)(try self.record(index)).graph_evaluated
+
+    pub func node_kind_count() -> i64:
+        return node_kinds
+
+    pub func node_kind_title(kind: i64) -> str:
+        return node_info(kind).title
+
+    ## A kind's output's port type (0 Shapes, 1 Points, 2 Number, 3 Color), -1 for none.
+    pub func node_kind_output(kind: i64) -> i64:
+        return node_info(kind).output
+
+    pub func node_input_count(kind: i64) -> i64:
+        return (i64)node_info(kind).input_count
+
+    pub func node_input_name(kind: i64, port: i64) -> str:
+        let info = node_info(kind)
+        return info.inputs[(usize)port].name if port >= 0 and port < (i64)info.input_count else ""
+
+    ## An input's port type; a Number wire may also go where a Color does.
+    pub func node_input_type(kind: i64, port: i64) -> i64:
+        let info = node_info(kind)
+        return info.inputs[(usize)port].port_type if port >= 0 and port < (i64)info.input_count else -1
+
+    ## The value slot an input drives, -1 for a data input.
+    pub func node_input_slot(kind: i64, port: i64) -> i64:
+        let info = node_info(kind)
+        return info.inputs[(usize)port].slot if port >= 0 and port < (i64)info.input_count else -1
+
+    pub func node_param_count(kind: i64) -> i64:
+        return (i64)node_info(kind).param_count
+
+    pub func node_param_name(kind: i64, param: i64) -> str:
+        let info = node_info(kind)
+        return info.params[(usize)param].name if param >= 0 and param < (i64)info.param_count else ""
+
+    ## Value `field` of a parameter: 0 how it is edited (0 a number, 1 a whole
+    ## number, 2 a toggle, 3 a color), 1 its slot, 2 and 3 its range.
+    pub func node_param_value(kind: i64, param: i64, field: i64) -> f64:
+        let info = node_info(kind)
+        if param < 0 or param >= (i64)info.param_count:
+            return 0.0
+        let entry = info.params[(usize)param]
+        return (f64)entry.kind if field == 0 else ((f64)entry.slot if field == 1 else (entry.low if field == 2 else entry.high))
 
 ## The record's graph output brought up to date with its graph and elements.
 func fresh_output(record: Record*) -> !:
@@ -124,36 +245,6 @@ func commit_layer(canvas: Canvas*, index: usize, list: VectorElement[], graph: G
         tiles = none
         try document.set_tiles(id, made)
 
-## Mark the cells of every shape that differs between `before` and `after`, by
-## place, where it was and where it is.
-func mark_changed_shapes(cells: CellMask*, before: const ShapeList*, after: const ShapeList*) -> !:
-    let common = before.count if before.count < after.count else after.count
-    # When most of many change, finding their cells costs what drawing every
-    # cell does: all are drawn.
-    var differ = before.count + after.count - 2 * common
-    for at in 0..<common:
-        if not same_spec(&before.specs[at], &after.specs[at]):
-            differ += 2
-    if differ > 512 and differ > before.count + after.count // 2:
-        cells.mark_all()
-        return
-    # The changed ones gathered (sharing their paths) and marked from one drawing.
-    let changed = try alloc ShapeSpec[before.count + after.count + 1] in memory.heap
-    defer free(changed) in memory.heap
-    var count: usize = 0
-    for at in 0..<common:
-        if not same_spec(&before.specs[at], &after.specs[at]):
-            changed[count] = before.specs[at]
-            changed[count + 1] = after.specs[at]
-            count += 2
-    for at in common..<before.count:
-        changed[count] = before.specs[at]
-        count += 1
-    for at in common..<after.count:
-        changed[count] = after.specs[at]
-        count += 1
-    try cells.mark_specs(changed[..<count])
-
 ## The layer at `index`'s graph replaced by `graph` (taken over) as step `name`,
 ## its elements kept.
 func commit_graph(canvas: Canvas*, index: usize, graph: Graph, name: str, joins: bool) -> !:
@@ -176,23 +267,6 @@ func graph_index(canvas: Canvas*, id: u64) -> usize!:
     if not canvas.records[index].shaped:
         error(invalid, "only a vector layer holds a node graph")
     return index
-
-## `Canvas.add_vector_layer`: a new vector layer on top named `name`, its graph
-## the default one, drawn: one step. Its id.
-func add_vector_layer_record(canvas: Canvas*, name: str) -> i64!:
-    try canvas.require_idle()
-    try canvas.begin_edit("New Vector Layer")
-    defer canvas.end_edit()
-    let id = try canvas.add_layer(name)
-    let index = try canvas.index((u64)id)
-    canvas.records[index].shaped = true
-    let graph = try default_graph(canvas.extent_x, canvas.extent_y)
-    var no_list: VectorElement[]
-    if canvas.document == none:
-        canvas.records[index].graph = graph
-        return id
-    try commit_layer(canvas, index, no_list, graph, none, -1, "New Vector Layer", -1, false)
-    return id
 
 ## The graph's output moved by the affine map `m` with the layer: its placement
 ## and the shapes it last made, which stay current.

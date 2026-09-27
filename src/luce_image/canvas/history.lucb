@@ -12,6 +12,222 @@
 #
 #==============================================================================================
 
+extend Canvas:
+    ## Make the next edit undo and redo together with the one before it, as
+    ## one step: several layers moved at once.
+    pub mutating func join_next_edit():
+        self.joining = true
+
+    ## Make the next step its own even where it would continue the last (typing
+    ## into the same text layer again): an edit session can then be taken back
+    ## on its own with `undo` down to `step_serial`.
+    pub mutating func separate_next_step():
+        self.separating = true
+
+    ## The serial of the step Undo would take back (0: none): unchanged
+    ## while nothing new is remembered.
+    pub func step_serial() -> i64:
+        return (i64)self.history[self.history_count - 1].serial if self.history_count > 0 else 0
+
+    ## How many bytes of GPU tiles the undo history may hold beyond what the
+    ## document shows (4 GiB by default): past it the oldest steps are dropped,
+    ## though the last step always stays. The next step applies it.
+    pub mutating func set_history_limit(bytes: i64) -> !:
+        if bytes < 0:
+            error(invalid, "a history budget cannot be negative")
+        self.history_budget = (u64)bytes
+
+    pub func history_limit() -> i64:
+        return (i64)self.history_budget
+
+    ## How many steps undo can take back.
+    pub func undo_steps() -> i64:
+        return (i64)self.history_count
+
+    ## Bytes of GPU memory in pixel tiles, across every open document with its
+    ## history and selection: a figure for a memory readout.
+    pub static func tile_memory() -> i64:
+        return (i64)tiles_alive() * (i64)tile_memory_bytes
+
+    pub func can_undo() -> bool:
+        return self.history_count > 0
+
+    pub func can_redo() -> bool:
+        return self.future_count > 0
+
+    ## Put back the pixels a layer (or its mask) had before the last edit.
+    pub mutating func undo() -> !:
+        try self.require_open()
+        try self.require_idle()
+        if self.history_count == 0:
+            error(invalid, "nothing to undo")
+        let document = self.document else trap("history without a document")
+        # An edit may have remembered several snapshots; they go back together.
+        while self.history_count > 0:
+            let entry = self.history[self.history_count - 1]
+            self.history_count -= 1
+            try push(&self.future, &self.future_count, try self.swap_in(document, entry))
+            if not entry.joined:
+                break
+
+    ## Redo the last undone edit.
+    pub mutating func redo() -> !:
+        try self.require_open()
+        try self.require_idle()
+        if self.future_count == 0:
+            error(invalid, "nothing to redo")
+        let document = self.document else trap("history without a document")
+        var first = true
+        while self.future_count > 0 and (first or self.future[self.future_count - 1].joined):
+            first = false
+            let entry = self.future[self.future_count - 1]
+            self.future_count -= 1
+            try push(&self.history, &self.history_count, try self.swap_in(document, entry))
+
+    ## Record a layer's pixels before a change, as step `name`, dropping the
+    ## redo trail and the oldest entries past the limit.
+    mutating func remember(layer: u64, tiles: Tiles, mask: bool = false, joined: bool = false, name: str = "Edit") -> !:
+        var owned = tiles
+        errdefer owned.destroy()
+        try require_loaded(&self)
+        # Pixels of a text layer changed as pixels (a move only moves it): it is
+        # no longer text. The step holds the whole document, with the pixels
+        # from before put back while it is taken, so undo brings the text back.
+        if not mask and name != "Move":
+            let index = self.index(layer) catch _:
+                recover self.count
+            if index < self.count and (self.records[index].typed or self.records[index].shaped):
+                let document = self.document else trap("pixels changed without a document")
+                var now = try document.take_tiles(layer, owned)
+                try self.remember_state(name)
+                var before = try document.take_tiles(layer, now)
+                before.destroy()
+                rasterize_type(&self, layer)
+                rasterize_shape(&self, layer)
+                return
+        # Inside an edit that recorded the whole document, its step already holds these pixels.
+        if self.edit_depth > 0 and self.edit_captured:
+            owned.destroy()
+            return
+        self.make_room()
+        let join = joined or (self.joining and self.history_count > 0)
+        self.joining = false
+        self.serial += 1
+        try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = tiles, mask = mask, joined = join, name = name, serial = self.serial))
+        try trim_history(&self)
+
+    ## Record the whole document before a change to what it is made of, as
+    ## step `name`. The same change to the same layer again (`layer` non-zero)
+    ## right after is one step with it — an opacity slider dragged — and
+    ## inside `begin_edit` nothing more is recorded. Nothing is kept before the
+    ## document is drawn once.
+    mutating func remember_state(name: str, layer: u64 = 0) -> !:
+        let document = self.document else return
+        try require_loaded(&self)
+        if self.edit_depth > 0 and self.history_count > 0:
+            return
+        if self.edit_depth == 0 and layer != 0 and self.future_count == 0 and self.history_count > 0:
+            let top = self.history[self.history_count - 1]
+            # Not into the step the document was saved at: the change after saving is its own.
+            if top.state != none and top.layer == layer and top.name == name and top.serial != self.saved_version and not self.separating:
+                return
+        var tree = try document.capture()
+        errdefer tree.destroy()
+        let records = try copy_records(self.records, self.count)
+        errdefer release_records(records, self.count)
+        var channels = try self.channels.copy()
+        errdefer channels.destroy()
+        let state = try new DocumentState(tree = tree, records = records, count = self.count, next_id = self.next_id, guides = self.guides, channels = channels) in memory.heap
+        errdefer free(state) in memory.heap
+        self.make_room()
+        let join = self.joining and self.history_count > 0
+        self.joining = false
+        self.separating = false
+        self.serial += 1
+        try push(&self.history, &self.history_count, Snapshot(layer = layer, tiles = Tiles(), mask = false, joined = join, state = state, name = name, serial = self.serial))
+        try trim_history(&self)
+
+    ## Drop the redo trail and, at the limit, the oldest step.
+    mutating func make_room():
+        clear_snapshots(&self.future, &self.future_count)
+        if self.history_count == 64:
+            drop_oldest(&self)
+
+    ## Put `entry`'s pixels or document in place, returning a snapshot of what
+    ## was there, for the other stack.
+    mutating func swap_in(document: Document*, entry: Snapshot) -> Snapshot!:
+        if let state = entry.state:
+            document.exchange(&state.tree)
+            let records = self.records
+            self.records = state.records
+            state.records = records
+            let count = self.count
+            self.count = state.count
+            state.count = count
+            let next_id = self.next_id
+            self.next_id = state.next_id
+            state.next_id = next_id
+            let guides = self.guides
+            self.guides = state.guides
+            state.guides = guides
+            let channels = self.channels
+            self.channels = state.channels
+            state.channels = channels
+            # History keeps the cells alone, not their GPU tiles.
+            state.channels.drop_gpu_tiles()
+            self.extent_x = document.width()
+            self.extent_y = document.height()
+            return entry
+        let current = try (document.take_mask(entry.layer, entry.tiles) if entry.mask else document.take_tiles(entry.layer, entry.tiles))
+        return Snapshot(layer = entry.layer, tiles = current, mask = entry.mask, joined = entry.joined, name = entry.name, serial = entry.serial)
+
+    ## Make everything until `end_edit` one step named `name`: a layer grouped
+    ## with others, a picture placed.
+    pub mutating func begin_edit(name: str) -> !:
+        try self.require_open()
+        if self.edit_depth == 0:
+            let before = self.serial
+            try self.remember_state(name)
+            self.edit_captured = self.serial != before
+        self.edit_depth += 1
+
+    pub mutating func end_edit():
+        if self.edit_depth > 0:
+            self.edit_depth -= 1
+
+    ## Whether the document differs from when it was last saved (or opened):
+    ## undoing back to that point counts as unchanged.
+    pub func modified() -> bool:
+        let version = self.history[self.history_count - 1].serial if self.history_count > 0 else 0
+        return version != self.saved_version
+
+    ## The document is as saved now.
+    pub mutating func mark_saved():
+        self.saved_version = self.history[self.history_count - 1].serial if self.history_count > 0 else 0
+
+    ## The step Undo would take back, or "" when there is none; `redo_name` likewise.
+    pub func undo_name() -> str:
+        return self.history[self.history_count - 1].name if self.history_count > 0 else ""
+
+    pub func redo_name() -> str:
+        return self.future[self.future_count - 1].name if self.future_count > 0 else ""
+
+    ## The steps Undo takes back one at a time, as a History panel lists them:
+    ## how many, and each one's name, 0 the oldest (what `undo_name` says when
+    ## it is the last). Snapshots taken together count once.
+    pub func history_steps() -> i64:
+        return (i64)step_starts(self.history, self.history_count, false, none)
+
+    pub func history_step_name(index: i64) -> str:
+        return step_name(self.history, self.history_count, false, index)
+
+    ## The steps Redo brings back, 0 the next one.
+    pub func future_steps() -> i64:
+        return (i64)step_starts(self.future, self.future_count, true, none)
+
+    pub func future_step_name(index: i64) -> str:
+        return step_name(self.future, self.future_count, true, index)
+
 ## The document as a state snapshot keeps it: the tree, extent and selection,
 ## and the layers' records, the guides and the alpha channels beside them.
 struct DocumentState:

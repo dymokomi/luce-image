@@ -11,6 +11,70 @@
 #
 #==============================================================================================
 
+extend Canvas:
+    ## Count layer `id`'s visible pixels by their encoded values for
+    ## `histogram`: Auto levels and the Levels dialog read it.
+    pub mutating func measure_histogram(id: i64) -> !:
+        try self.require_open()
+        let document = self.document else error(invalid, "draw the document once before measuring")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let tiles = layer.tiles() else error(invalid, "a group has no pixels to count")
+        self.clear_histogram()
+        try count_layer(self.histogram_counts[..<1024], tiles)
+
+    ## Count what shows below layer `id` — the whole picture with it and the
+    ## layers over it hidden — for `histogram`: what an adjustment layer's
+    ## Levels takes in.
+    pub mutating func measure_histogram_below(id: i64) -> !:
+        try self.require_open()
+        let document = self.document else error(invalid, "draw the document once before measuring")
+        let index = try self.index((u64)id)
+        let hidden = try alloc bool[self.count] in memory.heap
+        defer free(hidden) in memory.heap
+        for at in 0..<self.count:
+            let record = self.records[at]
+            # The groups holding it stay: hiding them would hide what is below it inside them.
+            hidden[at] = at >= index and record.visible and not self.holds(record.id, (u64)id)
+            if hidden[at]:
+                try document.set_appearance(record.id, false, record.opacity, (u32)record.blend)
+        self.clear_histogram()
+        count_flattened(self.histogram_counts[..<1024], &self) catch failure:
+            self.show_again(hidden)
+            error(failure.code, failure.message)
+        self.show_again(hidden)
+
+    ## Whether group `group` holds layer `id`, however deep.
+    func holds(group: u64, id: u64) -> bool:
+        var parent = id
+        while parent != 0:
+            let at = self.index(parent) catch _:
+                return false
+            parent = self.records[at].parent
+            if parent == group:
+                return true
+        return false
+
+    ## Put back the visibility `measure_histogram_below` took away.
+    mutating func show_again(hidden: const bool[]):
+        let document = self.document else return
+        for at in 0..<self.count:
+            if hidden[at]:
+                let record = self.records[at]
+                document.set_appearance(record.id, true, record.opacity, (u32)record.blend) catch _:
+                    recover ()
+
+    ## Empty the histogram's bins before a count.
+    mutating func clear_histogram():
+        for slot in 0..<(usize)1024:
+            self.histogram_counts[slot] = 0
+
+    ## How many pixels `measure_histogram` counted in bin `slot` (0..255) of
+    ## `channel`: 0 luminosity, 1 red, 2 green, 3 blue.
+    pub func histogram(channel: i64, slot: i64) -> i64!:
+        if channel < 0 or channel > 3 or slot < 0 or slot > 255:
+            error(invalid, "a histogram has channels 0..3 and bins 0..255")
+        return (i64)self.histogram_counts[(usize)(channel * 256 + slot)]
+
 ## Count `count` straight 8-bit sRGB RGBA pixels of `rgba` into `counts`
 ## (luminosity, then red, green and blue, 256 bins each).
 func count_rgba8(counts: u64[], rgba: const u8[], count: usize):
@@ -34,8 +98,7 @@ func count_layer(counts: u64[], tiles: const Tiles*) -> !:
     let rgba = try alloc u8[side * 4] in memory.heap
     defer free(rgba) in memory.heap
     var steps: u8[4097] = ---
-    for step in 0..<(usize)4097:
-        steps[step] = srgb_byte((f64)step / 4096.0)
+    transfer.srgb_byte_table(steps)
     for row in 0..<tiles.rows():
         for column in 0..<tiles.columns():
             if not tiles.painted(column, row):

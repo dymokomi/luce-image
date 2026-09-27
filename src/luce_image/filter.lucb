@@ -10,6 +10,7 @@
 import gpu
 import memory
 import math
+import transfer
 from tiles import Tiles, tile_size, box, unbox, flatten, tile_texture
 from luce_image.document import Document
 from luce_image.transform_window import Footprint, gather
@@ -227,6 +228,14 @@ func within_one(value: f64) -> bool:
 func blur_params(taps: f64, sigma: f64, horizontal: bool, extent: u32, srgb: bool) -> f32[6]:
     return [(f32)taps, (f32)sigma, 1.0 if horizontal else 0.0, (f32)extent, 1.0 if srgb and horizontal else 0.0, 1.0 if srgb and not horizontal else 0.0]
 
+
+## A linear component clamped to 0..1, sRGB-encoded.
+func encode(linear: f64) -> f64:
+    return transfer.srgb_encode(math.clamp(linear, 0.0, 1.0))
+
+func decode(encoded: f64) -> f64:
+    return transfer.srgb_decode(encoded)
+
 test "a gaussian blur spreads across tile edges and keeps alpha weight":
     var device = gpu.Device.open() catch failure:
         assert(failure.code == gpu.unavailable)
@@ -309,12 +318,6 @@ func mix_bits(seed: u64, at: u64, stream: u64) -> u64:
     v = (v ^ (v >> 27)) *% 0x94D049BB133111EB
     return v ^ (v >> 31)
 
-func encode(linear: f64) -> f64:
-    let v = math.clamp(linear, 0.0, 1.0)
-    return v * 12.92 if v <= 0.0031308 else 1.055 * math.pow(v, 1.0 / 2.4) - 0.055
-
-func decode(encoded: f64) -> f64:
-    return encoded / 12.92 if encoded <= 0.04045 else math.pow((encoded + 0.055) / 1.055, 2.4)
 
 test "noise moves an opaque grey the same way for the same seed and leaves transparency alone":
     var device = gpu.Device.open() catch failure:

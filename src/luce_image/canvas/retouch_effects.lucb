@@ -223,7 +223,7 @@ func finish_heal(canvas: Canvas*, stroke: Stroke*) -> !:
     errdefer healed.destroy()
     var read = HealRead(stroke = stroke, original = original, columns = original.columns(), window = window, pixels = pixels, bytes = bytes, healed = &healed, device = device)
     try read_pieces(device, (usize)original.columns() * (usize)original.rows(), (void*)&read, healed_piece, healed_visit)
-    try stroke.use_effect(&painter, document, healed, 2.0, canvas.heal_opacity)
+    try stroke.use_effect(&painter, try stroke_target(document, canvas.stroke_layer, false, true), healed, 2.0, canvas.heal_opacity)
 
 ## The box of the pixels the stroke painted (coverage past 1%); none when it painted nothing.
 func spot_bounds(device: gpu.Device, stroke: Stroke*, original: const Tiles*) -> Bounds?!:

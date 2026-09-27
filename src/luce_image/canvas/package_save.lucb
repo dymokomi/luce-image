@@ -413,7 +413,7 @@ func package_preview(canvas: Canvas*, out: Buffer*) -> !:
     for at in 0..<(usize)width * (usize)height:
         let alpha = math.clamp((f64)from_half(get_u16(halves, at * 8 + 6)), 0.0, 1.0)
         for channel in 0..<(usize)3:
-            pixels[at * 4 + channel] = srgb_byte((f64)from_half(get_u16(halves, at * 8 + channel * 2)))
+            pixels[at * 4 + channel] = transfer.srgb_byte((f64)from_half(get_u16(halves, at * 8 + channel * 2)))
         pixels[at * 4 + 3] = (u8)(alpha * 255.0 + 0.5)
     var encoder = try png.Encoder.begin((usize)width, (usize)height, png.Format.rgba8, out)
     defer encoder.close()

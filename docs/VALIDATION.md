@@ -1,5 +1,8 @@
 # Local validation — 2026-09-14
 
+(A record of the initial implementation. Cryptomatte has since moved to luce-exr,
+the brush engine to luce-painting and vector layers to luce-vector.)
+
 Source: initial implementation commit `4a480ee` (codec/library sources unchanged
 by this report). Host: macOS 15.7.3 arm64.
 

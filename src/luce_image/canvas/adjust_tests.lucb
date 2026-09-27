@@ -1,0 +1,217 @@
+#==============================================================================================
+#
+#   canvas/adjust_tests - Adjustments, adjustment layers, Curves, filters and their previews
+#
+#==============================================================================================
+
+test "previews show edits on the original pixels and end kept or dropped":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(32, 32)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Grey")
+    var target = try gpu.Texture.create(device, 32, 32, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    var pixels: u8[32 * 32 * 4]
+    discard(try shown_centre(&canvas, &target, pixels))
+    try canvas.set_brush(40.0, 1.0, 1.0, 1.0, 0.05, 0.05, 0.05, false)
+    try canvas.begin_stroke(layer, 16.0, 16.0)
+    try canvas.end_stroke()
+    # Dark grey: adjustments work in sRGB, where 0.05 linear is 0.25 and inverts to 0.75.
+    let base = try shown_centre(&canvas, &target, pixels)
+    assert(base > 5 and base < 25)
+    try canvas.begin_preview(layer)
+    assert(canvas.previewing())
+    try canvas.preview_adjust(2)
+    let inverted = try shown_centre(&canvas, &target, pixels)
+    assert(inverted > base + 40)
+    # A second preview applies to the original, not to the inverted pixels.
+    try canvas.set_adjustment(0, 0.3)
+    try canvas.preview_adjust(0)
+    let brighter = try shown_centre(&canvas, &target, pixels)
+    assert(brighter > base and brighter < inverted)
+    var rejected = false
+    canvas.undo() catch failure:
+        assert(failure.code == invalid)
+        rejected = true
+    assert(rejected)
+    try canvas.end_preview(false)
+    assert(not canvas.previewing())
+    assert((try shown_centre(&canvas, &target, pixels)) == base)
+    try canvas.begin_preview(layer)
+    try canvas.preview_adjust(2)
+    try canvas.end_preview(true)
+    assert(canvas.can_undo())
+    assert((try shown_centre(&canvas, &target, pixels)) == inverted)
+    try canvas.undo()
+    assert((try shown_centre(&canvas, &target, pixels)) == base)
+    # A white-to-transparent gradient across the canvas: the left edge lights, the right stays.
+    try canvas.fill_gradient(layer, 0.0, 0.0, 32.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0)
+    discard(try shown_centre(&canvas, &target, pixels))
+    assert(pixels[(0 * 32 + 0) * 4] > 200 and pixels[(0 * 32 + 31) * 4] < 40)
+    try canvas.undo()
+    assert((try shown_centre(&canvas, &target, pixels)) == base)
+    # The eyedropper reads the dot's grey back, and nothing at a bare corner.
+    try canvas.pick(16, 16)
+    assert(math.abs(canvas.picked_red() - 0.05) < 0.01 and canvas.picked_alpha() > 0.99)
+    try canvas.pick(0, 0)
+    assert(canvas.picked_alpha() == 0.0)
+    # Renaming reaches the record and the bound layer.
+    try canvas.rename_layer(layer, "Dot")
+    assert((try canvas.layer_name(0)) == "Dot")
+    # Text set on the layer is undoable.
+    try canvas.set_type(layer, "X", "Helvetica", "Regular", 24.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+    try canvas.undo()
+    assert((try shown_centre(&canvas, &target, pixels)) == base)
+    # A white glow lights the transparent surround of the dot; off again, it is dark.
+    try canvas.set_style_value(layer, 14, 1.0)
+    try canvas.set_style_value(layer, 15, 6.0)
+    try canvas.set_style_value(layer, 19, 1.0)
+    assert(try canvas.layer_styled(0))
+    discard(try shown_centre(&canvas, &target, pixels))
+    # The 40-pixel dot leaves only the corners bare; the glow reaches them.
+    let lit = pixels[0]
+    try canvas.set_style_value(layer, 14, 0.0)
+    discard(try shown_centre(&canvas, &target, pixels))
+    assert(lit > 20 and pixels[0] == 0 and not (try canvas.layer_styled(0)))
+    # A previewed transform is shown, then cancelled back to the original.
+    try canvas.begin_transform(layer)
+    try canvas.preview_transform(0.25, 0.25, 45.0, 0.0, 0.0, 16.0, 16.0)
+    assert((try shown_centre(&canvas, &target, pixels)) == base)
+    try canvas.end_transform(false)
+    assert((try shown_centre(&canvas, &target, pixels)) == base)
+    # The wand on the painted dot selects it and nothing of the transparent surround.
+    try canvas.select_wand(layer, 16, 16, 32.0, true, 0)
+    assert(canvas.has_selection() and canvas.selected_at(16, 16) == 255 and canvas.selected_at(1, 1) == 0)
+    try canvas.deselect()
+    # Curves: lifting the midtones brightens the dark grey; resetting restores identity.
+    try canvas.add_curve_point(0, 0.25, 0.6)
+    assert((try canvas.curve_point_count(0)) == 3 and (try canvas.curve_value(0, 0.25)) > 0.59)
+    try canvas.adjust_layer(layer, 7)
+    let lifted = try shown_centre(&canvas, &target, pixels)
+    assert(lifted > base + 40)
+    try canvas.reset_curve(0)
+    assert((try canvas.curve_point_count(0)) == 2)
+    try canvas.undo()
+    assert((try shown_centre(&canvas, &target, pixels)) == base)
+
+test "adjustment layers change what is below them live, leave the pixels alone, and save":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    let red = try canvas.add_layer("Red")
+    let green = try canvas.add_layer("Green")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(8, 8, 16, 16, 0)
+    try canvas.fill(red, false)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, false)
+    try canvas.select_rectangle(40, 40, 16, 16, 0)
+    try canvas.fill(green, false)
+    try canvas.deselect()
+    # A hue turn of a third, as a layer between the two: red below turns green, green above stays.
+    canvas.clear_adjustments()
+    try canvas.set_adjustment(0, 1.0 / 3.0)
+    let turn = try canvas.add_adjustment_layer("Hue", 1)
+    try canvas.reorder_layer(turn, -1)
+    assert((try canvas.layer_adjustment(1)) == 1 and (try canvas.layer_adjustment(0)) == -1 and (try canvas.adjustment_value(1, 0)) > 0.33)
+    var shown = try shown_at(&canvas, &target, 12, 12)
+    assert(shown[0] < 5 and shown[1] > 250)
+    shown = try shown_at(&canvas, &target, 44, 44)
+    assert(shown[1] > 250 and shown[2] < 5)
+    # Edited live: two thirds make it blue; the red layer's own pixels never changed.
+    try canvas.set_adjustment(0, 2.0 / 3.0)
+    try canvas.update_adjustment_layer(turn)
+    shown = try shown_at(&canvas, &target, 12, 12)
+    assert(shown[2] > 250 and shown[0] < 5)
+    try canvas.set_layer(turn, false, 1.0)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] > 250)
+    # Half opacity mixes halfway, as encoded values (128 each; the linear
+    # target stores about 55); a mask hiding all takes it away.
+    try canvas.set_layer(turn, true, 0.5)
+    shown = try shown_at(&canvas, &target, 12, 12)
+    assert(shown[0] > 45 and shown[0] < 65 and shown[2] > 45 and shown[2] < 65)
+    try canvas.set_mask(turn, true, 1)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] > 250)
+    try canvas.set_mask(turn, false)
+    try canvas.set_layer(turn, true, 1.0)
+    # What shows below the adjustment layer: the red square, before it is adjusted.
+    try canvas.measure_histogram_below(turn)
+    assert((try canvas.histogram(1, 255)) == 256 and (try canvas.histogram(3, 255)) == 0)
+    # It has no pixels to paint on or merge.
+    var refused = false
+    canvas.merge_down(turn) catch failure:
+        assert(failure.code == invalid)
+        refused = true
+    assert(refused)
+    # The package keeps it, and it shows the same.
+    try canvas.save_package("build/canvas-adjustments.l2d")
+    let restored = try Canvas.open("build/canvas-adjustments.l2d")
+    defer restored.release()
+    let copy = restored.value()
+    assert(copy.layer_count() == 3 and (try copy.layer_adjustment(1)) == 1 and (try copy.adjustment_value(1, 0)) > 0.66)
+    discard(try shown_at(copy, &target, 0, 0))
+    shown = try shown_at(copy, &target, 12, 12)
+    assert(shown[2] > 250 and shown[0] < 5)
+
+test "a Curves adjustment layer keeps its curves live, through undo and a save":
+    var canvas = try Canvas(32, 16)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Grey")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    let document = canvas.document else trap("bound")
+    try canvas.set_brush(1.0, 1.0, 1.0, 1.0, 0.25, 0.25, 0.25, false)
+    try canvas.fill(layer, false)
+    # Mid-grey lifted: the master curve through (0.25, 0.75).
+    try canvas.reset_curve(0)
+    try canvas.add_curve_point(0, 0.25, 0.75)
+    let curves_layer = try canvas.add_adjustment_layer("Curves", 7)
+    var composer = canvas.composer else trap("bound")
+    var bytes: u8[8]
+    let flat = try composer.tile(document, 0, 0, 0)
+    try flat.read(bytes, gpu.Region(4, 4, 1, 1))
+    let lifted = from_half((u16)bytes[0] | ((u16)bytes[1] << 8))
+    assert(lifted > 0.3)
+    # Saved and reopened, it is still a Curves layer with its point.
+    try canvas.save_package("build/canvas-curves.l2d")
+    let reopened = try Canvas.open("build/canvas-curves.l2d")
+    defer reopened.release()
+    let index = (i64)(try reopened.value().index((u64)curves_layer))
+    assert((try reopened.value().layer_adjustment(index)) == 7)
+    try reopened.value().stage_layer_curves(curves_layer)
+    assert((try reopened.value().curve_point_count(0)) == 3)
+
+test "filters preview and keep as one step: motion blur, lens correction, bloom, tonal contrast":
+    var canvas = try Canvas(64, 32)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, false)
+    try canvas.select_rectangle(28, 12, 8, 8, 0)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    var kind: i64 = 0
+    while kind < Canvas.filter_count():
+        let steps = canvas.history_count
+        let a = [0.0, 0.5, 0.5, 1.0][(usize)kind]
+        let b = [12.0, 0.2, 4.0, 6.0][(usize)kind]
+        try canvas.filter_layer(layer, kind, a, b, 1.0)
+        assert(canvas.history_count == steps + 1)
+        try canvas.undo()
+        kind += 1
+    var rejected = false
+    canvas.filter_layer(layer, 9, 0.0, 0.0, 0.0) catch failure:
+        assert(failure.code == invalid)
+        rejected = true
+    assert(rejected)

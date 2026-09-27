@@ -1,0 +1,192 @@
+#==============================================================================================
+#
+#   image/pixels - An image's pixels as the editor takes them
+#
+#   DESCRIPTION:
+#       8-bit RGBA out, straight-alpha linear-light RGBA f32 out (whole, by rows, or streamed
+#       in bands from a file never held whole), and images made from either. Integer samples
+#       decode through a table and whole pictures convert in bands on every processor.
+#
+#==============================================================================================
+
+extend Image:
+    ## An "RGBA" image's pixels as 8-bit samples, top-down, four per pixel: heap
+    ## bytes the caller frees.
+    pub mutating func rgba8() -> u8[]!:
+        try self.load()
+        if (try self.mode()) != "RGBA":
+            error(invalid, "only an RGBA image has 8-bit RGBA samples")
+        let bytes = try alloc u8[self.raster.pixels.length] in memory.heap
+        for index in 0..<bytes.length:
+            bytes[index] = (u8)self.raster.pixels[index]
+        return bytes
+
+    ## Every pixel as straight-alpha linear-light RGBA f32 samples, top-down,
+    ## four per pixel: integer modes are taken as sRGB-encoded, float modes as
+    ## linear already. For the editor's tiles; Base only.
+    pub mutating func linear_rgba(pixels: f32[]) -> !:
+        try self.load()
+        try self.linear_rgba_rows(0, self.raster.height, pixels)
+
+    ## Rows `first..<first + count` as `linear_rgba` gives them, into `pixels`
+    ## (`count` rows of RGBA f32): a picture turned into tiles a band at a time.
+    pub mutating func linear_rgba_rows(first: usize, count: usize, pixels: f32[]) -> !:
+        try self.load()
+        if first + count > self.raster.height or pixels.length != self.raster.width * count * 4:
+            error(invalid, "pixel buffer must hold width * count RGBA samples of rows in the picture")
+        let kind = self.raster.channels[0].kind
+        let stride = self.raster.channels.length
+        let rows = self.raster.pixels[first * self.raster.width * stride..<(first + count) * self.raster.width * stride]
+        # Which sample is which, worked out once as `getpixel` reads them.
+        var job = LinearJob(source = rows, pixels = pixels, stride = stride, width = self.raster.width,
+                            red = -1, green = -1, blue = -1, alpha = -1, scale = 1.0 / model.maximum(kind), encoded = kind != .float16 and kind != .float32 and kind != .float64,
+                            table = none, first = 0, last = count)
+        for c in 0..<self.raster.channels.length:
+            let name = self.raster.channels[c].name
+            if name == "Y":
+                job.red = (i64)c
+                job.green = (i64)c
+                job.blue = (i64)c
+            elif name == "R":
+                job.red = (i64)c
+            elif name == "G":
+                job.green = (i64)c
+            elif name == "B":
+                job.blue = (i64)c
+            elif name == "A":
+                job.alpha = (i64)c
+        # 8 and 16-bit samples decode through a table rather than a pow each.
+        if kind != .uint8 and kind != .uint16:
+            try linear_bands(&job)
+            return
+        let table = try alloc f32[256 if kind == .uint8 else 65536] in memory.heap
+        defer free(table) in memory.heap
+        for value in 0..<table.length:
+            table[value] = (f32)decode_srgb((f64)value * job.scale)
+        job.table = table
+        try linear_bands(&job)
+
+    ## The picture as linear-light straight RGBA f32, `rows` rows at a time,
+    ## to `sink` in order from the top (luce_image/streaming). A PNG, JPEG or
+    ## TIFF not yet decoded goes a band at a time and is never whole; any other
+    ## picture, or one already decoded, from its whole raster, which may take
+    ## at most `whole_picture_bytes`.
+    pub mutating func linear_rgba_bands(rows: usize, sink: LinearSink, context: void*?) -> !:
+        try self.ensure_open()
+        if not self.is_loaded() and (try self.stream_linear_from(rows, sink, context)):
+            return
+        if not self.is_loaded() and self.raster.width * self.raster.height * self.raster.channels.length > whole_picture_bytes // 8:
+            error(limit, "a picture this large opens only from PNG, JPEG or TIFF")
+        let width = self.raster.width
+        let height = self.raster.height
+        let band = try alloc f32[width * rows * 4] in memory.heap
+        defer free(band) in memory.heap
+        var top: usize = 0
+        while top < height:
+            let count = min_rows(rows, height - top)
+            try self.linear_rgba_rows(top, count, band[..<width * count * 4])
+            try sink(context, top, count, band[..<width * count * 4])
+            top += count
+
+    ## A PNG or JPEG not yet decoded as its encoded 8 or 16-bit RGBA samples,
+    ## `rows` rows at a time, to `sink` (luce_image/streaming); false for any
+    ## other picture, which `linear_rgba_bands` gives instead. A progressive
+    ## JPEG's first sight goes to `coarse` first, with the same `context`.
+    pub mutating func encoded_rgba_bands(rows: usize, sink: EncodedSink, context: void*?, coarse: CoarseSink? = none) -> bool!:
+        try self.ensure_open()
+        if self.is_loaded():
+            return false
+        if not self.head_only:
+            return try stream_encoded(&self.raster, none, rows, sink, context, coarse)
+        var source = try FileSource.open(self.raster.path, self.file_size)
+        defer source.close()
+        return try stream_encoded(&self.raster, &source, rows, sink, context, coarse)
+
+    ## `stream_linear` from the file when only its start is held.
+    mutating func stream_linear_from(rows: usize, sink: LinearSink, context: void*?) -> bool!:
+        if not self.head_only:
+            return try stream_linear(&self.raster, none, rows, sink, context)
+        var source = try FileSource.open(self.raster.path, self.file_size)
+        defer source.close()
+        return try stream_linear(&self.raster, &source, rows, sink, context)
+
+    ## An 8-bit RGBA image from straight-alpha linear-light RGBA f32 samples,
+    ## sRGB-encoded and clamped. Base only.
+    pub static func from_linear_rgba(width: usize, height: usize, pixels: const f32[]) -> interop.Reference[Image]!:
+        if pixels.length != width * height * 4:
+            error(invalid, "pixel data must hold width * height RGBA samples")
+        let image = try Image.create("RGBA", width, height)
+        errdefer image.release()
+        let target = image.value()
+        for index in 0..<width * height:
+            target.raster.pixels[index * 4] = (f64)transfer.srgb_byte((f64)pixels[index * 4])
+            target.raster.pixels[index * 4 + 1] = (f64)transfer.srgb_byte((f64)pixels[index * 4 + 1])
+            target.raster.pixels[index * 4 + 2] = (f64)transfer.srgb_byte((f64)pixels[index * 4 + 2])
+            target.raster.pixels[index * 4 + 3] = math.floor(math.clamp((f64)pixels[index * 4 + 3], 0.0, 1.0) * 255.0 + 0.5)
+        return image
+
+    ## An 8-bit RGBA image from `width * height * 4` sRGB-encoded bytes. Base only.
+    pub static func from_rgba8(width: usize, height: usize, bytes: const u8[]) -> interop.Reference[Image]!:
+        if bytes.length != width * height * 4:
+            error(invalid, "pixel data must hold width * height RGBA bytes")
+        let image = try Image.create("RGBA", width, height)
+        errdefer image.release()
+        let target = image.value()
+        for index in 0..<bytes.length:
+            target.raster.pixels[index] = (f64)bytes[index]
+        return image
+
+## Rows `first..<last` of an image for `linear_rgba`.
+struct LinearJob:
+    var source: const f64[]
+    var pixels: f32[]
+    var stride: usize
+    var width: usize
+    ## Each color's sample within a pixel; -1 when absent.
+    var red: i64
+    var green: i64
+    var blue: i64
+    var alpha: i64
+    var scale: f64
+    var encoded: bool
+    var table: const f32[]?
+    var first: usize
+    var last: usize
+
+func linear_entry(context: void*?, index: usize):
+    let bands = (LinearJob*)(context else return)
+    linear_rows(&bands[index])
+
+func linear_rows(job: LinearJob*):
+    for index in job.first * job.width..<job.last * job.width:
+        let at = index * job.stride
+        job.pixels[index * 4] = linear_sample(job, at, job.red)
+        job.pixels[index * 4 + 1] = linear_sample(job, at, job.green)
+        job.pixels[index * 4 + 2] = linear_sample(job, at, job.blue)
+        job.pixels[index * 4 + 3] = (f32)(job.source[at + (usize)job.alpha] * job.scale) if job.alpha >= 0 else 1.0
+
+func linear_sample(job: const LinearJob*, at: usize, channel: i64) -> f32:
+    if channel < 0:
+        return 0.0
+    let value = job.source[at + (usize)channel]
+    if let table = job.table:
+        return table[(usize)math.clamp(value, 0.0, (f64)(table.length - 1))]
+    return (f32)(decode_srgb(value * job.scale) if job.encoded else value * job.scale)
+
+func min_rows(a: usize, b: usize) -> usize:
+    return a if a < b else b
+
+## `job`'s rows in bands on the worker pool.
+func linear_bands(job: LinearJob*) -> !:
+    let rows = job.last
+    let workers = math.imin(16, math.imax(1, (i64)os.cpus())) if rows * job.width >= 262144 else 1
+    if workers <= 1:
+        linear_rows(job)
+        return
+    var bands: LinearJob[16]
+    let per = (rows + (usize)workers - 1) // (usize)workers
+    for band in 0..<(usize)workers:
+        bands[band] = *job
+        bands[band].first = min_rows(rows, band * per)
+        bands[band].last = min_rows(rows, band * per + per)
+    pool.run((usize)workers, linear_entry, (void*)&bands[0])

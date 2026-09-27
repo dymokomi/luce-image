@@ -5,10 +5,10 @@
 #   DESCRIPTION:
 #       A vector layer holds a list of elements, bottom first: shapes, pen paths and outlines
 #       brought in from SVG, each with its own geometry, fill and stroke (a ShapeSpec), a name
-#       and an eye. The layer's pixels are its visible elements drawn in order
-#       (vector_render.lucb), and an edit draws again only the cells the element it changed
-#       covered before or covers after. The Vector panel lists them; one may be active, and
-#       then a move, a transform, the shape options and the pen act on it alone.
+#       and an eye. luce-vector draws them into the layer's tiles, and an edit draws again only
+#       the cells the element it changed covered before or covers after (a CellMask). The
+#       Vector panel lists them; one may be active, and then a move, a transform, the shape
+#       options and the pen act on it alone.
 #
 #       The list is heap storage its record owns, copied with the record for the history and
 #       freed with it. An edit builds the new list beside the old, draws from it, and only
@@ -16,68 +16,152 @@
 #
 #==============================================================================================
 
-## One element of a vector layer.
-struct VectorElement:
-    ## Its name in the Vector panel, heap storage the element owns.
-    var name: str
-    var visible: bool = true
-    var spec: ShapeSpec
+extend Canvas:
+    ## How many vector elements the layer at `index` holds, bottom first.
+    pub func element_count(index: i64) -> i64!:
+        return (i64)(try self.record(index)).elements.length
 
-## What a new element of `kind` is called.
-func kind_name(kind: i64) -> str:
-    if kind == 0:
-        return "Rectangle"
-    if kind == 1:
-        return "Ellipse"
-    if kind == 2:
-        return "Line"
-    if kind == 3:
-        return "Polygon"
-    return "Path"
+    pub func element_name(index: i64, element: i64) -> str!:
+        return (try element_of(try self.record(index), element)).name
 
-## An element named `name` drawn from `spec`, which it takes over (freed if it cannot be made).
-func made_element(name: str, spec: ShapeSpec) -> VectorElement!:
-    var owned = spec
-    var copied: str = ""
-    with memory.heap:
-        copied = strings.copy(name) catch failure:
-            release_spec_path(&owned)
+    pub func element_visible(index: i64, element: i64) -> bool!:
+        return (try element_of(try self.record(index), element)).visible
+
+    ## Value `field` of element `element`, numbered as `layer_shape_value`'s;
+    ## 22 is its anchor count, 23 its runs (0 for one), 24 whether it is closed.
+    pub func element_value(index: i64, element: i64, field: i64) -> f64!:
+        let spec = (try element_of(try self.record(index), element)).spec
+        if field == 22:
+            return (f64)(spec.path.length // anchor_values)
+        if field == 23:
+            return (f64)spec.subpaths.length
+        if field == 24:
+            return 1.0 if spec.closed else 0.0
+        if field < 0 or field >= 22:
+            error(invalid, "an element has values 0..24")
+        return shape_values(spec)[(usize)field]
+
+    ## The layer at `index`'s active element, -1 for none.
+    pub func active_element(index: i64) -> i64!:
+        let record = try self.record(index)
+        return record.active if record.active < (i64)record.elements.length else -1
+
+    ## Make element `element` of layer `id` the one edits act on (-1: none, the
+    ## whole layer). Not a step: it is where the Vector panel points.
+    pub mutating func set_active_element(id: i64, element: i64) -> !:
+        let index = try self.index((u64)id)
+        if element < -1 or element >= (i64)self.records[index].elements.length:
+            error(invalid, "no such vector element")
+        self.records[index].active = element
+
+    ## Show or hide element `element` of layer `id`. One step.
+    pub mutating func set_element_visible(id: i64, element: i64, visible: bool) -> !:
+        let layer = (u64)id
+        let index = try vector_index(&self, layer)
+        let slot = try element_slot(&self, index, element)
+        if self.records[index].elements[slot].visible == visible:
+            return
+        var dirty = try CellMask.create(self.extent_x, self.extent_y)
+        defer dirty.close()
+        try dirty.mark(self.records[index].elements[slot])
+        let list = try copied_list(self.records[index].elements)
+        list[slot].visible = visible
+        try commit_elements(&self, index, list, &dirty, (i64)slot, "Show Vector" if visible else "Hide Vector", self.records[index].active)
+
+    ## Element `element` of layer `id` called `name`; one step, nothing drawn.
+    pub mutating func rename_element(id: i64, element: i64, name: str) -> !:
+        let layer = (u64)id
+        let index = try vector_index(&self, layer)
+        let slot = try element_slot(&self, index, element)
+        if name.length == 0:
+            error(invalid, "an element needs a name")
+        var copied: str = ""
+        with memory.heap:
+            copied = try strings.copy(name)
+        errdefer strings.release(copied)
+        try self.remember_state("Rename Vector", 0)
+        strings.release(self.records[index].elements[slot].name)
+        self.records[index].elements[slot].name = copied
+
+    ## Element `element` of layer `id` moved to place `to` (0 the bottom). One step.
+    pub mutating func move_element(id: i64, element: i64, to: i64) -> !:
+        let layer = (u64)id
+        let index = try vector_index(&self, layer)
+        let slot = try element_slot(&self, index, element)
+        let place = try element_slot(&self, index, to)
+        if slot == place:
+            return
+        var dirty = try CellMask.create(self.extent_x, self.extent_y)
+        defer dirty.close()
+        try dirty.mark(self.records[index].elements[slot])
+        let list = try copied_list(self.records[index].elements)
+        let moving = list[slot]
+        if place > slot:
+            for step in slot..<place:
+                list[step] = list[step + 1]
+        else:
+            var step = slot
+            while step > place:
+                list[step] = list[step - 1]
+                step -= 1
+        list[place] = moving
+        let name = "Bring Forward" if place > slot else "Send Backward"
+        try commit_elements(&self, index, list, &dirty, (i64)place, name, (i64)place)
+
+    ## A copy of element `element` of layer `id` just above it, active; one step.
+    pub mutating func duplicate_element(id: i64, element: i64) -> !:
+        let layer = (u64)id
+        let index = try vector_index(&self, layer)
+        let slot = try element_slot(&self, index, element)
+        var copy = try copied_element(self.records[index].elements[slot])
+        var text: u8[320]
+        let wanted = format(text, f"{copy.name} copy") catch _:
+            recover "Vector copy"
+        var named: str = ""
+        with memory.heap:
+            named = strings.copy(wanted) catch failure:
+                release_element(&copy)
+                error(failure.code, failure.message)
+        strings.release(copy.name)
+        copy.name = named
+        var list = copied_list(self.records[index].elements) catch failure:
+            release_element(&copy)
             error(failure.code, failure.message)
-    return VectorElement(name = copied, visible = true, spec = owned)
-
-## A copy of `element` that owns its own name and path.
-func copied_element(element: VectorElement) -> VectorElement!:
-    var copy = element
-    with memory.heap:
-        copy.name = try strings.copy(element.name)
-    errdefer strings.release(copy.name)
-    try copy_spec_path(&copy.spec)
-    return copy
-
-func release_element(element: VectorElement*):
-    strings.release(element.name)
-    release_spec_path(&element.spec)
-
-## A copy of `list`, every element its own.
-func copied_list(list: const VectorElement[]) -> VectorElement[]!:
-    var none_yet: VectorElement[]
-    if list.length == 0:
-        return none_yet
-    let copies = try alloc VectorElement[list.length] in memory.heap
-    for at in 0..<list.length:
-        copies[at] = copied_element(list[at]) catch failure:
-            for done in 0..<at:
-                release_element(&copies[done])
-            free(copies) in memory.heap
+        list = try list_with(list, slot + 1, copy)
+        var dirty = CellMask.create(self.extent_x, self.extent_y) catch failure:
+            free_list(list)
             error(failure.code, failure.message)
-    return copies
+        defer dirty.close()
+        try commit_elements(&self, index, list, &dirty, (i64)slot + 1, "Duplicate Vector", (i64)slot + 1)
 
-## Free a list and every element in it.
-func free_list(list: VectorElement[]):
-    for at in 0..<list.length:
-        release_element(&list[at])
-    if list.length > 0:
-        free(list) in memory.heap
+    ## Element `element` of layer `id` taken away; one step.
+    pub mutating func delete_element(id: i64, element: i64) -> !:
+        let layer = (u64)id
+        let index = try vector_index(&self, layer)
+        let slot = try element_slot(&self, index, element)
+        var dirty = try CellMask.create(self.extent_x, self.extent_y)
+        defer dirty.close()
+        try dirty.mark(self.records[index].elements[slot])
+        var list = try copied_list(self.records[index].elements)
+        list = try list_without(list, slot)
+        let active = self.records[index].active
+        let kept = -1 if active == (i64)slot else (active - 1 if active > (i64)slot else active)
+        try commit_elements(&self, index, list, &dirty, -1, "Delete Vector", kept)
+
+    ## Element `element` of layer `id` scaled, turned by `angle` degrees and
+    ## moved about the pivot, as `preview_transform`'s box. One step.
+    pub mutating func transform_element(id: i64, element: i64, scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64, pivot_x: f64, pivot_y: f64) -> !:
+        let layer = (u64)id
+        let warp = try affine_warp(scale_x, scale_y, angle * math.pi / 180.0, dx, dy, pivot_x, pivot_y)
+        let name = "Free Transform"
+        let index = try vector_index(&self, layer)
+        let slot = try element_slot(&self, index, element)
+        let forward = try warp.forward((f64)self.extent_x * 0.5, (f64)self.extent_y * 0.5)
+        var moved = transformed_shape(self.records[index].elements[slot].spec, forward) else error(invalid, "a vector element follows only an affine transform")
+        # The moved spec shares the element's path: a copy of its own for the new element.
+        copy_spec_path(&moved) catch failure:
+            error(failure.code, failure.message)
+        try replace_element_spec(&self, index, slot, moved, name, false)
 
 ## A record's elements and graph copied, for a copy of the record that owns its
 ## own; on failure it holds none.
@@ -106,44 +190,6 @@ func target_element(record: const Record*) -> usize?:
     if record.active >= 0 and record.active < (i64)count:
         return (usize)record.active
     return count - 1
-
-## `list` with `element` put in at `at`, taking both over (freed if it cannot).
-func list_with(list: VectorElement[], at: usize, element: VectorElement) -> VectorElement[]!:
-    var added = element
-    let grown = alloc VectorElement[list.length + 1] in memory.heap catch failure:
-        release_element(&added)
-        free_list(list)
-        error(failure.code, failure.message)
-    for index in 0..<at:
-        grown[index] = list[index]
-    grown[at] = added
-    for index in at..<list.length:
-        grown[index + 1] = list[index]
-    if list.length > 0:
-        free(list) in memory.heap
-    return grown
-
-## `list` without element `at`, which is freed; takes the list over.
-func list_without(list: VectorElement[], at: usize) -> VectorElement[]!:
-    release_element(&list[at])
-    var none_left: VectorElement[]
-    if list.length == 1:
-        free(list) in memory.heap
-        return none_left
-    let shrunk = alloc VectorElement[list.length - 1] in memory.heap catch failure:
-        # Element `at` is gone already: free the rest around it.
-        for index in 0..<list.length:
-            if index != at:
-                release_element(&list[index])
-        free(list) in memory.heap
-        error(failure.code, failure.message)
-    var to: usize = 0
-    for index in 0..<list.length:
-        if index != at:
-            shrunk[to] = list[index]
-            to += 1
-    free(list) in memory.heap
-    return shrunk
 
 ## Swap `list` in as the elements of the layer at `index`, as step `name`, its
 ## pixels drawn again where `dirty` marks and where element `changed` of the new
@@ -233,108 +279,6 @@ func element_target_layer(canvas: Canvas*, id: u64) -> usize!:
             error(invalid, "a layer with pixels cannot hold vector elements")
     return index
 
-## `Canvas.delete_element`: element `at` of layer `id` taken away; one step.
-func delete_vector_element(canvas: Canvas*, id: u64, at: i64) -> !:
-    let index = try vector_index(canvas, id)
-    let slot = try element_slot(canvas, index, at)
-    var dirty = try CellMask.create(canvas.extent_x, canvas.extent_y)
-    defer dirty.close()
-    try dirty.mark(canvas.records[index].elements[slot])
-    var list = try copied_list(canvas.records[index].elements)
-    list = try list_without(list, slot)
-    let active = canvas.records[index].active
-    let kept = -1 if active == (i64)slot else (active - 1 if active > (i64)slot else active)
-    try commit_elements(canvas, index, list, &dirty, -1, "Delete Vector", kept)
-
-## `Canvas.duplicate_element`: a copy of element `at` just above it, active; one step.
-func duplicate_vector_element(canvas: Canvas*, id: u64, at: i64) -> !:
-    let index = try vector_index(canvas, id)
-    let slot = try element_slot(canvas, index, at)
-    var copy = try copied_element(canvas.records[index].elements[slot])
-    var text: u8[320]
-    let wanted = format(text, f"{copy.name} copy") catch _:
-        recover "Vector copy"
-    var named: str = ""
-    with memory.heap:
-        named = strings.copy(wanted) catch failure:
-            release_element(&copy)
-            error(failure.code, failure.message)
-    strings.release(copy.name)
-    copy.name = named
-    var list = copied_list(canvas.records[index].elements) catch failure:
-        release_element(&copy)
-        error(failure.code, failure.message)
-    list = try list_with(list, slot + 1, copy)
-    var dirty = CellMask.create(canvas.extent_x, canvas.extent_y) catch failure:
-        free_list(list)
-        error(failure.code, failure.message)
-    defer dirty.close()
-    try commit_elements(canvas, index, list, &dirty, (i64)slot + 1, "Duplicate Vector", (i64)slot + 1)
-
-## `Canvas.move_element`: element `at` of layer `id` put at `to` in the stack
-## (0 the bottom), the others closing up round it; one step.
-func reorder_vector_element(canvas: Canvas*, id: u64, at: i64, to: i64) -> !:
-    let index = try vector_index(canvas, id)
-    let slot = try element_slot(canvas, index, at)
-    let place = try element_slot(canvas, index, to)
-    if slot == place:
-        return
-    var dirty = try CellMask.create(canvas.extent_x, canvas.extent_y)
-    defer dirty.close()
-    try dirty.mark(canvas.records[index].elements[slot])
-    let list = try copied_list(canvas.records[index].elements)
-    let moving = list[slot]
-    if place > slot:
-        for step in slot..<place:
-            list[step] = list[step + 1]
-    else:
-        var step = slot
-        while step > place:
-            list[step] = list[step - 1]
-            step -= 1
-    list[place] = moving
-    let name = "Bring Forward" if place > slot else "Send Backward"
-    try commit_elements(canvas, index, list, &dirty, (i64)place, name, (i64)place)
-
-## `Canvas.set_element_visible`: element `at`'s eye; one step.
-func show_vector_element(canvas: Canvas*, id: u64, at: i64, visible: bool) -> !:
-    let index = try vector_index(canvas, id)
-    let slot = try element_slot(canvas, index, at)
-    if canvas.records[index].elements[slot].visible == visible:
-        return
-    var dirty = try CellMask.create(canvas.extent_x, canvas.extent_y)
-    defer dirty.close()
-    try dirty.mark(canvas.records[index].elements[slot])
-    let list = try copied_list(canvas.records[index].elements)
-    list[slot].visible = visible
-    try commit_elements(canvas, index, list, &dirty, (i64)slot, "Show Vector" if visible else "Hide Vector", canvas.records[index].active)
-
-## `Canvas.rename_element`: element `at` called `name`; one step, nothing drawn.
-func rename_vector_element(canvas: Canvas*, id: u64, at: i64, name: str) -> !:
-    let index = try vector_index(canvas, id)
-    let slot = try element_slot(canvas, index, at)
-    if name.length == 0:
-        error(invalid, "an element needs a name")
-    var copied: str = ""
-    with memory.heap:
-        copied = try strings.copy(name)
-    errdefer strings.release(copied)
-    try canvas.remember_state("Rename Vector", 0)
-    strings.release(canvas.records[index].elements[slot].name)
-    canvas.records[index].elements[slot].name = copied
-
-## `Canvas.transform_element`: element `at` of layer `id` through the affine
-## map `warp`, as step `name`. A map a shape cannot follow is refused.
-func transform_vector_element(canvas: Canvas*, id: u64, at: i64, warp: Warp, name: str) -> !:
-    let index = try vector_index(canvas, id)
-    let slot = try element_slot(canvas, index, at)
-    let forward = try warp.forward((f64)canvas.extent_x * 0.5, (f64)canvas.extent_y * 0.5)
-    var moved = transformed_shape(canvas.records[index].elements[slot].spec, forward) else error(invalid, "a vector element follows only an affine transform")
-    # The moved spec shares the element's path: a copy of its own for the new element.
-    copy_spec_path(&moved) catch failure:
-        error(failure.code, failure.message)
-    try replace_element_spec(canvas, index, slot, moved, name, false)
-
 ## Every element of the layer at `index` (or the active one alone when
 ## `active_only` and it has one) moved by (`dx`, `dy`) in place, and the cells
 ## they left or reach drawn again. The step is the caller's.
@@ -374,3 +318,62 @@ func transform_all_elements(canvas: Canvas*, index: usize, forward: Warp) -> boo
         place_graph(&canvas.records[index], m)
     try redraw_vector(canvas, index)
     return true
+
+## `imported`'s elements, taken over, as layer `id`'s, their top-left at
+## (`left`, `top`), the layer drawn from them when the document is bound. The
+## step is the caller's; on failure the caller still owns them.
+func adopt_svg_vectors(canvas: Canvas*, id: u64, imported: SvgVectors*, left: f64, top: f64) -> !:
+    try canvas.require_open()
+    let index = try canvas.index(id)
+    for at in 0..<imported.list.length:
+        imported.list[at].spec.matrix[4] += left
+        imported.list[at].spec.matrix[5] += top
+    release_elements(&canvas.records[index])
+    canvas.records[index].elements = imported.list
+    canvas.records[index].shaped = true
+    var none_left: VectorElement[]
+    imported.list = none_left
+    if canvas.document != none:
+        try redraw_vector(canvas, index)
+
+## Layer `id`'s pixels for `list`: when `dirty` marks cells, its tiles as they
+## are with those cells drawn again; else every cell drawn afresh.
+func vector_tiles(canvas: Canvas*, id: u64, list: const VectorElement[], dirty: CellMask*?) -> Tiles!:
+    let device = canvas.device else error(invalid, "draw the document once before drawing a shape")
+    var tiles = try starting_tiles(canvas, device, id, dirty)
+    errdefer tiles.destroy()
+    try draw_elements(&tiles, list, dirty)
+    return tiles
+
+## The tiles an edit starts from: the layer's own, shared, with the marked cells
+## cleared; or none painted when every cell is drawn.
+func starting_tiles(canvas: Canvas*, device: gpu.Device, id: u64, dirty: CellMask*?) -> Tiles!:
+    let cells = dirty else return try Tiles.create(device, canvas.extent_x, canvas.extent_y)
+    let document = canvas.document else error(invalid, "draw the document once before drawing a shape")
+    let layer = document.find(id) else error(invalid, "no such layer")
+    let current = layer.tiles() else error(invalid, "a group has no pixels")
+    var tiles = try current.clone()
+    errdefer tiles.destroy()
+    for row in 0..<cells.rows:
+        for column in 0..<cells.columns:
+            if cells.marked(column, row):
+                try tiles.clear(column, row)
+    return tiles
+
+## Draw the vector layer at `index` again whole from its elements and graph.
+func redraw_vector(canvas: Canvas*, index: usize) -> !:
+    try redraw_layer(canvas, index, none)
+
+## Draw the vector layer at `index` again in the cells `dirty` marks.
+func redraw_vector_cells(canvas: Canvas*, index: usize, dirty: CellMask*) -> !:
+    try redraw_layer(canvas, index, dirty)
+
+func redraw_layer(canvas: Canvas*, index: usize, dirty: CellMask*?) -> !:
+    let document = canvas.document else error(invalid, "draw the document once before drawing a shape")
+    let record = &canvas.records[index]
+    try fresh_output(record)
+    let view = try drawn_elements(record.elements, &record.generated)
+    defer free_view(view)
+    var tiles = try vector_tiles(canvas, record.id, view, dirty)
+    errdefer tiles.destroy()
+    try document.set_tiles(record.id, tiles)

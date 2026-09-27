@@ -14,6 +14,141 @@
 #
 #==============================================================================================
 
+extend Canvas:
+    ## Edit › Transform › Warp on layer `id`: a Bézier patch over its painted
+    ## box, as found (`warp_point_*`, `set_warp_point`, `set_warp_preset`),
+    ## shown live until `end_mesh_warp`.
+    pub mutating func begin_warp(id: i64) -> !:
+        try begin_mesh_warp(&self, (u64)id, false, 0)
+
+    ## Edit › Puppet Warp on layer `id`: a mesh over its painted box at
+    ## `density` (0 fewer, 1 normal, 2 more) with no pins yet.
+    pub mutating func begin_puppet(id: i64, density: i64 = 1) -> !:
+        try begin_mesh_warp(&self, (u64)id, true, density)
+
+    ## Whether a warp or puppet warp is under way.
+    pub func mesh_warping() -> bool:
+        return self.mesh_warp != none
+
+    ## The box the warp's mesh covers: the layer's painted box.
+    pub mutating func mesh_box_left() -> f64!:
+        return (try mesh_session(&self)).box.left
+
+    pub mutating func mesh_box_top() -> f64!:
+        return (try mesh_session(&self)).box.top
+
+    pub mutating func mesh_box_right() -> f64!:
+        return (try mesh_session(&self)).box.right
+
+    pub mutating func mesh_box_bottom() -> f64!:
+        return (try mesh_session(&self)).box.bottom
+
+    ## Warp's control point `index` (0..15, row by row across the 4 by 4 grid).
+    pub mutating func warp_point_x(index: i64) -> f64!:
+        return (try mesh_session(&self)).points[(usize)(try warp_index(index)) * 2]
+
+    pub mutating func warp_point_y(index: i64) -> f64!:
+        return (try mesh_session(&self)).points[(usize)(try warp_index(index)) * 2 + 1]
+
+    ## Move Warp's control point `index` to (`x`, `y`); the next frame shows it.
+    pub mutating func set_warp_point(index: i64, x: f64, y: f64) -> !:
+        let shown = try mesh_session(&self)
+        let at = (usize)(try warp_index(index))
+        if not math.is_finite(x) or not math.is_finite(y):
+            error(invalid, "warp points must be finite")
+        shown.points[at * 2] = x
+        shown.points[at * 2 + 1] = y
+        shown.changed = true
+
+    ## Warp's header preset `kind` (warp_patch.lucb's `warp_*`) at `bend` (-1..1):
+    ## the points as the preset puts them; -1 puts them back as found.
+    pub mutating func set_warp_preset(kind: i64, bend: f64) -> !:
+        let shown = try mesh_session(&self)
+        if kind < 0:
+            try identity_patch(shown.box, shown.points[0..])
+        else:
+            try bend_patch(shown.box, kind, bend, shown.points[0..])
+        shown.changed = true
+
+    ## Put a puppet pin at (`x`, `y`); its index.
+    pub mutating func puppet_add_pin(x: f64, y: f64) -> i64!:
+        let puppet = try puppet_session(&self)
+        let index = try puppet.add_pin(x, y)
+        (try mesh_session(&self)).changed = true
+        return (i64)index
+
+    ## Drag puppet pin `index` to (`x`, `y`); the next frame shows it.
+    pub mutating func puppet_move_pin(index: i64, x: f64, y: f64) -> !:
+        let puppet = try puppet_session(&self)
+        try puppet.move_pin((usize)math.imax(0, index), x, y)
+        (try mesh_session(&self)).changed = true
+
+    ## Take puppet pin `index` away.
+    pub mutating func puppet_remove_pin(index: i64) -> !:
+        let puppet = try puppet_session(&self)
+        try puppet.remove_pin((usize)math.imax(0, index))
+        (try mesh_session(&self)).changed = true
+
+    pub mutating func puppet_pin_count() -> i64!:
+        return (i64)(try puppet_session(&self)).pin_count
+
+    pub mutating func puppet_pin_x(index: i64) -> f64!:
+        return (try puppet_session(&self)).pin_x((usize)math.imax(0, index))
+
+    pub mutating func puppet_pin_y(index: i64) -> f64!:
+        return (try puppet_session(&self)).pin_y((usize)math.imax(0, index))
+
+    ## The pin within `reach` pixels of (`x`, `y`); -1 for none.
+    pub mutating func puppet_hit(x: f64, y: f64, reach: f64) -> i64!:
+        return (try puppet_session(&self)).hit(x, y, reach)
+
+    ## Where the pins take the layer's point (`x`, `y`): for drawing the mesh as it bends.
+    pub mutating func puppet_place_x(x: f64, y: f64) -> f64!:
+        var px = 0.0
+        var py = 0.0
+        (try puppet_session(&self)).deform(x, y, &px, &py)
+        return px
+
+    pub mutating func puppet_place_y(x: f64, y: f64) -> f64!:
+        var px = 0.0
+        var py = 0.0
+        (try puppet_session(&self)).deform(x, y, &px, &py)
+        return py
+
+    ## Keep the warp as one undo step (`keep`), or leave the layer as it was.
+    pub mutating func end_mesh_warp(keep: bool) -> !:
+        let shown = try mesh_session(&self)
+        self.mesh_warp = none
+        defer drop_mesh_warping(shown)
+        if let composer = self.composer:
+            composer.drop_stand_ins()
+        if not keep:
+            return
+        try lay_mesh(shown)
+        let mesh = shown.mesh else return
+        let document = self.document else trap("warp without a document")
+        let composer = self.composer else trap("warp without a compositor")
+        let layer = document.find(shown.layer) else error(invalid, "the warped layer is gone")
+        let tiles = layer.tiles() else error(invalid, "the warped layer has no pixels")
+        try self.remember(shown.layer, try tiles.clone(), name = shown.name)
+        # Every cell the pixels leave or land on, within the canvas.
+        let span = (f64)tile_size
+        let left = math.min(mesh.source.left, mesh.landed.left)
+        let top = math.min(mesh.source.top, mesh.landed.top)
+        let right = math.max(mesh.source.right, mesh.landed.right)
+        let bottom = math.max(mesh.source.bottom, mesh.landed.bottom)
+        let first_column = (u32)math.max(0.0, math.floor((left - 1.0) / span))
+        let first_row = (u32)math.max(0.0, math.floor((top - 1.0) / span))
+        let last_column = (u32)math.min((f64)tiles.columns() - 1.0, math.floor((right + 1.0) / span))
+        let last_row = (u32)math.min((f64)tiles.rows() - 1.0, math.floor((bottom + 1.0) / span))
+        if right >= 0.0 and bottom >= 0.0:
+            var into = Landing(tiles = tiles, made = 0)
+            for row in first_row..<last_row + 1:
+                try shown.mesher.row_of_cells(&mesh, &shown.original, composer.levels(), row, first_column, last_column, mesh_threads, (void*)&into, land)
+            self.mesh_cells_made = into.made
+        layer.revision += 1
+        try self.restrict_to_selection(shown.layer, &self.history[self.history_count - 1].tiles)
+
 ## A warp under way on layer `layer`: its pixels as it began, what bends them,
 ## and the mesh laid for the last frame.
 struct MeshWarping:
@@ -102,41 +237,6 @@ func mesh_warp_cell(context: void*?, layer_levels: Pyramid*, layer: u64, mask: b
     let made = try shown.mesher.cell(&mesh, &shown.original, layer_levels, column, row, level)
     let texture = made else return made_nothing()
     return made_texture(texture)
-
-## End the warp: kept, the cells the mesh came from or lands on made at full
-## size as one undo step within the selection; else nothing changes.
-func end_mesh_warp(canvas: Canvas*, keep: bool) -> !:
-    let shown = try mesh_session(canvas)
-    canvas.mesh_warp = none
-    defer drop_mesh_warping(shown)
-    if let composer = canvas.composer:
-        composer.drop_stand_ins()
-    if not keep:
-        return
-    try lay_mesh(shown)
-    let mesh = shown.mesh else return
-    let document = canvas.document else trap("warp without a document")
-    let composer = canvas.composer else trap("warp without a compositor")
-    let layer = document.find(shown.layer) else error(invalid, "the warped layer is gone")
-    let tiles = layer.tiles() else error(invalid, "the warped layer has no pixels")
-    try canvas.remember(shown.layer, try tiles.clone(), name = shown.name)
-    # Every cell the pixels leave or land on, within the canvas.
-    let span = (f64)tile_size
-    let left = math.min(mesh.source.left, mesh.landed.left)
-    let top = math.min(mesh.source.top, mesh.landed.top)
-    let right = math.max(mesh.source.right, mesh.landed.right)
-    let bottom = math.max(mesh.source.bottom, mesh.landed.bottom)
-    let first_column = (u32)math.max(0.0, math.floor((left - 1.0) / span))
-    let first_row = (u32)math.max(0.0, math.floor((top - 1.0) / span))
-    let last_column = (u32)math.min((f64)tiles.columns() - 1.0, math.floor((right + 1.0) / span))
-    let last_row = (u32)math.min((f64)tiles.rows() - 1.0, math.floor((bottom + 1.0) / span))
-    if right >= 0.0 and bottom >= 0.0:
-        var into = Landing(tiles = tiles, made = 0)
-        for row in first_row..<last_row + 1:
-            try shown.mesher.row_of_cells(&mesh, &shown.original, composer.levels(), row, first_column, last_column, mesh_threads, (void*)&into, land)
-        canvas.mesh_cells_made = into.made
-    layer.revision += 1
-    try canvas.restrict_to_selection(shown.layer, &canvas.history[canvas.history_count - 1].tiles)
 
 ## Threads making a kept warp's cells' fields at once.
 let mesh_threads: usize = 8

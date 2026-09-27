@@ -31,18 +31,16 @@ def main():
     def run(command,timeout=180):
         subprocess.run([str(x) for x in command],check=True,cwd=ROOT,env=env,timeout=timeout)
     # The test command accepts backend selection but not build optimization flags.
-    for backend in sorted({flags[0] for flags in modes}):
-        run([args.base.resolve(),'test',ROOT/'src/luce_image/manifest_tests.lucb',backend])
     # Regression drivers are regenerated for each mode; no stale binary can pass.
     for flags in modes:
         print('MODE '+' '.join(flags),flush=True)
         for source,target in [('deflate_tests','deflate'),('codec_tests','codecs')]:
             run([args.base.resolve(),'build',ROOT/f'tests/{source}.lucb',*flags,'-o',ROOT/f'build/{target}'])
         with tempfile.TemporaryDirectory(prefix='luce-image-tests-') as tmp:
-            for source,target in [('api','api'),('crypto_api','cryptomatte'),('crypto_fixture','crypto_fixture'),('validate','validate'),('navigation','navigation')]:
+            for source,target in [('api','api'),('validate','validate'),('navigation','navigation')]:
                 run([args.luce.resolve(),'build',ROOT/f'tests/{source}.luc',*flags,'-o',ROOT/f'build/{target}'])
-                if source in ['api','crypto_api']: run([ROOT/f'build/{target}',tmp])
-            for test in ['deflate','raster','png','tiff','jpeg','exr','navigation','cryptomatte','malformed']:
+                if source == 'api': run([ROOT/f'build/{target}',tmp])
+            for test in ['deflate','raster','png','tiff','jpeg','exr','navigation','malformed']:
                 run([sys.executable,ROOT/f'tests/check_{test}.py'],timeout=300)
     print(f'PASS all {len(modes)} compiler modes',flush=True)
 

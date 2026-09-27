@@ -1,0 +1,172 @@
+#==============================================================================================
+#
+#   canvas/selecting_tests - Selections: shapes, the wand, color range, moving and copying what they hold
+#
+#==============================================================================================
+
+test "selected pixels move or copy with their selection, and edits keep inside it":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    # A red square at 8..24.
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(8, 8, 16, 16, 0)
+    try canvas.fill(layer, false)
+    # Moved right by 24: it leaves its place, lands at 32..48, and the outline follows.
+    try canvas.move_selected_pixels(layer, 24, 0, false)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 0)
+    assert((try shown_at(&canvas, &target, 36, 12))[0] == 255)
+    assert(canvas.selection_left() == 32 and canvas.selection_top() == 8)
+    try canvas.undo()
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 255 and (try shown_at(&canvas, &target, 36, 12))[0] == 0)
+    # Copied down by 24 (Alt): both places are red.
+    try canvas.select_rectangle(8, 8, 16, 16, 0)
+    try canvas.move_selected_pixels(layer, 0, 24, true)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 255 and (try shown_at(&canvas, &target, 12, 36))[0] == 255)
+    # An inversion with the top band selected changes only the top square.
+    try canvas.select_rectangle(0, 0, 64, 20, 0)
+    try canvas.adjust_layer(layer, 2)
+    let top = try shown_at(&canvas, &target, 12, 12)
+    let below = try shown_at(&canvas, &target, 12, 36)
+    assert(top[0] == 0 and top[1] == 255 and top[2] == 255)
+    assert(below[0] == 255 and below[1] == 0)
+    # A previewed inversion is kept inside the selection too, then dropped.
+    try canvas.begin_preview(layer)
+    try canvas.preview_adjust(2)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 255 and (try shown_at(&canvas, &target, 12, 36))[0] == 255)
+    try canvas.end_preview(false)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 0)
+    # A preview of the move shows it; dropped, nothing moved.
+    try canvas.select_rectangle(8, 32, 16, 16, 0)
+    try canvas.begin_preview(layer)
+    try canvas.preview_move_selected(24, 0, false)
+    assert((try shown_at(&canvas, &target, 36, 36))[0] == 255 and (try shown_at(&canvas, &target, 12, 36))[0] == 0)
+    try canvas.end_preview(false)
+    assert((try shown_at(&canvas, &target, 12, 36))[0] == 255 and (try shown_at(&canvas, &target, 36, 36))[0] == 0)
+
+test "layer via copy holds the selected pixels, and via cut takes them":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var canvas = try Canvas(64, 64)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Paint")
+    var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
+    defer target.destroy()
+    discard(try shown_at(&canvas, &target, 0, 0))
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.select_rectangle(8, 8, 32, 16, 0)
+    try canvas.fill(layer, false)
+    # Only the left half of the red band is selected for the copy.
+    try canvas.select_rectangle(8, 8, 16, 16, 0)
+    let copy = try canvas.layer_via_copy(layer)
+    assert(canvas.layer_count() == 2 and (try canvas.layer_name(1)) == "Layer via Copy")
+    try canvas.set_layer(layer, false, 1.0)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 255 and (try shown_at(&canvas, &target, 30, 12))[0] == 0)
+    try canvas.set_layer(layer, true, 1.0)
+    try canvas.set_layer(copy, false, 1.0)
+    # Via cut: a new layer takes the selected half, which leaves the original.
+    let taken = try canvas.layer_via_copy(layer, cut = true)
+    try canvas.set_layer(taken, false, 1.0)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 0 and (try shown_at(&canvas, &target, 30, 12))[0] == 255)
+    try canvas.set_layer(taken, true, 1.0)
+    try canvas.set_layer(layer, false, 1.0)
+    assert((try shown_at(&canvas, &target, 12, 12))[0] == 255 and (try shown_at(&canvas, &target, 30, 12))[0] == 0)
+
+test "selection shapes feather or harden alone, and the wand samples a square or every layer":
+    var canvas = try Canvas(64, 48)
+    defer canvas.close()
+    let bottom = try canvas.add_layer("Bottom")
+    let top = try canvas.add_layer("Top")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    # An anti-aliased ellipse has soft edge pixels; hard-edged it has none.
+    try canvas.select_ellipse(4, 4, 21, 21)
+    var soft = false
+    for x in 0..<(i64)30:
+        let value = canvas.selected_at(x, 7)
+        soft = soft or (value > 0 and value < 255)
+    assert(soft)
+    try canvas.set_selection_shape(0, false)
+    try canvas.select_ellipse(4, 4, 21, 21)
+    for x in 0..<(i64)30:
+        let value = canvas.selected_at(x, 7)
+        assert(value == 0 or value == 255)
+    # Feathered, a rectangle added to the ellipse fades out; the ellipse stays hard.
+    try canvas.set_selection_shape(4, true)
+    try canvas.select_rectangle(40, 10, 16, 16, 1)
+    assert(canvas.selected_at(48, 18) > 200 and canvas.selected_at(40, 18) > 0 and canvas.selected_at(40, 18) < 255 and canvas.selected_at(14, 14) == 255)
+    try canvas.set_selection_shape(0, true)
+    # The wand on all layers sees the top layer's red over the bottom's blue.
+    try canvas.deselect()
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, false)
+    try canvas.fill(bottom, false)
+    try canvas.select_rectangle(0, 0, 32, 48)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
+    try canvas.fill(top, false)
+    try canvas.deselect()
+    try canvas.select_wand(bottom, 50, 20, 10.0, true, 0, 3, true)
+    assert(canvas.selected_at(50, 20) == 255 and canvas.selected_at(10, 20) == 0)
+    try canvas.select_wand(bottom, 10, 20, 10.0, true, 0, 5, false)
+    assert(canvas.selected_at(10, 20) == 255 and canvas.selected_at(50, 20) == 255)
+
+test "color range selects the sampled color, and the shadows":
+    var canvas = try Canvas(96, 64)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Scene")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, false)
+    try canvas.fill(layer, false)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.8, 0.0, false)
+    try canvas.select_ellipse(33, 17, 30, 30, 0)
+    try canvas.fill(layer, false)
+    try canvas.deselect()
+    canvas.clear_range_samples()
+    try canvas.add_range_sample(1.0, 0.8, 0.0, false)
+    try canvas.select_color_range(layer, 0, 40.0, false)
+    assert(canvas.undo_name() == "Color Range" and canvas.has_selection())
+    assert(canvas.current().at(48, 32) == 255 and canvas.current().at(4, 4) == 0)
+    try canvas.select_color_range(layer, 9, 40.0, false, all_layers = false)
+    assert(canvas.current().at(48, 32) == 0 and canvas.current().at(4, 4) == 255)
+
+test "the color range dialog previews out of history; OK is one step, Cancel leaves nothing to redo":
+    var canvas = try Canvas(600, 400)
+    defer canvas.close()
+    let layer = try canvas.add_layer("Scene")
+    canvas.bind_headless() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, false)
+    try canvas.fill(layer, false)
+    try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.8, 0.0, false)
+    try canvas.select_ellipse(200, 100, 200, 200, 0)
+    try canvas.fill(layer, false)
+    try canvas.select_rectangle(0, 0, 20, 20, 0)
+    let before = canvas.undo_name()
+    try canvas.begin_color_range()
+    canvas.clear_range_samples()
+    try canvas.add_range_sample(1.0, 0.8, 0.0, false)
+    try canvas.preview_color_range(0, 40.0, false)
+    assert(canvas.undo_name() == before and canvas.selected_at(300, 200) == 255 and canvas.selected_at(5, 5) == 0)
+    try canvas.preview_color_range(0, 40.0, true)
+    assert(canvas.selected_at(300, 200) == 0 and canvas.selected_at(5, 5) == 255)
+    try canvas.finish_color_range(false, 0, 40.0, true)
+    assert(canvas.undo_name() == before and not canvas.can_redo() and canvas.selected_at(5, 5) == 255 and canvas.selected_at(300, 200) == 0)
+    assert(canvas.selected_at(30, 30) == 0)
+    try canvas.begin_color_range()
+    try canvas.preview_color_range(0, 40.0, false)
+    try canvas.finish_color_range(true, 0, 40.0, false)
+    assert(canvas.undo_name() == "Color Range" and canvas.selected_at(300, 200) == 255 and canvas.selected_at(5, 5) == 0)
+    try canvas.undo()
+    assert(canvas.undo_name() == before and canvas.selected_at(5, 5) == 255 and canvas.selected_at(300, 200) == 0)

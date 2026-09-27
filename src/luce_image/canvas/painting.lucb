@@ -1,0 +1,311 @@
+#==============================================================================================
+#
+#   canvas/painting - The brush, strokes, fills and the eyedropper
+#
+#   DESCRIPTION:
+#       The brush settings, a stroke from begin to end (with the retouching and smudge tools
+#       it hands over to), filling the selection or a gradient, and picking a color.
+#
+#==============================================================================================
+
+extend Canvas:
+    ## Where an edit to layer `id` goes: Quick Mask's layer while it is on.
+    func paint_target(id: i64) -> i64:
+        let document = self.document else return id
+        let quick = document.quick_layer() else return id
+        return (i64)quick.id
+
+    ## Whether edits to layer `id` (after `paint_target`) go to a mask.
+    mutating func paints_mask(id: i64) -> bool!:
+        if self.quick_mask():
+            return true
+        return self.mask_editing and self.records[try self.index((u64)id)].masked
+
+    ## Fill the selection (or the whole layer) on `layer` with the brush color
+    ## at its opacity, or clear it when `erase`. Undoable.
+    pub mutating func fill(layer: i64, erase: bool) -> !:
+        try self.require_open()
+        try self.require_idle()
+        let document = self.document else error(invalid, "draw the document once before filling")
+        var painter = self.painter else error(invalid, "draw the document once before filling")
+        let target = self.paint_target(layer)
+        let on_mask = try self.paints_mask(target)
+        var brush = self.brush
+        brush.erase = erase
+        # Edit › Fill is opaque, as Photoshop's: the brush's opacity is the brush's.
+        brush.opacity = 1.0
+        let before = try fill_selection(&painter, document, (u64)target, brush, on_mask, self.fill_fault)
+        try self.remember((u64)target, before, on_mask, name = "Fill")
+
+    ## Set the brush every following stroke paints with: its size, edge, color
+    ## and strength. The tip shape, dynamics and texture set separately stay.
+    pub mutating func set_brush(diameter: f64, hardness: f64, opacity: f64, flow: f64, red: f64, green: f64, blue: f64, erase: bool) -> !:
+        var brush = self.brush
+        brush.diameter = diameter
+        brush.hardness = hardness
+        brush.opacity = opacity
+        brush.flow = flow
+        brush.color = gpu.Color(red, green, blue, 1.0)
+        brush.erase = erase
+        try brush.check()
+        try gpu_check_color(brush.color)
+        self.brush = brush
+
+    ## Hard whole-pixel dabs without anti-aliasing, as Photoshop's Pencil, or
+    ## the brush's soft ones.
+    pub mutating func set_brush_aliased(aliased: bool):
+        self.brush.aliased = aliased
+
+    ## The tip's shape: dab spacing as a fraction of the diameter (Photoshop's
+    ## 25 % is 0.25), angle in degrees, roundness 0.05..1, and the smoothing
+    ## string in document pixels.
+    pub mutating func set_brush_shape(spacing: f64, angle: f64, roundness: f64, smoothing: f64) -> !:
+        var brush = self.brush
+        brush.spacing = spacing
+        brush.angle = angle
+        brush.roundness = roundness
+        brush.smoothing = smoothing
+        try brush.check()
+        self.brush = brush
+
+    ## The brush's jitters, each 0..1: size, angle and roundness (shape),
+    ## scatter as a fraction of the diameter with the dabs per step, flow
+    ## (transfer), hue, saturation and brightness (color).
+    pub mutating func set_brush_dynamics(size_jitter: f64, angle_jitter: f64, roundness_jitter: f64, scatter: f64, scatter_count: i64,
+                                         flow_jitter: f64, hue_jitter: f64, saturation_jitter: f64, brightness_jitter: f64) -> !:
+        var brush = self.brush
+        brush.size_jitter = size_jitter
+        brush.angle_jitter = angle_jitter
+        brush.roundness_jitter = roundness_jitter
+        brush.scatter = scatter
+        brush.scatter_count = scatter_count
+        brush.flow_jitter = flow_jitter
+        brush.hue_jitter = hue_jitter
+        brush.saturation_jitter = saturation_jitter
+        brush.brightness_jitter = brightness_jitter
+        try brush.check()
+        self.brush = brush
+
+    ## What drives brush parameter `parameter` (luce-painting's dynamics: 0 size, 1 flow,
+    ## 2 opacity, 3 angle, 4 roundness, 5 scatter, 6 texture depth, 7 hue,
+    ## 8 saturation, 9 brightness): control 0 off, 1 pen pressure, 2 pen
+    ## tilt, 3 azimuth, 4 barrel rotation, 5 airbrush wheel, 6 stroke
+    ## direction, 7 velocity, 8 fade over `steps` dabs; from `minimum` (0..1)
+    ## through `curve` (-1 firm .. 1 soft).
+    pub mutating func set_brush_dynamic(parameter: i64, control: i64, minimum: f64 = 0.0, curve: f64 = 0.0, steps: i64 = 25) -> !:
+        if parameter < 0 or parameter >= (i64)dynamic_count or control < 0 or control > (i64)Control.fade:
+            error(invalid, "brush dynamics are parameters 0..9 and controls 0..8")
+        let dynamic = Dynamic(control = (Control)(u8)control, minimum = minimum, curve = curve, steps = steps)
+        try dynamic.check()
+        self.brush.dynamics[(usize)parameter] = dynamic
+
+    ## The brush's texture: 0 none, 1 grain, 2 canvas weave, 3 dots, 4 the
+    ## image set by `set_brush_texture_image`, at `scale` (0.1..10) and `depth`
+    ## 0..1 (how much of it shows), multiplied (mode 0) or subtracted (1),
+    ## its values `invert`ed or not.
+    pub mutating func set_brush_texture(kind: i64, scale: f64, depth: f64, mode: i64 = 0, invert: bool = false) -> !:
+        var brush = self.brush
+        brush.texture = kind
+        brush.texture_scale = scale
+        brush.texture_depth = depth
+        brush.texture_mode = mode
+        brush.texture_invert = invert
+        try brush.check()
+        self.brush = brush
+
+    ## The brush's sampled tip: `width` × `height` grayscale coverage bytes
+    ## (255 paints), up to 1024 a side; no bytes paint with the round tip.
+    pub mutating func set_brush_tip(pixels: const u8[], width: i64, height: i64) -> !:
+        if self.stroke != none:
+            error(invalid, "finish the stroke first")
+        try self.brush_images.set_tip(pixels, (usize)math.max(0.0, (f64)width), (usize)math.max(0.0, (f64)height))
+
+    ## The brush's texture image (texture kind 4), as `set_brush_tip`'s bytes.
+    pub mutating func set_brush_texture_image(pixels: const u8[], width: i64, height: i64) -> !:
+        if self.stroke != none:
+            error(invalid, "finish the stroke first")
+        try self.brush_images.set_pattern(pixels, (usize)math.max(0.0, (f64)width), (usize)math.max(0.0, (f64)height))
+
+    ## Start painting on `layer` at a document point. The document must have
+    ## been drawn once, so its pixels are on a device. The layer's pixels before
+    ## the stroke go on the history.
+    ## The pen: `pressure` 0..1 (a mouse's 0 or 1 presses fully), its lean's
+    ## `azimuth` and `altitude` in degrees, barrel `rotation`, airbrush wheel
+    ## `tangential` and the time `at_ms` in milliseconds, for the brush's dynamics.
+    pub mutating func begin_stroke(layer: i64, x: f64, y: f64, pressure: f64 = 1.0, azimuth: f64 = 0.0, altitude: f64 = 90.0, rotation: f64 = 0.0, tangential: f64 = 0.0, at_ms: f64 = 0.0) -> !:
+        try self.require_open()
+        try require_loaded(&self)
+        try self.wait_idle()
+        if self.stroke != none or self.warp != none or self.liquify != none:
+            error(invalid, "a stroke is already in progress")
+        if self.preview != none:
+            error(invalid, "finish the preview first")
+        if self.retouch != retouch_paint:
+            try begin_retouch(&self, (u64)layer, x, y, Pen(pressure = pressure, azimuth = azimuth, altitude = altitude, rotation = rotation, tangential = tangential, time = at_ms))
+            return
+        let document = self.document else error(invalid, "draw the document once before painting")
+        var painter = self.painter else error(invalid, "draw the document once before painting")
+        let target = self.paint_target(layer)
+        let on_mask = try self.paints_mask(target)
+        let pen = Pen(pressure = pressure, azimuth = azimuth, altitude = altitude, rotation = rotation, tangential = tangential, time = at_ms)
+        try self.brush.check()
+        let stroke = try begin_boxed(&painter, try stroke_target(document, (u64)target, on_mask, false), self.brush, x, y, on_mask, pen, &self.brush_images)
+        errdefer finish_boxed(stroke)
+        try self.remember((u64)target, try stroke.original().clone(), on_mask, name = "Eraser" if self.brush.erase else "Brush Stroke")
+        self.stroke = stroke
+        self.stroke_layer = (u64)target
+
+    ## Continue the stroke to a document point, with the pen as `begin_stroke` takes it.
+    pub mutating func extend_stroke(x: f64, y: f64, pressure: f64 = 1.0, azimuth: f64 = 0.0, altitude: f64 = 90.0, rotation: f64 = 0.0, tangential: f64 = 0.0, at_ms: f64 = 0.0) -> !:
+        try self.require_open()
+        if self.warp_finishing:
+            error(invalid, "no stroke is in progress")
+        if let warp = self.warp:
+            try extend_warp(&self, warp, x, y)
+            return
+        if let shown = self.liquify:
+            try extend_liquify(shown, x, y)
+            return
+        let stroke = self.stroke else error(invalid, "no stroke is in progress")
+        let document = self.document else trap("stroke without a document")
+        var painter = self.painter else trap("stroke without a painter")
+        try stroke.extend(&painter, try stroke_target(document, self.stroke_layer, stroke.paints_mask(), true), x, y, Pen(pressure = pressure, azimuth = azimuth, altitude = altitude, rotation = rotation, tangential = tangential, time = at_ms))
+
+    ## End the stroke, keeping what it painted.
+    pub mutating func end_stroke() -> !:
+        try self.require_open()
+        if self.warp_finishing:
+            error(invalid, "no stroke is in progress")
+        if let warp = self.warp:
+            try finish_warp(&self, warp)
+            return
+        if let shown = self.liquify:
+            try finish_liquify(&self, shown)
+            return
+        try self.settle_stroke()
+        let stroke = self.stroke else error(invalid, "no stroke is in progress")
+        self.stroke = none
+        defer finish_boxed(stroke)
+        if self.retouch == retouch_heal:
+            try finish_heal(&self, stroke)
+
+    ## Whether a stroke takes points: one ended and still finishing does not.
+    pub func painting() -> bool:
+        return self.stroke != none or self.liquify != none or (self.warp != none and not self.warp_finishing)
+
+    ## Whether work goes on between frames (a smudge finishing on its worker,
+    ## tiles coming back in the background while coarser ones stand in): the
+    ## view keeps drawing until it is done.
+    pub func busy() -> bool:
+        return self.warp != none or self.coarse_shown or prefetch_pending() or refine_busy(&self) or self.opening != none or self.selection_behind()
+
+    ## Whether the selection's GPU tiles still lag it (a huge new selection
+    ## reaches the GPU a few cells a frame beyond those the view shows).
+    func selection_behind() -> bool:
+        let document = self.document else return false
+        return document.selection_behind()
+
+    ## Wait for a smudge still finishing and keep it. Everything that
+    ## changes or reads the whole document calls this first.
+    pub mutating func wait_idle() -> !:
+        if not self.warp_finishing:
+            return
+        let warp = self.warp else return
+        try keep_warp(&self, warp)
+
+    ## Whether smudge walks on a worker: on by default; off, each move
+    ## is walked before `extend_stroke` returns (scripts that time strokes).
+    pub mutating func set_async_warp(on: bool) -> !:
+        try self.wait_idle()
+        self.warp_async = on
+
+    ## Smudge's dab spacing, a fraction of the diameter (0.15 by default;
+    ## from about 0.2 the dabs show as beads along a soft stroke).
+    pub mutating func set_smudge_spacing(spacing: f64) -> !:
+        if not (spacing >= 0.01 and spacing <= 5.0):
+            error(invalid, "smudge spacing is 0.01..5 of the diameter")
+        self.smudge_spacing = spacing
+
+    ## Stamp the dabs the stroke queued since the last draw: pointer moves
+    ## only queue them, so however many arrive, a frame stamps them once.
+    mutating func settle_stroke() -> !:
+        if let warp = self.warp:
+            try settle_warp(&self, warp)
+            return
+        if let shown = self.liquify:
+            try settle_liquify(&self, shown)
+            return
+        if let shown = self.mesh_warp:
+            try settle_mesh_warp(&self, shown)
+            return
+        let stroke = self.stroke else return
+        let document = self.document else return
+        var painter = self.painter else return
+        try stroke.flush(&painter, try stroke_target(document, self.stroke_layer, stroke.paints_mask(), true))
+
+    ## Lay a linear gradient over layer `id` from one color at (`x0`, `y0`) to
+    ## another at (`x1`, `y1`), straight alpha in linear light, inside the
+    ## selection. Undoable.
+    pub mutating func fill_gradient(id: i64, x0: f64, y0: f64, x1: f64, y1: f64, r0: f64, g0: f64, b0: f64, a0: f64, r1: f64, g1: f64, b1: f64, a1: f64, radial: bool = false) -> !:
+        try self.require_open()
+        try self.require_idle()
+        let document = self.document else error(invalid, "draw the document once before filling")
+        var painter = self.painter else error(invalid, "draw the document once before filling")
+        let from_color = gpu.Color(r0, g0, b0, a0)
+        let to_color = gpu.Color(r1, g1, b1, a1)
+        try gpu_check_color(from_color)
+        try gpu_check_color(to_color)
+        if a0 < 0.0 or a0 > 1.0 or a1 < 0.0 or a1 > 1.0:
+            error(invalid, "gradient alphas must be in 0..1")
+        let target = self.paint_target(id)
+        let on_mask = try self.paints_mask(target)
+        var before = try fill_gradient(&painter, document, (u64)target, x0, y0, x1, y1, from_color, to_color, radial, on_mask)
+        errdefer before.destroy()
+        try self.remember((u64)target, before, on_mask, name = "Gradient")
+
+    ## The eyedropper: read the flattened document's color at a pixel into
+    ## `picked_red` and friends (linear light, straight alpha).
+    pub mutating func pick(x: i64, y: i64) -> !:
+        try self.require_open()
+        if x < 0 or y < 0 or x >= (i64)self.extent_x or y >= (i64)self.extent_y:
+            error(invalid, "the picked pixel lies outside the document")
+        try self.settle_stroke()
+        let document = self.document else error(invalid, "draw the document once before picking")
+        let composer = self.composer else error(invalid, "draw the document once before picking")
+        let texture = try composer.tile(document, (u32)(x // (i64)tile_size), (u32)(y // (i64)tile_size), 0)
+        var bytes: u8[8]
+        try texture.read(bytes, gpu.Region((u32)(x % (i64)tile_size), (u32)(y % (i64)tile_size), 1, 1))
+        for channel in 0..<(usize)4:
+            self.picked[channel] = (f64)from_half((u16)bytes[channel * 2] | ((u16)bytes[channel * 2 + 1] << 8))
+
+    pub func picked_red() -> f64:
+        return self.picked[0]
+
+    pub func picked_green() -> f64:
+        return self.picked[1]
+
+    pub func picked_blue() -> f64:
+        return self.picked[2]
+
+    pub func picked_alpha() -> f64:
+        return self.picked[3]
+
+## What a stroke on `layer`'s pixels (its mask with `on_mask`) paints on, as
+## luce-painting takes it: at the start with the selection it stays inside and
+## how the document mixes, once `begun` the tiles alone. An adjustment layer's
+## revision counts every stamp, as its mask counts as a whole.
+func stroke_target(document: Document*, layer: u64, on_mask: bool, begun: bool) -> PaintTarget!:
+    let found = document.find(layer) else error(invalid, "the painted layer is gone" if begun else "no such layer")
+    var tiles: Tiles* = ---
+    if on_mask:
+        tiles = found.mask_tiles() else error(invalid, "the painted mask is gone" if begun else "the layer has no mask")
+    else:
+        tiles = found.tiles() else error(invalid, "the painted layer has no pixels" if begun else "a group cannot be painted")
+    var target = PaintTarget(tiles = tiles)
+    if found.adjustment >= 0:
+        target.revision = &found.revision
+    if not begun:
+        target.selection = try document.selection_tiles()
+        target.mixing = document.mixing(on_mask)
+    return target
+

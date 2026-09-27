@@ -172,8 +172,8 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
         native.records[slot].stored = (i64)index
         if not group and adjustment < 0:
             try read_type(doc, element, native, id)
-            try read_elements(doc, element, native, id)
-            try read_graph(doc, element, native, id)
+            try load_elements(doc, element, native, id)
+            try load_graph(doc, element, native, id)
         if (try get_integer(doc, element, "mask")) != 0:
             try native.set_mask(id, true)
             native.records[slot].mask_linked = (try get_integer(doc, element, "mask_linked")) != 0
@@ -461,3 +461,23 @@ func decode_record(context: void*?, packed: const u8[], rows: u32, into: u8[]) -
     if used != packed.length:
         error(invalid, "a stored tile of the .l2d document is damaged")
     unfilter_tile(filtered, (usize)rows, into[..<bytes])
+
+## The elements `element` holds, if any: the layer with id `id` is a vector layer again.
+func load_elements(doc: prism.Document*, element: str, canvas: Canvas*, id: i64) -> !:
+    let list = (try read_elements(doc, element)) else return
+    let index = canvas.index((u64)id) catch failure:
+        free_list(list)
+        error(failure.code, failure.message)
+    release_elements(&canvas.records[index])
+    canvas.records[index].elements = list
+    canvas.records[index].shaped = true
+
+## The graph `element` holds, if any, as the graph of layer `id`.
+func load_graph(doc: prism.Document*, element: str, canvas: Canvas*, id: i64) -> !:
+    var graph = (try read_graph(doc, element)) else return
+    let index = canvas.index((u64)id) catch failure:
+        free_graph(&graph)
+        error(failure.code, failure.message)
+    free_graph(&canvas.records[index].graph)
+    canvas.records[index].graph = graph
+    canvas.records[index].generated_fresh = false

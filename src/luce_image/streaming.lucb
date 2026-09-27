@@ -18,6 +18,7 @@
 #==============================================================================================
 
 import math
+import transfer
 import memory
 import png
 import jpeg
@@ -44,8 +45,7 @@ pub type CoarseSink = func(void*?, usize, usize, const u8[]) -> unit!
 
 ## The sRGB decoding of an encoded component in 0..1.
 pub func decode_srgb(value: f64) -> f64:
-    let clamped = math.clamp(value, 0.0, 1.0)
-    return clamped / 12.92 if clamped <= 0.04045 else math.pow((clamped + 0.055) / 1.055, 2.4)
+    return transfer.srgb_decode(math.clamp(value, 0.0, 1.0))
 
 ## Rows gathered into bands of `rows` for a sink.
 struct Banding:
@@ -67,7 +67,7 @@ struct Banding:
 ## file's start is read from `file`.
 pub func stream_linear(raster: model.Raster*, file: FileSource*?, rows: usize, sink: LinearSink, context: void*?) -> bool!:
     let named = raster.file_format
-    let streams = named == "PNG" or named == "JPEG" or (named == "TIFF" and tiff_streams(raster))
+    let streams = named == "PNG" or named == "JPEG" or (named == "TIFF" and tiff.streams_by_rows(raster))
     if not streams:
         return false
     if rows == 0:
@@ -84,7 +84,7 @@ pub func stream_linear(raster: model.Raster*, file: FileSource*?, rows: usize, s
         fill_table(banding.table, 255.0)
         try jpeg_rows(raster, file, byte_rows, (void*)&banding)
     else:
-        try tiff_bands(raster, &banding)
+        discard(try tiff.decode_rows(raster, tiff_part, (void*)&banding))
     if banding.top + banding.filled != banding.height:
         error(invalid, "the picture ended before its last row")
     return true
@@ -220,62 +220,20 @@ func deep_rows(context: void*?, first: usize, count: usize, bytes: const u8[]) -
 
 # mark: TIFF ==================================================================================
 
-## Whether a probed TIFF decodes a row of strips or tiles at a time: upright,
-## its chunks in rows from the top (for each plane).
-func tiff_streams(raster: const model.Raster*) -> bool:
-    if raster.orientation != 1 or raster.chunks.length == 0:
-        return false
-    let planes = raster.channels.length if raster.planar == 2 else 1
-    if raster.chunks.length % planes != 0:
-        return false
-    let per_plane = raster.chunks.length // planes
-    for index in 1..<raster.chunks.length:
-        if index % per_plane != 0 and raster.chunks[index].y < raster.chunks[index - 1].y:
-            return false
-    return true
-
-## A TIFF a row of chunks at a time: each decoded into a raster of just those
-## rows (the chunk moved to its top), then made linear into the band.
-func tiff_bands(raster: model.Raster*, banding: Banding*) -> !:
-    let planes = raster.channels.length if raster.planar == 2 else 1
-    let per_plane = raster.chunks.length // planes
+## A TIFF's rows `top..<top + part.height` (luce-tiff's `decode_rows`) made linear into the band.
+func tiff_part(context: void*?, top: usize, part: const model.Raster*) -> !:
+    let banding = (Banding*)(context else trap("a TIFF's rows lost their band"))
     var names = ChannelPlaces(red = -1, green = -1, blue = -1, alpha = -1)
-    for channel in 0..<raster.channels.length:
-        names.take(raster.channels[channel].name, (i64)channel)
-    var first: usize = 0
-    while first < per_plane:
-        var last = first + 1
-        while last < per_plane and raster.chunks[last].y == raster.chunks[first].y:
-            last += 1
-        try tiff_rows(raster, banding, first, last, per_plane, &names)
-        first = last
-
-## Chunks `first..<last` of each plane (one row of them) decoded into a raster
-## of just their rows, the chunks read as if at its top, then made linear.
-func tiff_rows(raster: model.Raster*, banding: Banding*, first: usize, last: usize, per_plane: usize, names: const ChannelPlaces*) -> !:
-    let kind = raster.channels[0].kind
+    for channel in 0..<part.channels.length:
+        names.take(part.channels[channel].name, (i64)channel)
+    let kind = part.channels[0].kind
     let scale = 1.0 / model.maximum(kind)
     let encoded = kind != .float16 and kind != .float32 and kind != .float64
-    let top = raster.chunks[first].y
-    let rows = min_rows(raster.chunks[first].height, raster.height - top)
-    let stride = raster.channels.length
-    var part = *raster
-    part.height = rows
-    part.pixels = try alloc f64[raster.width * rows * stride] in memory.heap
-    defer free(part.pixels) in memory.heap
-    for index in 0..<part.pixels.length:
-        part.pixels[index] = 0.0
-    var one: model.Chunk[1] = ---
-    part.chunks = one[..<1]
-    for plane in 0..<raster.chunks.length // per_plane:
-        for index in first..<last:
-            one[0] = raster.chunks[plane * per_plane + index]
-            one[0].y = 0
-            try tiff.decode_chunk(&part, 0)
-    for y in 0..<rows:
+    let stride = part.channels.length
+    for y in 0..<part.height:
         let row = try next_row(banding, top + y)
-        for x in 0..<raster.width:
-            let at = (y * raster.width + x) * stride
+        for x in 0..<part.width:
+            let at = (y * part.width + x) * stride
             row[x * 4] = linear_of(part.pixels, at, names.red, scale, encoded)
             row[x * 4 + 1] = linear_of(part.pixels, at, names.green, scale, encoded)
             row[x * 4 + 2] = linear_of(part.pixels, at, names.blue, scale, encoded)

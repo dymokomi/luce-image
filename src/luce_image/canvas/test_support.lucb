@@ -1,0 +1,65 @@
+#==============================================================================================
+#
+#   canvas/test_support - What the canvas tests share: the build's pace and pixel reads
+#
+#   DESCRIPTION:
+#       The timing tests hold limits measured on an optimized native build. A build that
+#       runs everything slower (the C backend's debug build is tens of times so) meets
+#       them only stretched: `build_pace` times a fixed workload and says by how much.
+#       The pixel reads look at what the canvas shows and what a layer's tiles hold.
+#
+#==============================================================================================
+
+## What the workload takes in an optimized native build on the Mac the limits
+## were measured on (ms).
+let pace_native_ms: f64 = 70.0
+
+## This build's speed against an optimized native one: 1 or more.
+func build_pace() -> f64:
+    let started = time.now()
+    var state: u64 = 88172645463325252
+    var sum: u64 = 0
+    for step in 0..<(u64)50000000:
+        state ^= state << 13
+        state ^= state >> 7
+        state ^= state << 17
+        sum += (state & 0xffff) ^ step
+    let taken = (f64)(time.now() - started) / 1000000.0
+    # The sum is used, so the loop cannot be dropped.
+    if sum == 1:
+        print("unlikely")
+    print(f"build pace: workload {taken} ms")
+    return math.max(1.0, taken / pace_native_ms)
+
+## The color at one pixel of the canvas drawn at 1:1 over black.
+func shown_at(canvas: Canvas*, target: gpu.Texture*, x: u32, y: u32) -> u8[4]!:
+    # A smudge still finishing on its worker is kept before it is looked at.
+    try canvas.wait_idle()
+    let frame = try target.frame()
+    defer frame.release()
+    let root = try frame.value().target()
+    defer root.release()
+    try canvas.draw(root, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
+    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    var pixel: u8[4]
+    try target.read(pixel, gpu.Region(x, y, 1, 1))
+    return pixel
+
+## Layer `id`'s straight-alpha linear texel at (`x`, `y`), read from its tile.
+func layer_texel(canvas: Canvas*, id: i64, x: u32, y: u32) -> f32[4]!:
+    let document = canvas.document else trap("no document")
+    let layer = document.find((u64)id) else trap("no layer")
+    let tiles = layer.tiles() else trap("no tiles")
+    var texel: f32[4] = [0.0, 0.0, 0.0, 0.0]
+    let texture = (try tiles.texture(x // tile_size, y // tile_size)) else return texel
+    var bytes: u8[8]
+    try texture.read(bytes, gpu.Region(x % tile_size, y % tile_size, 1, 1))
+    for channel in 0..<(usize)4:
+        texel[channel] = from_half((u16)bytes[channel * 2] | ((u16)bytes[channel * 2 + 1] << 8))
+    return texel
+
+## The layer's tiles in the test document.
+func layer_tiles(canvas: Canvas*, layer: i64) -> Tiles*:
+    let document = canvas.document else trap("no document")
+    let found = document.find((u64)layer) else trap("no layer")
+    return found.tiles() else trap("no tiles")

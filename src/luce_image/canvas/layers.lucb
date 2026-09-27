@@ -1,0 +1,490 @@
+#==============================================================================================
+#
+#   canvas/layers - The layer stack
+#
+#   DESCRIPTION:
+#       Adding, placing, removing, reordering, duplicating and merging layers and groups; each
+#       layer's Record beside the GPU document's Layer, and the getters the Layers panel reads.
+#
+#==============================================================================================
+
+extend Canvas:
+    ## Add a transparent layer on top; returns its id.
+    pub mutating func add_layer(name: str) -> i64!:
+        try self.remember_state("New Layer")
+        return try self.add_record(name, false, -1)
+
+    ## Add an empty group on top; returns its id. Layers go in with `move_into`.
+    pub mutating func add_group(name: str) -> i64!:
+        try self.remember_state("New Group")
+        return try self.add_record(name, true, -1)
+
+    ## Add an adjustment layer of `kind` on top, with the staged parameters
+    ## (`set_adjustment`); returns its id. It has no pixels: it adjusts what
+    ## is below it live, through its mask, clipped to the layer below when
+    ## clipped — the non-destructive twin of `adjust_layer`. A Curves layer
+    ## takes the staged curves (`add_curve_point`).
+    pub mutating func add_adjustment_layer(name: str, kind: i64) -> i64!:
+        # Replace Color is destructive only, as Photoshop's: never a layer.
+        if kind < 0 or kind >= (i64)adjustment_count or kind == (i64)replace_color:
+            error(invalid, "no such adjustment for a layer")
+        try self.remember_state("New Adjustment Layer")
+        return try self.add_record(name, false, kind)
+
+    ## Give adjustment layer `id` the staged parameters: editing it, live.
+    pub mutating func update_adjustment_layer(id: i64) -> !:
+        try self.require_open()
+        try self.remember_state("Adjustment Layer", (u64)id)
+        let index = try self.index((u64)id)
+        let kind = self.records[index].adjustment
+        if kind < 0:
+            error(invalid, "not an adjustment layer")
+        self.records[index].adjustment_values = self.adjustment
+        if kind == (i64)curves:
+            self.records[index].curves = self.curves
+        if let document = self.document:
+            try document.set_adjustment((u64)id, kind, self.adjustment[..<parameter_count])
+            if kind == (i64)curves:
+                try document.set_curves((u64)id, self.curves)
+
+    ## Stage the curves of Curves layer `id` (`add_curve_point` and the rest
+    ## then edit them), for editing it.
+    pub mutating func stage_layer_curves(id: i64) -> !:
+        let index = try self.index((u64)id)
+        if self.records[index].adjustment != (i64)curves:
+            error(invalid, "not a Curves adjustment layer")
+        self.curves = self.records[index].curves
+
+    ## The adjustment kind of the layer at `index`, or -1 for a layer with pixels or a group.
+    pub func layer_adjustment(index: i64) -> i64!:
+        return (try self.record(index)).adjustment
+
+    ## Parameter `parameter` of the adjustment layer at `index`, for editing it.
+    pub func adjustment_value(index: i64, parameter: i64) -> f64!:
+        if parameter < 0 or parameter >= (i64)parameter_count:
+            error(invalid, "adjustments take parameters 0..22")
+        return (try self.record(index)).adjustment_values[(usize)parameter]
+
+    ## A layer, a group or an adjustment layer on top, its record and (bound) its tree node.
+    mutating func add_record(name: str, group: bool, adjustment: i64) -> i64!:
+        try self.require_open()
+        try self.record_room()
+        var copied: str = ""
+        with memory.heap:
+            copied = try strings.copy(name)
+        errdefer strings.release(copied)
+        var id = self.next_id
+        if let document = self.document:
+            var created: u64 = 0
+            if group:
+                created = try document.add_group(name)
+            elif adjustment >= 0:
+                created = try document.add_adjustment(name, adjustment, self.adjustment[..<parameter_count])
+                if adjustment == (i64)curves:
+                    try document.set_curves(created, self.curves)
+            else:
+                created = try document.add_layer(name)
+            # The document's id: Quick Mask's hidden layer took one of its own.
+            assert(created >= id)
+            id = created
+        self.records[self.count] = Record(id = id, name = copied, group = group, adjustment = adjustment, visible = true, opacity = 1.0, blend = 0, masked = false, clipped = false, picture = none, mask_picture = none)
+        if adjustment >= 0:
+            self.records[self.count].adjustment_values = self.adjustment
+            self.records[self.count].curves = self.curves
+        self.count += 1
+        self.next_id = id + 1
+        return (i64)id
+
+    ## Room for one more record.
+    mutating func record_room() -> !:
+        if self.count < self.records.length:
+            return
+        let capacity = 8 if self.records.length == 0 else self.records.length * 2
+        let grown = try alloc Record[capacity] in memory.heap
+        if self.count > 0:
+            memory.copy(grown, self.records, self.count)
+        if self.records.length > 0:
+            free(self.records) in memory.heap
+        self.records = grown
+
+    ## Move a layer — a group with everything in it — into group `parent` (0
+    ## the top level) at `position` among its layers, 0 the bottom, or on top
+    ## when past it. Unbound (a document being loaded), the order is kept as
+    ## the records have it.
+    pub mutating func move_into(id: i64, parent: i64, position: i64) -> !:
+        try self.require_open()
+        try self.remember_state("Move Layer")
+        let index = try self.index((u64)id)
+        if parent != 0:
+            let holder = try self.index((u64)parent)
+            if not self.records[holder].group:
+                error(invalid, "only a group can hold layers")
+        if let document = self.document:
+            try document.move_to((u64)id, none if parent == 0 else (u64)parent, (usize)position if position >= 0 else (usize)self.count)
+            try self.sync_records()
+            return
+        self.records[index].parent = (u64)parent
+
+    ## Put the records in the tree's order — each group's layers bottom to top,
+    ## then the group, as the Layers panel lists them upside down — with their
+    ## groups.
+    mutating func sync_records() -> !:
+        let document = self.document else return
+        let ids = try alloc u64[self.count] in memory.heap
+        defer free(ids) in memory.heap
+        let parents = try alloc u64[self.count] in memory.heap
+        defer free(parents) in memory.heap
+        var order = Order(ids = ids, parents = parents, count = 0)
+        post_order(document.layers(), 0, &order)
+        if order.count != self.count:
+            error(invalid, "the layer records and the document disagree")
+        let sorted = try alloc Record[self.records.length] in memory.heap
+        for at in 0..<order.count:
+            let index = try self.index(ids[at])
+            sorted[at] = self.records[index]
+            sorted[at].parent = parents[at]
+        free(self.records) in memory.heap
+        self.records = sorted
+
+    ## Replace a layer's pixels with the picture at `path`, which must be the
+    ## document's size.
+    pub mutating func load_layer(id: i64, path: str) -> !:
+        try self.require_open()
+        let picture = try Image.open(path)
+        errdefer picture.release()
+        if (try picture.value().width()) != (usize)self.extent_x or (try picture.value().height()) != (usize)self.extent_y:
+            error(invalid, "the picture must match the document's size")
+        try self.place((u64)id, picture)
+
+    mutating func place(id: u64, picture: interop.Reference[Image], x: i64 = 0, y: i64 = 0) -> !:
+        let index = try self.index(id)
+        if let document = self.document:
+            try document.set_tiles(id, try self.tiles_of(picture, x, y))
+            picture.release()
+            return
+        # Replace, then release: a release can run the cycle collector, which traces the records.
+        let previous = self.records[index].picture
+        self.records[index].picture = picture
+        self.records[index].picture_x = x
+        self.records[index].picture_y = y
+        if let old = previous:
+            old.release()
+
+    ## Tiles on the bound device holding `picture`'s pixels with its top-left
+    ## at document pixel (`x`, `y`); what lies past the canvas is kept past it
+    ## (for a `mask`, white past it is left out, as unpainted).
+    mutating func tiles_of(picture: interop.Reference[Image], x: i64 = 0, y: i64 = 0, mask: bool = false) -> Tiles!:
+        let device = self.device else error(invalid, "the document is not bound to a device")
+        let width = try picture.value().width()
+        let height = try picture.value().height()
+        var whole = Tiles()
+        if picture.value().is_camera_raw() and not picture.value().is_loaded():
+            # A raw develops a tile at a time straight into the grid.
+            whole = try raw_tiles(device, picture)
+        else:
+            # A band of 256 rows at a time, decoded as it goes where the format
+            # allows: never the picture whole in floats.
+            whole = try Tiles.create(device, (u32)width, (u32)height)
+            errdefer whole.destroy()
+            var banding = PictureBands(canvas = &self, tiles = &whole)
+            defer banding.close()
+            if not (try picture.value().encoded_rgba_bands((usize)tile_size, picture_coded_band, (void*)&banding)):
+                try picture.value().linear_rgba_bands((usize)tile_size, picture_band, (void*)&banding)
+        errdefer whole.destroy()
+        if x == 0 and y == 0 and width == (usize)self.extent_x and height == (usize)self.extent_y:
+            return whole
+        defer whole.destroy()
+        var tiles = try Tiles.create(device, self.extent_x, self.extent_y)
+        errdefer tiles.destroy()
+        let empty = 1.0 if mask else 0.0
+        try relocate(&whole, &tiles, 1.0, 1.0, (f64)x, (f64)y, false, gpu.Color(empty, empty, empty, empty))
+        return tiles
+
+    pub mutating func remove_layer(id: i64) -> !:
+        try self.require_open()
+        try self.remember_state("Delete Layer")
+        let index = try self.index((u64)id)
+        if let document = self.document:
+            try document.remove((u64)id)
+            # A group goes with everything in it: drop every record the tree lost.
+            var at: usize = 0
+            while at < self.count:
+                if document.find(self.records[at].id) == none:
+                    self.drop_record(at)
+                else:
+                    at += 1
+            return
+        self.drop_record(index)
+
+    mutating func drop_record(index: usize):
+        strings.release(self.records[index].name)
+        release_type(&self.records[index])
+        release_elements(&self.records[index])
+        if let picture = self.records[index].picture:
+            picture.release()
+        if let picture = self.records[index].mask_picture:
+            picture.release()
+        for shift in index..<(self.count - 1):
+            self.records[shift] = self.records[shift + 1]
+        self.count -= 1
+
+    ## Set a layer's visibility, opacity and blend mode (Photoshop's, by number;
+    ## `blend_mode_name` lists them).
+    pub mutating func set_layer(id: i64, visible: bool, opacity: f64, blend: i64 = 0) -> !:
+        try self.require_open()
+        try self.remember_state("Layer Properties", (u64)id)
+        if not math.is_finite(opacity) or opacity < 0.0 or opacity > 1.0:
+            error(invalid, "opacity must be in 0..1")
+        if blend < 0 or blend >= (i64)blend_mode_count:
+            error(invalid, "no such blend mode")
+        let index = try self.index((u64)id)
+        if let document = self.document:
+            try document.set_appearance((u64)id, visible, opacity, (u32)blend)
+        self.records[index].visible = visible
+        self.records[index].opacity = opacity
+        self.records[index].blend = blend
+
+    pub func layer_blend(index: i64) -> i64!:
+        return (try self.record(index)).blend
+
+    ## Move a layer one step up (1) or down (-1) in the stack.
+    pub mutating func reorder_layer(id: i64, step: i64) -> !:
+        try self.require_open()
+        try self.remember_state("Move Layer")
+        let index = try self.index((u64)id)
+        let target = (i64)index + step
+        if target < 0 or target >= (i64)self.count:
+            return
+        if let document = self.document:
+            # Among its own group's layers: a group moves with all it holds.
+            try document.reorder((u64)id, step)
+            try self.sync_records()
+            return
+        let moved = self.records[index]
+        self.records[index] = self.records[(usize)target]
+        self.records[(usize)target] = moved
+
+    ## Copy a layer with its mask and appearance just above it; returns the copy's id.
+    pub mutating func duplicate_layer(id: i64, name: str) -> i64!:
+        try self.require_open()
+        try self.require_idle()
+        try self.begin_edit("Duplicate Layer")
+        defer self.end_edit()
+        let index = try self.index((u64)id)
+        let created = try self.add_layer(name)
+        let copy = try self.index((u64)created)
+        self.records[copy].visible = self.records[index].visible
+        self.records[copy].opacity = self.records[index].opacity
+        self.records[copy].blend = self.records[index].blend
+        self.records[copy].clipped = self.records[index].clipped
+        self.records[copy].style = self.records[index].style
+        self.records[copy].masked = self.records[index].masked
+        # A vector layer's copy is a vector layer of copies of its elements.
+        if self.records[index].shaped:
+            self.records[copy].elements = self.records[index].elements
+            self.records[copy].graph = self.records[index].graph
+            try copy_elements(&self.records[copy])
+            self.records[copy].shaped = true
+            self.records[copy].active = self.records[index].active
+        if let document = self.document:
+            # The GPU copy carries the pixels; the record added above is replaced by it.
+            try document.remove((u64)created)
+            let actual = try document.duplicate((u64)id, name)
+            self.records[copy].id = actual
+            self.next_id = actual + 1
+            try self.sync_records()
+            return (i64)actual
+        elif let picture = self.records[index].picture:
+            self.records[copy].picture = picture.clone()
+        # Place the copy right above the source.
+        var at = copy
+        while at > index + 1:
+            let swap = self.records[at]
+            self.records[at] = self.records[at - 1]
+            self.records[at - 1] = swap
+            at -= 1
+        return (i64)self.records[index + 1].id
+
+    ## Merge a layer into the one below it. Not undoable: history entries for
+    ## both layers are dropped.
+    pub mutating func merge_down(id: i64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        try self.remember_state("Merge Down")
+        let document = self.document else error(invalid, "draw the document once before merging")
+        let composer = self.composer else error(invalid, "draw the document once before merging")
+        let index = try self.index((u64)id)
+        if index == 0:
+            error(invalid, "nothing below to merge into")
+        if self.records[index].adjustment >= 0 or self.records[index - 1].adjustment >= 0:
+            error(invalid, "adjustment layers do not merge yet")
+        try composer.merge_down(document, (u64)id)
+        # What it merged into holds pixels now, not text.
+        release_type(&self.records[index - 1])
+        strings.release(self.records[index].name)
+        release_type(&self.records[index])
+        release_elements(&self.records[index])
+        if let picture = self.records[index].picture:
+            picture.release()
+        for shift in index..<(self.count - 1):
+            self.records[shift] = self.records[shift + 1]
+        self.count -= 1
+        try self.sync_records()
+
+    ## Give layer `id` a new name.
+    pub mutating func rename_layer(id: i64, name: str) -> !:
+        try self.require_open()
+        try self.remember_state("Rename Layer")
+        if name.length == 0 or name.length > 256:
+            error(invalid, "a layer name is 1..256 bytes")
+        let index = try self.index((u64)id)
+        var copied: str = ""
+        with memory.heap:
+            copied = try strings.copy(name)
+        errdefer strings.release(copied)
+        if let document = self.document:
+            try document.rename((u64)id, name)
+        strings.release(self.records[index].name)
+        self.records[index].name = copied
+
+    ## How many blend modes there are.
+    pub static func blend_mode_count() -> i64:
+        return (i64)blend_mode_count
+
+    ## The name of a blend mode.
+    pub static func blend_mode_name(mode: i64) -> str!:
+        if mode < 0 or mode >= (i64)blend_mode_count:
+            error(invalid, "no such blend mode")
+        return blend_names[(usize)mode]
+
+    ## Layers from the bottom up.
+    ## The stack index of the top-most visible layer with pixels at a document
+    ## point (alpha over 5%), or -1 there is none: what Photoshop's Move tool
+    ## picks with Auto-Select or a Cmd-click.
+    pub mutating func layer_at(x: i64, y: i64) -> i64!:
+        try self.require_open()
+        if x < 0 or y < 0 or x >= (i64)self.extent_x or y >= (i64)self.extent_y:
+            return -1
+        let document = self.document else return -1
+        let column = (u32)x // tile_size
+        let row = (u32)y // tile_size
+        var texel: u8[8]
+        var index = (i64)self.count - 1
+        while index >= 0:
+            let record = self.records[(usize)index]
+            if record.visible:
+                if let layer = document.find(record.id):
+                    if let tiles = layer.tiles():
+                        if let texture = (try tiles.texture(column, row)):
+                            try texture.read(texel, gpu.Region((u32)x - column * tile_size, (u32)y - row * tile_size, 1, 1))
+                            if from_half((u16)texel[6] | ((u16)texel[7] << 8)) > 0.05:
+                                return index
+            index -= 1
+        return -1
+
+    pub func layer_count() -> i64:
+        return (i64)self.count
+
+    pub func layer_id(index: i64) -> i64!:
+        return (i64)(try self.record(index)).id
+
+    pub func layer_name(index: i64) -> str!:
+        return (try self.record(index)).name
+
+    pub func layer_visible(index: i64) -> bool!:
+        return (try self.record(index)).visible
+
+    pub func layer_opacity(index: i64) -> f64!:
+        return (try self.record(index)).opacity
+
+    mutating func adopt_extent(width: u32, height: u32) -> !:
+        end_range(&self)
+        self.extent_x = width
+        self.extent_y = height
+        var replacement = try Selection.create(width, height)
+        self.selection.destroy()
+        self.selection = replacement
+
+    func index(id: u64) -> usize!:
+        for index in 0..<self.count:
+            if self.records[index].id == id:
+                return index
+        error(invalid, "no such layer")
+
+    func record(index: i64) -> Record!:
+        if index < 0 or index >= (i64)self.count:
+            error(invalid, "layer index out of range")
+        return self.records[(usize)index]
+
+    ## Whether the layer at `index` is a group.
+    pub func layer_is_group(index: i64) -> bool!:
+        return (try self.record(index)).group
+
+    ## The id of the group holding the layer at `index`, 0 at the top level.
+    pub func layer_parent(index: i64) -> i64!:
+        return (i64)(try self.record(index)).parent
+
+    ## Where the layer at `index` sits among its group's layers (or the top
+    ## level's), 0 the bottom.
+    pub func layer_position(index: i64) -> i64!:
+        let record = try self.record(index)
+        if let document = self.document:
+            return (i64)(try document.position(record.id))
+        var position: i64 = 0
+        for at in 0..<(usize)index:
+            if self.records[at].parent == record.parent:
+                position += 1
+        return position
+
+    ## How many groups hold the layer at `index`: 0 at the top level.
+    pub func layer_depth(index: i64) -> i64!:
+        var depth: i64 = 0
+        var parent = (try self.record(index)).parent
+        while parent != 0:
+            depth += 1
+            parent = self.records[try self.index(parent)].parent
+        return depth
+
+    func checked_index(index: i64) -> i64!:
+        discard(try self.record(index))
+        return index
+
+    ## Move a layer's pixels by whole pixels, its mask with them (linked, as in
+    ## Photoshop); while editing the mask, the mask alone. Undoable in one step.
+    pub mutating func move_layer(id: i64, dx: i64, dy: i64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        if dx == 0 and dy == 0:
+            return
+        let document = self.document else error(invalid, "draw the document once before moving")
+        let index = try self.index((u64)id)
+        let on_mask = self.mask_editing and self.records[index].masked
+        # A text layer's place is part of the step, so undo puts it back too.
+        if not on_mask and self.records[index].typed:
+            try self.begin_edit("Move")
+            defer self.end_edit()
+            try self.shift_layer(document, index, dx, dy, false)
+            self.records[index].typeset.x += (f64)dx
+            self.records[index].typeset.y += (f64)dy
+            return
+        # A vector layer is drawn again where it went, only the cells its elements left
+        # or reach (the active one alone when there is one): past the canvas and back it
+        # stays whole.
+        if not on_mask and self.records[index].shaped:
+            try self.begin_edit("Move")
+            defer self.end_edit()
+            try self.remember_state("Move")
+            try shift_vector_elements(&self, index, (f64)dx, (f64)dy, true)
+            return
+        try self.shift_layer(document, index, dx, dy, on_mask)
+
+    ## The pixels (or mask) of the layer at `index` moved, remembered for undo;
+    ## a linked mask goes with the pixels.
+    mutating func shift_layer(document: Document*, index: usize, dx: i64, dy: i64, on_mask: bool) -> !:
+        let id = self.records[index].id
+        let before = try translate(document, id, dx, dy, on_mask)
+        try self.remember(id, before, on_mask, name = "Move")
+        if self.records[index].masked and self.records[index].mask_linked and not on_mask:
+            let mask_before = try translate(document, id, dx, dy, true)
+            try self.remember(id, mask_before, true, joined = true, name = "Move")
+

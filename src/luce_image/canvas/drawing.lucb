@@ -4,186 +4,250 @@
 #
 #==============================================================================================
 
-## `Canvas.draw`: the flattened document's tiles at the pyramid level for
-## `zoom`, as the Channels panel shows them (channels.lucb), over the
-## checkerboard when the canvas draws it, with Quick Mask's and the shown
-## alpha channels' tints in the same draw: all of it mixed as the document
-## blends its colors.
-func draw_canvas(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64) -> !:
-    try canvas.require_open()
-    try canvas.settle_stroke()
-    if not math.is_finite(zoom) or zoom <= 0.0 or zoom > 256.0 or not math.is_finite(offset_x) or not math.is_finite(offset_y):
-        error(invalid, "zoom must be in 0..256 and offsets finite")
-    let checked = try target.get()
-    if rectangle.width <= 0.0 or rectangle.height <= 0.0:
-        return
-    try canvas.bind(checked)
-    # A standalone frame has no device; it records nothing.
-    let document = canvas.document else return
-    let composer = canvas.composer else return
-    # The bands of a picture still opening that are ready since the last frame.
-    try collect_opening(canvas)
-    # A new frame: what the last one pinned may move, within the memory budget,
-    # once this draw is done with it. Later draws into the same frame keep what
-    # this one pins.
-    let settles = begin_frame(checked.frame_serial())
-    canvas.quick_drawn = false
-    if composite_shown_count(canvas) == 0:
-        # No composite channel shown: an alpha channel alone, or nothing.
-        try draw_channel_view(canvas, target, rectangle, zoom, offset_x, offset_y, 0)
-        if settles:
-            try settle_tiers(canvas)
-        return
-    let sources = try tint_sources(canvas)
-    var shading = try composite_shading(canvas, checked, sources.count > 0)
-    shading.squares_x = rectangle.x + offset_x
-    shading.squares_y = rectangle.y + offset_y
-    let clipped = try checked.clipped(rectangle)
-    defer clipped.release()
-    let area = clipped.value()
-    # The pyramid level whose tiles are at most one texel per point.
-    var level: u32 = 0
-    while level < 16 and zoom * (f64)(1u32 << (level + 1)) <= 1.0:
-        level += 1
-    let span = 1u32 << level
-    let tile_points = (f64)tile_size * (f64)span * zoom
-    let origin_x = rectangle.x + offset_x
-    let origin_y = rectangle.y + offset_y
-    let columns = (tile_columns(canvas.extent_x) + span - 1) // span
-    let rows = (tile_columns(canvas.extent_y) + span - 1) // span
-    let first_column = visible_cell(rectangle.x - origin_x, tile_points, columns)
-    let first_row = visible_cell(rectangle.y - origin_y, tile_points, rows)
-    let last_column = max_u32(first_column, visible_cell(rectangle.x + rectangle.width - origin_x, tile_points, columns - 1) + 1)
-    let last_row = max_u32(first_row, visible_cell(rectangle.y + rectangle.height - origin_y, tile_points, rows - 1) + 1)
-    # Tiles a background batch brought back since the last frame.
-    discard(try prefetch_collect())
-    # A batch that failed to decode something: this frame brings what it lacks
-    # back itself, so the failure is reported.
-    let waits = not progressive_loading or prefetch_had_failure()
-    if waits:
-        # The layer tiles the cells in view will need, brought back together first.
-        try composer.gather(document, first_column, first_row, min_u32(last_column, columns), min_u32(last_row, rows), level)
-    var lacking = Gathering.deferred()
-    defer lacking.release()
-    canvas.coarse_shown = false
-    for row in 0..<rows:
-        let top = origin_y + (f64)row * tile_points
-        if top >= rectangle.y + rectangle.height or top + tile_points <= rectangle.y:
-            continue
-        for column in 0..<columns:
-            let left = origin_x + (f64)column * tile_points
-            if left >= rectangle.x + rectangle.width or left + tile_points <= rectangle.x:
+extend Canvas:
+    ## Draw the view into textures of `texel_format` rather than a window's surface
+    ## (none): what the view's own pipelines (the checkerboard and tints, the
+    ## channel view, mattes) are made for. For headless renderers and benchmarks.
+    pub mutating func set_view_format(texel_format: gpu.Format?):
+        self.drop_view_pipelines()
+        self.view_format = texel_format
+
+    ## Let the view's own pipelines go, to be made again when next drawn.
+    mutating func drop_view_pipelines():
+        if let pipeline = self.quick_overlay:
+            var owned = pipeline
+            owned.destroy()
+            self.quick_overlay = none
+        if let shader = self.quick_shader:
+            var owned = shader
+            owned.destroy()
+            self.quick_shader = none
+        if let pipeline = self.channels_view:
+            var owned = pipeline
+            owned.destroy()
+            self.channels_view = none
+        if let shader = self.channels_shader:
+            var owned = shader
+            owned.destroy()
+            self.channels_shader = none
+
+    mutating func quick_pipeline() -> gpu.Pipeline!:
+        if let existing = self.quick_overlay:
+            return existing
+        let device = self.device else error(invalid, "draw the document once first")
+        var shader = try gpu.Shader.create(device, quickmask_frag_words, quickmask_frag_msl)
+        errdefer shader.destroy()
+        let pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.over, self.view_format)
+        self.quick_shader = shader
+        self.quick_overlay = pipeline
+        return pipeline
+
+    mutating func channels_pipeline() -> gpu.Pipeline!:
+        if let existing = self.channels_view:
+            return existing
+        let device = self.device else error(invalid, "draw the document once first")
+        var shader = try gpu.Shader.create(device, channels_frag_words, channels_frag_msl)
+        errdefer shader.destroy()
+        let pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.over, self.view_format)
+        self.channels_shader = shader
+        self.channels_view = pipeline
+        return pipeline
+
+    mutating func ants_pipeline() -> gpu.Pipeline!:
+        if let existing = self.ants:
+            return existing
+        let device = self.device else error(invalid, "draw the document once first")
+        var shader = try gpu.Shader.create(device, ants_frag_words, ants_frag_msl)
+        errdefer shader.destroy()
+        let pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.over)
+        self.ants_shader = shader
+        self.ants = pipeline
+        return pipeline
+
+    ## Draw the document onto `target`, clipped to `rectangle` (in the target's
+    ## points), with its top-left corner at `rectangle`'s origin plus `offset`,
+    ## scaled by `zoom` (document pixels to points). Binds the device on first
+    ## use. Pixels are crisp at and above 100% and filtered below it.
+    pub mutating func draw(target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64) -> !:
+        try self.require_open()
+        try self.settle_stroke()
+        if not math.is_finite(zoom) or zoom <= 0.0 or zoom > 256.0 or not math.is_finite(offset_x) or not math.is_finite(offset_y):
+            error(invalid, "zoom must be in 0..256 and offsets finite")
+        let checked = try target.get()
+        if rectangle.width <= 0.0 or rectangle.height <= 0.0:
+            return
+        try self.bind(checked)
+        # A standalone frame has no device; it records nothing.
+        let document = self.document else return
+        let composer = self.composer else return
+        # The bands of a picture still opening that are ready since the last frame.
+        try self.continue_opening()
+        # A new frame: what the last one pinned may move, within the memory budget,
+        # once this draw is done with it. Later draws into the same frame keep what
+        # this one pins.
+        let settles = begin_frame(checked.frame_serial())
+        self.quick_drawn = false
+        if composite_shown_count(&self) == 0:
+            # No composite channel shown: an alpha channel alone, or nothing.
+            try draw_channel_view(&self, target, rectangle, zoom, offset_x, offset_y, 0)
+            if settles:
+                try settle_tiers(&self)
+            return
+        let sources = try tint_sources(&self)
+        var shading = try composite_shading(&self, checked, sources.count > 0)
+        shading.squares_x = rectangle.x + offset_x
+        shading.squares_y = rectangle.y + offset_y
+        let clipped = try checked.clipped(rectangle)
+        defer clipped.release()
+        let area = clipped.value()
+        # The pyramid level whose tiles are at most one texel per point.
+        var level: u32 = 0
+        while level < 16 and zoom * (f64)(1u32 << (level + 1)) <= 1.0:
+            level += 1
+        let span = 1u32 << level
+        let tile_points = (f64)tile_size * (f64)span * zoom
+        let origin_x = rectangle.x + offset_x
+        let origin_y = rectangle.y + offset_y
+        let columns = (tile_columns(self.extent_x) + span - 1) // span
+        let rows = (tile_columns(self.extent_y) + span - 1) // span
+        let first_column = visible_cell(rectangle.x - origin_x, tile_points, columns)
+        let first_row = visible_cell(rectangle.y - origin_y, tile_points, rows)
+        let last_column = max_u32(first_column, visible_cell(rectangle.x + rectangle.width - origin_x, tile_points, columns - 1) + 1)
+        let last_row = max_u32(first_row, visible_cell(rectangle.y + rectangle.height - origin_y, tile_points, rows - 1) + 1)
+        # Tiles a background batch brought back since the last frame.
+        discard(try prefetch_collect())
+        # A batch that failed to decode something: this frame brings what it lacks
+        # back itself, so the failure is reported.
+        let waits = not progressive_loading or prefetch_had_failure()
+        if waits:
+            # The layer tiles the cells in view will need, brought back together first.
+            try composer.gather(document, first_column, first_row, min_u32(last_column, columns), min_u32(last_row, rows), level)
+        var lacking = Gathering.deferred()
+        defer lacking.release()
+        self.coarse_shown = false
+        for row in 0..<rows:
+            let top = origin_y + (f64)row * tile_points
+            if top >= rectangle.y + rectangle.height or top + tile_points <= rectangle.y:
                 continue
-            # The texels the document covers in this tile, and their extent in points.
-            let covered_x = min_u32(tile_size, (canvas.extent_x - column * span * tile_size + span - 1) // span)
-            let covered_y = min_u32(tile_size, (canvas.extent_y - row * span * tile_size + span - 1) // span)
-            let destination = gpu.Rect(left, top, (f64)covered_x * (f64)span * zoom, (f64)covered_y * (f64)span * zoom)
-            if not waits and not composer.kept(document, column, row, level) and (try composer.lacking(document, column, row, level, &lacking)) > 0:
-                # Its tiles come back in the background: a coarser level kept stands in.
-                if let coarse = composer.coarser(document, column, row, level, covered_x, covered_y):
-                    let tints = try tints_at(canvas, composer, &sources, column, row, level)
-                    try draw_view_tile(area, &shading, coarse.texture, destination, coarse.region, gpu.Filter.linear, &tints)
-                    canvas.coarse_shown = true
+            for column in 0..<columns:
+                let left = origin_x + (f64)column * tile_points
+                if left >= rectangle.x + rectangle.width or left + tile_points <= rectangle.x:
                     continue
-                # Nothing coarser is kept (the first frame): this cell waits.
-                try composer.gather(document, column, row, column + 1, row + 1, level)
-            let texture = try composer.tile(document, column, row, level)
-            # After the composite: its request lets go of what came before.
-            let tints = try tints_at(canvas, composer, &sources, column, row, level)
-            try draw_view_tile(area, &shading, texture, destination, gpu.Region(0, 0, covered_x, covered_y),
-                               gpu.Filter.nearest if zoom >= 1.0 else gpu.Filter.linear, &tints)
-    try lacking.finish()
-    canvas.quick_drawn = sources.count > 0 and sources.mask[0]
-    # The alpha channels shown that had no room in the draw, red over the picture.
-    try draw_channel_view(canvas, target, rectangle, zoom, offset_x, offset_y, sources.channels)
-    if settles:
-        try settle_tiers(canvas)
+                # The texels the document covers in this tile, and their extent in points.
+                let covered_x = min_u32(tile_size, (self.extent_x - column * span * tile_size + span - 1) // span)
+                let covered_y = min_u32(tile_size, (self.extent_y - row * span * tile_size + span - 1) // span)
+                let destination = gpu.Rect(left, top, (f64)covered_x * (f64)span * zoom, (f64)covered_y * (f64)span * zoom)
+                if not waits and not composer.kept(document, column, row, level) and (try composer.lacking(document, column, row, level, &lacking)) > 0:
+                    # Its tiles come back in the background: a coarser level kept stands in.
+                    if let coarse = composer.coarser(document, column, row, level, covered_x, covered_y):
+                        let tints = try tints_at(&self, composer, &sources, column, row, level)
+                        try draw_view_tile(area, &shading, coarse.texture, destination, coarse.region, gpu.Filter.linear, &tints)
+                        self.coarse_shown = true
+                        continue
+                    # Nothing coarser is kept (the first frame): this cell waits.
+                    try composer.gather(document, column, row, column + 1, row + 1, level)
+                let texture = try composer.tile(document, column, row, level)
+                # After the composite: its request lets go of what came before.
+                let tints = try tints_at(&self, composer, &sources, column, row, level)
+                try draw_view_tile(area, &shading, texture, destination, gpu.Region(0, 0, covered_x, covered_y),
+                                   gpu.Filter.nearest if zoom >= 1.0 else gpu.Filter.linear, &tints)
+        try lacking.finish()
+        self.quick_drawn = sources.count > 0 and sources.mask[0]
+        # The alpha channels shown that had no room in the draw, red over the picture.
+        try draw_channel_view(&self, target, rectangle, zoom, offset_x, offset_y, sources.channels)
+        if settles:
+            try settle_tiers(&self)
 
-## `Canvas.draw_layer`: one layer's own pixels, or its mask, scaled into `rectangle`.
-func draw_one_layer(canvas: Canvas*, target: interop.View[gpu.RenderTarget], index: i64, rectangle: gpu.Rect, mask: bool) -> !:
-    try canvas.require_open()
-    try canvas.settle_stroke()
-    let record = try canvas.record(index)
-    if rectangle.width <= 0.0 or rectangle.height <= 0.0:
-        return
-    let checked = try target.get()
-    let document = canvas.document else return
-    let layer = document.find(record.id) else return
-    let tiles = (layer.mask_tiles() else return) if mask else (layer.tiles() else return)
-    let composer = canvas.composer else return
-    let scale_x = rectangle.width / (f64)canvas.extent_x
-    let scale_y = rectangle.height / (f64)canvas.extent_y
-    # From the layer's level about a texel a point: a thumbnail is a few cells at most.
-    let level = view_level(math.min(scale_x, scale_y))
-    let span = (f64)((u64)tile_size << level)
-    composer.hold()
-    for row in 0..<level_cells(canvas.extent_y, level):
-        for column in 0..<level_cells(canvas.extent_x, level):
-            let texture = (try composer.level_texture(tiles, column, row, level, mask)) else continue
-            let covered_x = covered_at(canvas.extent_x, column, level)
-            let covered_y = covered_at(canvas.extent_y, row, level)
-            let step = (f64)(1u64 << level)
-            let destination = gpu.Rect(rectangle.x + (f64)column * span * scale_x, rectangle.y + (f64)row * span * scale_y,
-                                       (f64)covered_x * step * scale_x, (f64)covered_y * step * scale_y)
-            try gpu.draw_image(checked, texture, destination, gpu.Region(0, 0, covered_x, covered_y), 1.0, gpu.Filter.linear)
-
-## `Canvas.draw_moving`: the document with layer `id` shown moved by (`dx`, `dy`).
-func draw_canvas_moving(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, id: i64, dx: f64, dy: f64) -> !:
-    try canvas.require_open()
-    try canvas.settle_stroke()
-    let index = try canvas.index((u64)id)
-    if canvas.document == none:
-        try canvas.draw(target, rectangle, zoom, offset_x, offset_y)
-        return
-    let document = canvas.document else trap("checked")
-    let layer = document.find((u64)id) else error(invalid, "no such layer")
-    let shown = layer.visible
-    layer.visible = false
-    document.revision += 1
-    try canvas.draw(target, rectangle, zoom, offset_x, offset_y)
-    layer.visible = shown
-    document.revision += 1
-    if not shown or rectangle.width <= 0.0 or rectangle.height <= 0.0:
-        return
-    # The moving layer shows on the canvas only, what it had past the canvas included.
-    let left = math.max(rectangle.x, rectangle.x + offset_x)
-    let top = math.max(rectangle.y, rectangle.y + offset_y)
-    let right = math.min(rectangle.x + rectangle.width, rectangle.x + offset_x + (f64)canvas.extent_x * zoom)
-    let bottom = math.min(rectangle.y + rectangle.height, rectangle.y + offset_y + (f64)canvas.extent_y * zoom)
-    if right <= left or bottom <= top:
-        return
-    let checked = try target.get()
-    let clipped = try checked.clipped(gpu.Rect(left, top, right - left, bottom - top))
-    defer clipped.release()
-    let tiles = layer.tiles() else return
-    let opacity = canvas.records[index].opacity
-    let filter = gpu.Filter.nearest if zoom >= 1.0 else gpu.Filter.linear
-    let level = view_level(zoom)
-    if level > 0:
-        # Zoomed out: the layer's level, cell by cell, only those that show (what
-        # it has past the canvas shows again at full size).
-        let composer = canvas.composer else return
-        composer.hold()
+    ## Draw one layer's own pixels (or its mask when `mask` is set) scaled into
+    ## `rectangle` of `target`, for thumbnails. Needs the document bound.
+    pub mutating func draw_layer(target: interop.View[gpu.RenderTarget], index: i64, rectangle: gpu.Rect, mask: bool = false) -> !:
+        try self.require_open()
+        try self.settle_stroke()
+        let record = try self.record(index)
+        if rectangle.width <= 0.0 or rectangle.height <= 0.0:
+            return
+        let checked = try target.get()
+        let document = self.document else return
+        let layer = document.find(record.id) else return
+        let tiles = (layer.mask_tiles() else return) if mask else (layer.tiles() else return)
+        let composer = self.composer else return
+        let scale_x = rectangle.width / (f64)self.extent_x
+        let scale_y = rectangle.height / (f64)self.extent_y
+        # From the layer's level about a texel a point: a thumbnail is a few cells at most.
+        let level = view_level(math.min(scale_x, scale_y))
         let span = (f64)((u64)tile_size << level)
-        let step = (f64)(1u64 << level)
-        for row in 0..<level_cells(canvas.extent_y, level):
-            for column in 0..<level_cells(canvas.extent_x, level):
-                let destination = gpu.Rect(rectangle.x + offset_x + ((f64)column * span + dx) * zoom, rectangle.y + offset_y + ((f64)row * span + dy) * zoom,
-                                           (f64)covered_at(canvas.extent_x, column, level) * step * zoom, (f64)covered_at(canvas.extent_y, row, level) * step * zoom)
-                if not overlaps(destination, left, top, right, bottom):
-                    continue
-                let texture = (try composer.level_texture(tiles, column, row, level)) else continue
-                try gpu.draw_image(clipped.value(), texture, destination, gpu.Region(0, 0, covered_at(canvas.extent_x, column, level), covered_at(canvas.extent_y, row, level)), opacity, filter)
-        return
-    var parts = try pieces(tiles)
-    defer parts.destroy()
-    for at in 0..<parts.count:
-        let piece = parts.at(at)
-        let destination = gpu.Rect(rectangle.x + offset_x + ((f64)piece.x + dx) * zoom, rectangle.y + offset_y + ((f64)piece.y + dy) * zoom,
-                                   (f64)piece.source.width * zoom, (f64)piece.source.height * zoom)
-        if not overlaps(destination, left, top, right, bottom):
-            continue
-        try gpu.draw_image(clipped.value(), piece.texture, destination, piece.source, opacity, filter)
+        composer.hold()
+        for row in 0..<level_cells(self.extent_y, level):
+            for column in 0..<level_cells(self.extent_x, level):
+                let texture = (try composer.level_texture(tiles, column, row, level, mask)) else continue
+                let covered_x = covered_at(self.extent_x, column, level)
+                let covered_y = covered_at(self.extent_y, row, level)
+                let step = (f64)(1u64 << level)
+                let destination = gpu.Rect(rectangle.x + (f64)column * span * scale_x, rectangle.y + (f64)row * span * scale_y,
+                                           (f64)covered_x * step * scale_x, (f64)covered_y * step * scale_y)
+                try gpu.draw_image(checked, texture, destination, gpu.Region(0, 0, covered_x, covered_y), 1.0, gpu.Filter.linear)
+
+    ## Draw the document as `draw` does, but with layer `id` shown displaced by
+    ## (`dx`, `dy`) document pixels without touching its pixels: the live
+    ## preview of a move. The displaced layer is drawn on top of the rest in
+    ## normal blending at its opacity.
+    pub mutating func draw_moving(target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64,
+                                  id: i64, dx: f64, dy: f64) -> !:
+        try self.require_open()
+        try self.settle_stroke()
+        let index = try self.index((u64)id)
+        if self.document == none:
+            try self.draw(target, rectangle, zoom, offset_x, offset_y)
+            return
+        let document = self.document else trap("checked")
+        let layer = document.find((u64)id) else error(invalid, "no such layer")
+        let shown = layer.visible
+        layer.visible = false
+        document.revision += 1
+        try self.draw(target, rectangle, zoom, offset_x, offset_y)
+        layer.visible = shown
+        document.revision += 1
+        if not shown or rectangle.width <= 0.0 or rectangle.height <= 0.0:
+            return
+        # The moving layer shows on the canvas only, what it had past the canvas included.
+        let left = math.max(rectangle.x, rectangle.x + offset_x)
+        let top = math.max(rectangle.y, rectangle.y + offset_y)
+        let right = math.min(rectangle.x + rectangle.width, rectangle.x + offset_x + (f64)self.extent_x * zoom)
+        let bottom = math.min(rectangle.y + rectangle.height, rectangle.y + offset_y + (f64)self.extent_y * zoom)
+        if right <= left or bottom <= top:
+            return
+        let checked = try target.get()
+        let clipped = try checked.clipped(gpu.Rect(left, top, right - left, bottom - top))
+        defer clipped.release()
+        let tiles = layer.tiles() else return
+        let opacity = self.records[index].opacity
+        let filter = gpu.Filter.nearest if zoom >= 1.0 else gpu.Filter.linear
+        let level = view_level(zoom)
+        if level > 0:
+            # Zoomed out: the layer's level, cell by cell, only those that show (what
+            # it has past the canvas shows again at full size).
+            let composer = self.composer else return
+            composer.hold()
+            let span = (f64)((u64)tile_size << level)
+            let step = (f64)(1u64 << level)
+            for row in 0..<level_cells(self.extent_y, level):
+                for column in 0..<level_cells(self.extent_x, level):
+                    let destination = gpu.Rect(rectangle.x + offset_x + ((f64)column * span + dx) * zoom, rectangle.y + offset_y + ((f64)row * span + dy) * zoom,
+                                               (f64)covered_at(self.extent_x, column, level) * step * zoom, (f64)covered_at(self.extent_y, row, level) * step * zoom)
+                    if not overlaps(destination, left, top, right, bottom):
+                        continue
+                    let texture = (try composer.level_texture(tiles, column, row, level)) else continue
+                    try gpu.draw_image(clipped.value(), texture, destination, gpu.Region(0, 0, covered_at(self.extent_x, column, level), covered_at(self.extent_y, row, level)), opacity, filter)
+            return
+        var parts = try pieces(tiles)
+        defer parts.destroy()
+        for at in 0..<parts.count:
+            let piece = parts.at(at)
+            let destination = gpu.Rect(rectangle.x + offset_x + ((f64)piece.x + dx) * zoom, rectangle.y + offset_y + ((f64)piece.y + dy) * zoom,
+                                       (f64)piece.source.width * zoom, (f64)piece.source.height * zoom)
+            if not overlaps(destination, left, top, right, bottom):
+                continue
+            try gpu.draw_image(clipped.value(), piece.texture, destination, piece.source, opacity, filter)
 
 ## `Canvas.draw_selection`: marching ants along the selection's edge at screen resolution.
 func draw_canvas_selection(canvas: Canvas*, target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, phase: f64) -> !:

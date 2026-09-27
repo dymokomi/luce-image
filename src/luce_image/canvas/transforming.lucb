@@ -17,6 +17,120 @@
 #
 #==============================================================================================
 
+extend Canvas:
+    ## Begin a free transform of layer `id` and its linked mask (while editing
+    ## a mask, the mask alone); `add_to_transform` brings more layers. With a
+    ## selection the selected pixels float instead. Shown live by
+    ## `preview_transform` or `preview_distort`, kept or dropped by `end_transform`.
+    pub mutating func begin_transform(id: i64) -> !:
+        try begin_transform_session(&self, (u64)id, true)
+
+    pub mutating func add_to_transform(id: i64) -> !:
+        let session = self.transform_session else error(invalid, "no transform is in progress")
+        let document = self.document else trap("transform without a document")
+        try add_to_session(&self, document, session, (u64)id)
+
+    pub func transforming() -> bool:
+        return self.transform_session != none
+
+    ## Whether the transform under way moves floating selected pixels.
+    pub func transform_floats() -> bool:
+        let session = self.transform_session else return false
+        return session.floating
+
+    ## Show the transform's layers scaled by (`scale_x`, `scale_y`) — negative
+    ## flips — and turned `angle` degrees about (`pivot_x`, `pivot_y`), then
+    ## moved by (`dx`, `dy`).
+    ## `name` is the step's (Edit › Transform's Skew, say), kept as History names it.
+    pub mutating func preview_transform(scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64, pivot_x: f64, pivot_y: f64, name: str = "Free Transform") -> !:
+        try show_session(&self, try affine_warp(scale_x, scale_y, angle * math.pi / 180.0, dx, dy, pivot_x, pivot_y), transform_step_name(name))
+
+    ## Show the transform's layers distorted: the box at (`left`, `top`),
+    ## `width` by `height`, with its corners (top-left, top-right,
+    ## bottom-right, bottom-left) taken to the points given, in perspective.
+    pub mutating func preview_distort(left: f64, top: f64, width: f64, height: f64, x0: f64, y0: f64, x1: f64, y1: f64,
+                                      x2: f64, y2: f64, x3: f64, y3: f64, name: str = "Distort") -> !:
+        let corners: f64[8] = [x0, y0, x1, y1, x2, y2, x3, y3]
+        let box = Landed(left = left, top = top, right = left + width, bottom = top + height)
+        try show_session(&self, try quad_warp(left, top, width, height, corners[..<8]), transform_step_name(name), box)
+
+    ## How the transform resamples from now on: 0 nearest, 1 smooth
+    ## (bilinear), 2 high quality (bicubic). `preview_*` again to show it.
+    pub mutating func set_transform_sampling(sampling: i64) -> !:
+        let session = self.transform_session else error(invalid, "no transform is in progress")
+        if sampling < sampling_nearest or sampling > sampling_high:
+            error(invalid, "sampling is 0 nearest, 1 smooth or 2 high quality")
+        session.sampling = sampling
+
+    ## Keep what the transform shows as one undo step, or put it all back.
+    pub mutating func end_transform(keep: bool) -> !:
+        let session = self.transform_session else error(invalid, "no transform is in progress")
+        self.transform_session = none
+        if let composer = self.composer:
+            composer.drop_stand_ins()
+        defer drop_session(session)
+        let document = self.document else trap("transform without a document")
+        let transformer = self.transformer else trap("transform without a transformer")
+        try restore_session(document, session)
+        if not keep or not session.shown:
+            return
+        # From the pixels as they began, so the step undoes to them.
+        try self.begin_edit(session.name)
+        defer self.end_edit()
+        try warp_session(&self, document, transformer, session)
+        # Transformed text is pixels; vector elements follow an affine map and are
+        # drawn again, crisp, or else are pixels too.
+        for at in 0..<session.count:
+            let id = session.entries[at].id
+            rasterize_type(&self, id)
+            let index = self.index(id) catch _:
+                continue
+            if not self.records[index].shaped:
+                continue
+            let forward = session.warp.forward((f64)self.extent_x * 0.5, (f64)self.extent_y * 0.5) catch _:
+                recover session.warp
+            if session.floating or not (try transform_all_elements(&self, index, forward)):
+                rasterize_shape(&self, id)
+        if session.floating:
+            try self.live().warp(session.warp)
+
+    ## Free transform (as `preview_transform`) of layer `id` at once, one undo step.
+    pub mutating func transform_layer(id: i64, scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64, pivot_x: f64, pivot_y: f64) -> !:
+        try transform_now(&self, (u64)id, try affine_warp(scale_x, scale_y, angle * math.pi / 180.0, dx, dy, pivot_x, pivot_y), "Free Transform", true)
+
+    ## Mirror a layer's pixels (and linked mask) left to right, or top to
+    ## bottom, about the middle of what it has painted. Undoable.
+    pub mutating func flip_layer(id: i64, horizontal: bool) -> !:
+        if not try self.measure_content(id):
+            return
+        let pivot_x = (f64)(self.content.left + self.content.right) * 0.5
+        let pivot_y = (f64)(self.content.top + self.content.bottom) * 0.5
+        let warp = try affine_warp(-1.0 if horizontal else 1.0, 1.0 if horizontal else -1.0, 0.0, 0.0, 0.0, pivot_x, pivot_y)
+        try transform_now(&self, (u64)id, warp, "Flip Horizontal" if horizontal else "Flip Vertical", false)
+
+    ## Mirror the whole image — every layer and mask — about the canvas's
+    ## middle. Undoable in one step.
+    pub mutating func flip_canvas(horizontal: bool) -> !:
+        let document = self.document else error(invalid, "draw the document once before flipping")
+        let warp = try affine_warp(-1.0 if horizontal else 1.0, 1.0 if horizontal else -1.0, 0.0, 0.0, 0.0, (f64)self.extent_x * 0.5, (f64)self.extent_y * 0.5)
+        var begun = false
+        for index in 0..<self.count:
+            let layer = document.find(self.records[index].id) else continue
+            if layer.tiles() == none:
+                continue
+            if begun:
+                try self.add_to_transform((i64)self.records[index].id)
+            else:
+                try begin_transform_session(&self, self.records[index].id, false)
+                begun = true
+        let session = self.transform_session else return
+        session.warp = warp
+        session.shown = true
+        session.name = "Flip Canvas"
+        try self.end_transform(true)
+        # The step just taken holds the channels as they were.
+        try warp_channels(&self, warp)
+
 ## One layer in the session: its pixels and mask as the session began.
 struct Transformed:
     var id: u64
@@ -196,39 +310,6 @@ func restore_session(document: Document*, session: TransformSession*) -> !:
             var shown = try document.take_mask(entry.id, try entry.mask.clone())
             shown.destroy()
 
-## `Canvas.end_transform`: keep what is shown as one undo step (the outline
-## following floating pixels), or put everything back.
-func end_session(canvas: Canvas*, keep: bool) -> !:
-    let session = canvas.transform_session else error(invalid, "no transform is in progress")
-    canvas.transform_session = none
-    if let composer = canvas.composer:
-        composer.drop_stand_ins()
-    defer drop_session(session)
-    let document = canvas.document else trap("transform without a document")
-    let transformer = canvas.transformer else trap("transform without a transformer")
-    try restore_session(document, session)
-    if not keep or not session.shown:
-        return
-    # From the pixels as they began, so the step undoes to them.
-    try canvas.begin_edit(session.name)
-    defer canvas.end_edit()
-    try warp_session(canvas, document, transformer, session)
-    # Transformed text is pixels; vector elements follow an affine map and are
-    # drawn again, crisp, or else are pixels too.
-    for at in 0..<session.count:
-        let id = session.entries[at].id
-        rasterize_type(canvas, id)
-        let index = canvas.index(id) catch _:
-            continue
-        if not canvas.records[index].shaped:
-            continue
-        let forward = session.warp.forward((f64)canvas.extent_x * 0.5, (f64)canvas.extent_y * 0.5) catch _:
-            recover session.warp
-        if session.floating or not (try transform_all_elements(canvas, index, forward)):
-            rasterize_shape(canvas, id)
-    if session.floating:
-        try canvas.live().warp(session.warp)
-
 func drop_session(session: TransformSession*):
     for at in 0..<session.count:
         session.entries[at].pixels.destroy()
@@ -244,4 +325,4 @@ func transform_now(canvas: Canvas*, id: u64, warp: Warp, name: str, float_select
     session.warp = warp
     session.shown = true
     session.name = name
-    try end_session(canvas, true)
+    try canvas.end_transform(true)

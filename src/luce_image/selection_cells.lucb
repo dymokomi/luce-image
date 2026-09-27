@@ -6,8 +6,7 @@
 ## touches: a marquee across a 360-megapixel canvas holds its edge cells alone.
 import math
 import memory
-import os
-import thread
+import pool
 from tiles import tile_size
 
 ## Bytes in one cell's block: 256 rows of 256, whatever the cell's size.
@@ -303,36 +302,8 @@ func scan_item(context: void*?, item: usize):
     block.right = (i64)right
     block.bottom = (i64)bottom
 
-## Work dealt out over the processors an item at a time.
-struct Dealer:
-    var context: void*?
-    var work: func(void*?, usize) -> unit
-    var count: usize
-    var next: @usize
-
-func deal(raw: void*?):
-    let dealer = (Dealer*)(raw else return)
-    while true:
-        let item = dealer.next.add(1, .relaxed)
-        if item >= dealer.count:
-            return
-        dealer.work(dealer.context, item)
-
-## `work(context, item)` for every item in 0..<`count`, on up to 16
-## processors; the items go to whichever thread is free next.
+## `work(context, item)` for every item in 0..<`count`, on the worker pool (at
+## most 16 threads, this one among them); the items go to whichever thread is
+## free next.
 pub func each(count: usize, context: void*?, work: func(void*?, usize) -> unit):
-    if count == 0:
-        return
-    var dealer = Dealer(context = context, work = work, count = count)
-    let workers = math.imin(math.imin(16, math.imax(1, (i64)os.cpus())), (i64)count)
-    var handles: thread.Handle[16]
-    var started: usize = 0
-    for worker in 1..<(usize)workers:
-        # A thread that cannot start leaves its share to the others.
-        handles[started] = thread.spawn(deal, (void*)&dealer, name = "selection") catch failure:
-            break
-        started += 1
-    deal((void*)&dealer)
-    for index in 0..<started:
-        handles[index].join() catch failure:
-            trap("a selection thread failed to join")
+    pool.run(count, work, context, limit = 16)

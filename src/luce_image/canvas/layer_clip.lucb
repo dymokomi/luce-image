@@ -15,6 +15,85 @@
 #
 #==============================================================================================
 
+extend Canvas:
+    ## Copy layer `id` whole — pixels, mask, style, text, a group with all it
+    ## holds — on top of the layers copied so far, to paste here or into
+    ## another document; `forget_copied_layers` starts afresh. The app puts
+    ## `copied_layer_names` on the system clipboard (not for a drag between
+    ## documents).
+    pub mutating func copy_layer(id: i64) -> !:
+        try self.require_open()
+        try self.require_idle()
+        let document = self.document else error(invalid, "draw the document once before copying layers")
+        if let clip = layer_clip:
+            if clip.width != self.extent_x or clip.height != self.extent_y:
+                clear_layer_clip()
+        if layer_clip == none:
+            let records = try alloc Record[8] in memory.heap
+            errdefer free(records) in memory.heap
+            let layers = try alloc Layer*[4] in memory.heap
+            errdefer free(layers) in memory.heap
+            var names: str = ""
+            with memory.heap:
+                names = try strings.copy("")
+            layer_clip = try new LayerClip(layers = layers, layer_count = 0, records = records, record_count = 0, width = self.extent_x, height = self.extent_y, names = names) in memory.heap
+            # No pixels copied with these yet.
+            copied_width = 0
+            copied_height = 0
+        let clip = layer_clip else trap("just made")
+        if clip.layer_count == clip.layers.length:
+            let grown = try alloc Layer*[clip.layers.length * 2] in memory.heap
+            memory.copy(grown, clip.layers, clip.layer_count)
+            free(clip.layers) in memory.heap
+            clip.layers = grown
+        let snapshot = try document.snapshot((u64)id)
+        errdefer release_snapshot(snapshot)
+        try keep_records(&self, clip, snapshot)
+        clip.layers[clip.layer_count] = snapshot
+        clip.layer_count += 1
+        var names: str = ""
+        with memory.heap:
+            if clip.names.length > 0:
+                let parts: str[2] = [clip.names, snapshot.name]
+                names = try strings.join(parts, "\n")
+            else:
+                names = try strings.copy(snapshot.name)
+        strings.release(clip.names)
+        clip.names = names
+
+    ## Forget the copied layers.
+    pub static func forget_copied_layers():
+        clear_layer_clip()
+
+    ## The copied layers' names, a line each, as the system clipboard's text.
+    pub static func copied_layer_names() -> interop.Owned[str]!:
+        let clip = layer_clip else return try interop.copy_text("")
+        return try interop.copy_text(clip.names)
+
+    ## Whether Paste should take the copied layers, the system clipboard holding
+    ## a picture of `width` by `height` (and `text` when it holds none, `picture`
+    ## false): some are copied and the clipboard still holds what copying them
+    ## put there, their pixels or their names.
+    pub static func copied_layers_held(picture: bool, width: i64, height: i64, text: str) -> bool:
+        let clip = layer_clip else return false
+        if picture:
+            return copied_width != 0 and width == (i64)copied_width and height == (i64)copied_height
+        return text == clip.names
+
+    ## How many layers are copied.
+    pub static func copied_layers() -> i64:
+        let clip = layer_clip else return 0
+        return (i64)clip.layer_count
+
+    ## The copied layers into group `parent` (0 the top level) from `position`
+    ## up among its layers (negative: on top), as one step; the topmost's id.
+    ## They land where they were on a canvas of the same size or `in_place`,
+    ## else centred.
+    pub mutating func paste_layers(parent: i64, position: i64, in_place: bool = false) -> i64!:
+        try self.begin_edit("Paste Layers")
+        defer self.end_edit()
+        return try paste_layer_clip(&self, parent, position, in_place)
+
 struct LayerClip:
     ## Snapshots of the copied layers, bottom to top.
     var layers: Layer*[]
@@ -41,48 +120,6 @@ func clear_layer_clip():
     release_records(clip.records, clip.record_count)
     strings.release(clip.names)
     free(clip) in memory.heap
-
-## `Canvas.copy_layer`: layer `id` of `canvas`, with all it holds, added on top
-## of the copied layers; copying from another canvas starts afresh.
-func copy_layer_to_clip(canvas: Canvas*, id: i64) -> !:
-    try canvas.require_open()
-    try canvas.require_idle()
-    let document = canvas.document else error(invalid, "draw the document once before copying layers")
-    if let clip = layer_clip:
-        if clip.width != canvas.extent_x or clip.height != canvas.extent_y:
-            clear_layer_clip()
-    if layer_clip == none:
-        let records = try alloc Record[8] in memory.heap
-        errdefer free(records) in memory.heap
-        let layers = try alloc Layer*[4] in memory.heap
-        errdefer free(layers) in memory.heap
-        var names: str = ""
-        with memory.heap:
-            names = try strings.copy("")
-        layer_clip = try new LayerClip(layers = layers, layer_count = 0, records = records, record_count = 0, width = canvas.extent_x, height = canvas.extent_y, names = names) in memory.heap
-        # No pixels copied with these yet.
-        copied_width = 0
-        copied_height = 0
-    let clip = layer_clip else trap("just made")
-    if clip.layer_count == clip.layers.length:
-        let grown = try alloc Layer*[clip.layers.length * 2] in memory.heap
-        memory.copy(grown, clip.layers, clip.layer_count)
-        free(clip.layers) in memory.heap
-        clip.layers = grown
-    let snapshot = try document.snapshot((u64)id)
-    errdefer release_snapshot(snapshot)
-    try keep_records(canvas, clip, snapshot)
-    clip.layers[clip.layer_count] = snapshot
-    clip.layer_count += 1
-    var names: str = ""
-    with memory.heap:
-        if clip.names.length > 0:
-            let parts: str[2] = [clip.names, snapshot.name]
-            names = try strings.join(parts, "\n")
-        else:
-            names = try strings.copy(snapshot.name)
-    strings.release(clip.names)
-    clip.names = names
 
 ## The records of `layer` and all it holds, copied into `clip`.
 func keep_records(canvas: Canvas*, clip: LayerClip*, layer: const Layer*) -> !:

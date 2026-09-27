@@ -7,6 +7,7 @@
 import gpu
 import memory
 import math
+import transfer
 from tiles import Tiles
 from luce_image.document import Document
 from luce_image.filter import Filters
@@ -121,12 +122,14 @@ func smooth(low: f64, high: f64, value: f64) -> f64:
     let t = math.clamp((value - low) / (high - low), 0.0, 1.0)
     return t * t * (3.0 - 2.0 * t)
 
+
+
+## A linear component clamped to 0..1, sRGB-encoded.
 func encode(linear: f64) -> f64:
-    let v = math.clamp(linear, 0.0, 1.0)
-    return v * 12.92 if v <= 0.0031308 else 1.055 * math.pow(v, 1.0 / 2.4) - 0.055
+    return transfer.srgb_encode(math.clamp(linear, 0.0, 1.0))
 
 func decode(encoded: f64) -> f64:
-    return encoded / 12.92 if encoded <= 0.04045 else math.pow((encoded + 0.055) / 1.055, 2.4)
+    return transfer.srgb_decode(encoded)
 
 test "bloom spreads a bright spot's light around it; tonal contrast pushes an edge apart":
     var device = gpu.Device.open() catch failure:

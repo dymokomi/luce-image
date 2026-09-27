@@ -10,8 +10,7 @@ from `luce_image.image` and use explicit `try` and reference release.
   max_pixels=268435456)` snapshots the encoded file and probes the selected page
   or part. Pixel decoding is lazy.
 - `Image.open_bytes(data, threads=4, frame=0, max_bytes=1073741824,
-  max_pixels=268435456)` copies encoded bytes. There is no source directory for
-  resolving Cryptomatte sidecars.
+  max_pixels=268435456)` copies encoded bytes.
 - `Image.create(mode, width, height, color=none, max_bytes=1073741824)` allocates
   initialized pixels. Default is black with full alpha where applicable.
 - `Image.create_channels(width, height, names, kind=SampleType.float32,
@@ -32,7 +31,7 @@ uses 8-bit units; supply `a=1.0` when explicitly constructing floating RGBA colo
 `channel_index(name)`, `source_path()`.
 
 `load()` decodes once; `is_loaded()` reports pixel availability. `workers_used()`
-reports actual chunk workers after load. `close()` is idempotent. Closing any
+reports how many threads the chunks were spread over after load. `close()` is idempotent. Closing any
 managed alias invalidates the image for all aliases. `copy()` makes an independent
 image with copied metadata.
 
@@ -57,10 +56,6 @@ lazy pixel storage.
   This is numeric conversion, not ICC or transfer-function conversion. It drops
   metadata and resets the origin. Use explicit sample access for signed/HDR AOVs.
 
-Never bilinearly filter Cryptomatte ID channels, apply color transforms to them,
-or convert them to HALF. Extract a coverage mask first; that mask can be resized
-or converted for display normally.
-
 ## Metadata and output
 
 `metadata_count()`, `metadata_key(index)`, `metadata(name)`,
@@ -68,7 +63,7 @@ or converted for display normally.
 
 `metadata` reads string attributes; typed attributes require `metadata_bytes`.
 Missing attributes return empty text/bytes. The setter writes a string attribute;
-it is primarily for EXR/Cryptomatte metadata. Structural EXR fields such as
+it is primarily for EXR metadata. Structural EXR fields such as
 channels/compression/windows are regenerated on save, not controlled by string
 attributes. `set_origin(x, y)` updates the image's data-window origin with int32
 bounds checks.

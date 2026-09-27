@@ -14,6 +14,45 @@
 #
 #==============================================================================================
 
+extend Canvas:
+    ## Select › Transform Selection: begin reshaping the selection's outline
+    ## (the pixels stay); `preview_selection_transform` or
+    ## `preview_selection_distort` show it, `end_selection_transform` keeps it
+    ## as one step or puts it back.
+    pub mutating func begin_selection_transform() -> !:
+        try self.require_open()
+        if self.selection_warping != none:
+            error(invalid, "the selection is already being transformed")
+        if not self.has_selection():
+            error(invalid, "nothing is selected to transform")
+        let origin = try self.live().copy()
+        self.selection_warping = try new SelectionWarping(origin = origin, warp = none, levels = LevelOrigin(selection = none, level = 0),
+                                                            shown = Shown(selection = none, level = 0), shown_box = CellBox(), shown_current = false) in memory.heap
+
+    pub func transforming_selection() -> bool:
+        return self.selection_warping != none
+
+    ## The selection as it began, its box's corners moved to `c0`..`c7` (x, y
+    ## pairs clockwise from the top left): Distort and Perspective.
+    pub mutating func preview_selection_distort(left: f64, top: f64, width: f64, height: f64, c0: f64, c1: f64, c2: f64, c3: f64, c4: f64, c5: f64, c6: f64, c7: f64) -> !:
+        let corners: f64[8] = [c0, c1, c2, c3, c4, c5, c6, c7]
+        try show_selection_warp(&self, try quad_warp(left, top, width, height, corners))
+
+    ## Keep the reshaped selection as one step, or put back the one it began from.
+    pub mutating func end_selection_transform(keep: bool) -> !:
+        let session = self.selection_warping else return
+        if keep:
+            if let warp = session.warp:
+                var moved = try session.origin.copy()
+                errdefer moved.destroy()
+                try moved.warp(warp)
+                # History records the state before the change: the live one, still the origin.
+                try self.remember_state("Transform Selection")
+                var live = self.live()
+                live.destroy()
+                *live = moved
+        drop_selection_transform(&self)
+
 ## Transform Selection while the box is up.
 struct SelectionWarping:
     ## The selection it began from, as the live one stays meanwhile.
@@ -27,17 +66,6 @@ struct SelectionWarping:
     var shown: Shown
     var shown_box: CellBox
     var shown_current: bool
-
-## `Canvas.begin_selection_transform`.
-func begin_selection_transform(canvas: Canvas*) -> !:
-    try canvas.require_open()
-    if canvas.selection_warping != none:
-        error(invalid, "the selection is already being transformed")
-    if not canvas.has_selection():
-        error(invalid, "nothing is selected to transform")
-    let origin = try canvas.live().copy()
-    canvas.selection_warping = try new SelectionWarping(origin = origin, warp = none, levels = LevelOrigin(selection = none, level = 0),
-                                                        shown = Shown(selection = none, level = 0), shown_box = CellBox(), shown_current = false) in memory.heap
 
 ## Show the selection it began from through `warp`, from the next frame.
 func show_selection_warp(canvas: Canvas*, warp: Warp) -> !:
@@ -68,22 +96,6 @@ func level_warp(warp: Warp, level: u32) -> Warp:
     let up = Warp(m = [scale, 0.0, 0.0, 0.0, scale, 0.0, 0.0, 0.0, 1.0])
     let down = Warp(m = [1.0 / scale, 0.0, 0.0, 0.0, 1.0 / scale, 0.0, 0.0, 0.0, 1.0])
     return multiply(down, multiply(warp, up))
-
-## `Canvas.end_selection_transform`: keep the selection warped at full size
-## as one step, recorded against the one it began from, or leave that one.
-func end_selection_transform(canvas: Canvas*, keep: bool) -> !:
-    let session = canvas.selection_warping else return
-    if keep:
-        if let warp = session.warp:
-            var moved = try session.origin.copy()
-            errdefer moved.destroy()
-            try moved.warp(warp)
-            # History records the state before the change: the live one, still the origin.
-            try canvas.remember_state("Transform Selection")
-            var live = canvas.live()
-            live.destroy()
-            *live = moved
-    drop_selection_transform(canvas)
 
 ## Let a selection transform go with all it holds (ended, or the canvas closing).
 func drop_selection_transform(canvas: Canvas*):

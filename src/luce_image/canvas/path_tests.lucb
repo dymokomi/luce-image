@@ -1,4 +1,4 @@
-## Tests for pen paths (path_layers.lucb).
+## Tests for pen paths (luce-vector's vector/paths.lucb).
 
 test "a pen path is a curved shape layer: drawn, undone, moved, restyled and saved":
     var canvas = try Canvas(64, 48)

@@ -1,0 +1,9 @@
+## FNV-1a over 64-bit words, byte by byte: the digests the compositor's caches key on.
+pub func fnv_start() -> u64:
+    return 14695981039346656037
+
+pub func fnv_mix(digest: u64, value: u64) -> u64:
+    var mixed = digest
+    for shift in 0..<(u64)8:
+        mixed = (mixed ^ ((value >> (shift * 8)) & 0xff)) *% 1099511628211
+    return mixed

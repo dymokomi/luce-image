@@ -56,8 +56,7 @@ struct Bands:
             let left = (u32)index * strip_width
             bands.strips[index] = try gpu.Texture.create(device, min_u32(strip_width, canvas.extent_x - left), tile_size, gpu.Format.rgba8_linear)
         var steps: u8[4097] = ---
-        for step in 0..<(usize)4097:
-            steps[step] = srgb_byte((f64)step / 4096.0)
+        transfer.srgb_byte_table(steps)
         bands.table = try gpu.Texture.create(device, 4097, 1, gpu.Format.r8)
         try bands.table.upload(steps)
         bands.shader = try gpu.Shader.create(device, encode_frag_words, encode_frag_msl)
@@ -162,9 +161,3 @@ struct Bands:
 
 func max_usize(a: usize, b: usize) -> usize:
     return a if a > b else b
-
-## A linear component as an 8-bit sRGB value.
-func srgb_byte(linear: f64) -> u8:
-    let v = math.clamp(linear, 0.0, 1.0)
-    let encoded = v * 12.92 if v <= 0.0031308 else 1.055 * math.pow(v, 1.0 / 2.4) - 0.055
-    return (u8)math.floor(encoded * 255.0 + 0.5)

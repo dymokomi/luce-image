@@ -24,12 +24,12 @@ gives 128. Mixing linear light gives 188, which is visibly lighter than Photosho
   compositor's cache keys and the layer-effects keys include it. The `.l2d`
   manifest stores it as `/document/linear_blend`, which is why the package format
   is now version 5. `Document.mixing(on_mask)` hands each edit a `Mixing` value
-  (blending.lucb) that holds the flag and converts the colors the edit brings.
+  (luce-painting's `mixing`) that holds the flag and converts the colors the edit brings.
 - **Masks are gray levels, never encoded.** A mask's or selection's values are
   coverage. They mix as they are in both modes. A color painted into a mask lands
   as its encoded level, as in Photoshop: 50% gray paints 50%.
 - **CPU paths do the same.** Smudge encodes a cell's samples as it reads them in.
-  It uses a 64K table of half floats and decodes through a 4097-step table, so
+  It uses a 64K table of half floats and decodes through luce-color's 4097-step `SrgbTable`, so
   a dab costs no power functions. Spot healing, Bloom and Tonal Contrast, and the
   whole-picture export matte encode and decode directly.
 
@@ -40,12 +40,12 @@ gives 128. Mixing linear light gives 188, which is visibly lighter than Photosho
 | Layer compositing, all 26 blend modes, opacity and fill, masks, clipping, groups | `composite.frag` |
 | Adjustment layers mixed back by opacity and mask; the Blur layer | `adjust_mix.frag`, `blur.frag` |
 | Merge Down | `composite.frag` |
-| Brush and eraser: dab colors and flow build-up (dabs carry encoded colors), the opacity cap, the stroke over the layer | `dab.frag`, `paint.frag` |
+| Brush and eraser: dab colors and flow build-up (dabs carry encoded colors), the opacity cap, the stroke over the layer | luce-painting's `dab.frag`, `paint.frag` |
 | Clone Stamp, blur tool, dodge/burn, healing laid through the stroke | `paint.frag` (effect modes) |
-| Smudge | `warp.lucb` (CPU) |
+| Smudge | luce-painting's `smudge` (CPU) |
 | Spot healing's patch | `retouch_effects.lucb` (CPU) |
 | Fills at any opacity, and feathered selection edges | `paint.frag` |
-| Gradients: the stops interpolate as encoded values | `gradient.frag` |
+| Gradients: the stops interpolate as encoded values | luce-painting's `gradient.frag` |
 | Edits kept within a soft selection (adjustments, filters, previews) | `mask_mix.frag` |
 | Move and copy of selected pixels | `lift.frag` |
 | Gaussian blur: the first pass encodes, the second decodes | `blur.frag` |

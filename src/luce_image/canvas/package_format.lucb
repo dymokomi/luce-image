@@ -170,40 +170,10 @@ func encode_tile_record(context: void*?, texels: const u8[], into: u8[]) -> usiz
 
 # -- Work spread over the processors.
 
-## Tasks `0..<count` of `task(context, index)`, taken in turn by up to one
-## thread a processor (the caller's among them).
-struct SpreadWork:
-    var next: @usize
-    var count: usize
-    var context: void*?
-    var task: func(void*?, usize) -> unit
-
-func spread_entry(context: void*?):
-    spread_drain((SpreadWork*)(context else return))
-
-func spread_drain(work: SpreadWork*):
-    while true:
-        let index = work.next.add(1, .relaxed)
-        if index >= work.count:
-            return
-        work.task(work.context, index)
-
+## `task(context, index)` for every index in 0..<`count` on the worker pool, at
+## most 16 threads.
 func spread(count: usize, context: void*?, task: func(void*?, usize) -> unit) -> !:
-    var work = SpreadWork(count = count, context = context, task = task)
-    let workers = (usize)math.imin(16, math.imax(1, (i64)os.cpus()))
-    if workers <= 1 or count <= 1:
-        spread_drain(&work)
-        return
-    var handles: thread.Handle[16]
-    var started: usize = 0
-    for share in 1..<(workers if workers < count else count):
-        handles[started] = thread.spawn(spread_entry, (void*)&work, name = "l2d-tiles") catch failure:
-            discard(failure)
-            break
-        started += 1
-    spread_drain(&work)
-    for index in 0..<started:
-        try handles[index].join()
+    pool.run(count, task, context, limit = 16)
 
 # -- A file written and read in whole pieces.
 
