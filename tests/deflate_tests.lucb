@@ -1,10 +1,10 @@
 ## The deflate regression driver tests/run.py builds in every compiler mode: it
 ## inflates a packed file and checks it against the raw one.
-import files
+import luce_std.files
 import memory
 import c
-from binary import Buffer
-import compress
+from luce_raster.binary import Buffer
+import luce_compress.compress
 
 pub func main(arguments: str[]) -> i32!:
     let raw = try files.read((c.str)arguments[1])

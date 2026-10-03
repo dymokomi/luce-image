@@ -1,4 +1,4 @@
-from image import Image
+from luce_image.image import Image
 
 pub func main(arguments: list[str]) -> int!:
     if arguments.length != 2:

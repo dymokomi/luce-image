@@ -2,16 +2,16 @@
 ## decodes one picture (PNG, JPEG, EXR or TIFF) to raw samples and re-encodes it
 ## in a chosen format, for the Python checks in tests/ to compare against their
 ## reference readers.
-import files
+import luce_std.files
 import memory
 import c
 import strings
-import png
-import tiff
-import exr
-import jpeg
-from raster import Raster
-from binary import Buffer, double_bits
+import luce_png.png
+import luce_tiff.tiff
+import luce_exr.exr
+import luce_jpeg.jpeg
+from luce_raster.model import Raster
+from luce_raster.binary import Buffer, double_bits
 
 pub func main(arguments: str[]) -> i32!:
     var raster = Raster()

@@ -37,7 +37,7 @@ Its public imports are `image` (the `Image` API), `canvas` (the layered-document
 engine) and `brush_files` (brush masks from pictures and files, kept as PNG).
 
 ```luce
-from image import Image
+from luce_image.image import Image
 
 pub func main(arguments: list[str]) -> int!:
     let image = Image.open(arguments[0], threads = 4)
@@ -99,9 +99,9 @@ It does not build into, modify, or update the language repositories. Supply
 `--base /path/to/luce-base --luce /path/to/luce` to the test runner to test other
 compiler versions instead. See [testing](docs/TESTING.md) for dependencies and CI.
 
-The GPU shaders are GLSL under `src/luce_image/shaders/`; after changing one, regenerate
-`src/luce_image/shaders.lucb` with luce-gpu's generator (needs `glslangValidator` and `spirv-cross`):
-`python3 ../luce-gpu/tools/embed_shaders.py --public -I ../luce-color/shaders src/luce_image/shaders.lucb src/luce_image/shaders/composite.frag src/luce_image/shaders/adjust.frag src/luce_image/shaders/blur.frag src/luce_image/shaders/ants.frag src/luce_image/shaders/warp.frag src/luce_image/shaders/spread.frag src/luce_image/shaders/style.frag src/luce_image/shaders/lift.frag src/luce_image/shaders/mask_mix.frag src/luce_image/shaders/adjust_mix.frag src/luce_image/shaders/resample.frag src/luce_image/shaders/float.frag src/luce_image/shaders/encode.frag src/luce_image/shaders/liquify.frag src/luce_image/shaders/quickmask.frag src/luce_image/shaders/mesh.frag src/luce_image/shaders/channels.frag src/luce_image/shaders/transfer.frag` (this order keeps the generated file stable). `srgb.glsl`, the sRGB curve the
+The GPU shaders are GLSL under `src/shaders/`; after changing one, regenerate
+`src/shaders.lucb` with luce-gpu's generator (needs `glslangValidator` and `spirv-cross`):
+`python3 ../luce-gpu/tools/embed_shaders.py --public -I ../luce-color/shaders src/shaders.lucb src/shaders/composite.frag src/shaders/adjust.frag src/shaders/blur.frag src/shaders/ants.frag src/shaders/warp.frag src/shaders/spread.frag src/shaders/style.frag src/shaders/lift.frag src/shaders/mask_mix.frag src/shaders/adjust_mix.frag src/shaders/resample.frag src/shaders/float.frag src/shaders/encode.frag src/shaders/liquify.frag src/shaders/quickmask.frag src/shaders/mesh.frag src/shaders/channels.frag src/shaders/transfer.frag` (this order keeps the generated file stable). `srgb.glsl`, the sRGB curve the
 shaders mix through, is luce-color's.
 
 Documentation: [API](docs/API.md), [formats](docs/FORMATS.md),

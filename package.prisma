@@ -1,130 +1,118 @@
 #prisma 4.0
 def package "luce-image" {
     str owner = "dymokomi"
-    str version = "0.41.0"
+    str version = "0.42.0"
     str kind = "package"
     str language = "luce-base"
     str description = "The layered-document engine behind luced-2d: layers, GPU compositing, selections, painting, filters, transforms and history over shared GPU tiles, with a Pillow-inspired Image API and Cryptomatte 1.2."
     str readme = "README.md"
-
-    def export "image" {
-        str module = "luce_image.image"
-    }
-
-    def export "canvas" {
-        str module = "luce_image.canvas"
-    }
-
-    def export "brush_files" {
-        str module = "luce_image.brush_files"
-    }
+    str[] public = ["brush_files", "canvas", "image"]
 
     def dependency "luce-prism" {
         str owner = "dymokomi"
-        str version = "^0.1.0"
+        str version = "^0.2.0"
         str path = "../luce-prism"
     }
 
     def dependency "luce-raster" {
         str owner = "dymokomi"
-        str version = "^0.1.0"
+        str version = "^0.2.0"
         str path = "../luce-raster"
     }
 
     def dependency "luce-compress" {
         str owner = "dymokomi"
-        str version = "^0.2.2"
+        str version = "^0.4.0"
         str path = "../luce-compress"
     }
 
     def dependency "luce-png" {
         str owner = "dymokomi"
-        str version = "^0.3.1"
+        str version = "^0.4.0"
         str path = "../luce-png"
     }
 
     def dependency "luce-jpeg" {
         str owner = "dymokomi"
-        str version = "^0.4.0"
+        str version = "^0.5.0"
         str path = "../luce-jpeg"
     }
 
     def dependency "luce-tiff" {
         str owner = "dymokomi"
-        str version = "^0.1.4"
+        str version = "^0.2.0"
         str path = "../luce-tiff"
     }
 
     def dependency "luce-exr" {
         str owner = "dymokomi"
-        str version = "^0.2.0"
+        str version = "^0.3.0"
         str path = "../luce-exr"
     }
 
     def dependency "luce-psd" {
         str owner = "dymokomi"
-        str version = "^0.2.0"
+        str version = "^0.3.0"
         str path = "../luce-psd"
     }
 
     def dependency "luce-std" {
         str owner = "dymokomi"
-        str version = "^0.1.0"
+        str version = "^0.2.0"
         str path = "../luce-std"
     }
 
-
     def dependency "luce-color" {
         str owner = "dymokomi"
-        str version = "^0.2.3"
+        str version = "^0.3.0"
         str path = "../luce-color"
     }
 
     def dependency "luce-heic" {
         str owner = "dymokomi"
-        str version = "^0.1.0"
+        str version = "^0.2.0"
         str path = "../luce-heic"
     }
 
     def dependency "luce-raw" {
         str owner = "dymokomi"
-        str version = "^0.3.1"
+        str version = "^0.4.0"
         str path = "../luce-raw"
     }
 
     def dependency "luce-svg" {
         str owner = "dymokomi"
-        str version = "^0.4.6"
+        str version = "^0.5.0"
         str path = "../luce-svg"
     }
 
     def dependency "luce-vector" {
         str owner = "dymokomi"
-        str version = "^0.1.0"
+        str version = "^0.2.0"
         str path = "../luce-vector"
     }
 
     def dependency "luce-painting" {
         str owner = "dymokomi"
-        str version = "^0.1.0"
+        str version = "^0.2.0"
         str path = "../luce-painting"
     }
 
     def dependency "luce-canvas" {
         str owner = "dymokomi"
-        str version = "^0.1.22"
+        str version = "^0.2.0"
         str path = "../luce-canvas"
     }
 
     def dependency "luce-gpu" {
         str owner = "dymokomi"
-        str version = "^0.1.16"
+        str version = "^0.2.0"
         str path = "../luce-gpu"
     }
 
     def dependency "luce-fonts" {
         str owner = "dymokomi"
-        str version = "^0.2.0"
+        str version = "^0.3.0"
         str path = "../luce-fonts"
     }
 

@@ -1,0 +1,35 @@
+## Independent chunks of a raster (TIFF strips and tiles, EXR chunks) decoded on
+## the worker pool; no decoder state is shared.
+import luce_canvas.pool
+from luce_raster.model import Raster
+from luce_raster.errors import corrupt, invalid
+
+struct Work:
+    var image: Raster*
+    var decode: func(Raster*, usize) -> unit!
+    var failed: @bool
+
+func decode_entry(context: void*?, index: usize):
+    let work = (Work*)(context else return)
+    if work.failed.load(.acquire):
+        return
+    work.decode(work.image, index) catch failure:
+        work.failed.store(true, .release)
+
+## Every chunk of `image` through `operation` on at most `threads` threads (1..64);
+## how many threads the chunks were spread over.
+pub func decode(image: Raster*, operation: func(Raster*, usize) -> unit!, threads: usize) -> usize!:
+    if threads < 1 or threads > 64:
+        error(invalid, "thread count must be in 1-64")
+    let count = image.chunks.length
+    let n = threads if threads < count else count
+    if n <= 1:
+        for i in 0..<count:
+            try operation(image, i)
+        return 1
+    var work = Work(image = image, decode = operation)
+    pool.run(count, decode_entry, (void*)&work, limit = n)
+    if work.failed.load(.acquire):
+        error(corrupt, "image chunk decode failed; retry with threads=1 for detailed error")
+    let width = pool.width()
+    return n if n < width else width

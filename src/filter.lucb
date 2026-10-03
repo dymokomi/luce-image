@@ -1,0 +1,428 @@
+## Destructive filters over a layer's tiles, made once when applied (and for
+## a dialog's preview), never re-evaluated. A Gaussian blur is two separable
+## passes; each output tile samples its own input tile and the two neighbours
+## along the pass, so the radius is limited to one tile (256 pixels). Motion
+## Blur and Lens Correction sample the whole layer flattened into one texture
+## (resample.frag). Noise is made on the CPU, the same for the same seed;
+## Bloom and Tonal Contrast (light_filters.lucb) mix a blurred copy back in.
+## Blurs and resampling mix a document's colors as it blends them (`srgb`:
+## as sRGB-encoded values, Photoshop's default), a mask's values as they are.
+import luce_gpu.gpu
+import memory
+import luce_std.math
+import luce_color.transfer
+from luce_canvas.tiles import Tiles, tile_size, box, unbox, flatten, tile_texture
+from document import Document
+from transform_window import Footprint, gather
+from luce_canvas.pyramid import Pyramid, tile_bytes
+from shaders import blur_frag_words, blur_frag_msl, resample_frag_words, resample_frag_msl
+from luce_raster.errors import invalid
+
+pub struct Filters:
+    var owner: gpu.Device
+    var blur_shader: gpu.Shader
+    var blur: gpu.Pipeline
+    var resample_shader: gpu.Shader
+    var resample: gpu.Pipeline
+    var blank: gpu.Texture
+
+    pub static func create(device: gpu.Device) -> Filters!:
+        var blur_shader = try gpu.Shader.create(device, blur_frag_words, blur_frag_msl)
+        errdefer blur_shader.destroy()
+        var blur = try gpu.Pipeline.create(device, blur_shader, gpu.Blend.replace, gpu.Format.rgba16_float)
+        errdefer blur.destroy()
+        var resample_shader = try gpu.Shader.create(device, resample_frag_words, resample_frag_msl)
+        errdefer resample_shader.destroy()
+        var resample = try gpu.Pipeline.create(device, resample_shader, gpu.Blend.replace, gpu.Format.rgba16_float)
+        errdefer resample.destroy()
+        var blank = try tile_texture(device)
+        errdefer blank.destroy()
+        let zeros = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+        defer free(zeros) in memory.heap
+        for index in 0..<zeros.length:
+            zeros[index] = 0
+        try blank.upload(zeros)
+        return Filters(owner = device, blur_shader = blur_shader, blur = blur, resample_shader = resample_shader, resample = resample, blank = blank)
+
+    ## Blur `layer` with a Gaussian of `radius` pixels (0.5..250; taps reach
+    ## three sigma, at most one tile).
+    pub func gaussian_blur(document: Document*, layer: u64, radius: f64, on_mask: bool = false) -> !:
+        if not math.is_finite(radius) or radius < 0.5 or radius > 250.0:
+            error(invalid, "blur radius must be 0.5..250 pixels")
+        let target = document.find(layer) else error(invalid, "no such layer")
+        try self.blur_tiles(try target.edited_tiles(on_mask), radius, document.mixes_encoded(on_mask))
+        target.revision += 1
+
+    ## `tiles` blurred with a Gaussian of `radius` pixels (0.5..250), mixing
+    ## sRGB-encoded values with `srgb`: the first pass encodes what it reads,
+    ## the second decodes what it writes.
+    pub func blur_tiles(tiles: Tiles*, radius: f64, srgb: bool) -> !:
+        let sigma = radius
+        let taps = math.min(255.0, math.ceil(sigma * 3.0))
+        try self.pass(tiles, taps, sigma, true, srgb)
+        try self.pass(tiles, taps, sigma, false, srgb)
+
+    ## Filter › Blur › Motion Blur: `layer` smeared `distance` pixels (1..999)
+    ## along `angle` degrees (0 is left to right, 90 upwards).
+    pub func motion_blur(document: Document*, layer: u64, angle: f64, distance: f64, on_mask: bool = false) -> !:
+        if not math.is_finite(angle) or not math.is_finite(distance) or distance < 1.0 or distance > 999.0:
+            error(invalid, "a motion blur goes 1..999 pixels at a finite angle")
+        try self.resampled(document, layer, 0.0, angle * math.pi / 180.0, distance, 0.0, on_mask)
+
+    ## Filter › Lens Correction: barrel (positive `distortion`, -1..1) or
+    ## pincushion straightened, and red-cyan and blue-yellow fringes (-1..1)
+    ## moved back into line.
+    pub func lens_correction(document: Document*, layer: u64, distortion: f64, red_cyan: f64, blue_yellow: f64, on_mask: bool = false) -> !:
+        if not within_one(distortion) or not within_one(red_cyan) or not within_one(blue_yellow):
+            error(invalid, "lens corrections are -1..1")
+        try self.resampled(document, layer, 1.0, distortion, red_cyan, blue_yellow, on_mask)
+
+    ## Every cell of `layer` drawn anew by resample.frag's `kind`, each from a
+    ## window of the layer holding every place it reads: no texture the size of
+    ## the layer, so layers past 16384 pixels filter like small ones.
+    func resampled(document: Document*, layer: u64, kind: f64, a: f64, b: f64, c: f64, on_mask: bool) -> !:
+        let target = document.find(layer) else error(invalid, "no such layer")
+        let tiles = try target.edited_tiles(on_mask)
+        let empty = 1.0 if on_mask else 0.0
+        let srgb: f32 = document.srgb_flag(on_mask)
+        # Every window reads the layer as it was, while its cells are replaced.
+        var before = try tiles.clone()
+        defer before.destroy()
+        var pyramid = try Pyramid.create(self.owner, tile_bytes)
+        defer pyramid.destroy()
+        let width = (f64)tiles.width()
+        let height = (f64)tiles.height()
+        for row in 0..<tiles.rows():
+            for column in 0..<tiles.columns():
+                let reads = resample_reads(kind, a, b, c, (f64)(column * tile_size), (f64)(row * tile_size), width, height)
+                var window = try gather(self.owner, &before, &pyramid, reads, 0, on_mask, gpu.Color(empty, empty, empty, empty))
+                defer window.destroy()
+                let window_width = (f64)(try window.texture.width())
+                let window_height = (f64)(try window.texture.height())
+                var params: f32[16] = [(f32)kind, (f32)a, (f32)b, (f32)c, (f32)(column * tile_size), (f32)(row * tile_size), (f32)width, (f32)height,
+                                       (f32)window.left, (f32)window.top, (f32)window_width, (f32)window_height, srgb, 0.0, 0.0, 0.0]
+                let fresh = try self.resample_cell(tiles, &params, window.texture)
+                try tiles.set(column, row, fresh)
+        target.revision += 1
+
+    ## The device the filters draw on.
+    pub func device() -> gpu.Device:
+        return self.owner
+
+    ## resample.frag with `params` over `window`, into a tile of its own (a
+    ## preview's cell, handed to the compositor).
+    pub func resample_tile(params: f32[16]*, window: gpu.Texture) -> gpu.Texture!:
+        var fresh = try tile_texture(self.owner)
+        errdefer fresh.destroy()
+        let frame = try fresh.frame()
+        defer frame.release()
+        let area = try frame.value().target()
+        defer area.release()
+        try gpu.shade(area.value(), self.resample, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&(*params)[0], 64), [window], gpu.Filter.nearest)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        return fresh
+
+    func resample_cell(tiles: const Tiles*, params: f32[16]*, window: gpu.Texture) -> gpu.Texture!:
+        var fresh = try tiles.blank()
+        errdefer fresh.destroy()
+        let frame = try fresh.frame()
+        defer frame.release()
+        let area = try frame.value().target()
+        defer area.release()
+        try gpu.shade(area.value(), self.resample, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&(*params)[0], 64), [window], gpu.Filter.nearest)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        return fresh
+
+    ## Cell (`column`, `row`) of `tiles` as `blur_tiles` would leave it, made
+    ## alone: the horizontal pass over it and the cells above and below, then
+    ## the vertical pass over those three. None where it stays empty.
+    pub func blur_cell(tiles: const Tiles*, column: u32, row: u32, radius: f64, srgb: bool) -> gpu.Texture?!:
+        let taps = math.min(255.0, math.ceil(radius * 3.0))
+        # Zero textures stand for lines left empty; destroying one does nothing.
+        var across: gpu.Texture[3] = [gpu.Texture(), gpu.Texture(), gpu.Texture()]
+        var made: bool[3] = [false, false, false]
+        defer across[0].destroy()
+        defer across[1].destroy()
+        defer across[2].destroy()
+        for index in 0..<(usize)3:
+            let at = (i64)row + (i64)index - 1
+            if at < 0 or at >= (i64)tiles.rows():
+                continue
+            let line = (u32)at
+            let before = (try tiles.texture(column - 1, line)) if column > 0 else none
+            let after = (try tiles.texture(column + 1, line)) if column + 1 < tiles.columns() else none
+            let middle = (try tiles.texture(column, line))
+            if middle == none and before == none and after == none:
+                continue
+            across[index] = try self.blur_one(tiles.region(column, line).width, taps, radius, true, srgb, before, middle, after)
+            made[index] = true
+        if not made[0] and not made[1] and not made[2]:
+            return none
+        let up: gpu.Texture? = across[0] if made[0] else none
+        let here: gpu.Texture? = across[1] if made[1] else none
+        let down: gpu.Texture? = across[2] if made[2] else none
+        return try self.blur_one(tiles.region(column, row).height, taps, radius, false, srgb, up, here, down)
+
+    ## One pass of the blur over three tiles in a line, into a new tile; with
+    ## `srgb` the horizontal pass encodes and the vertical one decodes.
+    pub func blur_one(extent: u32, taps: f64, sigma: f64, horizontal: bool, srgb: bool, before: gpu.Texture?, middle: gpu.Texture?, after: gpu.Texture?) -> gpu.Texture!:
+        var params = blur_params(taps, sigma, horizontal, extent, srgb)
+        var fresh = try tile_texture(self.owner)
+        errdefer fresh.destroy()
+        let frame = try fresh.frame()
+        defer frame.release()
+        let whole = try frame.value().target()
+        defer whole.release()
+        try gpu.shade(whole.value(), self.blur, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 24),
+                      [before else self.blank, middle else self.blank, after else self.blank], gpu.Filter.nearest)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        return fresh
+
+    ## One direction over every tile that has pixels or a neighbour with pixels
+    ## within reach; tiles that stay empty stay `none`.
+    func pass(tiles: Tiles*, taps: f64, sigma: f64, horizontal: bool, srgb: bool) -> !:
+        var source = try tiles.clone()
+        defer source.destroy()
+        for row in 0..<tiles.rows():
+            for column in 0..<tiles.columns():
+                let middle = (try source.texture(column, row))
+                var before: gpu.Texture? = none
+                var after: gpu.Texture? = none
+                if horizontal:
+                    if column > 0:
+                        before = (try source.texture(column - 1, row))
+                    if column + 1 < tiles.columns():
+                        after = (try source.texture(column + 1, row))
+                else:
+                    if row > 0:
+                        before = (try source.texture(column, row - 1))
+                    if row + 1 < tiles.rows():
+                        after = (try source.texture(column, row + 1))
+                if middle == none and before == none and after == none:
+                    continue
+                let area = tiles.region(column, row)
+                var params = blur_params(taps, sigma, horizontal, area.width if horizontal else area.height, srgb)
+                var fresh = try tiles.blank()
+                errdefer fresh.destroy()
+                let frame = try fresh.frame()
+                defer frame.release()
+                let whole = try frame.value().target()
+                defer whole.release()
+                try gpu.shade(whole.value(), self.blur, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 24),
+                              [before else self.blank, middle else self.blank, after else self.blank], gpu.Filter.nearest)
+                discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+                try tiles.set(column, row, fresh)
+
+    pub mutating func destroy():
+        self.blank.destroy()
+        self.resample.destroy()
+        self.resample_shader.destroy()
+        self.blur.destroy()
+        self.blur_shader.destroy()
+
+func within_one(value: f64) -> bool:
+    return math.is_finite(value) and value >= -1.0 and value <= 1.0
+
+## blur.frag's parameters for one pass: with `srgb` the horizontal pass
+## encodes what it reads and the vertical one decodes what it writes.
+func blur_params(taps: f64, sigma: f64, horizontal: bool, extent: u32, srgb: bool) -> f32[6]:
+    return [(f32)taps, (f32)sigma, 1.0 if horizontal else 0.0, (f32)extent, 1.0 if srgb and horizontal else 0.0, 1.0 if srgb and not horizontal else 0.0]
+
+
+## A linear component clamped to 0..1, sRGB-encoded.
+func encode(linear: f64) -> f64:
+    return transfer.srgb_encode(math.clamp(linear, 0.0, 1.0))
+
+func decode(encoded: f64) -> f64:
+    return transfer.srgb_decode(encoded)
+
+test "a gaussian blur spreads across tile edges and keeps alpha weight":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var document = try Document.create(device, 512, 64)
+    defer document.destroy()
+    let layer = try document.add_layer("Dot")
+    let count = (usize)512 * 64 * 4
+    let pixels = try alloc f32[count] in memory.heap
+    defer free(pixels) in memory.heap
+    for index in 0..<count:
+        pixels[index] = 0.0
+    # An opaque red bar on the left tile, ending exactly at the tile edge.
+    for y in 0..<(usize)64:
+        for x in 200..<(usize)256:
+            pixels[(y * 512 + x) * 4] = 1.0
+            pixels[(y * 512 + x) * 4 + 3] = 1.0
+    var tiles = try Tiles.create(device, 512, 64)
+    try tiles.write(pixels)
+    try document.set_tiles(layer, tiles)
+    var filters = try Filters.create(device)
+    defer filters.destroy()
+    try filters.gaussian_blur(&document, layer, 4.0)
+    let current = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
+    try current.read(pixels)
+    # The bar bleeds into the right tile; color stays pure red where it bleeds.
+    let past = (32 * 512 + 258) * 4
+    assert(pixels[past + 3] > 0.05 and pixels[past + 3] < 0.6 and pixels[past] > 0.99)
+    assert(pixels[(32 * 512 + 228) * 4 + 3] > 0.99)
+    assert(pixels[(32 * 512 + 300) * 4 + 3] == 0.0)
+    var rejected = false
+    filters.gaussian_blur(&document, layer, 0.0) catch failure:
+        assert(failure.code == invalid)
+        rejected = true
+    assert(rejected)
+
+## Filter › Noise › Add Noise: Gaussian noise on `layer`'s encoded values with
+## a deviation of `amount` (0..1 of full scale), the same in every channel when
+## `monochrome`; where the layer is transparent nothing changes. The same
+## `seed` makes the same grain, so a preview holds still while it is tuned.
+## `uniform`: grain evenly spread over ±`amount`, as Photoshop's Uniform;
+## otherwise Gaussian with deviation `amount`.
+pub func add_noise(document: Document*, layer: u64, amount: f64, monochrome: bool, seed: u64, on_mask: bool = false, uniform: bool = false) -> !:
+    if not math.is_finite(amount) or amount < 0.0 or amount > 1.0:
+        error(invalid, "noise amount must be in 0..1")
+    let target = document.find(layer) else error(invalid, "no such layer")
+    let tiles = try target.edited_tiles(on_mask)
+    let count = (usize)tiles.width() * (usize)tiles.height()
+    let pixels = try alloc f32[count * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    try tiles.read(pixels)
+    for at in 0..<count:
+        if pixels[at * 4 + 3] <= 0.0:
+            continue
+        let shared = grain(seed, (u64)at, 0, uniform) * amount
+        for channel in 0..<(usize)3:
+            let offset = shared if monochrome else grain(seed, (u64)at, (u64)channel + 1, uniform) * amount
+            let encoded = math.clamp(encode((f64)pixels[at * 4 + channel]) + offset, 0.0, 1.0)
+            pixels[at * 4 + channel] = (f32)decode(encoded)
+    try tiles.write(pixels)
+    target.revision += 1
+
+## One grain sample: uniform in -1..1, or a standard normal one.
+func grain(seed: u64, at: u64, stream: u64, uniform: bool) -> f64:
+    if uniform:
+        return (f64)(mix_bits(seed, at, stream * 2) >> 11) / 9007199254740992.0 * 2.0 - 1.0
+    return gaussian(seed, at, stream)
+
+## A standard normal sample for pixel `at` in stream `stream`: Box-Muller over two hashed uniforms.
+func gaussian(seed: u64, at: u64, stream: u64) -> f64:
+    let first = (f64)(mix_bits(seed, at, stream * 2) >> 11) / 9007199254740992.0
+    let second = (f64)(mix_bits(seed, at, stream * 2 + 1) >> 11) / 9007199254740992.0
+    return math.sqrt(-2.0 * math.log(math.max(first, 1e-12))) * math.cos(2.0 * math.pi * second)
+
+## SplitMix64 over the seed, pixel and stream.
+func mix_bits(seed: u64, at: u64, stream: u64) -> u64:
+    var v = seed ^ (at *% 0x9E3779B97F4A7C15) ^ (stream *% 0xC2B2AE3D27D4EB4F)
+    v = (v ^ (v >> 30)) *% 0xBF58476D1CE4E5B9
+    v = (v ^ (v >> 27)) *% 0x94D049BB133111EB
+    return v ^ (v >> 31)
+
+
+test "noise moves an opaque grey the same way for the same seed and leaves transparency alone":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var document = try Document.create(device, 8, 1)
+    defer document.destroy()
+    let layer = try document.add_layer("Grey")
+    let pixels = try alloc f32[32] in memory.heap
+    defer free(pixels) in memory.heap
+    for at in 0..<(usize)8:
+        for channel in 0..<(usize)3:
+            pixels[at * 4 + channel] = 0.2140
+        pixels[at * 4 + 3] = 1.0 if at < 6 else 0.0
+    var tiles = try Tiles.create(device, 8, 1)
+    try tiles.write(pixels)
+    try document.set_tiles(layer, tiles)
+    try add_noise(&document, layer, 0.2, false, 7)
+    let current = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
+    try current.read(pixels)
+    var moved = 0
+    for at in 0..<(usize)6:
+        if math.abs((f64)pixels[at * 4] - 0.2140) > 0.001:
+            moved += 1
+    assert(moved >= 4 and pixels[6 * 4 + 3] == 0.0 and pixels[3] == 1.0)
+    let first = pixels[0]
+    # The same seed on the same grey makes the same grain; monochrome keeps channels together.
+    for at in 0..<(usize)6:
+        for channel in 0..<(usize)3:
+            pixels[at * 4 + channel] = 0.2140
+    try current.write(pixels)
+    try add_noise(&document, layer, 0.2, false, 7)
+    try current.read(pixels)
+    assert(pixels[0] == first)
+    for at in 0..<(usize)6:
+        for channel in 0..<(usize)3:
+            pixels[at * 4 + channel] = 0.2140
+    try current.write(pixels)
+    try add_noise(&document, layer, 0.2, true, 7)
+    try current.read(pixels)
+    assert(pixels[0] == pixels[1] and pixels[1] == pixels[2])
+
+test "a motion blur smears along its angle only; lens correction's stretch empties the corners":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var document = try Document.create(device, 300, 64)
+    defer document.destroy()
+    let layer = try document.add_layer("Dot")
+    let count = (usize)300 * 64 * 4
+    let pixels = try alloc f32[count] in memory.heap
+    defer free(pixels) in memory.heap
+    for index in 0..<count:
+        pixels[index] = 0.0
+    # An opaque red square across the tile edge at x 256.
+    for y in 28..<(usize)36:
+        for x in 252..<(usize)260:
+            pixels[(y * 300 + x) * 4] = 1.0
+            pixels[(y * 300 + x) * 4 + 3] = 1.0
+    var tiles = try Tiles.create(device, 300, 64)
+    try tiles.write(pixels)
+    try document.set_tiles(layer, tiles)
+    var filters = try Filters.create(device)
+    defer filters.destroy()
+    try filters.motion_blur(&document, layer, 0.0, 20.0)
+    let current = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
+    try current.read(pixels)
+    # Sideways it spreads, across the tile edge; above and below it does not.
+    assert(pixels[(32 * 300 + 266) * 4 + 3] > 0.05 and pixels[(32 * 300 + 245) * 4 + 3] > 0.05 and pixels[(24 * 300 + 256) * 4 + 3] < 0.01)
+    assert(pixels[(32 * 300 + 266) * 4] > 0.99)
+    # A full-frame layer keeps its size under a barrel correction, its corners emptied.
+    for index in 0..<count:
+        pixels[index] = 1.0
+    try current.write(pixels)
+    try filters.lens_correction(&document, layer, -1.0, 0.0, 0.0)
+    try current.read(pixels)
+    assert(pixels[(32 * 300 + 150) * 4 + 3] > 0.99 and pixels[(1 * 300 + 1) * 4 + 3] < 0.01)
+
+## The layer pixels resample.frag's `kind` reads for the cell at (`x0`, `y0`)
+## of a `width` by `height` layer, a margin for the taps, within the layer.
+pub func resample_reads(kind: f64, a: f64, b: f64, c: f64, x0: f64, y0: f64, width: f64, height: f64) -> Footprint:
+    var reads = Footprint(left = x0, top = y0, right = x0 + (f64)tile_size, bottom = y0 + (f64)tile_size)
+    if kind < 0.5:
+        # Motion blur: taps along the line, half the distance either way.
+        let half = b * 0.5 + 2.0
+        reads = Footprint(left = reads.left - half, top = reads.top - half, right = reads.right + half, bottom = reads.bottom + half)
+    else:
+        # Lens correction moves pixels along rays from the middle, and can fold
+        # near the corners: where a grid over the cell lands, for each channel.
+        var found = Footprint(left = 1.0e18, top = 1.0e18, right = -1.0e18, bottom = -1.0e18)
+        let centre_x = width * 0.5
+        let centre_y = height * 0.5
+        let reach = math.sqrt(centre_x * centre_x + centre_y * centre_y)
+        for step_y in 0..<(usize)17:
+            for step_x in 0..<(usize)17:
+                let x = x0 + (f64)step_x * (f64)tile_size / 16.0
+                let y = y0 + (f64)step_y * (f64)tile_size / 16.0
+                let dx = (x - centre_x) / reach
+                let dy = (y - centre_y) / reach
+                let scale = 1.0 - a * 0.5 * (dx * dx + dy * dy)
+                for shift in [0.0, b * 0.01, c * 0.01]:
+                    let px = centre_x + dx * (scale + shift) * reach
+                    let py = centre_y + dy * (scale + shift) * reach
+                    found = Footprint(left = math.min(found.left, px), top = math.min(found.top, py), right = math.max(found.right, px), bottom = math.max(found.bottom, py))
+        reads = Footprint(left = found.left - 4.0, top = found.top - 4.0, right = found.right + 4.0, bottom = found.bottom + 4.0)
+    return Footprint(left = math.max(0.0, reads.left), top = math.max(0.0, reads.top), right = math.min(width, reads.right), bottom = math.min(height, reads.bottom))

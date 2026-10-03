@@ -7,7 +7,7 @@
 ## places it instead on a new layer of a document 500 pixels bigger each way,
 ## centred, so off the cells' grid, as File › Import does. Peak memory is the
 ## caller's to measure (`/usr/bin/time -l`).
-import gpu
+import luce_gpu.gpu
 import thread
 import time
 from canvas import Canvas

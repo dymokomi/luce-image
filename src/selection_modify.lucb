@@ -1,0 +1,400 @@
+## Select › Modify over a selection's cells (selection_cells.lucb): expand or
+## contract by a square of `pixels`, then feather the edge with a box blur of
+## `feather`, each separable, a horizontal pass then a vertical one; Border (a
+## band of a width along the edge) and Smooth (a box blur taken back to a
+## narrow edge, rounding corners and dropping specks). Samples past the
+## document are clear in every pass.
+##
+## Only cells within reach of an edge change: a cell whose neighbourhood (the
+## cell and `pixels + feather` around it) is one value throughout keeps that
+## value, unless the value is selected and the neighbourhood runs past the
+## document, whose clear outside then eats in. Every other cell is worked out
+## on its own, on every processor, from a window of the cell plus that apron,
+## so the work and memory follow the selection's edge, not the document.
+import luce_std.math
+import memory
+from luce_canvas.tiles import tile_size
+from selection_cells import Cells, each
+
+## What a pass over the cells does.
+let kind_modify: i64 = 0
+let kind_border: i64 = 1
+let kind_smooth: i64 = 2
+
+## Expand (`pixels` > 0) or contract (< 0) `cells`, then feather by `feather`.
+pub func modify(cells: Cells*, pixels: i64, feather: i64) -> !:
+    try pass_cells(cells, kind_modify, pixels, feather, math.iabs(pixels) + feather)
+
+## Select › Modify › Border: the band `width` pixels wide centered on the
+## selection's edge, softened by a pixel.
+pub func border(cells: Cells*, width: i64) -> !:
+    let radius = (width + 1) // 2
+    try pass_cells(cells, kind_border, radius, 1, radius + 1)
+
+## Select › Modify › Smooth: each pixel as the mean of the square `radius`
+## around it, taken back to a narrow soft edge at half coverage.
+pub func smooth(cells: Cells*, radius: i64) -> !:
+    try pass_cells(cells, kind_smooth, 0, radius, radius)
+
+## One pass of `kind` over every cell within `apron` of an edge.
+func pass_cells(cells: Cells*, kind: i64, pixels: i64, feather: i64, apron: i64) -> !:
+    let count = cells.count()
+    # Which cells need working out; the rest keep (or take) one value.
+    let values = try alloc i64[count] in memory.heap
+    defer free(values) in memory.heap
+    var pending: usize = 0
+    for index in 0..<count:
+        values[index] = settled_value(cells, index, apron)
+        # A band along the edge: away from any edge there is none.
+        if kind == kind_border and values[index] > 0:
+            values[index] = 0
+        if values[index] < 0:
+            pending += 1
+    let items = try alloc usize[pending] in memory.heap
+    defer free(items) in memory.heap
+    # The cells as they were, shared, for the workers to read while each
+    # cell worked out gets a block of its own to write.
+    var before = try cells.copy()
+    defer before.destroy()
+    var at: usize = 0
+    for index in 0..<count:
+        if values[index] < 0:
+            items[at] = index
+            at += 1
+            discard(cells.fresh(index))
+        elif cells.uniform(index) != values[index]:
+            cells.fill(index, (u8)values[index])
+    var job = ModifyJob(source = &before, target = cells, items = items, kind = kind, pixels = pixels, feather = feather, apron = apron, failed = false)
+    each(pending, (void*)&job, modify_item)
+    if job.failed:
+        error(memory.exhausted, "out of memory modifying the selection")
+
+## The one value cell `index` holds after the change, when its neighbourhood
+## of `apron` pixels decides it without looking; -1 when it must be worked out.
+pub func settled_value(cells: const Cells*, index: usize, apron: i64) -> i64:
+    let value = cells.uniform(index)
+    if value < 0:
+        return -1
+    let left = cells.origin_x(index) - apron
+    let top = cells.origin_y(index) - apron
+    let right = cells.origin_x(index) + cells.cell_width(index) + apron
+    let bottom = cells.origin_y(index) + cells.cell_height(index) + apron
+    # Selected pixels near the document's edge meet its clear outside.
+    if value != 0 and (left < 0 or top < 0 or right > (i64)cells.extent_x or bottom > (i64)cells.extent_y):
+        return -1
+    let columns = (i64)cells.columns()
+    let first_column = math.imax(0, left) // (i64)tile_size
+    let last_column = math.imin((i64)cells.extent_x - 1, right - 1) // (i64)tile_size
+    let first_row = math.imax(0, top) // (i64)tile_size
+    let last_row = math.imin((i64)cells.extent_y - 1, bottom - 1) // (i64)tile_size
+    for row in first_row..<last_row + 1:
+        for column in first_column..<last_column + 1:
+            if cells.uniform((usize)(row * columns + column)) != value:
+                return -1
+    return value
+
+## The cells to work out: read from `source`, written to `target`'s blocks.
+struct ModifyJob:
+    var source: const Cells*
+    var target: const Cells*
+    var items: const usize[]
+    var kind: i64
+    var pixels: i64
+    var feather: i64
+    var apron: i64
+    var failed: bool
+
+## Work out one cell: gather its window, run the passes, keep the middle.
+func modify_item(context: void*?, item: usize):
+    let job = (ModifyJob*)(context else return)
+    let cells = job.source
+    let index = job.items[item]
+    let apron = job.apron
+    let width = cells.cell_width(index)
+    let height = cells.cell_height(index)
+    var window = Window(left = cells.origin_x(index) - apron, top = cells.origin_y(index) - apron,
+                        width = width + 2 * apron, height = height + 2 * apron, extent_x = (i64)cells.extent_x, extent_y = (i64)cells.extent_y)
+    let size = (usize)(window.width * window.height)
+    let a = alloc u8[size] in memory.heap catch failure:
+        job.failed = true
+        return
+    defer free(a) in memory.heap
+    let b = alloc u8[size] in memory.heap catch failure:
+        job.failed = true
+        return
+    defer free(b) in memory.heap
+    let scratch = alloc u8[(usize)math.imax(window.width, window.height) * 2] in memory.heap catch failure:
+        job.failed = true
+        return
+    defer free(scratch) in memory.heap
+    gather(cells, &window, a)
+    var current = a
+    var other = b
+    if job.kind == kind_border:
+        let c = alloc u8[size] in memory.heap catch failure:
+            job.failed = true
+            return
+        defer free(c) in memory.heap
+        border_window(a, b, c, &window, job.pixels, scratch)
+        keep_middle(job.target, index, a, &window, apron, width, height)
+        return
+    if job.kind == kind_smooth:
+        box_rows(a, b, &window, job.feather, 0)
+        window.clear_outside(b)
+        box_columns(b, a, &window, job.feather, job.feather)
+        ramp(a)
+        keep_middle(job.target, index, a, &window, apron, width, height)
+        return
+    # Each pass leaves good values a radius further in than the last.
+    var margin: i64 = 0
+    if job.pixels != 0:
+        let radius = math.iabs(job.pixels)
+        let grow = job.pixels > 0
+        extreme_rows(current, other, &window, radius, grow, margin, scratch)
+        window.clear_outside(other)
+        extreme_columns(other, current, &window, radius, grow, margin + radius, scratch)
+        window.clear_outside(current)
+        margin += radius
+    if job.feather > 0:
+        box_rows(current, other, &window, job.feather, margin)
+        window.clear_outside(other)
+        box_columns(other, current, &window, job.feather, margin + job.feather)
+        margin += job.feather
+    keep_middle(job.target, index, current, &window, apron, width, height)
+
+## The cell itself: the window's middle, rows of 256 in its block.
+pub func keep_middle(target: const Cells*, index: usize, current: const u8[], window: const Window*, apron: i64, width: i64, height: i64):
+    let result = (target.block(index) else return).bytes
+    memory.set(result, 0)
+    for y in 0..<height:
+        let source_at = (usize)((y + apron) * window.width + apron)
+        memory.copy(result[(usize)y * (usize)tile_size..<(usize)y * (usize)tile_size + (usize)width], current[source_at..<source_at + (usize)width], (usize)width)
+
+## Border in a window: the selection grown by `radius` less it shrunk by
+## `radius` (both from the same pixels), then a box of one: into `a`.
+func border_window(a: u8[], b: u8[], c: u8[], window: const Window*, radius: i64, scratch: u8[]):
+    memory.copy(c, a, a.length)
+    extreme_rows(a, b, window, radius, true, 0, scratch)
+    window.clear_outside(b)
+    extreme_columns(b, a, window, radius, true, radius, scratch)
+    extreme_rows(c, b, window, radius, false, 0, scratch)
+    window.clear_outside(b)
+    extreme_columns(b, c, window, radius, false, radius, scratch)
+    for at in 0..<a.length:
+        a[at] = a[at] - c[at] if a[at] > c[at] else 0
+    window.clear_outside(a)
+    box_rows(a, b, window, 1, radius)
+    window.clear_outside(b)
+    box_columns(b, a, window, 1, radius + 1)
+
+## Smooth's last step: a blurred edge taken back to a few pixels about half coverage.
+pub func ramp(bytes: u8[]):
+    for at in 0..<bytes.length:
+        let value = ((i64)bytes[at] - 128) * 4 + 128
+        bytes[at] = (u8)math.imin(255, math.imax(0, value))
+
+## A window onto the document, in document pixels, and the document's size.
+pub struct Window:
+    pub var left: i64
+    pub var top: i64
+    pub var width: i64
+    pub var height: i64
+    pub var extent_x: i64
+    pub var extent_y: i64
+
+    ## Zero every byte of `bytes` (the window's) that lies past the document.
+    pub func clear_outside(bytes: u8[]):
+        let inside_left = math.imax(0, -self.left)
+        let inside_right = math.imin(self.width, self.extent_x - self.left)
+        for y in 0..<self.height:
+            let line = (usize)(y * self.width)
+            let document_y = self.top + y
+            if document_y < 0 or document_y >= self.extent_y or inside_right <= inside_left:
+                memory.set(bytes[line..<line + (usize)self.width], 0)
+                continue
+            if inside_left > 0:
+                memory.set(bytes[line..<line + (usize)inside_left], 0)
+            if inside_right < self.width:
+                memory.set(bytes[line + (usize)inside_right..<line + (usize)self.width], 0)
+
+## The window's coverage from the cells, clear past the document: whole rows
+## of each cell at a time.
+pub func gather(cells: const Cells*, window: const Window*, bytes: u8[]):
+    memory.set(bytes, 0)
+    let left = math.imax(0, window.left)
+    let top = math.imax(0, window.top)
+    let right = math.imin(window.extent_x, window.left + window.width)
+    let bottom = math.imin(window.extent_y, window.top + window.height)
+    if right <= left or bottom <= top:
+        return
+    let columns = (i64)cells.columns()
+    for row in top // (i64)tile_size..<(bottom - 1) // (i64)tile_size + 1:
+        for column in left // (i64)tile_size..<(right - 1) // (i64)tile_size + 1:
+            let index = (usize)(row * columns + column)
+            let x0 = math.imax(left, column * (i64)tile_size)
+            let x1 = math.imin(right, (column + 1) * (i64)tile_size)
+            let y0 = math.imax(top, row * (i64)tile_size)
+            let y1 = math.imin(bottom, (row + 1) * (i64)tile_size)
+            let span = (usize)(x1 - x0)
+            let value = cells.uniform(index)
+            for y in y0..<y1:
+                let to = (usize)((y - window.top) * window.width + x0 - window.left)
+                if value >= 0:
+                    memory.set(bytes[to..<to + span], (u8)value)
+                    continue
+                let block = cells.block(index) else continue
+                let source_at = (usize)((y - row * (i64)tile_size) * (i64)tile_size + x0 - column * (i64)tile_size)
+                memory.copy(bytes[to..<to + span], block.bytes[source_at..<source_at + span], span)
+
+# mark: Separable passes ========================================================================
+#
+# Each works on the rows (or columns) `margin` in from the window's edges, the
+# only ones the previous passes left good, and leaves good values a radius in
+# further. The largest (or smallest) over a run uses van Herk and Gil-Werman's
+# running extremes, the box its running sum: a few steps a pixel whatever the
+# radius.
+
+## The largest (`grow`) or smallest value over each run of 2 * `radius` + 1 in
+## every good row of `source`, into `target`.
+pub func extreme_rows(source: const u8[], target: u8[], window: const Window*, radius: i64, grow: bool, margin: i64, scratch: u8[]):
+    let width = window.width
+    for y in margin..<window.height - margin:
+        let line = (usize)(y * width)
+        extreme_line(source, target, line, 1, width, radius, grow, scratch)
+
+## As `extreme_rows`, down every good column: the same running extremes,
+## a whole row of columns at a time so the memory is walked in order.
+pub func extreme_columns(source: const u8[], target: u8[], window: const Window*, radius: i64, grow: bool, margin: i64, scratch: u8[]):
+    discard(scratch)
+    let width = (usize)window.width
+    let height = window.height
+    let first = (usize)margin
+    let last = (usize)math.imax(margin, window.width - margin)
+    if last <= first or height <= 0:
+        return
+    let run = 2 * radius + 1
+    let forward = alloc u8[source.length] in memory.heap catch failure:
+        # No room for the rows at once: a column at a time.
+        let line = alloc u8[(usize)height * 2] in memory.heap catch again:
+            trap("out of memory in a selection pass")
+        defer free(line) in memory.heap
+        for x in first..<last:
+            extreme_line(source, target, x, width, height, radius, grow, line)
+        return
+    defer free(forward) in memory.heap
+    let backward = alloc u8[source.length] in memory.heap catch failure:
+        trap("out of memory in a selection pass")
+    defer free(backward) in memory.heap
+    # Extremes from each block of rows' start downwards, and from its end upwards.
+    var at: i64 = 0
+    while at < height:
+        let end = math.imin(at + run, height)
+        for y in at..<end:
+            let row = (usize)y * width
+            if y == at:
+                memory.copy(forward[row + first..<row + last], source[row + first..<row + last], last - first)
+                continue
+            let above = row - width
+            for x in first..<last:
+                let sample = source[row + x]
+                let value = forward[above + x]
+                forward[row + x] = (sample if sample > value else value) if grow else (sample if sample < value else value)
+        var y = end - 1
+        while y >= at:
+            let row = (usize)y * width
+            if y == end - 1:
+                memory.copy(backward[row + first..<row + last], source[row + first..<row + last], last - first)
+            else:
+                let below = row + width
+                for x in first..<last:
+                    let sample = source[row + x]
+                    let value = backward[below + x]
+                    backward[row + x] = (sample if sample > value else value) if grow else (sample if sample < value else value)
+            y -= 1
+        at = end
+    for place in radius..<height - radius:
+        let low_row = (usize)(place - radius) * width
+        let high_row = (usize)(place + radius) * width
+        let row = (usize)place * width
+        for x in first..<last:
+            let low = backward[low_row + x]
+            let high = forward[high_row + x]
+            target[row + x] = (low if low > high else high) if grow else (low if low < high else high)
+
+## One line of `length` values from `start`, `stride` apart: each place from
+## `radius` to `length - radius` takes the extreme over its run.
+func extreme_line(source: const u8[], target: u8[], start: usize, stride: usize, length: i64, radius: i64, grow: bool, scratch: u8[]):
+    let run = 2 * radius + 1
+    let n = (usize)length
+    # Extremes from each block's start forwards, and from its end backwards.
+    let forward = scratch[..<n]
+    let backward = scratch[n..<2 * n]
+    var at: usize = 0
+    while at < n:
+        let end = math.imin((i64)(at + (usize)run), length)
+        var value = source[start + at * stride]
+        for i in at..<(usize)end:
+            let sample = source[start + i * stride]
+            value = (sample if sample > value else value) if grow else (sample if sample < value else value)
+            forward[i] = value
+        value = source[start + ((usize)end - 1) * stride]
+        var i = (usize)end
+        while i > at:
+            i -= 1
+            let sample = source[start + i * stride]
+            value = (sample if sample > value else value) if grow else (sample if sample < value else value)
+            backward[i] = value
+        at = (usize)end
+    for place in radius..<length - radius:
+        let low = backward[(usize)(place - radius)]
+        let high = forward[(usize)(place + radius)]
+        target[start + (usize)place * stride] = (low if low > high else high) if grow else (low if low < high else high)
+
+## A box blur of 2 * `radius` + 1 along every good row, rounding down.
+pub func box_rows(source: const u8[], target: u8[], window: const Window*, radius: i64, margin: i64):
+    for y in margin..<window.height - margin:
+        box_line(source, target, (usize)(y * window.width), 1, window.width, radius)
+
+## As `box_rows`, down every good column: a running sum for each column,
+## a whole row of them at a time so the memory is walked in order.
+pub func box_columns(source: const u8[], target: u8[], window: const Window*, radius: i64, margin: i64):
+    let width = (usize)window.width
+    let height = window.height
+    let first = (usize)margin
+    let last = (usize)math.imax(margin, window.width - margin)
+    if height <= 2 * radius or last <= first:
+        return
+    let run = 2 * radius + 1
+    let totals = alloc i64[width] in memory.heap catch failure:
+        for x in first..<last:
+            box_line(source, target, x, width, height, radius)
+        return
+    defer free(totals) in memory.heap
+    for x in first..<last:
+        totals[x] = 0
+    for y in 0..<run - 1:
+        let row = (usize)y * width
+        for x in first..<last:
+            totals[x] += (i64)source[row + x]
+    for place in radius..<height - radius:
+        let adding = (usize)(place + radius) * width
+        let row = (usize)place * width
+        let leaving = (usize)(place - radius) * width
+        for x in first..<last:
+            let total = totals[x] + (i64)source[adding + x]
+            target[row + x] = (u8)(total // run)
+            totals[x] = total - (i64)source[leaving + x]
+
+## One line: each place from `radius` to `length - radius` takes the mean of
+## its run, by a running sum.
+func box_line(source: const u8[], target: u8[], start: usize, stride: usize, length: i64, radius: i64):
+    if length <= 2 * radius:
+        return
+    let run = 2 * radius + 1
+    var total: i64 = 0
+    for i in 0..<run - 1:
+        total += (i64)source[start + (usize)i * stride]
+    for place in radius..<length - radius:
+        total += (i64)source[start + (usize)(place + radius) * stride]
+        target[start + (usize)place * stride] = (u8)(total // run)
+        total -= (i64)source[start + (usize)(place - radius) * stride]

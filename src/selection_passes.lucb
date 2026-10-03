@@ -1,0 +1,131 @@
+## The GPU passes that make a selection act on pixels: moving (or copying) the
+## selected pixels of a layer, as Photoshop's Move tool does with a selection,
+## and keeping an edit — an adjustment, a filter — only where the selection
+## covers it. Built once per device, like the other engine passes. Soft
+## edges mix a document's colors as it blends them (sRGB-encoded unless it
+## blends in linear light), a mask's values as they are.
+import luce_gpu.gpu
+import luce_std.math
+from luce_canvas.tiles import Tiles, tile_size, tile_texture
+from document import Document
+from transform_window import Footprint, gather
+from luce_canvas.pyramid import Pyramid, tile_bytes
+from shaders import lift_frag_words, lift_frag_msl, mask_mix_frag_words, mask_mix_frag_msl
+from luce_raster.errors import invalid
+
+pub struct SelectionPasses:
+    var owner: gpu.Device
+    var lift_shader: gpu.Shader
+    var lift: gpu.Pipeline
+    var mix_shader: gpu.Shader
+    var mix: gpu.Pipeline
+
+    pub static func create(device: gpu.Device) -> SelectionPasses!:
+        var lift_shader = try gpu.Shader.create(device, lift_frag_words, lift_frag_msl)
+        errdefer lift_shader.destroy()
+        var lift = try gpu.Pipeline.create(device, lift_shader, gpu.Blend.replace, gpu.Format.rgba16_float)
+        errdefer lift.destroy()
+        var mix_shader = try gpu.Shader.create(device, mask_mix_frag_words, mask_mix_frag_msl)
+        errdefer mix_shader.destroy()
+        var mix = try gpu.Pipeline.create(device, mix_shader, gpu.Blend.replace, gpu.Format.rgba16_float)
+        errdefer mix.destroy()
+        return SelectionPasses(owner = device, lift_shader = lift_shader, lift = lift, mix_shader = mix_shader, mix = mix)
+
+    ## Move the pixels of `layer` that `selection` covers by (`dx`, `dy`) whole
+    ## pixels: they lift out of the layer (or, when `copy`, stay as well) and land
+    ## over what is there. `left`, `top`, `right`, `bottom` bound the selection;
+    ## tiles neither it nor its moved copy reach are left alone. What leaves the
+    ## document is lost.
+    pub func move_selected(document: Document*, layer: u64, selection: const Tiles*, dx: i64, dy: i64, copy: bool,
+                           left: i64, top: i64, right: i64, bottom: i64) -> !:
+        let target = document.find(layer) else error(invalid, "no such layer")
+        let tiles = target.tiles() else error(invalid, "a group has no pixels to move")
+        if dx == 0 and dy == 0:
+            return
+        # Cells are replaced as they are made, so every window reads the layer as it was.
+        var before = try tiles.clone()
+        defer before.destroy()
+        var pyramid = try Pyramid.create(self.owner, tile_bytes)
+        defer pyramid.destroy()
+        let clear = gpu.Color(0.0, 0.0, 0.0, 0.0)
+        for row in 0..<tiles.rows():
+            for column in 0..<tiles.columns():
+                let x0 = (i64)(column * tile_size)
+                let y0 = (i64)(row * tile_size)
+                let x1 = x0 + (i64)tile_size
+                let y1 = y0 + (i64)tile_size
+                let under = x0 < right and x1 > left and y0 < bottom and y1 > top
+                let landing = x0 < right + dx and x1 > left + dx and y0 < bottom + dy and y1 > top + dy
+                if not (landing or (under and not copy)):
+                    continue
+                # A window holding the cell and where its moved pixels come from, within the document.
+                let reads = Footprint(left = (f64)math.imax(0, math.imin(x0, x0 - dx)), top = (f64)math.imax(0, math.imin(y0, y0 - dy)),
+                                      right = (f64)math.imin((i64)tiles.width(), math.imax(x1, x1 - dx)), bottom = (f64)math.imin((i64)tiles.height(), math.imax(y1, y1 - dy)))
+                var pixels = try gather(self.owner, &before, &pyramid, reads, 0, false, clear)
+                defer pixels.destroy()
+                var coverage = try gather(self.owner, selection, &pyramid, reads, 0, false, clear)
+                defer coverage.destroy()
+                # The lift shader reads the window as its whole document.
+                var params: f32[8] = [(f32)(x0 - pixels.left), (f32)(y0 - pixels.top), (f32)dx, (f32)dy,
+                                      (f32)(reads.right - (f64)pixels.left), (f32)(reads.bottom - (f64)pixels.top), 1.0 if copy else 0.0, document.srgb_flag()]
+                let fresh = try self.lift_cell(tiles, &params, pixels.texture, coverage.texture)
+                try tiles.set(column, row, fresh)
+        target.revision += 1
+
+    func lift_cell(tiles: const Tiles*, params: f32[8]*, pixels: gpu.Texture, coverage: gpu.Texture) -> gpu.Texture!:
+        var fresh = try tiles.blank()
+        errdefer fresh.destroy()
+        let frame = try fresh.frame()
+        defer frame.release()
+        let area = try frame.value().target()
+        defer area.release()
+        try gpu.shade(area.value(), self.lift, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&(*params)[0], 32), [pixels, coverage], gpu.Filter.nearest)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        return fresh
+
+    ## Keep the edit just made to `layer` only where `selection` covers it: each
+    ## tile becomes `before` and the edited pixels mixed by coverage.
+    pub func restrict(document: Document*, layer: u64, before: const Tiles*, selection: const Tiles*, on_mask: bool = false) -> !:
+        let target = document.find(layer) else error(invalid, "no such layer")
+        let tiles = try target.edited_tiles(on_mask)
+        var blank = try tiles.blank()
+        defer blank.destroy()
+        var params: f32[1] = [document.srgb_flag(on_mask)]
+        for row in 0..<tiles.rows():
+            for column in 0..<tiles.columns():
+                let edited = (try tiles.texture(column, row))
+                let original = (try before.texture(column, row))
+                if edited == none and original == none:
+                    continue
+                var fresh = try tiles.blank()
+                errdefer fresh.destroy()
+                let frame = try fresh.frame()
+                defer frame.release()
+                let area = try frame.value().target()
+                defer area.release()
+                try gpu.shade(area.value(), self.mix, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 4),
+                              [original else blank, edited else blank, (try selection.texture(column, row)) else blank], gpu.Filter.nearest)
+                discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+                try tiles.set(column, row, fresh)
+        target.revision += 1
+
+    ## `edited` kept only where `coverage` (a selection's tile, in red) covers
+    ## it, over `original`: one tile of `restrict`, at any level, into a tile
+    ## of its own (a preview's cell); `srgb` mixes the encoded values.
+    pub func mix_tile(original: gpu.Texture, edited: gpu.Texture, coverage: gpu.Texture, srgb: bool) -> gpu.Texture!:
+        var fresh = try tile_texture(self.owner)
+        errdefer fresh.destroy()
+        let frame = try fresh.frame()
+        defer frame.release()
+        let area = try frame.value().target()
+        defer area.release()
+        var params: f32[1] = [1.0 if srgb else 0.0]
+        try gpu.shade(area.value(), self.mix, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 4), [original, edited, coverage], gpu.Filter.nearest)
+        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        return fresh
+
+    pub mutating func destroy():
+        self.mix.destroy()
+        self.mix_shader.destroy()
+        self.lift.destroy()
+        self.lift_shader.destroy()

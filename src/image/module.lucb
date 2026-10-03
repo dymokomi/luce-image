@@ -1,0 +1,538 @@
+#==============================================================================================
+#
+#   image - The owning Image API
+#
+#   DESCRIPTION:
+#       A Pillow-style image over the format packages (luce-png, luce-jpeg, luce-tiff,
+#       luce-exr, luce-heic, luce-raw, luce-psd through them, and SVG through luce-svg):
+#       opened lazily, loaded on first use, saved atomically. Codec code is entirely Luce
+#       Base. Fragments, in ORDER:
+#
+#       module.lucb    Image: opening, loading, samples, metadata, saving
+#       pixels.lucb    8-bit and linear-light RGBA out and in, streamed in bands
+#       edit.lucb      copy, crop, channels, convert and resize
+#
+#==============================================================================================
+
+import c as c_api
+import luce_std.files
+import interop
+import memory
+import luce_canvas.pool
+import luce_std.math
+import luce_color.transfer
+import strings
+import os
+import luce_raster.model
+import luce_png.png
+import luce_jpeg.jpeg
+import luce_tiff.tiff
+import luce_exr.exr
+import luce_raw.raw
+import luce_heic.heic
+import parallel
+from luce_svg.render import is_svg, render_svg
+from streaming import LinearSink, EncodedSink, CoarseSink, stream_linear, stream_encoded, decode_srgb
+from file_source import FileSource, read_head
+from luce_raster.binary import Buffer
+from luce_raster.errors import invalid, unsupported, limit
+
+pub type SampleType = model.SampleType
+
+pub struct Pixel:
+    pub let r: f64 = 0.0
+    pub let g: f64 = 0.0
+    pub let b: f64 = 0.0
+    pub let a: f64 = 255.0
+
+func check_path(path: str) -> !:
+    if path.length == 0 or strings.contains(path, "\0"):
+        error(invalid, "path is empty or contains a NUL byte")
+
+## Probe `raster`'s encoded bytes: the file whole, or when `head` its start
+## alone (file_source), which a PNG or JPEG's probe needs no more than.
+func probe(raster: model.Raster*, head: bool = false) -> !:
+    if raster.encoded.length < 4:
+        error(invalid, "image signature is truncated")
+    let data = raster.encoded
+    if data[0] == 137:
+        if raster.frame != 0:
+            error(invalid, "PNG has one frame")
+        if head:
+            try png.probe_head(raster)
+        else:
+            try png.probe(raster)
+    elif data[0] == 255 and data[1] == 216:
+        if raster.frame != 0:
+            error(invalid, "JPEG has one frame")
+        try jpeg.probe(raster)
+    elif data[0] == 118 and data[1] == 47:
+        try exr.probe(raster)
+    elif heic.is_heic(data):
+        try heic.probe(raster)
+    elif raw.detect(data) or raw.recognize(data):
+        # Camera raws before TIFF: most of them are TIFF files underneath (CR3 is
+        # ISO media, RAF and CRW their own). One luce-raw knows but cannot develop
+        # yet says so, rather than being read as a TIFF.
+        try raw.probe(raster)
+    elif (data[0] == 'I' and data[1] == 'I') or (data[0] == 'M' and data[1] == 'M'):
+        try tiff.probe(raster)
+    else:
+        error(unsupported, "unrecognized image signature")
+
+## Whether a probed file is a camera raw luce-raw develops.
+func is_raw_format(name: str) -> bool:
+    for format_name in ["DNG", "CR2", "CR3", "NEF", "ARW", "ORF", "RW2", "PEF", "RAF"]:
+        if name == format_name:
+            return true
+    return false
+
+func configure_mode(raster: model.Raster*, mode: str) -> !:
+    let nc: usize = 3 if mode == "RGB" or mode == "RGBF" else 4 if mode == "RGBA" or mode == "RGBAF" else 2 if mode == "LA" else 1
+    if mode != "L" and mode != "LA" and mode != "RGB" and mode != "RGBA" and mode != "I;16" and mode != "I" and mode != "F" and mode != "RGBF" and mode != "RGBAF":
+        error(invalid, "unsupported image mode")
+    let kind = SampleType.uint16 if mode == "I;16" else SampleType.uint32 if mode == "I" else SampleType.float32 if mode == "F" or mode == "RGBF" or mode == "RGBAF" else SampleType.uint8
+    try raster.standard(nc, kind)
+
+pub struct Image:
+    var raster: model.Raster
+    var threads: usize = 4
+    var active_workers: usize
+    var closed: bool
+    ## A PNG or JPEG opened from its file's start alone (file_source): its
+    ## bands decode from the file, which must stay `file_size` bytes.
+    var head_only: bool
+    var file_size: u64
+
+    func init():
+        self.raster = model.Raster()
+        self.threads = 4
+        self.active_workers = 0
+        self.closed = false
+        self.head_only = false
+        self.file_size = 0
+
+    static func own(raster: model.Raster, threads: usize = 4) -> interop.Reference[Image]!:
+        var reservation = try interop.Reservation[Image](image_type)
+        errdefer reservation.cancel()
+        let native = try new Image() in memory.heap
+        native.raster = raster
+        native.threads = threads
+        return reservation.publish(native, memory.heap)
+
+    func ensure_open() -> !:
+        if self.closed:
+            error(invalid, "image is closed")
+
+    ## Read the file now (a large PNG or JPEG only as far as its probe needs,
+    ## the rest read in pieces as it decodes); decode pixels lazily on
+    ## load/access/save.
+    pub static func open(path: str, threads: usize = 4, frame: usize = 0, max_bytes: usize = 4294967296, max_pixels: usize = 268435456) -> interop.Reference[Image]!:
+        try check_path(path)
+        if threads < 1 or threads > 64:
+            error(invalid, "thread count must be in 1-64")
+        if is_svg(path):
+            # Drawn rather than decoded: vector artwork at a size fit to edit.
+            let rendered = try render_svg(path, max_bytes, max_pixels)
+            defer free(rendered.pixels) in memory.heap
+            return try Image.from_linear_rgba(rendered.width, rendered.height, rendered.pixels)
+        var raster = model.Raster(max_bytes = max_bytes, max_pixels = max_pixels, frame = frame)
+        errdefer raster.close()
+        with memory.heap:
+            raster.path = try strings.copy(path)
+        var size: u64 = 0
+        raster.encoded = try read_head((c_api.str)raster.path, max_bytes, &size)
+        let head_only = (u64)raster.encoded.length < size
+        try probe(&raster, head_only)
+        let opened = try Image.own(raster, threads)
+        opened.value().head_only = head_only
+        opened.value().file_size = size
+        return opened
+
+    ## As `open`, from encoded bytes held in memory; the bytes are copied.
+    pub static func open_bytes(data: const u8[], threads: usize = 4, frame: usize = 0, max_bytes: usize = 4294967296, max_pixels: usize = 268435456) -> interop.Reference[Image]!:
+        if threads < 1 or threads > 64 or data.length > max_bytes:
+            error(invalid, "invalid threads or encoded byte limit")
+        var raster = model.Raster(max_bytes = max_bytes, max_pixels = max_pixels, frame = frame)
+        errdefer raster.close()
+        raster.encoded = try alloc u8[data.length] in memory.heap
+        memory.copy(raster.encoded, data, data.length)
+        try probe(&raster)
+        return try Image.own(raster, threads)
+
+    ## A new image in a Pillow mode ("L", "LA", "RGB", "RGBA", "I;16", "I", "F",
+    ## "RGBF", "RGBAF"), every pixel `color` or opaque black.
+    pub static func create(mode: str, width: usize, height: usize, color: Pixel? = none, max_bytes: usize = 4294967296) -> interop.Reference[Image]!:
+        var raster = model.Raster(width = width, height = height, max_bytes = max_bytes)
+        errdefer raster.close()
+        try configure_mode(&raster, mode)
+        try raster.allocate()
+        let pixel = color else Pixel(a = model.maximum(raster.channels[0].kind))
+        for i in 0..<width * height:
+            for c in 0..<raster.channels.length:
+                let name = raster.channels[c].name
+                raster.pixels[i * raster.channels.length + c] = pixel.a if name == "A" else pixel.g if name == "G" else pixel.b if name == "B" else pixel.r
+        return try Image.own(raster)
+
+    ## Named channels are used for AOVs and Cryptomatte; default storage is FLOAT.
+    pub static func create_channels(width: usize, height: usize, names: const str[], kind: SampleType = .float32, max_bytes: usize = 4294967296) -> interop.Reference[Image]!:
+        var raster = model.Raster(width = width, height = height, max_bytes = max_bytes)
+        errdefer raster.close()
+        for name in names:
+            try raster.channel(name, kind)
+        try raster.allocate()
+        return try Image.own(raster)
+
+    pub func width() -> usize!:
+        try self.ensure_open()
+        return self.raster.width
+
+    pub func height() -> usize!:
+        try self.ensure_open()
+        return self.raster.height
+
+    ## (width, height).
+    pub func size() -> (usize, usize)!:
+        try self.ensure_open()
+        return (self.raster.width, self.raster.height)
+
+    ## The data window's top-left: EXR's offset, zero for other formats.
+    pub func origin() -> (i64, i64)!:
+        try self.ensure_open()
+        return (self.raster.xmin, self.raster.ymin)
+
+    ## The format the image was read from: "PNG", "JPEG", "TIFF" or "EXR"; empty when created.
+    pub func file_format() -> str!:
+        try self.ensure_open()
+        return self.raster.file_format
+
+    ## How many frames (TIFF pages, EXR parts) the file holds.
+    pub func n_frames() -> usize!:
+        try self.ensure_open()
+        return self.raster.frames
+
+    ## The frame now selected; `seek` changes it.
+    pub func tell() -> usize!:
+        try self.ensure_open()
+        return self.raster.frame
+
+    pub func channel_count() -> usize!:
+        try self.ensure_open()
+        return self.raster.channels.length
+
+    pub func channel_name(index: usize) -> str!:
+        try self.ensure_open()
+        if index >= self.raster.channels.length:
+            error(invalid, "channel index out of range")
+        return self.raster.channels[index].name
+
+    pub func channel_type(index: usize) -> SampleType!:
+        try self.ensure_open()
+        if index >= self.raster.channels.length:
+            error(invalid, "channel index out of range")
+        return self.raster.channels[index].kind
+
+    ## The index of the channel named `name`; an error when there is none.
+    pub func channel_index(name: str) -> usize!:
+        try self.ensure_open()
+        return try self.raster.find_channel(name)
+
+    ## The Pillow mode the channels make, or "MULTI" when they fit none (named
+    ## AOV channels, mixed sample types).
+    pub func mode() -> str!:
+        try self.ensure_open()
+        let channels = self.raster.channels
+        let kind = channels[0].kind
+        for channel in channels:
+            if channel.kind != kind:
+                return "MULTI"
+        if channels.length == 1:
+            return "L" if kind == .uint8 else "I;16" if kind == .uint16 else "I" if kind == .uint32 else "F"
+        if channels.length == 2 and channels[0].name == "Y" and kind == .uint8:
+            return "LA"
+        if channels.length == 3 and channels[0].name == "R" and channels[1].name == "G" and channels[2].name == "B":
+            return "RGB" if kind == .uint8 else "RGBF" if kind == .float32 else "MULTI"
+        if channels.length == 4 and channels[0].name == "R" and channels[3].name == "A":
+            return "RGBA" if kind == .uint8 else "RGBAF" if kind == .float32 else "MULTI"
+        return "MULTI"
+
+    ## Whether the file is a camera raw luce-raw develops (so its pixels can come
+    ## straight from `raw.develop`, a tile at a time).
+    pub func is_camera_raw() -> bool:
+        return not self.closed and is_raw_format(self.raster.file_format)
+
+    ## The file's bytes as read, for decoders working from them directly (a
+    ## camera raw's; only a PNG or JPEG is opened from its start alone).
+    pub func encoded_bytes() -> const u8[]:
+        return self.raster.encoded
+
+    ## How many threads decoding uses.
+    pub func thread_count() -> usize:
+        return self.threads
+
+    ## Whether the pixels are decoded; most reads decode them on first use.
+    pub func is_loaded() -> bool:
+        return not self.closed and self.raster.pixels.length > 0
+
+    ## How many threads the last decode used.
+    pub func workers_used() -> usize:
+        return self.active_workers
+
+    ## Decode the pixels now, in parallel for TIFF, EXR, HEIC and camera raws.
+    pub mutating func load() -> !:
+        try self.ensure_open()
+        if self.is_loaded():
+            return
+        try self.read_whole_file()
+        try self.raster.allocate()
+        errdefer self.discard_pixels()
+        if self.raster.file_format == "PNG":
+            try png.decode(&self.raster)
+            self.active_workers = 1
+        elif self.raster.file_format == "JPEG":
+            try jpeg.decode(&self.raster)
+            self.active_workers = 1
+        elif self.raster.file_format == "HEIC":
+            try heic.decode(&self.raster, self.threads)
+            self.active_workers = self.threads
+        elif is_raw_format(self.raster.file_format):
+            # A raw develops whole, on its own threads.
+            try raw.decode(&self.raster, raw.Options(threads = self.threads))
+            self.active_workers = self.threads
+        elif self.raster.file_format == "TIFF":
+            self.active_workers = try parallel.decode(&self.raster, tiff.decode_chunk, self.threads)
+        else:
+            self.active_workers = try parallel.decode(&self.raster, exr.decode_chunk, self.threads)
+
+    ## A picture opened from its file's start alone gets the file whole, for a
+    ## decode that works from it all. The file must not have changed.
+    mutating func read_whole_file() -> !:
+        if not self.head_only:
+            return
+        let whole = try read_whole((c_api.str)self.raster.path, self.raster.max_bytes)
+        errdefer free(whole) in memory.heap
+        if (u64)whole.length != self.file_size:
+            error(invalid, "the picture's file changed since it was opened")
+        if self.raster.file_format == "PNG":
+            # The probe's palette and transparency, of the whole file now; the
+            # scratch raster only borrows the bytes.
+            var scratch = model.Raster(max_bytes = self.raster.max_bytes, max_pixels = self.raster.max_pixels)
+            scratch.encoded = whole
+            defer:
+                var empty: u8[]
+                scratch.encoded = empty
+                scratch.close()
+            try png.probe(&scratch)
+            self.raster.palette = scratch.palette
+            self.raster.transparency = scratch.transparency
+        free(self.raster.encoded) in memory.heap
+        self.raster.encoded = whole
+        self.head_only = false
+
+    mutating func discard_pixels():
+        if self.raster.pixels.length > 0:
+            free(self.raster.pixels) in memory.heap
+        var empty: f64[]
+        self.raster.pixels = empty
+        self.active_workers = 0
+
+    ## Select frame `frame` of the file, as Pillow's seek; the pixels decode again on use.
+    pub mutating func seek(frame: usize) -> !:
+        try self.ensure_open()
+        if frame == self.raster.frame:
+            return
+        try self.read_whole_file()
+        let selected = try Image.open_bytes(self.raster.encoded, self.threads, frame, self.raster.max_bytes, self.raster.max_pixels)
+        defer selected.release()
+        let other = selected.value()
+        if self.raster.path.length > 0:
+            with memory.heap:
+                other.raster.path = try strings.copy(self.raster.path)
+        self.raster.close()
+        self.raster = other.raster
+        other.raster = model.Raster()
+        self.active_workers = 0
+
+    func offset(x: usize, y: usize, channel: usize) -> usize!:
+        if x >= self.raster.width or y >= self.raster.height or channel >= self.raster.channels.length:
+            error(invalid, "pixel or channel index out of range")
+        return (y * self.raster.width + x) * self.raster.channels.length + channel
+
+    ## One raw sample of one channel, in the channel's own range.
+    pub mutating func get_sample(x: usize, y: usize, channel: usize = 0) -> f64!:
+        try self.load()
+        return self.raster.pixels[try self.offset(x, y, channel)]
+
+    ## Set one raw sample of one channel.
+    pub mutating func put_sample(x: usize, y: usize, channel: usize, value: f64) -> !:
+        try self.load()
+        self.raster.pixels[try self.offset(x, y, channel)] = value
+
+    ## The color at a pixel from its Y or R, G, B and A channels, in the samples'
+    ## own range; alpha is the maximum when there is no A channel.
+    pub mutating func getpixel(x: usize, y: usize) -> Pixel!:
+        try self.load()
+        discard(try self.offset(x, y, 0))
+        var r: f64 = 0.0
+        var g: f64 = 0.0
+        var b: f64 = 0.0
+        var a = model.maximum(self.raster.channels[0].kind)
+        for c in 0..<self.raster.channels.length:
+            let name = self.raster.channels[c].name
+            let value = self.raster.pixels[(y * self.raster.width + x) * self.raster.channels.length + c]
+            if name == "Y":
+                r = value
+                g = value
+                b = value
+            elif name == "R":
+                r = value
+            elif name == "G":
+                g = value
+            elif name == "B":
+                b = value
+            elif name == "A":
+                a = value
+        return Pixel(r, g, b, a)
+
+    ## Set a pixel's color channels; named non-color channels take `put_sample`.
+    pub mutating func putpixel(x: usize, y: usize, pixel: Pixel) -> !:
+        try self.load()
+        discard(try self.offset(x, y, 0))
+        for c in 0..<self.raster.channels.length:
+            let name = self.raster.channels[c].name
+            if name != "Y" and name != "R" and name != "G" and name != "B" and name != "A":
+                error(invalid, "use put_sample for named non-color channels")
+        for c in 0..<self.raster.channels.length:
+            let name = self.raster.channels[c].name
+            self.raster.pixels[(y * self.raster.width + x) * self.raster.channels.length + c] = pixel.a if name == "A" else pixel.g if name == "G" else pixel.b if name == "B" else pixel.r
+
+    pub func metadata_count() -> usize!:
+        try self.ensure_open()
+        return self.raster.attributes.length
+
+    pub func metadata_key(index: usize) -> str!:
+        try self.ensure_open()
+        if index >= self.raster.attributes.length:
+            error(invalid, "metadata index out of range")
+        return self.raster.attributes[index].name
+
+    ## A string attribute's value, or empty when there is none; typed ones take `metadata_bytes`.
+    pub func metadata(name: str) -> str!:
+        try self.ensure_open()
+        for entry in self.raster.attributes:
+            if entry.name == name:
+                if entry.type_name != "string":
+                    error(invalid, "typed metadata must be read with metadata_bytes")
+                return (str)entry.data
+        return ""
+
+    ## An attribute's type name as the file stores it ("string", EXR's "v2f"…), or empty.
+    pub func metadata_type(name: str) -> str!:
+        try self.ensure_open()
+        for entry in self.raster.attributes:
+            if entry.name == name:
+                return entry.type_name
+        return ""
+
+    ## An attribute's raw bytes, whatever its type, or empty.
+    pub func metadata_bytes(name: str) -> const u8[]!:
+        try self.ensure_open()
+        for entry in self.raster.attributes:
+            if entry.name == name:
+                return entry.data
+        return b""
+
+    ## Move the data window's top-left, as EXR stores it.
+    pub mutating func set_origin(x: i64, y: i64) -> !:
+        try self.ensure_open()
+        if x < -2147483648 or y < -2147483648 or x > 2147483647 - (i64)self.raster.width + 1 or y > 2147483647 - (i64)self.raster.height + 1:
+            error(invalid, "image data window exceeds int32")
+        self.raster.xmin = x
+        self.raster.ymin = y
+
+    ## The path the image was opened from, or empty.
+    pub func source_path() -> str!:
+        try self.ensure_open()
+        return self.raster.path
+
+    pub mutating func set_metadata(name: str, value: str) -> !:
+        try self.ensure_open()
+        if strings.contains(name, "\0"):
+            error(invalid, "metadata name contains NUL")
+        try self.raster.attribute(name, "string", value.bytes)
+
+    ## Encode and write atomically to `path`: the format from `file_format` or the
+    ## extension; `compression` and `tile` for TIFF and EXR, `quality` (1..100) for
+    ## JPEG, `bigtiff` for TIFF.
+    pub mutating func save(path: str, file_format: str = "", compression: str = "zip", quality: i64 = 90, tile: usize = 0, bigtiff: bool = false) -> !:
+        try check_path(path)
+        # Managed Luce text is a byte view, not necessarily NUL-terminated.
+        let destination = try strings.copy(path)
+        defer strings.release(destination)
+        var selected = file_format
+        if selected.length == 0:
+            let dot = strings.find_last(path, ".") else error(invalid, "output format is required without a filename extension")
+            selected = (str)path.bytes[dot + 1..]
+        let encoded = try self.encode(selected, compression, quality, tile, bigtiff)
+        defer free(encoded) in memory.heap
+        try files.write_atomic((c_api.str)destination, encoded)
+
+    ## The image encoded as `file_format` ("png", "jpg"/"jpeg", "tif"/"tiff" or
+    ## "exr"), with the options `save` takes: heap bytes the caller frees.
+    pub mutating func encode(file_format: str, compression: str = "zip", quality: i64 = 90, tile: usize = 0, bigtiff: bool = false) -> u8[]!:
+        try self.load()
+        let lower = try strings.to_lower(file_format)
+        defer strings.release(lower)
+        var encoded = Buffer(maximum = self.raster.max_bytes)
+        defer encoded.close()
+        if lower == "png":
+            if tile != 0 or bigtiff:
+                error(invalid, "tile and BigTIFF options do not apply to PNG")
+            try png.encode(&self.raster, &encoded)
+        elif lower == "jpg" or lower == "jpeg":
+            if tile != 0 or bigtiff:
+                error(invalid, "tile and BigTIFF options do not apply to JPEG")
+            try jpeg.encode(&self.raster, &encoded, quality)
+        elif lower == "tif" or lower == "tiff":
+            try tiff.encode(&self.raster, &encoded, compression, tile, bigtiff)
+        elif lower == "exr":
+            if bigtiff:
+                error(invalid, "BigTIFF option does not apply to EXR")
+            try exr.encode(&self.raster, &encoded, compression, tile)
+        else:
+            error(unsupported, "unsupported output image format")
+        let view = encoded.view()
+        let bytes = try alloc u8[view.length] in memory.heap
+        memory.copy(bytes, view, view.length)
+        return bytes
+
+    pub mutating func close():
+        if self.closed:
+            return
+        self.raster.close()
+        self.closed = true
+
+pub let image_type: interop.Type[Image] = interop.Type[Image]("Image", Image.close, closeable = true)
+
+## The most a picture decoded whole may take as f64 samples.
+pub let whole_picture_bytes: usize = 4294967296
+
+## A file's bytes, heap storage of exactly its size (at most `most`): read
+## into one buffer rather than one grown by doubling, which for a picture of
+## hundreds of megabytes left as much again behind.
+func read_whole(path: c_api.str, most: usize) -> u8[]!:
+    var file = try files.File.open(path)
+    defer file.destroy()
+    let size = try file.seek(0, files.SeekOrigin.end)
+    discard(try file.seek(0))
+    if size < 0 or (u64)size > (u64)most:
+        error(limit, "the file exceeds the read limit")
+    let data = try alloc u8[(usize)size] in memory.heap
+    errdefer free(data) in memory.heap
+    var used: usize = 0
+    while used < data.length:
+        let count = try file.read(data[used..])
+        if count == 0:
+            error(invalid, "the file ended before its size")
+        used += count
+    return data
