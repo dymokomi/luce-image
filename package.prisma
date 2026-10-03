@@ -1,7 +1,7 @@
 #prisma 4.0
 def package "luce-image" {
     str owner = "dymokomi"
-    str version = "0.42.0"
+    str version = "0.42.1"
     str kind = "package"
     str language = "luce-base"
     str description = "The layered-document engine behind luced-2d: layers, GPU compositing, selections, painting, filters, transforms and history over shared GPU tiles, with a Pillow-inspired Image API and Cryptomatte 1.2."

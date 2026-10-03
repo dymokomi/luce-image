@@ -4,8 +4,8 @@
 ## covers it. Built once per device, like the other engine passes. Soft
 ## edges mix a document's colors as it blends them (sRGB-encoded unless it
 ## blends in linear light), a mask's values as they are.
-import luce_gpu.gpu
-import luce_std.math
+from luce_gpu import gpu
+from luce_std import math
 from luce_canvas.tiles import Tiles, tile_size, tile_texture
 from document import Document
 from transform_window import Footprint, gather

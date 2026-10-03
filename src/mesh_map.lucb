@@ -18,7 +18,7 @@
 #
 #==============================================================================================
 
-import luce_std.math
+from luce_std import math
 import memory
 from luce_canvas.half import to_half, from_half
 from transform_window import Footprint

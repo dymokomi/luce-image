@@ -1,6 +1,6 @@
 ## Independent chunks of a raster (TIFF strips and tiles, EXR chunks) decoded on
 ## the worker pool; no decoder state is shared.
-import luce_canvas.pool
+from luce_canvas import pool
 from luce_raster.model import Raster
 from luce_raster.errors import corrupt, invalid
 

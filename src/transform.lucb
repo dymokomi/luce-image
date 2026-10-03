@@ -2,9 +2,9 @@
 ## turned and moved together (free transform), or distorted in perspective. Pixels moved past the canvas
 ## are kept past it (see `Tiles`) and come back when moved back, as in
 ## Compositor.
-import luce_gpu.gpu
+from luce_gpu import gpu
 import interop
-import luce_std.math
+from luce_std import math
 import memory
 from luce_canvas.tiles import Tiles, tile_size, tile_texture
 from extent import relocate, landing_cells, canvas_part, reaches_past_part

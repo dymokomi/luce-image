@@ -4,8 +4,8 @@
 ## stroke inside) in separable passes over that texture, and `style.frag`
 ## writes, per cell, what goes under the layer and — when the style has
 ## effects inside it — the layer recolored by them.
-import luce_gpu.gpu
-import luce_std.math
+from luce_gpu import gpu
+from luce_std import math
 import memory
 from luce_canvas.tiles import Tiles, tile_size, flatten
 from document import Document, Layer, Style

@@ -8,7 +8,7 @@
 ## A level cell whose square of document cells is one value throughout takes
 ## that value without looking at a byte; only the squares an edge crosses are
 ## read, a run of document pixels at a time, so the work follows the edge.
-import luce_std.math
+from luce_std import math
 import memory
 from luce_canvas.tiles import tile_size
 from selection_cells import Cells, each

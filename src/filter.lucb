@@ -7,10 +7,10 @@
 ## Bloom and Tonal Contrast (light_filters.lucb) mix a blurred copy back in.
 ## Blurs and resampling mix a document's colors as it blends them (`srgb`:
 ## as sRGB-encoded values, Photoshop's default), a mask's values as they are.
-import luce_gpu.gpu
+from luce_gpu import gpu
 import memory
-import luce_std.math
-import luce_color.transfer
+from luce_std import math
+from luce_color import transfer
 from luce_canvas.tiles import Tiles, tile_size, box, unbox, flatten, tile_texture
 from document import Document
 from transform_window import Footprint, gather

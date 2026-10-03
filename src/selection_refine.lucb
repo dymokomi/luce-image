@@ -10,7 +10,7 @@
 ## work and memory follow the selection's edge, not the document. A `limit`
 ## box leaves the cells outside it as they are: the live preview works out
 ## only what the view shows.
-import luce_std.math
+from luce_std import math
 import time
 import memory
 from luce_canvas.tiles import tile_size

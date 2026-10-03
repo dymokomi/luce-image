@@ -5,7 +5,7 @@
 ## every wholly selected cell shares one tile. A frame drawing the ants may
 ## catch up only the cells it shows and a few more (`update` with `only`):
 ## a huge new selection then reaches the GPU over several frames.
-import luce_gpu.gpu
+from luce_gpu import gpu
 import memory
 from luce_canvas.tiles import Tiles, CellRange, tile_size, box, unbox, tile_texture
 from luce_canvas.half import to_half

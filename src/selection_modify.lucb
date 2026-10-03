@@ -11,7 +11,7 @@
 ## document, whose clear outside then eats in. Every other cell is worked out
 ## on its own, on every processor, from a window of the cell plus that apron,
 ## so the work and memory follow the selection's edge, not the document.
-import luce_std.math
+from luce_std import math
 import memory
 from luce_canvas.tiles import tile_size
 from selection_cells import Cells, each

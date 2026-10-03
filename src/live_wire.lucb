@@ -3,7 +3,7 @@
 ## strong edge and much across flat color. The window is a few hundred
 ## samples of one pyramid level round the last anchor and the pointer, so a
 ## trace costs the same on a postcard and on a 15000×24000 document.
-import luce_std.math
+from luce_std import math
 import memory
 from luce_raster.errors import invalid
 

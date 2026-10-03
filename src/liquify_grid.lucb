@@ -14,7 +14,7 @@
 #
 #==============================================================================================
 
-import luce_std.math
+from luce_std import math
 import memory
 from luce_canvas.half import to_half
 from luce_raster.errors import invalid

@@ -3,7 +3,7 @@
 ## with pixels), in bounded time, with the untouched cells still one value
 ## and so costing no memory. The small-canvas correctness tests sit beside
 ## each (selection_tests.lucb, selection_refine.lucb).
-import luce_std.math
+from luce_std import math
 import memory
 import time
 from luce_canvas.tiles import tile_size

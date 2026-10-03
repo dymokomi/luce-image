@@ -4,9 +4,9 @@
 ## `Tiles`). A layer is read as pieces that never overlap: each canvas cell's
 ## region, and each outside cell's part past the canvas (the whole cell off
 ## the grid; a right and a bottom strip on the canvas's edge).
-import luce_gpu.gpu
+from luce_gpu import gpu
 import interop
-import luce_std.math
+from luce_std import math
 import memory
 from luce_canvas.tiles import Tiles, CellRange, Bounds, tile_size, min_i64, max_i64
 from shaders import transfer_frag_words, transfer_frag_msl

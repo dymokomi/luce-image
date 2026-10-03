@@ -35,24 +35,24 @@
 ## the device of the first target it is drawn on; until then layers and their
 ## pictures wait on the CPU, so a document can be built before it is shown.
 import c as c_api
-import luce_std.files
-import luce_jpeg.jpeg
-import luce_png.png
-import luce_compress.flate
-import luce_raw.raw
-import luce_gpu.gpu
+from luce_std import files
+from luce_jpeg import jpeg
+from luce_png import png
+from luce_compress import flate
+from luce_raw import raw
+from luce_gpu import gpu
 import interop
-import luce_std.math
+from luce_std import math
 import memory
-import luce_canvas.pool
+from luce_canvas import pool
 import ownership
-import luce_std.paths
-import luce_prism.prism
+from luce_std import paths
+from luce_prism import prism
 import strings
-import luce_svg.svg
+from luce_svg import svg
 import os
 import time
-import luce_color.transfer
+from luce_color import transfer
 import thread
 import sync
 from image import Image, Pixel
@@ -95,8 +95,8 @@ from filter_preview import resample_level_cell, blur_level_cell
 from stand_in import StandIn, Made, made_texture, made_nothing, made_original, next_generation
 from luce_canvas.pyramid import Pyramid
 from selection_passes import SelectionPasses
-import luce_psd.psd
-import luce_fonts.fonts
+from luce_psd import psd
+from luce_fonts import fonts
 from geometry import resize_canvas, resize_image
 from selection import Selection
 from selection_cells import Mode, Cells, block_bytes

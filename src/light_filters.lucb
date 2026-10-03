@@ -4,10 +4,10 @@
 ## pushed, strongest in the midtones — the look of Nik's and Luminar's.
 ## Both mix a document's colors as it blends them: as sRGB-encoded values
 ## unless it blends in linear light (a mask's values as they are).
-import luce_gpu.gpu
+from luce_gpu import gpu
 import memory
-import luce_std.math
-import luce_color.transfer
+from luce_std import math
+from luce_color import transfer
 from luce_canvas.tiles import Tiles
 from document import Document
 from filter import Filters

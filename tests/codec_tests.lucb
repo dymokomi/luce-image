@@ -2,14 +2,14 @@
 ## decodes one picture (PNG, JPEG, EXR or TIFF) to raw samples and re-encodes it
 ## in a chosen format, for the Python checks in tests/ to compare against their
 ## reference readers.
-import luce_std.files
+from luce_std import files
 import memory
 import c
 import strings
-import luce_png.png
-import luce_tiff.tiff
-import luce_exr.exr
-import luce_jpeg.jpeg
+from luce_png import png
+from luce_tiff import tiff
+from luce_exr import exr
+from luce_jpeg import jpeg
 from luce_raster.model import Raster
 from luce_raster.binary import Buffer, double_bits
 

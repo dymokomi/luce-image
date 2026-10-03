@@ -12,8 +12,8 @@
 #
 #==============================================================================================
 
-import luce_gpu.gpu
-import luce_std.math
+from luce_gpu import gpu
+from luce_std import math
 from luce_canvas.tiles import Tiles, tile_size, min_i64, max_i64
 from luce_canvas.pyramid import Pyramid, covered_at, cell_exists
 from projective import Warp, multiply

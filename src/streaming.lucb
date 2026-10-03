@@ -17,13 +17,13 @@
 #
 #==============================================================================================
 
-import luce_std.math
-import luce_color.transfer
+from luce_std import math
+from luce_color import transfer
 import memory
-import luce_png.png
-import luce_jpeg.jpeg
-import luce_tiff.tiff
-import luce_raster.model
+from luce_png import png
+from luce_jpeg import jpeg
+from luce_tiff import tiff
+from luce_raster import model
 from file_source import FileSource, read_source
 from luce_canvas.half import to_half
 from luce_raster.errors import invalid

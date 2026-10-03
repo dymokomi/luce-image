@@ -6,7 +6,7 @@
 ##
 ## Modes here are add, subtract and intersect; replace is add onto cells
 ## cleared first, which the callers do.
-import luce_std.math
+from luce_std import math
 import memory
 from luce_canvas.tiles import tile_size
 from selection_cells import Cells, Mode, block_bytes, each

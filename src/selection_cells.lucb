@@ -4,9 +4,9 @@
 ## every copy of the selection (an undo step's) until one of them writes to
 ## one, so a copy costs a pointer a cell and a change costs only the cells it
 ## touches: a marquee across a 360-megapixel canvas holds its edge cells alone.
-import luce_std.math
+from luce_std import math
 import memory
-import luce_canvas.pool
+from luce_canvas import pool
 from luce_canvas.tiles import tile_size
 
 ## Bytes in one cell's block: 256 rows of 256, whatever the cell's size.

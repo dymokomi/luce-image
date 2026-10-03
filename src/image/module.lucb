@@ -15,21 +15,21 @@
 #==============================================================================================
 
 import c as c_api
-import luce_std.files
+from luce_std import files
 import interop
 import memory
-import luce_canvas.pool
-import luce_std.math
-import luce_color.transfer
+from luce_canvas import pool
+from luce_std import math
+from luce_color import transfer
 import strings
 import os
-import luce_raster.model
-import luce_png.png
-import luce_jpeg.jpeg
-import luce_tiff.tiff
-import luce_exr.exr
-import luce_raw.raw
-import luce_heic.heic
+from luce_raster import model
+from luce_png import png
+from luce_jpeg import jpeg
+from luce_tiff import tiff
+from luce_exr import exr
+from luce_raw import raw
+from luce_heic import heic
 import parallel
 from luce_svg.render import is_svg, render_svg
 from streaming import LinearSink, EncodedSink, CoarseSink, stream_linear, stream_encoded, decode_srgb

@@ -4,10 +4,10 @@
 ## block at a time through a `FileSource` (png/jpeg `decode_rows_at`), so the
 ## open never holds the file's bytes. Every other picture is read whole.
 import c as c_api
-import luce_std.files
+from luce_std import files
 import memory
-import luce_png.png
-import luce_jpeg.jpeg
+from luce_png import png
+from luce_jpeg import jpeg
 from luce_raster.errors import invalid, limit
 
 ## The start read first: most files' headers fit, and a file this small is

@@ -3,14 +3,10 @@
 ## by a fixed range: one of the six hues, or the highlights, midtones or
 ## shadows. Subtracted samples take their neighbourhood back out. Coverage
 ## fades with the distance, so the edge of a range is soft, as Photoshop's.
-import luce_std.math
+from luce_std import math
 import memory
-import luce_canvas.pool
-import luce_color.color
-import luce_color.space
-import luce_color.lab
-import luce_color.hsl
-import luce_color.transfer
+from luce_canvas import pool
+from luce_color import color, space, lab, hsl, transfer
 import os
 from luce_raster.errors import invalid
 

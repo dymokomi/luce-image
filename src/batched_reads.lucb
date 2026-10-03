@@ -4,7 +4,7 @@
 ## loop that reads tiles one after another (the flattened picture, Color
 ## Range's copy, a heal's window, a clone preview, bounds past the canvas)
 ## goes through here instead of a read and a full stop per tile.
-import luce_gpu.gpu
+from luce_gpu import gpu
 import memory
 from luce_raster.errors import invalid
 

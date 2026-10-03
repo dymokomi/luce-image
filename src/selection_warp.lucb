@@ -8,7 +8,7 @@
 ## source cell at a time, then walks its pixels stepping the map along each
 ## row: no division or cell lookup per tap, so a transform of a
 ## 360-megapixel selection costs its edge.
-import luce_std.math
+from luce_std import math
 import memory
 from luce_canvas.tiles import tile_size
 from projective import Warp, quad_warp, affine_warp

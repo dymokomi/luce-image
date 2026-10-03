@@ -13,7 +13,7 @@
 #
 #==============================================================================================
 
-import luce_std.math
+from luce_std import math
 import memory
 from transform_window import Footprint
 from mesh_map import MeshMap

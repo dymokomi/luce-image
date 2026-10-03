@@ -10,8 +10,8 @@
 ## `--linear` blends with gamma 1.0; `--plain` draws without the
 ## checkerboard; `--stacked` puts seven more layers between them, each in its
 ## own blend mode.
-import luce_gpu.gpu
-import luce_std.math
+from luce_gpu import gpu
+from luce_std import math
 import time
 from canvas import Canvas
 

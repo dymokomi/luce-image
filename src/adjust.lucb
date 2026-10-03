@@ -1,9 +1,9 @@
 ## Destructive adjustments: a layer's tiles rewritten through one fragment
 ## program, tile by tile. Only tiles the layer has are touched; the rest stay
 ## transparent. The caller keeps the tiles from before for undo.
-import luce_gpu.gpu
+from luce_gpu import gpu
 import memory
-import luce_std.math
+from luce_std import math
 from luce_canvas.tiles import Tiles, tile_size, tile_texture
 from document import Document
 from shaders import adjust_frag_words, adjust_frag_msl

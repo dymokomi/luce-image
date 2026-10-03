@@ -13,7 +13,7 @@
 #
 #==============================================================================================
 
-import luce_gpu.gpu
+from luce_gpu import gpu
 from luce_canvas.pyramid import Pyramid
 
 ## What a stand-in makes for a cell: a tile of its own (handed over), nothing

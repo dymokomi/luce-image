@@ -12,9 +12,9 @@
 ## wholly matching or wholly not costing nothing; a contiguous wand then
 ## floods through it from the seed, a cell that matches wholly being taken at
 ## once and only mixed cells being walked pixel by pixel.
-import luce_gpu.gpu
-import luce_std.math
-import luce_color.transfer
+from luce_gpu import gpu
+from luce_std import math
+from luce_color import transfer
 import memory
 from luce_canvas.tiles import tile_size
 from luce_canvas.half import from_half

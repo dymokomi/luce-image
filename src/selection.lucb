@@ -5,8 +5,8 @@
 ## or wholly clear cost no memory and copies share the rest, so a selection
 ## of a huge canvas, and every undo step's copy of it, costs its edges.
 ## Shapes combine in Photoshop's modes: replace, add, subtract, intersect.
-import luce_gpu.gpu
-import luce_std.math
+from luce_gpu import gpu
+from luce_std import math
 from luce_canvas.tiles import Tiles, CellRange, tile_size
 from projective import Warp
 from selection_cells import Cells, Covered, Mode, each

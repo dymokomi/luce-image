@@ -3,9 +3,9 @@
 ## negative offset) and resampling the whole image to a new size. Every raster
 ## layer and mask is rebuilt tile by tile on the GPU; pixels the new canvas
 ## does not reach are kept past it, as Compositor keeps them.
-import luce_gpu.gpu
+from luce_gpu import gpu
 import interop
-import luce_std.math
+from luce_std import math
 import memory
 from luce_canvas.tiles import Tiles, tile_size, box, unbox
 from extent import relocate

@@ -3,7 +3,7 @@
 ## ((m0 x + m1 y + m2) / w, (m3 x + m4 y + m5) / w) with w = m6 x + m7 y + m8.
 ## A `Warp` runs backwards — from where a pixel lands to where it comes from —
 ## which is what resampling needs; `forward` turns it round.
-import luce_std.math
+from luce_std import math
 from luce_raster.errors import invalid
 
 pub struct Warp:
