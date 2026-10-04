@@ -444,10 +444,9 @@ func open_psd(path: str) -> interop.Reference[Canvas]!:
     with memory.heap:
         name = try strings.copy(path)
     defer strings.release(name)
-    # files.read allocates from the current allocator; it is freed there.
     let data = try files.read((c_api.str)name)
-    defer free(data)
-    var parsed = try psd.parse(data)
+    defer data.release()
+    var parsed = try psd.parse(data.value)
     defer parsed.close()
     var reservation = try interop.Reservation[Canvas](canvas_type)
     errdefer reservation.cancel()

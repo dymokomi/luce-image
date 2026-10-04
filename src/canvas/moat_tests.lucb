@@ -384,8 +384,8 @@ test "a picture that opens but cannot be decoded fails the bind that loads it, a
     # Its headers stay, so opening it (which reads just those) succeeds; its
     # compressed pixels end halfway.
     let data = try files.read((c_api.str)"build/stream-broken.jpg")
-    defer free(data)
-    try files.write_atomic((c_api.str)"build/stream-broken.jpg", data[..<data.length // 2])
+    defer data.release()
+    try files.write_atomic((c_api.str)"build/stream-broken.jpg", data.value[..<data.value.length // 2])
     let opened = try Canvas.open("build/stream-broken.jpg")
     defer opened.release()
     var canvas = opened.value()

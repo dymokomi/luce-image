@@ -390,9 +390,10 @@ func clear_old_package(path: str) -> !:
     if found.kind != files.FileKind.directory:
         return
     let manifest = try paths.join(path, "document.prisma")
-    discard(files.metadata((c_api.str)manifest) catch failure:
+    defer manifest.release()
+    discard(files.metadata((c_api.str)manifest.value) catch failure:
         error(invalid, "a folder that is not a document is in the way of the saved file"))
-    try files.delete_path(path, recursive = true)
+    try files.remove_tree((c_api.str)path)
 
 ## A small flattened PNG of the document into `out`: the composite at the
 ## first pyramid level that fits in 256 pixels.

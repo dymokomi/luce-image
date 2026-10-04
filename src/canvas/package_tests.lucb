@@ -120,13 +120,13 @@ test "a save that cannot finish leaves the document already on disk as it was":
     defer target.destroy()
     discard(try shown_at(&canvas, &target, 0, 0))
     try canvas.fill_gradient(layer, 0.0, 0.0, 300.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0)
-    files.delete_path("build/package-keep.l2d.saving", recursive = true) catch failure:
+    files.remove_tree((c_api.str)"build/package-keep.l2d.saving") catch failure:
         discard(failure)
     try canvas.save_package("build/package-keep.l2d")
     let kept = try files.read((c_api.str)"build/package-keep.l2d")
-    defer free(kept)
+    defer kept.release()
     # Something in the way of the file being written: the save fails.
-    try files.make_directory("build/package-keep.l2d.saving")
+    try files.create_directory((c_api.str)"build/package-keep.l2d.saving")
     try canvas.fill_gradient(layer, 0.0, 0.0, 300.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
     var failed = false
     canvas.save_package("build/package-keep.l2d") catch failure:
@@ -134,9 +134,9 @@ test "a save that cannot finish leaves the document already on disk as it was":
         failed = true
     assert(failed)
     let after = try files.read((c_api.str)"build/package-keep.l2d")
-    defer free(after)
-    assert(after.length == kept.length and (str)after == (str)kept)
-    try files.delete_path("build/package-keep.l2d.saving", recursive = true)
+    defer after.release()
+    assert(after.value.length == kept.value.length and (str)after.value == (str)kept.value)
+    try files.remove_tree((c_api.str)"build/package-keep.l2d.saving")
 
 test "a document past its memory budget saves and opens within it, pixels unchanged":
     var device = gpu.Device.open() catch failure:
