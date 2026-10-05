@@ -80,7 +80,7 @@ pub struct SelectionPasses:
         let area = try frame.value().target()
         defer area.release()
         try gpu.shade(area.value(), self.lift, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&(*params)[0], 32), [pixels, coverage], gpu.Filter.nearest)
-        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
         return fresh
 
     ## Keep the edit just made to `layer` only where `selection` covers it: each
@@ -105,7 +105,7 @@ pub struct SelectionPasses:
                 defer area.release()
                 try gpu.shade(area.value(), self.mix, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 4),
                               [original else blank, edited else blank, (try selection.texture(column, row)) else blank], gpu.Filter.nearest)
-                discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+                _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
                 try tiles.set(column, row, fresh)
         target.revision += 1
 
@@ -121,10 +121,10 @@ pub struct SelectionPasses:
         defer area.release()
         var params: f32[1] = [1.0 if srgb else 0.0]
         try gpu.shade(area.value(), self.mix, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 4), [original, edited, coverage], gpu.Filter.nearest)
-        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
         return fresh
 
-    pub mutating func destroy():
+    pub func destroy():
         self.mix.destroy()
         self.mix_shader.destroy()
         self.lift.destroy()

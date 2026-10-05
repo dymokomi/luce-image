@@ -61,7 +61,7 @@ func read_band(context: void*?, column: u32, row: u32, halves: u8[]) -> bool!:
     let left = (i64)column * (i64)tile_size
     if left + (i64)tile_size <= 3000 or left >= 4200:
         return false
-    discard(band.cells_read.add(1, .relaxed))
+    _ = band.cells_read.add(1, .relaxed)
     let one = to_half(1.0)
     memory.set(halves, 0)
     for y in 0..<(usize)tile_size:

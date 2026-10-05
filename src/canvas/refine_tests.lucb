@@ -15,7 +15,7 @@ test "border, smooth, grow and similar change the selection as one step each":
     let layer = try canvas.add_layer("Paint")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     # A red block on the left, a blue one on the right, a red one past a gap.
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
     try canvas.select_rectangle(0, 0, 300, 500, 0)
@@ -54,7 +54,7 @@ test "transform selection reshapes the outline, not the pixels, and undoes as on
     let layer = try canvas.add_layer("Paint")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
     try canvas.select_rectangle(100, 100, 100, 100, 0)
     try canvas.fill(layer, false)
@@ -77,7 +77,7 @@ test "transform selection reshapes the outline, not the pixels, and undoes as on
     assert(canvas.selection_left() >= 49 and canvas.selection_left() <= 50 and canvas.selection_width() >= 200 and canvas.selection_width() <= 202)
     assert(canvas.selected_at(52, 150) == 255 and canvas.selected_at(247, 150) == 255)
     # The pixels stayed where they were.
-    let pixels = try alloc f32[400 * 300 * 4] in memory.heap
+    let pixels = try new f32[400 * 300 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     try layer_tiles(&canvas, layer).read(pixels)
     assert(pixels[(60 * 400 + 60) * 4 + 3] == 0.0 and pixels[(150 * 400 + 150) * 4 + 3] == 1.0)
@@ -106,7 +106,7 @@ test "quick mask paints the selection with the painting tools and turns back int
     canvas.view_format = gpu.Format.rgba8_linear
     # A white layer, so the tint shows against it.
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, false)
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     try canvas.fill(layer, false)
     try canvas.select_rectangle(0, 0, 40, 300, 0)
     let steps = canvas.history_steps()
@@ -117,7 +117,7 @@ test "quick mask paints the selection with the painting tools and turns back int
     let tinted = try shown_at(&canvas, &target, 50, 10)
     assert(tinted[0] == 255 and tinted[1] >= 54 and tinted[1] <= 56 and tinted[2] == tinted[1])
     assert((try shown_at(&canvas, &target, 10, 10))[1] == 255)
-    let white = try alloc f32[300 * 300 * 4] in memory.heap
+    let white = try new f32[300 * 300 * 4] --- in memory.heap
     defer free(white) in memory.heap
     try layer_tiles(&canvas, layer).read(white)
     assert(white[(10 * 300 + 50) * 4 + 1] == 1.0)
@@ -129,7 +129,7 @@ test "quick mask paints the selection with the painting tools and turns back int
     try canvas.extend_stroke(20.0, 250.0)
     try canvas.end_stroke()
     # The layer's own pixels are as they were.
-    let pixels = try alloc f32[300 * 300 * 4] in memory.heap
+    let pixels = try new f32[300 * 300 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     try layer_tiles(&canvas, layer).read(pixels)
     assert(pixels[(200 * 300 + 20) * 4] == 1.0 and pixels[(200 * 300 + 20) * 4 + 3] == 1.0)
@@ -175,7 +175,7 @@ func half_white(width: u32, height: u32, edge: i64, target: gpu.Texture*) -> Can
     var canvas = try Canvas((i64)width, (i64)height)
     errdefer canvas.close()
     let layer = try canvas.add_layer("Paint")
-    discard(try shown_at(&canvas, target, 0, 0))
+    _ = try shown_at(&canvas, target, 0, 0)
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, false)
     try canvas.fill(layer, false)
     try canvas.select_rectangle(edge, 0, (i64)width - edge, (i64)height, 0)
@@ -336,7 +336,7 @@ test "grow takes its colors from the selection's solid pixels, not its anti-alia
     let layer = try canvas.add_layer("Paint")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     # A pink ground, a red disc on it with a soft (anti-aliased) edge whose
     # blends run from the red to the pink.
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.35, 0.35, false)
@@ -360,7 +360,7 @@ test "edit fill is opaque whatever the brush's opacity":
     let layer = try canvas.add_layer("Paint")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     # A half-opaque brush, then Edit › Fill with white over the black backdrop.
     try canvas.set_brush(10.0, 1.0, 0.5, 1.0, 1.0, 1.0, 1.0, false)
     try canvas.select_all()

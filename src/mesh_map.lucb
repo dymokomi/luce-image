@@ -54,7 +54,7 @@ pub struct MeshMap:
         if columns < 1 or rows < 1 or landing.length != (columns + 1) * (rows + 1) * 2:
             error(invalid, "a mesh lattice needs a point landed for each of its corners")
         let count = (columns + 1) * (rows + 1)
-        let points = try alloc f64[count * 4] in memory.heap
+        let points = try new f64[count * 4] --- in memory.heap
         errdefer free(points) in memory.heap
         let width = source.right - source.left
         let height = source.bottom - source.top
@@ -72,9 +72,9 @@ pub struct MeshMap:
                 points[at * 4 + 3] = y
                 landed = Footprint(left = math.min(landed.left, x), top = math.min(landed.top, y), right = math.max(landed.right, x), bottom = math.max(landed.bottom, y))
         let triangles = columns * rows * 2
-        let corners = try alloc u32[triangles * 3] in memory.heap
+        let corners = try new u32[triangles * 3] --- in memory.heap
         errdefer free(corners) in memory.heap
-        let outer = try alloc u8[triangles] in memory.heap
+        let outer = try new u8[triangles] --- in memory.heap
         errdefer free(outer) in memory.heap
         for r in 0..<rows:
             for c in 0..<columns:
@@ -100,7 +100,7 @@ pub struct MeshMap:
         try mesh.file()
         return mesh
 
-    pub mutating func destroy():
+    pub func destroy():
         free(self.points) in memory.heap
         free(self.corners) in memory.heap
         free(self.outer) in memory.heap
@@ -114,13 +114,13 @@ pub struct MeshMap:
         return self.outer.length
 
     ## File every triangle under the buckets its landed box touches.
-    mutating func file() -> !:
+    func file() -> !:
         self.first_x = (i64)math.floor(self.landed.left / bucket_side)
         self.first_y = (i64)math.floor(self.landed.top / bucket_side)
         self.across = (i64)math.floor(self.landed.right / bucket_side) - self.first_x + 1
         self.down = (i64)math.floor(self.landed.bottom / bucket_side) - self.first_y + 1
         let buckets = (usize)(self.across * self.down)
-        self.starts = try alloc u32[buckets + 1] in memory.heap
+        self.starts = try new u32[buckets + 1] --- in memory.heap
         for index in 0..<self.starts.length:
             self.starts[index] = 0
         # Count, then place: each bucket's triangles side by side.
@@ -132,8 +132,8 @@ pub struct MeshMap:
                     self.starts[index] = total
                     total += here
                 self.starts[buckets] = total
-                self.items = try alloc u32[(usize)total] in memory.heap
-            let filled = try alloc u32[buckets] in memory.heap
+                self.items = try new u32[(usize)total] --- in memory.heap
+            let filled = try new u32[buckets] --- in memory.heap
             defer free(filled) in memory.heap
             for index in 0..<buckets:
                 filled[index] = 0
@@ -174,7 +174,7 @@ pub struct MeshMap:
     pub func field(x0: f64, y0: f64, spacing: f64, n: i64, rim: f64, bytes: u8[], cover: u8[]) -> Reach:
         var reach = Reach(moved = false, left = 1.0e18, top = 1.0e18, right = -1.0e18, bottom = -1.0e18)
         let count = (usize)(n * n)
-        let shift = alloc f32[count * 2] in memory.heap catch failure:
+        let shift = new f32[count * 2] --- in memory.heap catch failure:
             trap("out of memory for a mesh field")
         defer free(shift) in memory.heap
         for index in 0..<count:
@@ -359,7 +359,7 @@ func read_shift(bytes: const u8[], at: usize, axis: usize) -> f64:
 
 test "a moved lattice reads back as the move, covers what it lands on and nothing past it":
     let source = Footprint(left = 0.0, top = 0.0, right = 100.0, bottom = 100.0)
-    let landing = try alloc f64[25 * 2] in memory.heap
+    let landing = try new f64[25 * 2] --- in memory.heap
     defer free(landing) in memory.heap
     for r in 0..<(usize)5:
         for c in 0..<(usize)5:
@@ -369,9 +369,9 @@ test "a moved lattice reads back as the move, covers what it lands on and nothin
     defer mesh.destroy()
     assert(mesh.triangles() == 32 and mesh.landed.left == 10.0 and mesh.landed.bottom == 105.0)
     let n: i64 = 129
-    let bytes = try alloc u8[(usize)(n * n) * 8] in memory.heap
+    let bytes = try new u8[(usize)(n * n) * 8] --- in memory.heap
     defer free(bytes) in memory.heap
-    let cover = try alloc u8[(usize)(n * n)] in memory.heap
+    let cover = try new u8[(usize)(n * n)] --- in memory.heap
     defer free(cover) in memory.heap
     let reach = mesh.field(0.0, 0.0, 1.0, n, 1.0, bytes, cover)
     assert(reach.moved and math.abs(reach.left) < 1e-6 and math.abs(reach.right - 100.0) < 1e-6)

@@ -16,7 +16,7 @@ extend Canvas:
     ## Let the documents' tiles use `fraction` (0.1..0.95) of the GPU's and the
     ## machine's memory, as Photoshop's Memory Usage: past it, the least wanted
     ## tiles move from the GPU to RAM. One setting for every document.
-    pub mutating func set_memory_usage(fraction: f64) -> !:
+    pub func set_memory_usage(fraction: f64) -> !:
         if not (fraction >= 0.1 and fraction <= 0.95):
             error(invalid, "memory usage must be 0.1..0.95 of what the machine has")
         memory_usage = fraction
@@ -50,14 +50,14 @@ extend Canvas:
 
     ## Set the GPU and RAM budgets in bytes directly (0 for none): tests, and
     ## seeing the governor work on a small machine.
-    pub mutating func set_memory_budgets(gpu_bytes: i64, ram_bytes: i64) -> !:
+    pub func set_memory_budgets(gpu_bytes: i64, ram_bytes: i64) -> !:
         if gpu_bytes < 0 or ram_bytes < 0:
             error(invalid, "memory budgets are bytes, 0 for none")
         force_memory_budgets((usize)gpu_bytes, (usize)ram_bytes)
 
     ## Begin a new epoch and keep the tiers within their budgets now, as a
     ## frame does: for headless work between steps.
-    pub mutating func settle_memory() -> !:
+    pub func settle_memory() -> !:
         residency_advance()
         try settle_tiers(&self)
 

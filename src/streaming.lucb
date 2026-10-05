@@ -72,8 +72,8 @@ pub func stream_linear(raster: model.Raster*, file: FileSource*?, rows: usize, s
         return false
     if rows == 0:
         error(invalid, "a band has at least one row")
-    var banding = Banding(width = raster.width, height = raster.height, rows = rows, band = try alloc f32[raster.width * rows * 4] in memory.heap,
-                          top = 0, filled = 0, table = try alloc f32[65536] in memory.heap, sink = sink, context = context)
+    var banding = Banding(width = raster.width, height = raster.height, rows = rows, band = try new f32[raster.width * rows * 4] --- in memory.heap,
+                          top = 0, filled = 0, table = try new f32[65536] --- in memory.heap, sink = sink, context = context)
     defer free(banding.band) in memory.heap
     defer free(banding.table) in memory.heap
     if named == "PNG":
@@ -84,7 +84,7 @@ pub func stream_linear(raster: model.Raster*, file: FileSource*?, rows: usize, s
         fill_table(banding.table, 255.0)
         try jpeg_rows(raster, file, byte_rows, (void*)&banding)
     else:
-        discard(try tiff.decode_rows(raster, tiff_part, (void*)&banding))
+        _ = try tiff.decode_rows(raster, tiff_part, (void*)&banding)
     if banding.top + banding.filled != banding.height:
         error(invalid, "the picture ended before its last row")
     return true
@@ -101,7 +101,7 @@ pub func stream_encoded(raster: model.Raster*, file: FileSource*?, rows: usize, 
         error(invalid, "a band has at least one row")
     let deep = named == "PNG" and raster.bits == 16
     let pixel: usize = 8 if deep else 4
-    var banding = EncodedBands(width = raster.width, height = raster.height, rows = rows, pixel = pixel, deep = deep, band = try alloc u8[raster.width * rows * pixel] in memory.heap,
+    var banding = EncodedBands(width = raster.width, height = raster.height, rows = rows, pixel = pixel, deep = deep, band = try new u8[raster.width * rows * pixel] --- in memory.heap,
                                top = 0, filled = 0, sink = sink, context = context)
     defer free(banding.band) in memory.heap
     if named == "PNG":
@@ -250,7 +250,7 @@ struct ChannelPlaces:
     var blue: i64
     var alpha: i64
 
-    mutating func take(name: str, channel: i64):
+    func take(name: str, channel: i64):
         if name == "Y":
             self.red = channel
             self.green = channel

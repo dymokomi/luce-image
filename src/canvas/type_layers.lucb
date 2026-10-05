@@ -19,8 +19,8 @@ extend Canvas:
     ## point text), aligned 0 left, 1 center, 2 right or 3 justified, tracked
     ## in thousandths of an em and led `leading` pixels (0: the face's). Its
     ## pixels are set from these on every change. Undoable; typing coalesces.
-    pub mutating func set_type(id: i64, text: str, family: str, style: str, size: f64, red: f64, green: f64, blue: f64, x: f64, y: f64,
-                               box_width: f64 = 0.0, alignment: i64 = 0, tracking: f64 = 0.0, leading: f64 = 0.0) -> !:
+    pub func set_type(id: i64, text: str, family: str, style: str, size: f64, red: f64, green: f64, blue: f64, x: f64, y: f64,
+                      box_width: f64 = 0.0, alignment: i64 = 0, tracking: f64 = 0.0, leading: f64 = 0.0) -> !:
         try set_layer_type(&self, (u64)id, TypeSpec(text = text, family = family, style = style, size = size, red = red, green = green, blue = blue, x = x, y = y,
                                                     box_width = box_width, alignment = alignment, tracking = tracking, leading = leading))
 
@@ -47,10 +47,10 @@ extend Canvas:
         return values[(usize)field]
 
     ## The installed font families, listed once: how many, and each by index.
-    pub mutating func font_family_count() -> i64!:
+    pub func font_family_count() -> i64!:
         return (i64)(try family_names(&self)).length()
 
-    pub mutating func font_family(index: i64) -> str!:
+    pub func font_family(index: i64) -> str!:
         if index < 0:
             error(invalid, "no such family")
         return try (try family_names(&self)).at((usize)index)
@@ -130,7 +130,7 @@ func rendered_type(canvas: Canvas*, spec: TypeSpec) -> Tiles!:
     defer set.close()
     let width = (usize)set.bitmap.width
     let height = (usize)set.bitmap.height
-    let pixels = try alloc f32[width * height * 4] in memory.heap
+    let pixels = try new f32[width * height * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     for at in 0..<(width * height):
         pixels[at * 4] = (f32)spec.red

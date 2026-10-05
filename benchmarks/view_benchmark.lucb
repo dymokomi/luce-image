@@ -126,6 +126,6 @@ func frame(canvas: Canvas*, target: gpu.Texture*, zoom: f64, x: f64, y: f64) -> 
     let root = try root_frame.value().target()
     defer root.release()
     try canvas.draw(root, gpu.Rect(width = (f64)view_width, height = (f64)view_height), zoom, x, y)
-    discard(try root_frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    _ = try root_frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0))
     var texel: u8[4]
     try target.read(texel, gpu.Region(view_width // 2, view_height // 2, 1, 1))

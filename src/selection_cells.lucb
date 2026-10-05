@@ -45,7 +45,7 @@ pub struct Covered:
     pub var right: i64 = 0
     pub var bottom: i64 = 0
 
-    mutating func take(left: i64, top: i64, right: i64, bottom: i64):
+    func take(left: i64, top: i64, right: i64, bottom: i64):
         if not self.found:
             self = Covered(found = true, left = left, top = top, right = right, bottom = bottom)
             return
@@ -72,9 +72,9 @@ pub struct Cells:
         let columns = (width + tile_size - 1) // tile_size
         let rows = (height + tile_size - 1) // tile_size
         let count = (usize)columns * (usize)rows
-        let blocks = try alloc Block*?[count] in memory.heap
+        let blocks = try new Block*?[count] --- in memory.heap
         errdefer free(blocks) in memory.heap
-        let values = try alloc u8[count] in memory.heap
+        let values = try new u8[count] --- in memory.heap
         for index in 0..<count:
             blocks[index] = none
         memory.set(values, 0)
@@ -90,7 +90,7 @@ pub struct Cells:
                 copy.blocks[index] = block
         return copy
 
-    pub mutating func destroy():
+    pub func destroy():
         for index in 0..<self.blocks.length:
             self.release(index)
         if self.blocks.length > 0:
@@ -144,17 +144,17 @@ pub struct Cells:
         return self.blocks[index]
 
     ## Make cell `index` `value` throughout, letting its block go.
-    pub mutating func fill(index: usize, value: u8):
+    pub func fill(index: usize, value: u8):
         self.release(index)
         self.values[index] = value
 
     ## Every cell `value` throughout.
-    pub mutating func fill_all(value: u8):
+    pub func fill_all(value: u8):
         for index in 0..<self.blocks.length:
             self.fill(index, value)
 
     ## Put `other`'s cell `source` here at `index`, shared.
-    pub mutating func share(index: usize, other: const Cells*, source: usize):
+    pub func share(index: usize, other: const Cells*, source: usize):
         self.release(index)
         self.values[index] = other.values[source]
         if let block = other.blocks[source]:
@@ -165,38 +165,38 @@ pub struct Cells:
     ## made from the cell's one value, or copied when shared. Safe from several
     ## threads on different cells: a block shared with another selection is
     ## only ever read there while this one changes.
-    pub mutating func writable(index: usize) -> u8[]:
+    pub func writable(index: usize) -> u8[]:
         if let block = self.blocks[index]:
             if block.references == 1:
                 block.scanned = false
                 block.version = 0
                 return block.bytes
-            let copied = self.fresh_block()
+            let copied = Cells.fresh_block()
             memory.copy(copied.bytes, block.bytes, block_bytes)
             block.references -= 1
             self.blocks[index] = copied
             return copied.bytes
-        let made = self.fresh_block()
+        let made = Cells.fresh_block()
         memory.set(made.bytes, self.values[index])
         self.blocks[index] = made
         return made.bytes
 
     ## A block of its own for cell `index`, its bytes unset: for a change
     ## that writes every byte.
-    pub mutating func fresh(index: usize) -> u8[]:
+    pub func fresh(index: usize) -> u8[]:
         self.release(index)
-        let made = self.fresh_block()
+        let made = Cells.fresh_block()
         self.blocks[index] = made
         return made.bytes
 
-    func fresh_block() -> Block*:
-        let bytes = alloc u8[block_bytes] in memory.heap catch failure:
+    static func fresh_block() -> Block*:
+        let bytes = new u8[block_bytes] --- in memory.heap catch failure:
             trap("out of memory for a selection cell")
         let block = new Block(references = 1, version = 0, scanned = false, kind = 1, left = 0, top = 0, right = 0, bottom = 0, bytes = bytes) in memory.heap catch failure:
             trap("out of memory for a selection cell")
         return block
 
-    mutating func release(index: usize):
+    func release(index: usize):
         let block = self.blocks[index] else return
         self.blocks[index] = none
         block.references -= 1
@@ -217,14 +217,14 @@ pub struct Cells:
     ## After a change: the blocks written since are scanned (on every
     ## processor), those one value throughout become that value again, each
     ## other gets a new version; the box of every selected pixel is returned.
-    pub mutating func settle() -> Covered!:
+    pub func settle() -> Covered!:
         var pending: usize = 0
         for block in self.blocks:
             if let written = block:
                 if not written.scanned:
                     pending += 1
         if pending > 0:
-            let items = try alloc usize[pending] in memory.heap
+            let items = try new usize[pending] --- in memory.heap
             defer free(items) in memory.heap
             var at: usize = 0
             for index in 0..<self.blocks.length:

@@ -162,8 +162,8 @@ func unfilter_tile(filtered: const u8[], rows: usize, texels: u8[]):
 ## codec's bound): filtered, then deflated at the document's level; its
 ## length. What the memory governor's compressed tier packs with, on workers.
 func encode_tile_record(context: void*?, texels: const u8[], into: u8[]) -> usize!:
-    discard(context)
-    let filtered = try alloc u8[texels.length] in memory.heap
+    _ = context
+    let filtered = try new u8[texels.length] --- in memory.heap
     defer free(filtered) in memory.heap
     filter_tile(texels, (usize)tile_size, filtered)
     return try flate.deflate_raw(filtered, tile_deflate_level, into, true)
@@ -188,7 +188,7 @@ func write_all(file: files.File*, bytes: const u8[]) -> !:
 
 ## Fill all of `buffer` from `file` at `offset`.
 func read_at(file: files.File*, offset: u64, buffer: u8[]) -> !:
-    discard(try file.seek((i64)offset))
+    _ = try file.seek((i64)offset)
     var done: usize = 0
     while done < buffer.length:
         let got = try file.read(buffer[done..])

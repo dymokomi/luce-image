@@ -37,7 +37,7 @@ pub struct Filters:
         errdefer resample.destroy()
         var blank = try tile_texture(device)
         errdefer blank.destroy()
-        let zeros = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+        let zeros = try new u8[(usize)tile_size * (usize)tile_size * 8] --- in memory.heap
         defer free(zeros) in memory.heap
         for index in 0..<zeros.length:
             zeros[index] = 0
@@ -119,7 +119,7 @@ pub struct Filters:
         let area = try frame.value().target()
         defer area.release()
         try gpu.shade(area.value(), self.resample, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&(*params)[0], 64), [window], gpu.Filter.nearest)
-        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
         return fresh
 
     func resample_cell(tiles: const Tiles*, params: f32[16]*, window: gpu.Texture) -> gpu.Texture!:
@@ -130,7 +130,7 @@ pub struct Filters:
         let area = try frame.value().target()
         defer area.release()
         try gpu.shade(area.value(), self.resample, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&(*params)[0], 64), [window], gpu.Filter.nearest)
-        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
         return fresh
 
     ## Cell (`column`, `row`) of `tiles` as `blur_tiles` would leave it, made
@@ -175,7 +175,7 @@ pub struct Filters:
         defer whole.release()
         try gpu.shade(whole.value(), self.blur, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 24),
                       [before else self.blank, middle else self.blank, after else self.blank], gpu.Filter.nearest)
-        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
         return fresh
 
     ## One direction over every tile that has pixels or a neighbour with pixels
@@ -210,10 +210,10 @@ pub struct Filters:
                 defer whole.release()
                 try gpu.shade(whole.value(), self.blur, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 24),
                               [before else self.blank, middle else self.blank, after else self.blank], gpu.Filter.nearest)
-                discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+                _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
                 try tiles.set(column, row, fresh)
 
-    pub mutating func destroy():
+    pub func destroy():
         self.blank.destroy()
         self.resample.destroy()
         self.resample_shader.destroy()
@@ -227,7 +227,6 @@ func within_one(value: f64) -> bool:
 ## encodes what it reads and the vertical one decodes what it writes.
 func blur_params(taps: f64, sigma: f64, horizontal: bool, extent: u32, srgb: bool) -> f32[6]:
     return [(f32)taps, (f32)sigma, 1.0 if horizontal else 0.0, (f32)extent, 1.0 if srgb and horizontal else 0.0, 1.0 if srgb and not horizontal else 0.0]
-
 
 ## A linear component clamped to 0..1, sRGB-encoded.
 func encode(linear: f64) -> f64:
@@ -245,7 +244,7 @@ test "a gaussian blur spreads across tile edges and keeps alpha weight":
     defer document.destroy()
     let layer = try document.add_layer("Dot")
     let count = (usize)512 * 64 * 4
-    let pixels = try alloc f32[count] in memory.heap
+    let pixels = try new f32[count] --- in memory.heap
     defer free(pixels) in memory.heap
     for index in 0..<count:
         pixels[index] = 0.0
@@ -285,7 +284,7 @@ pub func add_noise(document: Document*, layer: u64, amount: f64, monochrome: boo
     let target = document.find(layer) else error(invalid, "no such layer")
     let tiles = try target.edited_tiles(on_mask)
     let count = (usize)tiles.width() * (usize)tiles.height()
-    let pixels = try alloc f32[count * 4] in memory.heap
+    let pixels = try new f32[count * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     try tiles.read(pixels)
     for at in 0..<count:
@@ -318,7 +317,6 @@ func mix_bits(seed: u64, at: u64, stream: u64) -> u64:
     v = (v ^ (v >> 27)) *% 0x94D049BB133111EB
     return v ^ (v >> 31)
 
-
 test "noise moves an opaque grey the same way for the same seed and leaves transparency alone":
     var device = gpu.Device.open() catch failure:
         assert(failure.code == gpu.unavailable)
@@ -327,7 +325,7 @@ test "noise moves an opaque grey the same way for the same seed and leaves trans
     var document = try Document.create(device, 8, 1)
     defer document.destroy()
     let layer = try document.add_layer("Grey")
-    let pixels = try alloc f32[32] in memory.heap
+    let pixels = try new f32[32] --- in memory.heap
     defer free(pixels) in memory.heap
     for at in 0..<(usize)8:
         for channel in 0..<(usize)3:
@@ -370,7 +368,7 @@ test "a motion blur smears along its angle only; lens correction's stretch empti
     defer document.destroy()
     let layer = try document.add_layer("Dot")
     let count = (usize)300 * 64 * 4
-    let pixels = try alloc f32[count] in memory.heap
+    let pixels = try new f32[count] --- in memory.heap
     defer free(pixels) in memory.heap
     for index in 0..<count:
         pixels[index] = 0.0

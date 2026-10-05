@@ -46,7 +46,7 @@ pub struct Puppet:
         let step = longer / across
         let columns = (usize)math.clamp(math.ceil((box.right - box.left) / step), 2.0, 128.0)
         let rows = (usize)math.clamp(math.ceil((box.bottom - box.top) / step), 2.0, 128.0)
-        let pins = try alloc f64[pin_limit * 4] in memory.heap
+        let pins = try new f64[pin_limit * 4] --- in memory.heap
         return Puppet(box = box, columns = columns, rows = rows, pins = pins, pin_count = 0)
 
     ## As `create`, on the heap: free it with `destroy` then `free`.
@@ -55,11 +55,11 @@ pub struct Puppet:
         errdefer made.destroy()
         return try new Puppet(box = made.box, columns = made.columns, rows = made.rows, pins = made.pins, pin_count = 0) in memory.heap
 
-    pub mutating func destroy():
+    pub func destroy():
         free(self.pins) in memory.heap
 
     ## Put a pin at (`x`, `y`); its index.
-    pub mutating func add_pin(x: f64, y: f64) -> usize!:
+    pub func add_pin(x: f64, y: f64) -> usize!:
         if self.pin_count == pin_limit:
             error(limit, "a puppet warp takes at most 64 pins")
         if not math.is_finite(x) or not math.is_finite(y):
@@ -77,14 +77,14 @@ pub struct Puppet:
         return self.pin_count - 1
 
     ## Move pin `index` to (`x`, `y`).
-    pub mutating func move_pin(index: usize, x: f64, y: f64) -> !:
+    pub func move_pin(index: usize, x: f64, y: f64) -> !:
         if index >= self.pin_count or not math.is_finite(x) or not math.is_finite(y):
             error(invalid, "no such pin, or not somewhere finite")
         self.pins[index * 4 + 2] = x
         self.pins[index * 4 + 3] = y
 
     ## Take pin `index` away.
-    pub mutating func remove_pin(index: usize) -> !:
+    pub func remove_pin(index: usize) -> !:
         if index >= self.pin_count:
             error(invalid, "no such pin")
         for at in index..<self.pin_count - 1:
@@ -194,7 +194,7 @@ pub struct Puppet:
     ## The landed lattice, as a mesh drawn backwards.
     pub func mesh() -> MeshMap!:
         let count = (self.columns + 1) * (self.rows + 1)
-        let landing = try alloc f64[count * 2] in memory.heap
+        let landing = try new f64[count * 2] --- in memory.heap
         defer free(landing) in memory.heap
         let width = self.box.right - self.box.left
         let height = self.box.bottom - self.box.top
@@ -216,8 +216,8 @@ test "a puppet with no pins, or pins left in place, changes nothing; one pin mov
     var y = 0.0
     puppet.deform(123.0, 45.0, &x, &y)
     assert(x == 123.0 and y == 45.0)
-    discard(try puppet.add_pin(100.0, 100.0))
-    discard(try puppet.add_pin(300.0, 200.0))
+    _ = try puppet.add_pin(100.0, 100.0)
+    _ = try puppet.add_pin(300.0, 200.0)
     puppet.deform(123.0, 45.0, &x, &y)
     assert(math.abs(x - 123.0) < 1e-6 and math.abs(y - 45.0) < 1e-6)
     # Both pins moved by the same amount: everything moves with them.

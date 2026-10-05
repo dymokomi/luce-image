@@ -21,7 +21,7 @@ extend Canvas:
     ## another document; `forget_copied_layers` starts afresh. The app puts
     ## `copied_layer_names` on the system clipboard (not for a drag between
     ## documents).
-    pub mutating func copy_layer(id: i64) -> !:
+    pub func copy_layer(id: i64) -> !:
         try self.require_open()
         try self.require_idle()
         let document = self.document else error(invalid, "draw the document once before copying layers")
@@ -29,9 +29,9 @@ extend Canvas:
             if clip.width != self.extent_x or clip.height != self.extent_y:
                 clear_layer_clip()
         if layer_clip == none:
-            let records = try alloc Record[8] in memory.heap
+            let records = try new Record[8] --- in memory.heap
             errdefer free(records) in memory.heap
-            let layers = try alloc Layer*[4] in memory.heap
+            let layers = try new Layer*[4] --- in memory.heap
             errdefer free(layers) in memory.heap
             var names: str = ""
             with memory.heap:
@@ -42,7 +42,7 @@ extend Canvas:
             copied_height = 0
         let clip = layer_clip else trap("just made")
         if clip.layer_count == clip.layers.length:
-            let grown = try alloc Layer*[clip.layers.length * 2] in memory.heap
+            let grown = try new Layer*[clip.layers.length * 2] --- in memory.heap
             memory.copy(grown, clip.layers, clip.layer_count)
             free(clip.layers) in memory.heap
             clip.layers = grown
@@ -89,7 +89,7 @@ extend Canvas:
     ## up among its layers (negative: on top), as one step; the topmost's id.
     ## They land where they were on a canvas of the same size or `in_place`,
     ## else centred.
-    pub mutating func paste_layers(parent: i64, position: i64, in_place: bool = false) -> i64!:
+    pub func paste_layers(parent: i64, position: i64, in_place: bool = false) -> i64!:
         try self.begin_edit("Paste Layers")
         defer self.end_edit()
         return try paste_layer_clip(&self, parent, position, in_place)
@@ -124,7 +124,7 @@ func clear_layer_clip():
 ## The records of `layer` and all it holds, copied into `clip`.
 func keep_records(canvas: Canvas*, clip: LayerClip*, layer: const Layer*) -> !:
     if clip.record_count == clip.records.length:
-        let grown = try alloc Record[clip.records.length * 2] in memory.heap
+        let grown = try new Record[clip.records.length * 2] --- in memory.heap
         memory.copy(grown, clip.records, clip.record_count)
         free(clip.records) in memory.heap
         clip.records = grown

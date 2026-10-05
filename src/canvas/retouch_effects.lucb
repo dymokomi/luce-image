@@ -40,7 +40,7 @@ struct CloneSource:
 
     ## A source cell: the layer's tile, or the frozen document flattened there
     ## (borrowed until the compositor's next request).
-    mutating func cell_at(column: u32, row: u32) -> gpu.Texture?!:
+    func cell_at(column: u32, row: u32) -> gpu.Texture?!:
         if let document = self.frozen:
             let composer = self.composer else trap("a frozen clone without a compositor")
             return try composer.tile(document, column, row, 0)
@@ -98,7 +98,7 @@ func clone_cell(context: void*?, column: u32, row: u32) -> gpu.Texture?!:
             let bottom = math.imin(y1, from_row * size + size)
             try gpu.copy_image(target.value(), texture, gpu.Rect((f64)(left - source.dx - cell_x), (f64)(top - source.dy - cell_y), (f64)(right - left), (f64)(bottom - top)),
                                gpu.Region((u32)(left - from_column * size), (u32)(top - from_row * size), (u32)(right - left), (u32)(bottom - top)))
-    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+    _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
     return cell
 
 func release_clone(context: void*?):
@@ -197,15 +197,15 @@ func finish_heal(canvas: Canvas*, stroke: Stroke*) -> !:
     var painter = canvas.painter else trap("stroke without a painter")
     let device = canvas.device else trap("stroke without a device")
     let original = stroke.original()
-    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    let bytes = try new u8[(usize)tile_size * (usize)tile_size * 8] --- in memory.heap
     defer free(bytes) in memory.heap
     let hole = (try spot_bounds(device, stroke, original)) else return
     let window = heal_window(hole, (i64)canvas.extent_x, (i64)canvas.extent_y)
     let width = (usize)(window.right - window.left)
     let height = (usize)(window.bottom - window.top)
-    let pixels = try alloc f32[width * height * 4] in memory.heap
+    let pixels = try new f32[width * height * 4] --- in memory.heap
     defer free(pixels) in memory.heap
-    let painted = try alloc u8[width * height] in memory.heap
+    let painted = try new u8[width * height] --- in memory.heap
     defer free(painted) in memory.heap
     # The patch mixes the picture's colors as the document blends them.
     let encoded = document.mixes_encoded()

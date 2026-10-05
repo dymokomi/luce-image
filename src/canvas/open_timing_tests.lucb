@@ -24,9 +24,9 @@ func write_plain_png(path: str, width: usize, height: usize) -> !:
     try png_chunk(&file, "IHDR", header)
     let stride = width * 3 + 1
     let group: usize = 64
-    let rows = try alloc u8[stride * group] in memory.heap
+    let rows = try new u8[stride * group] --- in memory.heap
     defer free(rows) in memory.heap
-    let packed = try alloc u8[stride * group + 65536] in memory.heap
+    let packed = try new u8[stride * group + 65536] --- in memory.heap
     defer free(packed) in memory.heap
     let zlib: u8[2] = [0x78, 0x01]
     try png_chunk(&file, "IDAT", zlib)
@@ -76,7 +76,7 @@ func write_big_jpeg(path: str, width: usize, height: usize) -> !:
     var encoder = try jpeg.Encoder.begin(width, height, jpeg.Input.rgba, &encoded, jpeg.EncodeOptions(quality = 85))
     defer encoder.close()
     let group: usize = 256
-    let band = try alloc u8[width * group * 4] in memory.heap
+    let band = try new u8[width * group * 4] --- in memory.heap
     defer free(band) in memory.heap
     var top: usize = 0
     while top < height:
@@ -133,7 +133,7 @@ func open_as_window(device: gpu.Device, path: str) -> OpenTimes!:
     assert(canvas.opening_percent() == 100)
     # The last frame has the bottom rows, and the document edits again.
     assert(not dark(try opening_pixel(&target, middle, (u32)(height * zoom) - 2)))
-    discard(try canvas.add_layer("After"))
+    _ = try canvas.add_layer("After")
     canvas.close()
     return times
 
@@ -178,7 +178,7 @@ func draw_opening_frame(canvas: Canvas*, target: gpu.Texture*, zoom: f64) -> !:
     let root = try frame.value().target()
     defer root.release()
     try canvas.draw(root, gpu.Rect(width = (f64)opening_view_width, height = (f64)opening_view_height), zoom, 0.0, 0.0)
-    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0))
 
 func opening_pixel(target: gpu.Texture*, x: u32, y: u32) -> u8[4]!:
     var read: u8[4]
@@ -230,9 +230,9 @@ test "a picture loaded in the background makes the same tiles as one loaded at o
     # TIFF strips (linear floats) and JPEG, each over a partial last row and column.
     let width: usize = 700
     let height: usize = 600
-    let bytes = try alloc u8[width * height * 4] in memory.heap
+    let bytes = try new u8[width * height * 4] --- in memory.heap
     defer free(bytes) in memory.heap
-    let words = try alloc u16[width * height * 4] in memory.heap
+    let words = try new u16[width * height * 4] --- in memory.heap
     defer free(words) in memory.heap
     for index in 0..<bytes.length:
         bytes[index] = (u8)((index * 7 + index // 2801) % 256)
@@ -252,9 +252,9 @@ test "a picture loaded in the background makes the same tiles as one loaded at o
     try encoder.finish()
     try write_file("build/background-open-16.png", deep.view())
     let cells = (usize)tile_columns((u32)width) * (usize)tile_columns((u32)height) * (usize)tile_size * (usize)tile_size * 4
-    let at_once = try alloc f32[cells] in memory.heap
+    let at_once = try new f32[cells] --- in memory.heap
     defer free(at_once) in memory.heap
-    let in_background = try alloc f32[cells] in memory.heap
+    let in_background = try new f32[cells] --- in memory.heap
     defer free(in_background) in memory.heap
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
@@ -316,7 +316,7 @@ func placed_layer(device: gpu.Device, target: gpu.Texture*, path: str, center_x:
     let tiles = found.tiles() else trap("pixels")
     var flat = try flatten_all(device, tiles)
     defer flat.destroy()
-    let texels = try alloc u8[(usize)(try flat.texture.width()) * (usize)(try flat.texture.height()) * 8] in memory.heap
+    let texels = try new u8[(usize)(try flat.texture.width()) * (usize)(try flat.texture.height()) * 8] --- in memory.heap
     errdefer free(texels) in memory.heap
     try flat.texture.read(texels)
     return PlacedLayer(texels = texels, left = flat.left, top = flat.top)
@@ -329,7 +329,7 @@ test "a picture placed in the background makes the same layer as one placed at o
     # Soft alpha over a partial last row and column, as a PNG and a JPEG.
     let width: usize = 700
     let height: usize = 600
-    let bytes = try alloc u8[width * height * 4] in memory.heap
+    let bytes = try new u8[width * height * 4] --- in memory.heap
     defer free(bytes) in memory.heap
     for index in 0..<bytes.length:
         bytes[index] = (u8)((index * 7 + index // 2801) % 256)
@@ -355,13 +355,13 @@ test "a picture placed in the background makes the same layer as one placed at o
                 assert(loaded.texels[index] == at_once.texels[index])
 
 func ignore_band(context: void*?, first: usize, count: usize, samples: const u8[], deep: bool) -> !:
-    discard(context)
+    _ = context
 
 test "a large PNG or JPEG opens from its file's start; a whole decode reads the rest, a changed file is refused":
     # Noise, so each file is well over the 64 KiB start read first.
     let width: usize = 500
     let height: usize = 400
-    let bytes = try alloc u8[width * height * 4] in memory.heap
+    let bytes = try new u8[width * height * 4] --- in memory.heap
     defer free(bytes) in memory.heap
     var seed: u32 = 99
     for index in 0..<bytes.length:
@@ -387,9 +387,9 @@ test "a large PNG or JPEG opens from its file's start; a whole decode reads the 
         defer changed.release()
         try write_file(path, b"\x89PNG\r\n\x1a\n")
         var refused = false
-        discard(changed.value().encoded_rgba_bands(64, ignore_band, none) catch failure:
+        _ = changed.value().encoded_rgba_bands(64, ignore_band, none) catch failure:
             refused = failure.code == invalid
-            recover false)
+            recover false
         assert(refused)
 
 test "a progressive JPEG or interlaced PNG shows a coarse picture before its rows, then the tiles of one opened at once":
@@ -410,9 +410,9 @@ test "a progressive JPEG or interlaced PNG shows a coarse picture before its row
 ## tiles of an open at once.
 func coarse_then_whole(device: gpu.Device, path: str, width: u32, height: u32, near: bool) -> !:
     let cells = (usize)tile_columns(width) * (usize)tile_columns(height) * (usize)tile_size * (usize)tile_size * 4
-    let at_once = try alloc f32[cells] in memory.heap
+    let at_once = try new f32[cells] --- in memory.heap
     defer free(at_once) in memory.heap
-    let in_background = try alloc f32[cells] in memory.heap
+    let in_background = try new f32[cells] --- in memory.heap
     defer free(in_background) in memory.heap
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
@@ -438,7 +438,7 @@ func coarse_then_whole(device: gpu.Device, path: str, width: u32, height: u32, n
             let made = try coarse_cell((void*)opening, composer.levels(), opening.layer, false, 0, 0, 0)
             var texture = made.texture else trap("a coarse cell")
             defer texture.destroy()
-            let texels = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+            let texels = try new u8[(usize)tile_size * (usize)tile_size * 8] --- in memory.heap
             defer free(texels) in memory.heap
             try texture.read(texels)
             var difference = 0.0

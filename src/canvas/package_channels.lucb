@@ -28,7 +28,7 @@ let coverage_stamp_bit: u64 = 0x8000000000000000
 func write_channels(canvas: Canvas*, writer: PackageWriter*) -> !:
     if canvas.channels.count == 0:
         return
-    let packed = try alloc u8[flate.deflate_bound(block_bytes)] in memory.heap
+    let packed = try new u8[flate.deflate_bound(block_bytes)] --- in memory.heap
     defer free(packed) in memory.heap
     for index in 0..<canvas.channels.count:
         let selection = &canvas.channels.items[index].selection
@@ -79,9 +79,9 @@ func read_channels(canvas: Canvas*, source: const PackageSource*, doc: prism.Doc
     defer strings.release(native)
     var file = try files.File.open((c_api.str)native)
     defer file.destroy()
-    let packed = try alloc u8[flate.deflate_bound(block_bytes)] in memory.heap
+    let packed = try new u8[flate.deflate_bound(block_bytes)] --- in memory.heap
     defer free(packed) in memory.heap
-    let first = try alloc i64[source.blobs.length if source.blobs.length > 0 else 1] in memory.heap
+    let first = try new i64[source.blobs.length if source.blobs.length > 0 else 1] --- in memory.heap
     defer free(first) in memory.heap
     for at in 0..<first.length:
         first[at] = -1

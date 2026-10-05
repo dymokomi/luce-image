@@ -81,19 +81,19 @@ struct Copy:
 
     static func of(tiles: const Tiles*, encoded: bool) -> Copy!:
         let count = (usize)tiles.width() * (usize)tiles.height()
-        let pixels = try alloc f32[count * 4] in memory.heap
+        let pixels = try new f32[count * 4] --- in memory.heap
         errdefer free(pixels) in memory.heap
         try tiles.read(pixels)
         if encoded:
             for at in 0..<count:
                 for channel in 0..<(usize)3:
                     pixels[at * 4 + channel] = (f32)encode((f64)pixels[at * 4 + channel])
-        let glow = try alloc f32[count * 4] in memory.heap
+        let glow = try new f32[count * 4] --- in memory.heap
         memory.copy(glow, pixels, count * 4)
         return Copy(pixels = pixels, glow = glow, count = count, width = tiles.width(), height = tiles.height(), device = tiles.device(), encoded = encoded)
 
     ## The pixels written back to `tiles`, in linear light again.
-    mutating func store(tiles: Tiles*) -> !:
+    func store(tiles: Tiles*) -> !:
         if self.encoded:
             for at in 0..<self.count:
                 for channel in 0..<(usize)3:
@@ -102,7 +102,7 @@ struct Copy:
 
     ## `glow` blurred `radius` pixels on the device, mixing its values as they
     ## are (already encoded when the copy is).
-    mutating func blurred(filters: const Filters*, radius: f64) -> !:
+    func blurred(filters: const Filters*, radius: f64) -> !:
         if not math.is_finite(radius) or radius < 1.0 or radius > 250.0:
             error(invalid, "the radius must be 1..250 pixels")
         var tiles = try Tiles.create(self.device, self.width, self.height)
@@ -111,7 +111,7 @@ struct Copy:
         try filters.blur_tiles(&tiles, radius, false)
         try tiles.read(self.glow)
 
-    mutating func destroy():
+    func destroy():
         free(self.pixels) in memory.heap
         free(self.glow) in memory.heap
 
@@ -121,8 +121,6 @@ func luma(pixels: const f32[], at: usize) -> f64:
 func smooth(low: f64, high: f64, value: f64) -> f64:
     let t = math.clamp((value - low) / (high - low), 0.0, 1.0)
     return t * t * (3.0 - 2.0 * t)
-
-
 
 ## A linear component clamped to 0..1, sRGB-encoded.
 func encode(linear: f64) -> f64:
@@ -140,7 +138,7 @@ test "bloom spreads a bright spot's light around it; tonal contrast pushes an ed
     defer document.destroy()
     let layer = try document.add_layer("Scene")
     let count = (usize)64 * 64
-    let pixels = try alloc f32[count * 4] in memory.heap
+    let pixels = try new f32[count * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     # Dark grey, a white square in the middle.
     for y in 0..<(usize)64:

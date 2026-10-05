@@ -12,7 +12,7 @@ extend Canvas:
     ## Give a layer a mask, or remove its mask. `fill` is what the new mask
     ## holds: 0 reveals everything, 1 hides everything (Photoshop's Alt-click),
     ## 2 reveals the selection.
-    pub mutating func set_mask(id: i64, present: bool, fill: i64 = 0) -> !:
+    pub func set_mask(id: i64, present: bool, fill: i64 = 0) -> !:
         try self.require_open()
         try self.require_idle()
         try self.remember_state("Layer Mask")
@@ -36,7 +36,7 @@ extend Canvas:
         return (try self.record(index)).masked
 
     ## Disable a layer's mask — kept, hiding nothing — or enable it again.
-    pub mutating func enable_mask(id: i64, enabled: bool) -> !:
+    pub func enable_mask(id: i64, enabled: bool) -> !:
         try self.require_open()
         try self.remember_state("Disable Mask")
         let index = try self.index((u64)id)
@@ -51,7 +51,7 @@ extend Canvas:
 
     ## Link a layer's mask to its pixels (the default: it moves and transforms
     ## with them) or unlink it (it stays where it is). Undoable.
-    pub mutating func link_mask(id: i64, linked: bool) -> !:
+    pub func link_mask(id: i64, linked: bool) -> !:
         try self.require_open()
         let index = try self.index((u64)id)
         if not self.records[index].masked:
@@ -64,7 +64,7 @@ extend Canvas:
 
     ## Give layer `target` a copy of layer `source`'s mask, replacing any it
     ## has: Photoshop's Alt-drag of a mask thumbnail. Undoable.
-    pub mutating func copy_mask(source: i64, target: i64) -> !:
+    pub func copy_mask(source: i64, target: i64) -> !:
         try self.require_open()
         try self.require_idle()
         let source_index = try self.index((u64)source)
@@ -83,18 +83,18 @@ extend Canvas:
 
     ## Route strokes to the selected layer's mask instead of its pixels: white
     ## reveals, black hides.
-    pub mutating func edit_mask(enabled: bool):
+    pub func edit_mask(enabled: bool):
         self.mask_editing = enabled
 
     ## Whether edits to layer `id` go to its mask: it has one and it is being edited.
-    mutating func editing_mask_of(id: i64) -> bool!:
+    func editing_mask_of(id: i64) -> bool!:
         return self.mask_editing and self.records[try self.index((u64)id)].masked
 
     pub func editing_mask() -> bool:
         return self.mask_editing
 
     ## Clip a layer to the nearest unclipped layer below it, or unclip it.
-    pub mutating func set_clipped(id: i64, clipped: bool) -> !:
+    pub func set_clipped(id: i64, clipped: bool) -> !:
         try self.require_open()
         try self.remember_state("Clipping Mask")
         let index = try self.index((u64)id)
@@ -104,7 +104,7 @@ extend Canvas:
 
     ## Set one of layer `id`'s style settings, by field (`style_value` lists
     ## them); the compositor draws the effects and the document keeps them.
-    pub mutating func set_style_value(id: i64, field: i64, value: f64) -> !:
+    pub func set_style_value(id: i64, field: i64, value: f64) -> !:
         try self.remember_state("Layer Style", (u64)id)
         var style = try self.style_of(id)
         try style.set_field(field, value)
@@ -134,7 +134,7 @@ extend Canvas:
         return self.records[index].style
 
     ## Every field was checked as it was set (`Style.set_field`).
-    mutating func set_style(id: i64, style: Style) -> !:
+    func set_style(id: i64, style: Style) -> !:
         let index = try self.index((u64)id)
         if let document = self.document:
             (document.find((u64)id) else error(invalid, "no such layer")).style = style
@@ -142,4 +142,3 @@ extend Canvas:
 
     pub func layer_clipped(index: i64) -> bool!:
         return (try self.record(index)).clipped
-

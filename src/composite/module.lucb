@@ -129,7 +129,7 @@ pub struct Composer:
         errdefer pipeline.destroy()
         var blank = try tile_texture(device)
         errdefer blank.destroy()
-        let zeros = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+        let zeros = try new u8[(usize)tile_size * (usize)tile_size * 8] --- in memory.heap
         defer free(zeros) in memory.heap
         for index in 0..<zeros.length:
             zeros[index] = 0
@@ -162,7 +162,7 @@ pub struct Composer:
 
     ## The flattened tile at `column`, `row` of pyramid `level`, borrowed until
     ## the next call. Straight-alpha rgba16_float, transparent where nothing is.
-    pub mutating func tile(document: const Document*, column: u32, row: u32, level: u32) -> gpu.Texture!:
+    pub func tile(document: const Document*, column: u32, row: u32, level: u32) -> gpu.Texture!:
         if level > 16:
             error(invalid, "pyramid levels go up to 16")
         let span = 1u32 << level
@@ -193,7 +193,7 @@ pub struct Composer:
     ## Forget the composites and `tiles`' level tiles over row `row` of cells,
     ## about to change as a picture loads into `tiles` a band at a time: made
     ## from the rows so far, they would only fill the caches until pushed out.
-    pub mutating func forget_band(document: const Document*, tiles: const Tiles*, row: u32):
+    pub func forget_band(document: const Document*, tiles: const Tiles*, row: u32):
         var level: u32 = 0
         while level <= 16:
             let span = (u64)tile_size << level
@@ -233,7 +233,7 @@ pub struct Composer:
     ## yet kept would otherwise bring back one at a time, each decoded on this
     ## thread (luce-canvas tiles/gathering). A draw calls it before asking for
     ## the cells; a tile it misses (a blur's neighbors) still comes back alone.
-    pub mutating func gather(document: const Document*, first_column: u32, first_row: u32, last_column: u32, last_row: u32, level: u32) -> !:
+    pub func gather(document: const Document*, first_column: u32, first_row: u32, last_column: u32, last_row: u32, level: u32) -> !:
         var pending = Gathering.create()
         for row in first_row..<last_row:
             for column in first_column..<last_column:
@@ -243,12 +243,12 @@ pub struct Composer:
         try pending.finish()
 
     ## Whether the composite of cell (`column`, `row`) at `level` is kept.
-    pub mutating func kept(document: const Document*, column: u32, row: u32, level: u32) -> bool:
+    pub func kept(document: const Document*, column: u32, row: u32, level: u32) -> bool:
         return self.cache.has(self.composite_key(document, column, row, level) | 1)
 
     ## Add to `pending` (deferred) the layer tiles making that composite would
     ## bring back; how many it lacks.
-    pub mutating func lacking(document: const Document*, column: u32, row: u32, level: u32, pending: Gathering*) -> usize!:
+    pub func lacking(document: const Document*, column: u32, row: u32, level: u32, pending: Gathering*) -> usize!:
         let before = pending.missing()
         try self.gather_layers(document.layers(), column, row, level, pending)
         return pending.missing() - before
@@ -256,7 +256,7 @@ pub struct Composer:
     ## The nearest coarser composite kept that covers cell (`column`, `row`) of
     ## `level` (whose covered texels are `covered_x` by `covered_y`), and the
     ## texels of it that stand for the cell; none when no coarser one is kept.
-    pub mutating func coarser(document: const Document*, column: u32, row: u32, level: u32, covered_x: u32, covered_y: u32) -> Coarser?:
+    pub func coarser(document: const Document*, column: u32, row: u32, level: u32, covered_x: u32, covered_y: u32) -> Coarser?:
         for up in 1..<(u32)8:
             let coarse = level + up
             if coarse > 16:
@@ -283,11 +283,11 @@ pub struct Composer:
     ## Cell (`column`, `row`) of any store at `level`, for drawing outside a
     ## composite (thumbnails, marching ants, a layer being moved): borrowed
     ## until the next `hold` or composite request; none where it is empty.
-    pub mutating func level_texture(tiles: const Tiles*, column: u32, row: u32, level: u32, mask: bool = false) -> gpu.Texture?!:
+    pub func level_texture(tiles: const Tiles*, column: u32, row: u32, level: u32, mask: bool = false) -> gpu.Texture?!:
         return try self.pyramid.texture(tiles, column, row, level, mask)
 
     ## Begin a drawing request whose level tiles must stay until it is done.
-    pub mutating func hold():
+    pub func hold():
         self.cache.hold()
         self.pyramid.hold()
 
@@ -295,13 +295,13 @@ pub struct Composer:
     ## empty. A level-0 tile kept in RAM comes up for this composite alone
     ## (released when `tile` has made it), so compositing a document mostly in
     ## RAM costs uploads rather than GPU memory.
-    mutating func source(tiles: const Tiles*, column: u32, row: u32, mask: bool = false) -> gpu.Texture?!:
+    func source(tiles: const Tiles*, column: u32, row: u32, mask: bool = false) -> gpu.Texture?!:
         return try self.pyramid.pass_texture(tiles, column, row, self.level, mask)
 
     ## Show layer `stand_in.layer` (or its mask) through `stand_in` until
     ## `drop_stand_ins`, replacing one it has already; a new generation
     ## redraws every tile it reaches.
-    pub mutating func stand_in(stand_in: StandIn) -> !:
+    pub func stand_in(stand_in: StandIn) -> !:
         for index in 0..<self.stand_in_count:
             if self.stand_ins[index].layer == stand_in.layer and self.stand_ins[index].mask == stand_in.mask:
                 if self.stand_ins[index].generation != stand_in.generation:
@@ -314,16 +314,16 @@ pub struct Composer:
         self.stand_in_count += 1
 
     ## Show every layer through its own tiles again.
-    pub mutating func drop_stand_ins():
+    pub func drop_stand_ins():
         self.stand_in_count = 0
         self.forget_stand_in_keys()
 
     ## Remember `key`, cached while stand-ins show, to let it go with them.
-    mutating func note_stand_in_key(key: u64) -> !:
+    func note_stand_in_key(key: u64) -> !:
         if self.stand_in_count == 0:
             return
         if self.stand_in_key_count == self.stand_in_keys.length:
-            let grown = try alloc u64[self.stand_in_keys.length * 2 + 64] in memory.heap
+            let grown = try new u64[self.stand_in_keys.length * 2 + 64] --- in memory.heap
             for index in 0..<self.stand_in_key_count:
                 grown[index] = self.stand_in_keys[index]
             if self.stand_in_keys.length > 0:
@@ -333,17 +333,17 @@ pub struct Composer:
         self.stand_in_key_count += 1
 
     ## Let go of what was cached for the stand-ins as they were.
-    mutating func forget_stand_in_keys():
+    func forget_stand_in_keys():
         for index in 0..<self.stand_in_key_count:
             self.cache.forget(self.stand_in_keys[index])
         self.stand_in_key_count = 0
 
     ## The layer levels it keeps: what a stand-in reads, for work made outside a draw.
-    pub mutating func levels() -> Pyramid*:
+    pub func levels() -> Pyramid*:
         return &self.pyramid
 
     ## Forget every rendered tile.
-    pub mutating func clear():
+    pub func clear():
         self.cache.clear()
         self.pyramid.clear()
         for index in 0..<effects_budget:
@@ -351,7 +351,7 @@ pub struct Composer:
                 drop_effects(&self.effects[index])
                 self.effects[index].live = false
 
-    pub mutating func destroy():
+    pub func destroy():
         if self.stand_in_keys.length > 0:
             free(self.stand_in_keys) in memory.heap
         var no_keys: u64[]

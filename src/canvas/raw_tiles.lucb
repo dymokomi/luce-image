@@ -46,9 +46,9 @@ func raw_tiles(device: gpu.Device, picture: interop.Reference[Image]) -> Tiles!:
     let columns = (usize)tiles.columns()
     let cells = columns * (usize)tiles.rows()
     let per_tile = (usize)tile_size * (usize)tile_size * 8
-    let slots = try alloc u8[cells * per_tile] in memory.heap
+    let slots = try new u8[cells * per_tile] --- in memory.heap
     defer free(slots) in memory.heap
-    let painted = try alloc bool[cells] in memory.heap
+    let painted = try new bool[cells] --- in memory.heap
     defer free(painted) in memory.heap
     for index in 0..<cells:
         painted[index] = false

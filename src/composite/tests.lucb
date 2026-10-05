@@ -15,7 +15,7 @@ test "composite flattens layers with opacity, caches by identity and scales leve
     var document = try Document.create(device, 300, 260)
     defer document.destroy()
     let count = (usize)300 * 260 * 4
-    let pixels = try alloc f32[count] in memory.heap
+    let pixels = try new f32[count] --- in memory.heap
     defer free(pixels) in memory.heap
     for index in 0..<count:
         pixels[index] = 0.0
@@ -48,14 +48,14 @@ test "composite flattens layers with opacity, caches by identity and scales leve
     assert(r > 0.209 and r < 0.219 and g > 0.209 and g < 0.219 and a == 1.0)
     # The same request is a cache hit; a change to the top layer is not, and
     # hiding it leaves the bottom-only tile at (1, 1) untouched.
-    discard(try composer.tile(&document, 0, 0, 0))
+    _ = try composer.tile(&document, 0, 0, 0)
     assert(composer.renders == 1)
-    discard(try composer.tile(&document, 1, 1, 0))
+    _ = try composer.tile(&document, 1, 1, 0)
     assert(composer.renders == 2)
     try document.set_appearance(top, true, 0.25)
-    discard(try composer.tile(&document, 0, 0, 0))
+    _ = try composer.tile(&document, 0, 0, 0)
     assert(composer.renders == 3)
-    discard(try composer.tile(&document, 1, 1, 0))
+    _ = try composer.tile(&document, 1, 1, 0)
     assert(composer.renders == 3)
     # Level 1 covers the whole document in one tile.
     let coarse = try composer.tile(&document, 0, 0, 1)
@@ -111,10 +111,10 @@ test "composite flattens layers with opacity, caches by identity and scales leve
     assert(linear_red > 0.49 and linear_red < 0.51)
     document.linear_blend = false
     var rejected = false
-    discard(composer.tile(&document, 4, 0, 0) catch failure:
+    _ = composer.tile(&document, 4, 0, 0) catch failure:
         assert(failure.code == invalid)
         rejected = true
-        recover coarse)
+        recover coarse
     assert(rejected)
 
 test "a styled layer's glow is composited under it":
@@ -125,7 +125,7 @@ test "a styled layer's glow is composited under it":
     var document = try Document.create(device, 64, 64)
     defer document.destroy()
     let count = (usize)64 * 64 * 4
-    let pixels = try alloc f32[count] in memory.heap
+    let pixels = try new f32[count] --- in memory.heap
     defer free(pixels) in memory.heap
     for index in 0..<count:
         pixels[index] = 0.0
@@ -140,7 +140,7 @@ test "a styled layer's glow is composited under it":
     var composer = try Composer.create(device, 4)
     defer composer.destroy()
     var plain = try composer.tile(&document, 0, 0, 0)
-    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    let bytes = try new u8[(usize)tile_size * (usize)tile_size * 8] --- in memory.heap
     defer free(bytes) in memory.heap
     try plain.read(bytes)
     assert(bytes[(32 * 256 + 12) * 8 + 7] == 0)
@@ -161,7 +161,7 @@ test "a blur layer softens what is below it across cell edges, and the cache fol
     defer document.destroy()
     let layer = try document.add_layer("Bar")
     let count = (usize)512 * 64 * 4
-    let pixels = try alloc f32[count] in memory.heap
+    let pixels = try new f32[count] --- in memory.heap
     defer free(pixels) in memory.heap
     for index in 0..<count:
         pixels[index] = 0.0
@@ -174,11 +174,11 @@ test "a blur layer softens what is below it across cell edges, and the cache fol
     try tiles.write(pixels)
     try document.set_tiles(layer, tiles)
     let values: f64[1] = [6.0]
-    discard(try document.add_adjustment("Blur", (i64)blur, values))
+    _ = try document.add_adjustment("Blur", (i64)blur, values)
     var composer = try Composer.create(device)
     defer composer.destroy()
     let right = try composer.tile(&document, 1, 0, 0)
-    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    let bytes = try new u8[(usize)tile_size * (usize)tile_size * 8] --- in memory.heap
     defer free(bytes) in memory.heap
     try right.read(bytes)
     # Just right of the edge the white bleeds in (alpha half in f16 bytes 6..7).
@@ -192,5 +192,5 @@ test "a blur layer softens what is below it across cell edges, and the cache fol
             pixels[(y * 512 + x) * 4 + 3] = 0.0
     let current = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
     try current.write(pixels)
-    discard(try composer.tile(&document, 1, 0, 0))
+    _ = try composer.tile(&document, 1, 0, 0)
     assert(composer.renders == before + 1)

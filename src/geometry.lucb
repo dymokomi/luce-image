@@ -65,7 +65,7 @@ test "canvas and image resizing keep pixels in place, scale them, and keep what 
     defer document.destroy()
     let layer = try document.add_layer("Dot")
     let count = (usize)300 * 40 * 4
-    let pixels = try alloc f32[count] in memory.heap
+    let pixels = try new f32[count] --- in memory.heap
     defer free(pixels) in memory.heap
     for index in 0..<count:
         pixels[index] = 0.0
@@ -80,19 +80,19 @@ test "canvas and image resizing keep pixels in place, scale them, and keep what 
     # Crop to x 250..300, y 0..40: the dot lands at (10, 10).
     try resize_canvas(&document, 50, 40, -250, 0)
     assert(document.width() == 50 and document.height() == 40)
-    let cropped = try alloc f32[(usize)50 * 40 * 4] in memory.heap
+    let cropped = try new f32[(usize)50 * 40 * 4] --- in memory.heap
     defer free(cropped) in memory.heap
     try ((document.find(layer) else trap("layer")).tiles() else trap("tiles")).read(cropped)
     assert(cropped[(10 * 50 + 10) * 4 + 1] > 0.99)
     # Grow to 100 x 80 with the old canvas at (20, 20): the dot is at (30, 30).
     try resize_canvas(&document, 100, 80, 20, 20)
-    let grown = try alloc f32[(usize)100 * 80 * 4] in memory.heap
+    let grown = try new f32[(usize)100 * 80 * 4] --- in memory.heap
     defer free(grown) in memory.heap
     try ((document.find(layer) else trap("layer")).tiles() else trap("tiles")).read(grown)
     assert(grown[(30 * 100 + 30) * 4 + 1] > 0.99 and grown[(10 * 100 + 10) * 4 + 3] == 0.0)
     # Double the image: the dot spreads around (60, 60).
     try resize_image(&document, 200, 160)
-    let doubled = try alloc f32[(usize)200 * 160 * 4] in memory.heap
+    let doubled = try new f32[(usize)200 * 160 * 4] --- in memory.heap
     defer free(doubled) in memory.heap
     try ((document.find(layer) else trap("layer")).tiles() else trap("tiles")).read(doubled)
     assert(doubled[(60 * 200 + 60) * 4 + 3] > 0.2 and doubled[(30 * 200 + 30) * 4 + 3] == 0.0)
@@ -100,7 +100,7 @@ test "canvas and image resizing keep pixels in place, scale them, and keep what 
     # canvas grown 440 to the left shows it again at (20, 60).
     assert(((document.find(layer) else trap("layer")).tiles() else trap("tiles")).has_outside())
     try resize_canvas(&document, 700, 160, 440, 0)
-    let revealed = try alloc f32[(usize)700 * 160 * 4] in memory.heap
+    let revealed = try new f32[(usize)700 * 160 * 4] --- in memory.heap
     defer free(revealed) in memory.heap
     try ((document.find(layer) else trap("layer")).tiles() else trap("tiles")).read(revealed)
     assert(revealed[(60 * 700 + 20) * 4] > 0.2 and revealed[(60 * 700 + 20) * 4 + 3] > 0.2 and revealed[(60 * 700 + 500) * 4 + 3] > 0.2)

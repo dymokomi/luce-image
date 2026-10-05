@@ -59,7 +59,7 @@ func warp_item(context: void*?, index: usize):
         return
     var window = Window(left = reach.left, top = reach.top, width = reach.right - reach.left, height = reach.bottom - reach.top,
                         extent_x = (i64)job.source.extent_x, extent_y = (i64)job.source.extent_y)
-    let pixels = alloc u8[(usize)(window.width * window.height)] in memory.heap catch failure:
+    let pixels = new u8[(usize)(window.width * window.height)] --- in memory.heap catch failure:
         job.failed = true
         return
     defer free(pixels) in memory.heap
@@ -205,7 +205,7 @@ func shapes_cells(width: u32, height: u32) -> Cells!:
                 elif px >= 560 and py < 40:
                     value = 255
                 bytes[(usize)(y * (i64)tile_size + x)] = (u8)value
-    discard(try cells.settle())
+    _ = try cells.settle()
     return cells
 
 test "a gathered, stepped warp matches sampling tap by tap, and a limit leaves the rest clear":

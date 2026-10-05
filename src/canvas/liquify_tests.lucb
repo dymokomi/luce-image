@@ -6,7 +6,7 @@
 
 ## Every straight-alpha sample of layer `layer`, `width` by `height`.
 func pushed_samples(canvas: Canvas*, layer: i64, width: usize, height: usize) -> f32[]!:
-    let pixels = try alloc f32[width * height * 4] in memory.heap
+    let pixels = try new f32[width * height * 4] --- in memory.heap
     errdefer free(pixels) in memory.heap
     try layer_tiles(canvas, layer).read(pixels)
     return pixels
@@ -31,9 +31,9 @@ test "a push drags what is under the tip along its path, shows it live, and undo
     let layer = try canvas.add_layer("Paint")
     var target = try gpu.Texture.create(device, 128, 128, gpu.Format.rgba8_linear)
     defer target.destroy()
-    let view = try alloc u8[128 * 128 * 4] in memory.heap
+    let view = try new u8[128 * 128 * 4] --- in memory.heap
     defer free(view) in memory.heap
-    let kept = try alloc u8[128 * 128 * 4] in memory.heap
+    let kept = try new u8[128 * 128 * 4] --- in memory.heap
     defer free(kept) in memory.heap
     try drawn(&canvas, &target, 1.0, 0.0, 0.0, view)
     # A blue bar down the whole layer, across the cell edge at y 256.
@@ -75,9 +75,9 @@ test "a push across cell edges leaves no seam, and its coarse preview looks like
     let layer = try canvas.add_layer("Paint")
     var target = try gpu.Texture.create(device, 512, 384, gpu.Format.rgba8_linear)
     defer target.destroy()
-    let view = try alloc u8[512 * 384 * 4] in memory.heap
+    let view = try new u8[512 * 384 * 4] --- in memory.heap
     defer free(view) in memory.heap
-    let kept = try alloc u8[512 * 384 * 4] in memory.heap
+    let kept = try new u8[512 * 384 * 4] --- in memory.heap
     defer free(kept) in memory.heap
     try drawn(&canvas, &target, 0.25, 0.0, 0.0, view)
     # Black to white across the picture: smooth, so a seam would show.

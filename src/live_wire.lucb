@@ -78,14 +78,14 @@ pub func trace(field: const Field*, from_x: i64, from_y: i64, to_x: i64, to_y: i
         error(invalid, "the live wire's ends must lie inside its window")
     let count = (usize)(field.width * field.height)
     # The cost to enter each sample: little on a strong edge, 1 on flat color.
-    let step = try alloc f64[count] in memory.heap
+    let step = try new f64[count] --- in memory.heap
     defer free(step) in memory.heap
     for index in 0..<count:
         let pulled = pull(field.strength[index], contrast)
         step[index] = 0.05 + 0.95 * (1.0 - pulled)
-    let cost = try alloc f64[count] in memory.heap
+    let cost = try new f64[count] --- in memory.heap
     defer free(cost) in memory.heap
-    let back = try alloc u32[count] in memory.heap
+    let back = try new u32[count] --- in memory.heap
     defer free(back) in memory.heap
     var queue = try Queue.create(count)
     defer queue.destroy()
@@ -127,7 +127,7 @@ pub func trace(field: const Field*, from_x: i64, from_y: i64, to_x: i64, to_y: i
     while at != start:
         at = (usize)back[at]
         steps += 1
-    let path = try alloc i64[steps * 2] in memory.heap
+    let path = try new i64[steps * 2] --- in memory.heap
     at = goal
     var slot = steps
     while true:
@@ -149,14 +149,14 @@ struct Queue:
     var place: i64[]
 
     static func create(count: usize) -> Queue!:
-        let heap = try alloc u32[count] in memory.heap
+        let heap = try new u32[count] --- in memory.heap
         errdefer free(heap) in memory.heap
-        let place = try alloc i64[count] in memory.heap
+        let place = try new i64[count] --- in memory.heap
         for index in 0..<count:
             place[index] = absent
         return Queue(heap = heap, size = 0, place = place)
 
-    mutating func destroy():
+    func destroy():
         free(self.heap) in memory.heap
         free(self.place) in memory.heap
 
@@ -168,7 +168,7 @@ struct Queue:
         return self.place[index] == finished
 
     ## Put `index` in, or move it up after its cost fell.
-    mutating func lower(index: usize, cost: const f64[]):
+    func lower(index: usize, cost: const f64[]):
         var at = self.size
         if self.place[index] >= 0:
             at = (usize)self.place[index]
@@ -186,7 +186,7 @@ struct Queue:
         self.place[index] = (i64)at
 
     ## Take the cheapest out, finished.
-    mutating func pop(cost: const f64[]) -> usize:
+    func pop(cost: const f64[]) -> usize:
         let top = (usize)self.heap[0]
         self.place[top] = finished
         self.size -= 1
@@ -218,12 +218,12 @@ let finished: i64 = -2
 ## A window of `width` by `height` flat at 0.2 with a vertical step to 0.9 at
 ## column `edge`: its strengths.
 func stepped(width: i64, height: i64, edge: i64) -> Field!:
-    let luma = try alloc f32[(usize)((width + 2) * (height + 2))] in memory.heap
+    let luma = try new f32[(usize)((width + 2) * (height + 2))] --- in memory.heap
     defer free(luma) in memory.heap
     for y in 0..<height + 2:
         for x in 0..<width + 2:
             luma[(usize)(y * (width + 2) + x)] = 0.9 if x - 1 >= edge else 0.2
-    let strength = try alloc f32[(usize)(width * height)] in memory.heap
+    let strength = try new f32[(usize)(width * height)] --- in memory.heap
     try strengths(luma, width, height, strength)
     return Field(left = 100, top = 50, width = width, height = height, strength = strength)
 

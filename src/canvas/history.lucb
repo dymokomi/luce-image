@@ -15,13 +15,13 @@
 extend Canvas:
     ## Make the next edit undo and redo together with the one before it, as
     ## one step: several layers moved at once.
-    pub mutating func join_next_edit():
+    pub func join_next_edit():
         self.joining = true
 
     ## Make the next step its own even where it would continue the last (typing
     ## into the same text layer again): an edit session can then be taken back
     ## on its own with `undo` down to `step_serial`.
-    pub mutating func separate_next_step():
+    pub func separate_next_step():
         self.separating = true
 
     ## The serial of the step Undo would take back (0: none): unchanged
@@ -32,7 +32,7 @@ extend Canvas:
     ## How many bytes of GPU tiles the undo history may hold beyond what the
     ## document shows (4 GiB by default): past it the oldest steps are dropped,
     ## though the last step always stays. The next step applies it.
-    pub mutating func set_history_limit(bytes: i64) -> !:
+    pub func set_history_limit(bytes: i64) -> !:
         if bytes < 0:
             error(invalid, "a history budget cannot be negative")
         self.history_budget = (u64)bytes
@@ -56,7 +56,7 @@ extend Canvas:
         return self.future_count > 0
 
     ## Put back the pixels a layer (or its mask) had before the last edit.
-    pub mutating func undo() -> !:
+    pub func undo() -> !:
         try self.require_open()
         try self.require_idle()
         if self.history_count == 0:
@@ -71,7 +71,7 @@ extend Canvas:
                 break
 
     ## Redo the last undone edit.
-    pub mutating func redo() -> !:
+    pub func redo() -> !:
         try self.require_open()
         try self.require_idle()
         if self.future_count == 0:
@@ -86,7 +86,7 @@ extend Canvas:
 
     ## Record a layer's pixels before a change, as step `name`, dropping the
     ## redo trail and the oldest entries past the limit.
-    mutating func remember(layer: u64, tiles: Tiles, mask: bool = false, joined: bool = false, name: str = "Edit") -> !:
+    func remember(layer: u64, tiles: Tiles, mask: bool = false, joined: bool = false, name: str = "Edit") -> !:
         var owned = tiles
         errdefer owned.destroy()
         try require_loaded(&self)
@@ -121,7 +121,7 @@ extend Canvas:
     ## right after is one step with it — an opacity slider dragged — and
     ## inside `begin_edit` nothing more is recorded. Nothing is kept before the
     ## document is drawn once.
-    mutating func remember_state(name: str, layer: u64 = 0) -> !:
+    func remember_state(name: str, layer: u64 = 0) -> !:
         let document = self.document else return
         try require_loaded(&self)
         if self.edit_depth > 0 and self.history_count > 0:
@@ -148,14 +148,14 @@ extend Canvas:
         try trim_history(&self)
 
     ## Drop the redo trail and, at the limit, the oldest step.
-    mutating func make_room():
+    func make_room():
         clear_snapshots(&self.future, &self.future_count)
         if self.history_count == 64:
             drop_oldest(&self)
 
     ## Put `entry`'s pixels or document in place, returning a snapshot of what
     ## was there, for the other stack.
-    mutating func swap_in(document: Document*, entry: Snapshot) -> Snapshot!:
+    func swap_in(document: Document*, entry: Snapshot) -> Snapshot!:
         if let state = entry.state:
             document.exchange(&state.tree)
             let records = self.records
@@ -183,7 +183,7 @@ extend Canvas:
 
     ## Make everything until `end_edit` one step named `name`: a layer grouped
     ## with others, a picture placed.
-    pub mutating func begin_edit(name: str) -> !:
+    pub func begin_edit(name: str) -> !:
         try self.require_open()
         if self.edit_depth == 0:
             let before = self.serial
@@ -191,7 +191,7 @@ extend Canvas:
             self.edit_captured = self.serial != before
         self.edit_depth += 1
 
-    pub mutating func end_edit():
+    pub func end_edit():
         if self.edit_depth > 0:
             self.edit_depth -= 1
 
@@ -202,7 +202,7 @@ extend Canvas:
         return version != self.saved_version
 
     ## The document is as saved now.
-    pub mutating func mark_saved():
+    pub func mark_saved():
         self.saved_version = self.history[self.history_count - 1].serial if self.history_count > 0 else 0
 
     ## The step Undo would take back, or "" when there is none; `redo_name` likewise.
@@ -324,14 +324,14 @@ struct StampSet:
     var count: usize
 
     static func create(capacity: usize) -> StampSet!:
-        let slots = try alloc u64[capacity] in memory.heap
+        let slots = try new u64[capacity] --- in memory.heap
         memory.set(u8[]((u8*)slots.data, slots.length * 8), 0)
         return StampSet(slots = slots, count = 0)
 
-    mutating func add(stamp: u64) -> !:
+    func add(stamp: u64) -> !:
         if (self.count + 1) * 2 > self.slots.length:
             let old = self.slots
-            let grown = try alloc u64[old.length * 2] in memory.heap
+            let grown = try new u64[old.length * 2] --- in memory.heap
             memory.set(u8[]((u8*)grown.data, grown.length * 8), 0)
             self.slots = grown
             self.count = 0
@@ -341,7 +341,7 @@ struct StampSet:
             free(old) in memory.heap
         self.insert(stamp)
 
-    mutating func insert(stamp: u64):
+    func insert(stamp: u64):
         let mask = self.slots.length - 1
         var at = (usize)((stamp *% 0x9e3779b97f4a7c15) >> 20) & mask
         while self.slots[at] != 0:
@@ -351,14 +351,14 @@ struct StampSet:
         self.slots[at] = stamp
         self.count += 1
 
-    mutating func destroy():
+    func destroy():
         free(self.slots) in memory.heap
 
 ## Append `entry` to a snapshot list, growing it.
 func push(list: Snapshot[]*, count: usize*, entry: Snapshot) -> !:
     if *count == list.length:
         let capacity = 16 if list.length == 0 else list.length * 2
-        let grown = try alloc Snapshot[capacity] in memory.heap
+        let grown = try new Snapshot[capacity] --- in memory.heap
         if *count > 0:
             memory.copy(grown, *list, *count)
         if list.length > 0:
@@ -376,7 +376,7 @@ func clear_snapshots(list: Snapshot[]*, count: usize*):
 ## A copy of the first `count` records, names and all, for a state snapshot
 ## (pictures waiting to be bound are not kept: a bound document has none).
 func copy_records(records: const Record[], count: usize) -> Record[]!:
-    let copies = try alloc Record[count if count > 0 else 1] in memory.heap
+    let copies = try new Record[count if count > 0 else 1] --- in memory.heap
     # On failure the records copied so far go, and the one being copied lets go
     # of what it took.
     var copied: usize = 0
@@ -443,5 +443,5 @@ func step_starts(entries: const Snapshot[], count: usize, future: bool, index: i
 ## The name of step `index` of a history stack, "" past its end.
 func step_name(entries: const Snapshot[], count: usize, future: bool, index: i64) -> str:
     var named = count
-    discard(step_starts(entries, count, future, index, &named))
+    _ = step_starts(entries, count, future, index, &named)
     return entries[named].name if named < count else ""

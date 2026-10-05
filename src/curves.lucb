@@ -39,7 +39,7 @@ pub struct Curve:
 
     ## Add a point, keeping the points sorted by input; a point at an existing
     ## input replaces it.
-    pub mutating func add(x: f64, y: f64) -> !:
+    pub func add(x: f64, y: f64) -> !:
         if not math.is_finite(x) or not math.is_finite(y) or x < 0.0 or x > 1.0 or y < 0.0 or y > 1.0:
             error(invalid, "curve points lie in 0..1")
         var index: usize = 0
@@ -59,7 +59,7 @@ pub struct Curve:
         self.ys[index] = y
         self.count += 1
 
-    pub mutating func clear():
+    pub func clear():
         self.count = 0
 
     ## The curve's output for `x`: a monotone cubic through the points, held
@@ -121,12 +121,12 @@ pub struct Curves:
         return &self.channels[index]
 
     ## Add a point to one channel's curve (see `Curve.add`).
-    pub mutating func add(channel: usize, x: f64, y: f64) -> !:
+    pub func add(channel: usize, x: f64, y: f64) -> !:
         try check_channel(channel)
         try self.channels[channel].add(x, y)
 
     ## Empty one channel's curve; with no points it passes values through.
-    pub mutating func clear(channel: usize) -> !:
+    pub func clear(channel: usize) -> !:
         try check_channel(channel)
         self.channels[channel].clear()
 

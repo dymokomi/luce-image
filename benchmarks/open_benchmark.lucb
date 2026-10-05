@@ -114,7 +114,7 @@ func draw_fitted(canvas: Canvas*, target: gpu.Texture*, zoom: f64) -> !:
     let root = try frame.value().target()
     defer root.release()
     try canvas.draw(root, gpu.Rect(width = (f64)view_width, height = (f64)view_height), zoom, 0.0, 0.0)
-    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0))
 
 func pixel(target: gpu.Texture*, x: u32, y: u32) -> u8[4]!:
     var read: u8[4]

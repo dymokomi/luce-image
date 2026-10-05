@@ -12,11 +12,11 @@
 extend Image:
     ## An "RGBA" image's pixels as 8-bit samples, top-down, four per pixel: heap
     ## bytes the caller frees.
-    pub mutating func rgba8() -> u8[]!:
+    pub func rgba8() -> u8[]!:
         try self.load()
         if (try self.mode()) != "RGBA":
             error(invalid, "only an RGBA image has 8-bit RGBA samples")
-        let bytes = try alloc u8[self.raster.pixels.length] in memory.heap
+        let bytes = try new u8[self.raster.pixels.length] --- in memory.heap
         for index in 0..<bytes.length:
             bytes[index] = (u8)self.raster.pixels[index]
         return bytes
@@ -24,13 +24,13 @@ extend Image:
     ## Every pixel as straight-alpha linear-light RGBA f32 samples, top-down,
     ## four per pixel: integer modes are taken as sRGB-encoded, float modes as
     ## linear already. For the editor's tiles; Base only.
-    pub mutating func linear_rgba(pixels: f32[]) -> !:
+    pub func linear_rgba(pixels: f32[]) -> !:
         try self.load()
         try self.linear_rgba_rows(0, self.raster.height, pixels)
 
     ## Rows `first..<first + count` as `linear_rgba` gives them, into `pixels`
     ## (`count` rows of RGBA f32): a picture turned into tiles a band at a time.
-    pub mutating func linear_rgba_rows(first: usize, count: usize, pixels: f32[]) -> !:
+    pub func linear_rgba_rows(first: usize, count: usize, pixels: f32[]) -> !:
         try self.load()
         if first + count > self.raster.height or pixels.length != self.raster.width * count * 4:
             error(invalid, "pixel buffer must hold width * count RGBA samples of rows in the picture")
@@ -59,7 +59,7 @@ extend Image:
         if kind != .uint8 and kind != .uint16:
             try linear_bands(&job)
             return
-        let table = try alloc f32[256 if kind == .uint8 else 65536] in memory.heap
+        let table = try new f32[256 if kind == .uint8 else 65536] --- in memory.heap
         defer free(table) in memory.heap
         for value in 0..<table.length:
             table[value] = (f32)decode_srgb((f64)value * job.scale)
@@ -71,7 +71,7 @@ extend Image:
     ## TIFF not yet decoded goes a band at a time and is never whole; any other
     ## picture, or one already decoded, from its whole raster, which may take
     ## at most `whole_picture_bytes`.
-    pub mutating func linear_rgba_bands(rows: usize, sink: LinearSink, context: void*?) -> !:
+    pub func linear_rgba_bands(rows: usize, sink: LinearSink, context: void*?) -> !:
         try self.ensure_open()
         if not self.is_loaded() and (try self.stream_linear_from(rows, sink, context)):
             return
@@ -79,7 +79,7 @@ extend Image:
             error(limit, "a picture this large opens only from PNG, JPEG or TIFF")
         let width = self.raster.width
         let height = self.raster.height
-        let band = try alloc f32[width * rows * 4] in memory.heap
+        let band = try new f32[width * rows * 4] --- in memory.heap
         defer free(band) in memory.heap
         var top: usize = 0
         while top < height:
@@ -92,7 +92,7 @@ extend Image:
     ## `rows` rows at a time, to `sink` (luce_image/streaming); false for any
     ## other picture, which `linear_rgba_bands` gives instead. A progressive
     ## JPEG's first sight goes to `coarse` first, with the same `context`.
-    pub mutating func encoded_rgba_bands(rows: usize, sink: EncodedSink, context: void*?, coarse: CoarseSink? = none) -> bool!:
+    pub func encoded_rgba_bands(rows: usize, sink: EncodedSink, context: void*?, coarse: CoarseSink? = none) -> bool!:
         try self.ensure_open()
         if self.is_loaded():
             return false
@@ -103,7 +103,7 @@ extend Image:
         return try stream_encoded(&self.raster, &source, rows, sink, context, coarse)
 
     ## `stream_linear` from the file when only its start is held.
-    mutating func stream_linear_from(rows: usize, sink: LinearSink, context: void*?) -> bool!:
+    func stream_linear_from(rows: usize, sink: LinearSink, context: void*?) -> bool!:
         if not self.head_only:
             return try stream_linear(&self.raster, none, rows, sink, context)
         var source = try FileSource.open(self.raster.path, self.file_size)

@@ -14,13 +14,13 @@ test "the history lists its steps by name, undo side oldest first and redo side 
     let base = try canvas.add_layer("Base")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     let first = canvas.history_steps()
     try canvas.select_rectangle(4, 4, 8, 8, 0)
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
     try canvas.fill(base, false)
     let extra = try canvas.add_layer("Extra")
-    discard(extra)
+    _ = extra
     let steps = canvas.history_steps()
     assert(steps == first + 3)
     assert(canvas.history_step_name(steps - 3) == "Select" and canvas.history_step_name(steps - 2) == "Fill")
@@ -42,7 +42,7 @@ test "everything undoes: layers, properties, styles, masks, selections and the c
     let base = try canvas.add_layer("Base")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     # A new layer, then undone and redone.
     let extra = try canvas.add_layer("Extra")
     assert(canvas.layer_count() == 2 and canvas.undo_name() == "New Layer")
@@ -108,7 +108,7 @@ test "the document knows whether it is as saved; exports leave that alone":
     let layer = try canvas.add_layer("Paint")
     var target = try gpu.Texture.create(device, 32, 32, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     assert(not canvas.modified())
     try canvas.set_layer(layer, true, 0.5)
     assert(canvas.modified())
@@ -134,7 +134,7 @@ test "the history keeps within its budget by dropping its oldest steps, keeping 
     let layer = try canvas.add_layer("Paint")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     # Each gradient gives all sixteen cells tiles of their own; its step holds the last ones.
     try canvas.set_history_limit(40 * 524288)
     for step in 0..<(i64)6:

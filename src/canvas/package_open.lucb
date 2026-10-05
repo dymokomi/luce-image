@@ -22,7 +22,7 @@ struct PackageSource:
     var blobs: PackageBlob[]
     var cells: PackageCell[]
 
-    mutating func destroy():
+    func destroy():
         strings.release(self.path)
         if self.blobs.length > 0:
             free(self.blobs) in memory.heap
@@ -60,10 +60,10 @@ func read_package(path: str, manifest: u8[]*) -> PackageSource!:
     for (offset, length) in [(trailer.manifest_offset, trailer.manifest_length), (trailer.index_offset, trailer.index_length)]:
         if offset > body or length > body - offset or length > ((u64)1 << 31):
             error(invalid, "the .l2d document's tables are damaged")
-    let text = try alloc u8[(usize)trailer.manifest_length] in memory.heap
+    let text = try new u8[(usize)trailer.manifest_length] --- in memory.heap
     errdefer free(text) in memory.heap
     try read_at(&file, trailer.manifest_offset, text)
-    let index = try alloc u8[(usize)trailer.index_length] in memory.heap
+    let index = try new u8[(usize)trailer.index_length] --- in memory.heap
     defer free(index) in memory.heap
     try read_at(&file, trailer.index_offset, index)
     var source = try parse_index(index, body)
@@ -85,8 +85,8 @@ func parse_index(index: const u8[], body: u64) -> PackageSource!:
     if at_cells + 4 + cell_count * package_cell_bytes > index.length:
         error(invalid, "the .l2d document's index is damaged")
     var source = PackageSource(path = "")
-    source.blobs = try alloc PackageBlob[blob_count if blob_count > 0 else 1] in memory.heap
-    source.cells = try alloc PackageCell[cell_count if cell_count > 0 else 1] in memory.heap
+    source.blobs = try new PackageBlob[blob_count if blob_count > 0 else 1] --- in memory.heap
+    source.cells = try new PackageCell[cell_count if cell_count > 0 else 1] --- in memory.heap
     let most = (u64)flate.deflate_bound((usize)tile_size * tile_row_bytes)
     for blob in 0..<blob_count:
         let at = 4 + blob * package_blob_bytes
@@ -127,7 +127,7 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
     try native.set_resolution(try get_number(doc, "/document", "resolution"))
     # The layer the application had selected; a file without it selects none.
     native.selected_layer_index = get_integer(doc, "/document", "selected") catch failure:
-        discard(failure)
+        _ = failure
         recover -1
     let profile_value = try doc.get("/document", "profile")
     defer profile_value.release()
@@ -135,7 +135,7 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
     try native.set_linear_blend(try get_integer(doc, "/document", "linear_blend") != 0)
     let total = doc.child_count("/layers")
     # The ids the file's layers get, for groups named by their place in it.
-    let ids = try alloc i64[total if total > 0 else 1] in memory.heap
+    let ids = try new i64[total if total > 0 else 1] --- in memory.heap
     defer free(ids) in memory.heap
     for index in 0..<total:
         let element = doc.child_at("/layers", index) else error(invalid, "a layer element is missing")
@@ -161,7 +161,7 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
         try native.set_clipped(id, (try get_integer(doc, element, "clipped")) != 0)
         # A layer without styles has no style fields.
         let styled = get_number(doc, element, "shadow") catch failure:
-            discard(failure)
+            _ = failure
             recover -1.0
         if styled >= 0.0:
             let names = style_field_names()
@@ -181,7 +181,7 @@ func open_package(path: str) -> interop.Reference[Canvas]!:
     # The guides.
     for index in 0..<doc.child_count("/guides"):
         let element = doc.child_at("/guides", index) else break
-        discard(try native.add_guide((try get_integer(doc, element, "vertical")) != 0, try get_number(doc, element, "position")))
+        _ = try native.add_guide((try get_integer(doc, element, "vertical")) != 0, try get_number(doc, element, "position"))
     try read_channels(native, &source, doc)
     # Groups come after their layers in the file, so layers go into them once all are read.
     for index in 0..<total:
@@ -246,7 +246,7 @@ func inflate_slot(context: void*?, slot: usize):
     let filtered = batch.filtered[slot * size..<slot * size + bytes]
     # It fills `filtered` exactly and answers how much of the record it read.
     let used = flate.inflate_raw(batch.packed[slot * bound..<slot * bound + batch.lengths[slot]], filtered) catch failure:
-        discard(failure)
+        _ = failure
         batch.failed.store(true, .release)
         return
     if used != batch.lengths[slot]:
@@ -282,7 +282,7 @@ func load_tiles(canvas: Canvas*, source: PackageSource*, file: files.File*, back
     if beyond:
         try tiles.cover(outside)
     # Where each blob went first on the canvas grid, for cells that share it.
-    let first = try alloc i64[source.blobs.length if source.blobs.length > 0 else 1] in memory.heap
+    let first = try new i64[source.blobs.length if source.blobs.length > 0 else 1] --- in memory.heap
     defer free(first) in memory.heap
     for at in 0..<first.length:
         first[at] = -1
@@ -290,20 +290,20 @@ func load_tiles(canvas: Canvas*, source: PackageSource*, file: files.File*, back
     let bound = flate.deflate_bound(size)
     var batch = LoadBatch()
     batch.failed.store(false, .release)
-    batch.packed = try alloc u8[load_batch * bound] in memory.heap
+    batch.packed = try new u8[load_batch * bound] --- in memory.heap
     defer free(batch.packed) in memory.heap
-    batch.filtered = try alloc u8[load_batch * size] in memory.heap
+    batch.filtered = try new u8[load_batch * size] --- in memory.heap
     defer free(batch.filtered) in memory.heap
-    batch.texels = try alloc u8[load_batch * size] in memory.heap
+    batch.texels = try new u8[load_batch * size] --- in memory.heap
     defer free(batch.texels) in memory.heap
-    batch.lengths = try alloc usize[load_batch] in memory.heap
+    batch.lengths = try new usize[load_batch] --- in memory.heap
     defer free(batch.lengths) in memory.heap
-    batch.rows = try alloc usize[load_batch] in memory.heap
+    batch.rows = try new usize[load_batch] --- in memory.heap
     defer free(batch.rows) in memory.heap
-    let places = try alloc PackageCell[load_batch] in memory.heap
+    let places = try new PackageCell[load_batch] --- in memory.heap
     defer free(places) in memory.heap
     # Cells showing a tile loaded for an earlier cell; shared once it is placed.
-    let shares = try alloc PackageCell[source.cells.length if source.cells.length > 0 else 1] in memory.heap
+    let shares = try new PackageCell[source.cells.length if source.cells.length > 0 else 1] --- in memory.heap
     defer free(shares) in memory.heap
     var share_count: usize = 0
     var staged: usize = 0
@@ -375,7 +375,7 @@ struct LevelBuild:
     var done: u32
 
     ## Rows 0..`row` of level 0 are in: make every level's rows they complete.
-    mutating func rows_through(row: u32) -> !:
+    func rows_through(row: u32) -> !:
         if self.top == 0 or row + 1 <= self.done:
             return
         let composer = self.canvas.composer else return
@@ -394,7 +394,7 @@ struct LevelBuild:
             let columns = (self.tiles.columns() + span - 1) // span
             for level_row in before..<after:
                 for column in 0..<columns:
-                    discard(try composer.levels().texture(self.tiles, column, level_row, level, self.mask))
+                    _ = try composer.levels().texture(self.tiles, column, level_row, level, self.mask)
         self.done = finished
 
 ## Inflate the batch's `count` records across the processors, upload them in
@@ -444,18 +444,18 @@ func build_levels(canvas: Canvas*, tiles: const Tiles*, mask: bool) -> !:
         return
     let mark = transient_mark()
     defer release_transients(mark)
-    discard(try composer.levels().texture(tiles, 0, 0, level, mask))
+    _ = try composer.levels().texture(tiles, 0, 0, level, mask)
     try settle_job(canvas)
 
 ## luce-canvas's decode of this format's records (tiles/backing): inflate the
 ## record, then undo its filter into `into`'s first `rows` texel rows. Runs on
 ## worker threads too.
 func decode_record(context: void*?, packed: const u8[], rows: u32, into: u8[]) -> !:
-    discard(context)
+    _ = context
     let bytes = (usize)rows * tile_row_bytes
     if bytes > into.length:
         error(invalid, "a stored tile of the .l2d document is damaged")
-    let filtered = try alloc u8[bytes] in memory.heap
+    let filtered = try new u8[bytes] --- in memory.heap
     defer free(filtered) in memory.heap
     let used = try flate.inflate_raw(packed, filtered)
     if used != packed.length:

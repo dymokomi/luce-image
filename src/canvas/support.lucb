@@ -11,7 +11,7 @@ extend Canvas:
     ## Bind to a GPU device of the canvas's own, with no window or drawing:
     ## what scripts and tests run headless use before editing. Nothing when
     ## already bound; fails when there is no GPU.
-    pub mutating func bind_headless() -> !:
+    pub func bind_headless() -> !:
         try self.require_open()
         if self.document != none:
             return
@@ -21,10 +21,10 @@ extend Canvas:
 
     ## Bind headless to the device `other` is bound to, so layers copy
     ## between them: several documents open at once without a window.
-    pub mutating func bind_beside(other: interop.Reference[Canvas]) -> !:
+    pub func bind_beside(other: interop.Reference[Canvas]) -> !:
         try self.bind_sharing(try other.get())
 
-    mutating func bind_sharing(other: const Canvas*) -> !:
+    func bind_sharing(other: const Canvas*) -> !:
         try self.require_open()
         if self.document != none:
             return
@@ -34,12 +34,12 @@ extend Canvas:
         try load_package(&self)
 
     ## Bind to `acquired`, which the canvas owns from here (on failure too).
-    mutating func bind_device(acquired: gpu.Device) -> !:
+    func bind_device(acquired: gpu.Device) -> !:
         try self.attach_device(acquired)
         try self.load_pictures()
 
     ## The GPU document on `acquired`, its layers as the records say, empty.
-    mutating func attach_device(acquired: gpu.Device) -> !:
+    func attach_device(acquired: gpu.Device) -> !:
         var binding = Binding(device = acquired)
         errdefer unwind(&binding)
         let device = binding.device else trap("bound")
@@ -51,13 +51,13 @@ extend Canvas:
         for index in 0..<self.count:
             let record = self.records[index]
             if record.group:
-                discard(try document.add_group(record.name))
+                _ = try document.add_group(record.name)
             elif record.adjustment >= 0:
-                discard(try document.add_adjustment(record.name, record.adjustment, record.adjustment_values[..<parameter_count]))
+                _ = try document.add_adjustment(record.name, record.adjustment, record.adjustment_values[..<parameter_count])
                 if record.adjustment == (i64)curves:
                     try document.set_curves(record.id, record.curves)
             else:
-                discard(try document.add_layer(record.name))
+                _ = try document.add_layer(record.name)
             try document.set_appearance(record.id, record.visible, record.opacity, (u32)record.blend)
             if record.masked:
                 try document.set_mask(record.id, true)
@@ -101,7 +101,7 @@ extend Canvas:
     ## happens: a picture that cannot be read leaves its layer empty, every
     ## other still loads, and the first failure is returned, for the window to
     ## report (a draw's bind is where a picture opened as a document loads).
-    mutating func load_pictures() -> !:
+    func load_pictures() -> !:
         var failed: ErrorCode? = none
         var message: str = ""
         for index in 0..<self.count:
@@ -124,7 +124,7 @@ extend Canvas:
         if let code = failed:
             error(code, message)
 
-    mutating func load_picture(index: usize, picture: interop.Reference[Image], x: i64, y: i64, mask: bool) -> !:
+    func load_picture(index: usize, picture: interop.Reference[Image], x: i64, y: i64, mask: bool) -> !:
         defer picture.release()
         let tiles = try self.tiles_of(picture, x, y, mask)
         let document = self.document else trap("bound")
@@ -138,7 +138,7 @@ extend Canvas:
         if self.closed:
             error(invalid, "the document is closed")
 
-    pub mutating func close():
+    pub func close():
         if self.closed:
             return
         self.closed = true
@@ -253,7 +253,7 @@ extend Canvas:
 
     ## Add a guide across the document at `position` pixels: a vertical one
     ## at that x, a horizontal one at that y. Its index. Undoable.
-    pub mutating func add_guide(vertical: bool, position: f64) -> i64!:
+    pub func add_guide(vertical: bool, position: f64) -> i64!:
         try self.require_open()
         if not math.is_finite(position):
             error(invalid, "a guide's place must be finite")
@@ -266,7 +266,7 @@ extend Canvas:
         return (i64)self.guides.count - 1
 
     ## Move guide `index` to `position`; a drag of one guide is one step. Undoable.
-    pub mutating func move_guide(index: i64, position: f64) -> !:
+    pub func move_guide(index: i64, position: f64) -> !:
         try self.require_open()
         let at = try self.guide_index(index)
         if not math.is_finite(position):
@@ -274,7 +274,7 @@ extend Canvas:
         try self.remember_state("Move Guide", (u64)(1000000 + index))
         self.guides.positions[at] = position
 
-    pub mutating func remove_guide(index: i64) -> !:
+    pub func remove_guide(index: i64) -> !:
         try self.require_open()
         let at = try self.guide_index(index)
         try self.remember_state("Delete Guide")
@@ -284,7 +284,7 @@ extend Canvas:
         self.guides.count -= 1
 
     ## View › Clear Guides. Undoable.
-    pub mutating func clear_guides() -> !:
+    pub func clear_guides() -> !:
         try self.require_open()
         if self.guides.count == 0:
             return

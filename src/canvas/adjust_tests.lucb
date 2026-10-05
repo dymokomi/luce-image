@@ -15,7 +15,7 @@ test "previews show edits on the original pixels and end kept or dropped":
     var target = try gpu.Texture.create(device, 32, 32, gpu.Format.rgba8_linear)
     defer target.destroy()
     var pixels: u8[32 * 32 * 4]
-    discard(try shown_centre(&canvas, &target, pixels))
+    _ = try shown_centre(&canvas, &target, pixels)
     try canvas.set_brush(40.0, 1.0, 1.0, 1.0, 0.05, 0.05, 0.05, false)
     try canvas.begin_stroke(layer, 16.0, 16.0)
     try canvas.end_stroke()
@@ -49,7 +49,7 @@ test "previews show edits on the original pixels and end kept or dropped":
     assert((try shown_centre(&canvas, &target, pixels)) == base)
     # A white-to-transparent gradient across the canvas: the left edge lights, the right stays.
     try canvas.fill_gradient(layer, 0.0, 0.0, 32.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0)
-    discard(try shown_centre(&canvas, &target, pixels))
+    _ = try shown_centre(&canvas, &target, pixels)
     assert(pixels[(0 * 32 + 0) * 4] > 200 and pixels[(0 * 32 + 31) * 4] < 40)
     try canvas.undo()
     assert((try shown_centre(&canvas, &target, pixels)) == base)
@@ -70,11 +70,11 @@ test "previews show edits on the original pixels and end kept or dropped":
     try canvas.set_style_value(layer, 15, 6.0)
     try canvas.set_style_value(layer, 19, 1.0)
     assert(try canvas.layer_styled(0))
-    discard(try shown_centre(&canvas, &target, pixels))
+    _ = try shown_centre(&canvas, &target, pixels)
     # The 40-pixel dot leaves only the corners bare; the glow reaches them.
     let lit = pixels[0]
     try canvas.set_style_value(layer, 14, 0.0)
-    discard(try shown_centre(&canvas, &target, pixels))
+    _ = try shown_centre(&canvas, &target, pixels)
     assert(lit > 20 and pixels[0] == 0 and not (try canvas.layer_styled(0)))
     # A previewed transform is shown, then cancelled back to the original.
     try canvas.begin_transform(layer)
@@ -108,7 +108,7 @@ test "adjustment layers change what is below them live, leave the pixels alone, 
     let green = try canvas.add_layer("Green")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
     try canvas.select_rectangle(8, 8, 16, 16, 0)
     try canvas.fill(red, false)
@@ -157,7 +157,7 @@ test "adjustment layers change what is below them live, leave the pixels alone, 
     defer restored.release()
     let copy = restored.value()
     assert(copy.layer_count() == 3 and (try copy.layer_adjustment(1)) == 1 and (try copy.adjustment_value(1, 0)) > 0.66)
-    discard(try shown_at(copy, &target, 0, 0))
+    _ = try shown_at(copy, &target, 0, 0)
     shown = try shown_at(copy, &target, 12, 12)
     assert(shown[2] > 250 and shown[0] < 5)
 

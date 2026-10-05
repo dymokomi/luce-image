@@ -29,7 +29,7 @@ extend Canvas:
 
     ## Select element `element`'s outline, combined with the selection by
     ## `mode` (0 replace, 1 add, 2 subtract, 3 intersect). One step.
-    pub mutating func select_element(index: i64, element: i64, mode: i64 = 0) -> !:
+    pub func select_element(index: i64, element: i64, mode: i64 = 0) -> !:
         let at_index = (usize)(try self.checked_index(index))
         try self.require_open()
         let spec = (try element_of(self.records[at_index], element)).spec
@@ -42,7 +42,7 @@ extend Canvas:
         defer shape.destroy()
         var first_turn = 0.0
         var runs: usize = 0
-        var points = try alloc f64[256] in memory.heap
+        var points = try new f64[256] --- in memory.heap
         defer free(points) in memory.heap
         for contour in 0..<drawing.contour_count():
             let start = drawing.contour_start(contour)
@@ -51,7 +51,7 @@ extend Canvas:
                 continue
             if size * 2 > points.length:
                 free(points) in memory.heap
-                points = try alloc f64[size * 2] in memory.heap
+                points = try new f64[size * 2] --- in memory.heap
             var turn = 0.0
             for at in 0..<size:
                 let a = drawing.point(start + at)
@@ -74,7 +74,7 @@ extend Canvas:
     ## Element `element`'s outline in document pixels, flattened, for drawing
     ## it: how many points; `outline_x`, `outline_y` and `outline_starts` (a
     ## point beginning a new run) read them until the next call.
-    pub mutating func element_outline(index: i64, element: i64) -> i64!:
+    pub func element_outline(index: i64, element: i64) -> i64!:
         let at_index = (usize)(try self.checked_index(index))
         self.outline_count = 0
         let spec = (try element_of(self.records[at_index], element)).spec
@@ -138,7 +138,7 @@ func restyle_target(canvas: Canvas*, id: u64, style: const f64[]) -> !:
 func put_outline(canvas: Canvas*, x: f64, y: f64, starts: bool) -> !:
     if (canvas.outline_count + 1) * 3 > canvas.outline.length:
         let capacity = 384 if canvas.outline.length == 0 else canvas.outline.length * 2
-        let grown = try alloc f64[capacity] in memory.heap
+        let grown = try new f64[capacity] --- in memory.heap
         if canvas.outline_count > 0:
             memory.copy(grown, canvas.outline, canvas.outline_count * 3)
         if canvas.outline.length > 0:

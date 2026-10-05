@@ -14,7 +14,7 @@ func drawn(canvas: Canvas*, target: gpu.Texture*, zoom: f64, offset_x: f64, offs
     let width = (f64)(try target.width())
     let height = (f64)(try target.height())
     try canvas.draw(root, gpu.Rect(width = width, height = height), zoom, offset_x, offset_y)
-    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0))
     try target.read(pixels)
 
 ## How far apart two drawings are: the share of pixels differing by more than
@@ -62,11 +62,11 @@ test "a transform preview drawn at a coarse level looks like the kept transform,
     var target = try gpu.Texture.create(device, 256, 192, gpu.Format.rgba8_linear)
     defer target.destroy()
     let size = (usize)256 * 192 * 4
-    let before = try alloc u8[size] in memory.heap
+    let before = try new u8[size] --- in memory.heap
     defer free(before) in memory.heap
-    let previewed = try alloc u8[size] in memory.heap
+    let previewed = try new u8[size] --- in memory.heap
     defer free(previewed) in memory.heap
-    let kept = try alloc u8[size] in memory.heap
+    let kept = try new u8[size] --- in memory.heap
     defer free(kept) in memory.heap
     try drawn(&canvas, &target, 0.125, 0.0, 0.0, before)
     try paint_rectangles(&canvas, layer)
@@ -80,9 +80,9 @@ test "a transform preview drawn at a coarse level looks like the kept transform,
     var close_target = try gpu.Texture.create(device, 128, 128, gpu.Format.rgba8_linear)
     defer close_target.destroy()
     let close_size = (usize)128 * 128 * 4
-    let close_previewed = try alloc u8[close_size] in memory.heap
+    let close_previewed = try new u8[close_size] --- in memory.heap
     defer free(close_previewed) in memory.heap
-    let close_kept = try alloc u8[close_size] in memory.heap
+    let close_kept = try new u8[close_size] --- in memory.heap
     defer free(close_kept) in memory.heap
     try drawn(&canvas, &close_target, 1.0, -900.0, -600.0, close_previewed)
     # The layer itself is as it was until the transform is kept.
@@ -124,9 +124,9 @@ test "a floating selection's transform preview at a coarse level looks like the 
     var target = try gpu.Texture.create(device, 256, 192, gpu.Format.rgba8_linear)
     defer target.destroy()
     let size = (usize)256 * 192 * 4
-    let previewed = try alloc u8[size] in memory.heap
+    let previewed = try new u8[size] --- in memory.heap
     defer free(previewed) in memory.heap
-    let kept = try alloc u8[size] in memory.heap
+    let kept = try new u8[size] --- in memory.heap
     defer free(kept) in memory.heap
     try drawn(&canvas, &target, 0.125, 0.0, 0.0, kept)
     try paint_rectangles(&canvas, layer)
@@ -138,9 +138,9 @@ test "a floating selection's transform preview at a coarse level looks like the 
     var close_target = try gpu.Texture.create(device, 256, 256, gpu.Format.rgba8_linear)
     defer close_target.destroy()
     let close_size = (usize)256 * 256 * 4
-    let close_previewed = try alloc u8[close_size] in memory.heap
+    let close_previewed = try new u8[close_size] --- in memory.heap
     defer free(close_previewed) in memory.heap
-    let close_kept = try alloc u8[close_size] in memory.heap
+    let close_kept = try new u8[close_size] --- in memory.heap
     defer free(close_kept) in memory.heap
     try drawn(&canvas, &close_target, 1.0, -700.0, -550.0, close_previewed)
     try canvas.end_transform(true)
@@ -161,11 +161,11 @@ test "filter previews drawn at a coarse level look like the kept filter, inside 
     var target = try gpu.Texture.create(device, 256, 192, gpu.Format.rgba8_linear)
     defer target.destroy()
     let size = (usize)256 * 192 * 4
-    let before = try alloc u8[size] in memory.heap
+    let before = try new u8[size] --- in memory.heap
     defer free(before) in memory.heap
-    let previewed = try alloc u8[size] in memory.heap
+    let previewed = try new u8[size] --- in memory.heap
     defer free(previewed) in memory.heap
-    let kept = try alloc u8[size] in memory.heap
+    let kept = try new u8[size] --- in memory.heap
     defer free(kept) in memory.heap
     try drawn(&canvas, &target, 0.125, 0.0, 0.0, before)
     try paint_rectangles(&canvas, layer)

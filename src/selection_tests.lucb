@@ -174,7 +174,7 @@ test "the GPU tiles follow the cells, uploading only the cells that changed":
     selection.rectangle(520, 0, 50, 50, Mode.add)
     let second = (try selection.gpu_tiles(device)) else trap("something is selected")
     assert(second == first and second.stamp(0, 0) == whole and second.stamp(1, 0) == edge and second.stamp(2, 0) != 0)
-    let pixels = try alloc f32[600 * 300 * 4] in memory.heap
+    let pixels = try new f32[600 * 300 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     try second.read(pixels)
     for probe in [(i64)(100 * 600 + 100), 10 * 600 + 310, 10 * 600 + 530, 299 * 600 + 290, 299 * 600 + 5, 60 * 600 + 530]:
@@ -224,7 +224,7 @@ func soften(coverage: u8[], scratch: u8[], w: usize, h: usize, radius: usize, ho
 
 ## Tests' oracle: Select › Modify on a whole document's bytes.
 func dense_adjust(coverage: u8[], w: usize, h: usize, pixels: i64, feather: i64):
-    let scratch = alloc u8[coverage.length] in memory.heap catch failure:
+    let scratch = new u8[coverage.length] --- in memory.heap catch failure:
         trap("out of memory in a test")
     defer free(scratch) in memory.heap
     if pixels != 0:
@@ -250,7 +250,7 @@ test "modify matches the whole-document passes, near edges and across cells":
     let height: u32 = 520
     let pixels: i64[11] = [1, 7, 40, 270, -1, -7, -40, -270, 0, 0, 12]
     let feathers: i64[11] = [0, 0, 0, 0, 0, 0, 0, 0, 3, 90, 9]
-    let dense = try alloc u8[(usize)width * (usize)height] in memory.heap
+    let dense = try new u8[(usize)width * (usize)height] --- in memory.heap
     defer free(dense) in memory.heap
     for case in 0..<(usize)13:
         var selection = try busy_selection(width, height)
@@ -281,10 +281,10 @@ test "modify matches the whole-document passes, near edges and across cells":
 ## Tests' oracle: Border on a whole document's bytes.
 func dense_border(coverage: u8[], w: usize, h: usize, width: i64):
     let radius = (usize)((width + 1) // 2)
-    let grown = alloc u8[coverage.length] in memory.heap catch failure:
+    let grown = new u8[coverage.length] --- in memory.heap catch failure:
         trap("out of memory in a test")
     defer free(grown) in memory.heap
-    let scratch = alloc u8[coverage.length] in memory.heap catch failure:
+    let scratch = new u8[coverage.length] --- in memory.heap catch failure:
         trap("out of memory in a test")
     defer free(scratch) in memory.heap
     memory.copy(grown, coverage, coverage.length)
@@ -299,7 +299,7 @@ func dense_border(coverage: u8[], w: usize, h: usize, width: i64):
 
 ## Tests' oracle: Smooth on a whole document's bytes.
 func dense_smooth(coverage: u8[], w: usize, h: usize, radius: i64):
-    let scratch = alloc u8[coverage.length] in memory.heap catch failure:
+    let scratch = new u8[coverage.length] --- in memory.heap catch failure:
         trap("out of memory in a test")
     defer free(scratch) in memory.heap
     soften(coverage, scratch, w, h, (usize)radius, true)
@@ -328,7 +328,7 @@ test "a warped selection samples only the cells its edge crosses, and agrees wit
     var every = try Cells.create(600, 520)
     defer every.destroy()
     for index in 0..<every.count():
-        let shape = try alloc u8[block_bytes] in memory.heap
+        let shape = try new u8[block_bytes] --- in memory.heap
         defer free(shape) in memory.heap
         memory.set(shape, 0)
         for row in 0..<every.cell_height(index):
@@ -356,7 +356,7 @@ test "a warped selection samples only the cells its edge crosses, and agrees wit
 test "border and smooth match the whole-document passes across cells":
     let width: u32 = 600
     let height: u32 = 520
-    let dense = try alloc u8[(usize)width * (usize)height] in memory.heap
+    let dense = try new u8[(usize)width * (usize)height] --- in memory.heap
     defer free(dense) in memory.heap
     let amounts: i64[6] = [1, 4, 25, 3, 10, 60]
     for case in 0..<(usize)7:
@@ -456,7 +456,6 @@ func read_buffer(context: void*?, column: u32, row: u32, halves: u8[]) -> bool!:
                 halves[at + 1] = (u8)(bits >> 8)
     return painted
 
-
 ## Tests' oracle: whether pixel `b` of `bytes` is within `limit` of pixel `a`.
 func within(bytes: const u8[], a: usize, b: usize, limit: i64) -> bool:
     for channel in 0..<(usize)4:
@@ -468,7 +467,7 @@ func within(bytes: const u8[], a: usize, b: usize, limit: i64) -> bool:
 ## Tests' oracle: the magic wand on a whole document's pixels as it once ran,
 ## the seed pixel first averaged over its `reach`: 255 where matched.
 func dense_wand(source: const f32[], width: usize, height: usize, x: i64, y: i64, reach: i64, tolerance: f64, contiguous: bool, matched: u8[]):
-    let pixels = alloc f32[source.length] in memory.heap catch failure:
+    let pixels = new f32[source.length] --- in memory.heap catch failure:
         trap("out of memory in a test")
     defer free(pixels) in memory.heap
     memory.copy(pixels, source, source.length)
@@ -486,7 +485,7 @@ func dense_wand(source: const f32[], width: usize, height: usize, x: i64, y: i64
     if reach > 0:
         for channel in 0..<(usize)4:
             pixels[((usize)y * width + (usize)x) * 4 + channel] = (f32)(sum[channel] / count)
-    let bytes = alloc u8[width * height * 4] in memory.heap catch failure:
+    let bytes = new u8[width * height * 4] --- in memory.heap catch failure:
         trap("out of memory in a test")
     defer free(bytes) in memory.heap
     for index in 0..<(width * height):
@@ -501,7 +500,7 @@ func dense_wand(source: const f32[], width: usize, height: usize, x: i64, y: i64
             if within(bytes, seed, index, limit):
                 matched[index] = 255
         return
-    let queue = alloc u32[width * height] in memory.heap catch failure:
+    let queue = new u32[width * height] --- in memory.heap catch failure:
         trap("out of memory in a test")
     defer free(queue) in memory.heap
     var head: usize = 0
@@ -528,7 +527,7 @@ func dense_wand(source: const f32[], width: usize, height: usize, x: i64, y: i64
 ## tells apart by tolerance, a transparent cell, a moat splitting a region,
 ## and halves-exact values so the half floats read back unchanged.
 func wand_picture(width: usize, height: usize) -> f32[]!:
-    let pixels = try alloc f32[width * height * 4] in memory.heap
+    let pixels = try new f32[width * height * 4] --- in memory.heap
     memory.set(u8[]((u8*)pixels.data, pixels.length * 4), 0)
     for y in 0..<height:
         for x in 0..<width:
@@ -553,7 +552,7 @@ test "the wand read a cell at a time matches the whole-document wand":
     let height: usize = 520
     let pixels = try wand_picture(width, height)
     defer free(pixels) in memory.heap
-    let matched = try alloc u8[width * height] in memory.heap
+    let matched = try new u8[width * height] --- in memory.heap
     defer free(matched) in memory.heap
     var buffer = Buffer(pixels = pixels, width = width, height = height)
     let seeds: i64[10] = [10, 10, 255, 255, 256, 256, 599, 519, 400, 100]

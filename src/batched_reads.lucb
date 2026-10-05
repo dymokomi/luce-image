@@ -41,7 +41,7 @@ pub func read_pieces(device: gpu.Device, count: usize, context: void*?, piece: f
     shares[1].batch = try gpu.ReadBatch.begin(device)
     defer release_share(&shares[1])
     for index in 0..<(usize)2:
-        shares[index].offsets = try alloc usize[256] in memory.heap
+        shares[index].offsets = try new usize[256] --- in memory.heap
     var next: usize = 0
     next = try fill_share(&shares[0], next, count, context, piece)
     if next < count:

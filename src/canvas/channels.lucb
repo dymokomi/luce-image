@@ -30,15 +30,15 @@ extend Canvas:
 
     ## Select › Save Selection: the selection as a new alpha channel at the
     ## end, named `name`; its index. Undoable.
-    pub mutating func save_selection_channel(name: str) -> i64!:
+    pub func save_selection_channel(name: str) -> i64!:
         return try add_channel(&self, name, false, self.channels.count, "Save Selection")
 
     ## The panel's New Channel: an alpha channel selecting nothing, at the end.
-    pub mutating func new_channel(name: str) -> i64!:
+    pub func new_channel(name: str) -> i64!:
         return try add_channel(&self, name, true, self.channels.count, "New Channel")
 
     ## A copy of channel `index` named `name`, just after it; its index.
-    pub mutating func duplicate_channel(index: i64, name: str) -> i64!:
+    pub func duplicate_channel(index: i64, name: str) -> i64!:
         try self.require_open()
         try check_channel_name(name)
         let source = try channel_at(&self, index)
@@ -55,10 +55,10 @@ extend Canvas:
         return index + 1
 
     ## Alpha channel `index` called `name`. One step.
-    pub mutating func rename_channel(index: i64, name: str) -> !:
+    pub func rename_channel(index: i64, name: str) -> !:
         try self.require_open()
         try check_channel_name(name)
-        discard(try channel_at(&self, index))
+        _ = try channel_at(&self, index)
         try self.remember_state("Rename Channel")
         var copied: str = ""
         with memory.heap:
@@ -68,19 +68,19 @@ extend Canvas:
         channel.name = copied
 
     ## Alpha channel `index` taken away. One step.
-    pub mutating func delete_channel(index: i64) -> !:
+    pub func delete_channel(index: i64) -> !:
         try self.require_open()
-        discard(try channel_at(&self, index))
+        _ = try channel_at(&self, index)
         try self.remember_state("Delete Channel")
         self.channels.remove((usize)index)
 
     ## Select › Load Selection: channel `index` combined into the selection by
     ## `mode` (0 replace, 1 add, 2 subtract, 3 intersect); with `invert`, what
     ## the channel leaves out. Undoable.
-    pub mutating func load_channel(index: i64, mode: i64 = 0, invert: bool = false) -> !:
+    pub func load_channel(index: i64, mode: i64 = 0, invert: bool = false) -> !:
         try self.require_open()
         let how = try selection_mode(mode)
-        discard(try channel_at(&self, index))
+        _ = try channel_at(&self, index)
         try self.remember_state("Load Selection")
         let channel = try channel_at(&self, index)
         if not invert:
@@ -102,7 +102,7 @@ extend Canvas:
     pub func channel_shown(index: i64) -> bool!:
         return (try channel_of(&self, index)).shown
 
-    pub mutating func set_channel_shown(index: i64, shown: bool) -> !:
+    pub func set_channel_shown(index: i64, shown: bool) -> !:
         let channel = try channel_at(&self, index)
         channel.shown = shown
         if not shown:
@@ -113,12 +113,12 @@ extend Canvas:
     pub func composite_shown(channel: i64) -> bool:
         return channel >= 0 and channel < 3 and self.view_channels[(usize)channel]
 
-    pub mutating func set_composite_view(red: bool, green: bool, blue: bool):
+    pub func set_composite_view(red: bool, green: bool, blue: bool):
         self.view_channels = [red, green, blue]
 
     ## A Channels panel thumbnail scaled into `rectangle`: the composite (0),
     ## its red, green or blue (1..3), or alpha channel `channel - 4`.
-    pub mutating func draw_channel(target: interop.View[gpu.RenderTarget], channel: i64, rectangle: gpu.Rect) -> !:
+    pub func draw_channel(target: interop.View[gpu.RenderTarget], channel: i64, rectangle: gpu.Rect) -> !:
         try self.require_open()
         if channel < 0 or channel >= 4 + (i64)self.channels.count:
             error(invalid, "no such channel")
@@ -171,7 +171,7 @@ struct Channels:
         var copied = Channels(count = 0)
         if self.count == 0:
             return copied
-        copied.items = try alloc Channel[self.count] in memory.heap
+        copied.items = try new Channel[self.count] --- in memory.heap
         errdefer copied.destroy()
         for index in 0..<self.count:
             var name: str = ""
@@ -184,9 +184,9 @@ struct Channels:
         return copied
 
     ## Take `channel` in at `at`, those from there on moving down one.
-    mutating func insert(at: usize, channel: Channel) -> !:
+    func insert(at: usize, channel: Channel) -> !:
         if self.count == self.items.length:
-            let grown = try alloc Channel[8 if self.items.length == 0 else self.items.length * 2] in memory.heap
+            let grown = try new Channel[8 if self.items.length == 0 else self.items.length * 2] --- in memory.heap
             if self.count > 0:
                 memory.copy(grown, self.items, self.count)
             if self.items.length > 0:
@@ -200,7 +200,7 @@ struct Channels:
         self.count += 1
 
     ## Take channel `at` out and free it.
-    mutating func remove(at: usize):
+    func remove(at: usize):
         strings.release(self.items[at].name)
         self.items[at].selection.destroy()
         for index in at + 1..<self.count:
@@ -208,11 +208,11 @@ struct Channels:
         self.count -= 1
 
     ## Let every channel's GPU tiles go (a list put away in history).
-    mutating func drop_gpu_tiles():
+    func drop_gpu_tiles():
         for index in 0..<self.count:
             self.items[index].selection.drop_gpu_tiles()
 
-    mutating func destroy():
+    func destroy():
         for index in 0..<self.count:
             strings.release(self.items[index].name)
             self.items[index].selection.destroy()
@@ -515,7 +515,7 @@ func draw_alpha_thumbnail(canvas: Canvas*, target: const gpu.RenderTarget*, sele
     let scale = size.pixel_width / size.width if size.width > 0.0 else 1.0
     let width = (u32)math.clamp(math.ceil(rectangle.width * scale), 1.0, 512.0)
     let height = (u32)math.clamp(math.ceil(rectangle.height * scale), 1.0, 512.0)
-    let pixels = try alloc u8[(usize)width * (usize)height] in memory.heap
+    let pixels = try new u8[(usize)width * (usize)height] --- in memory.heap
     defer free(pixels) in memory.heap
     memory.set(pixels, 255)
     try target.mask(pixels, width, height, rectangle, gpu.Color(0.0, 0.0, 0.0, 1.0))

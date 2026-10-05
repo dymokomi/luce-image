@@ -12,7 +12,7 @@ extend Canvas:
     ## Find layer `id`'s painted box, exactly, for `content_left` and the rest
     ## (past the canvas too); false when it has nothing painted. It reads the
     ## layer back from the GPU.
-    pub mutating func measure_content(id: i64) -> bool!:
+    pub func measure_content(id: i64) -> bool!:
         try self.require_open()
         let document = self.document else error(invalid, "draw the document once before measuring")
         let layer = document.find((u64)id) else error(invalid, "no such layer")
@@ -27,7 +27,7 @@ extend Canvas:
     ## `based_on` — 0 transparent pixels, 1 the top-left pixel's color, 2 the
     ## bottom-right's — for `content_left` and the rest; false when nothing
     ## is left. It reads the picture back from the GPU.
-    pub mutating func measure_trim(based_on: i64) -> bool!:
+    pub func measure_trim(based_on: i64) -> bool!:
         if based_on < 0 or based_on > 2:
             error(invalid, "trim is based on 0 transparency, 1 the top-left color or 2 the bottom-right color")
         # The flattened picture a band of 8-bit sRGB rows at a time: what Trim
@@ -88,7 +88,7 @@ extend Canvas:
 
     ## Change the canvas size, keeping the pixels with their top-left at the
     ## offset. Not undoable: the history is dropped.
-    pub mutating func resize_canvas(width: i64, height: i64, offset_x: i64, offset_y: i64) -> !:
+    pub func resize_canvas(width: i64, height: i64, offset_x: i64, offset_y: i64) -> !:
         try self.require_open()
         try self.require_idle()
         try self.remember_state("Canvas Size")
@@ -102,7 +102,7 @@ extend Canvas:
         try self.adopt_extent((u32)width, (u32)height)
 
     ## Crop the canvas to the selection's bounding box.
-    pub mutating func crop() -> !:
+    pub func crop() -> !:
         try self.begin_edit("Crop")
         defer self.end_edit()
         if not self.has_selection():
@@ -111,7 +111,7 @@ extend Canvas:
 
     ## Image › Reveal All: grow the canvas to hold every layer's pixels, those
     ## moved past it included; false when nothing lies past it. Undoable.
-    pub mutating func reveal_all() -> bool!:
+    pub func reveal_all() -> bool!:
         try self.require_open()
         let document = self.document else error(invalid, "draw the document once before revealing")
         var box = Bounds(left = 0, top = 0, right = (i64)self.extent_x, bottom = (i64)self.extent_y)
@@ -133,7 +133,7 @@ extend Canvas:
         return true
 
     ## Resample the whole image to a new size. Not undoable: the history is dropped.
-    pub mutating func resize_image(width: i64, height: i64, smooth: bool = true) -> !:
+    pub func resize_image(width: i64, height: i64, smooth: bool = true) -> !:
         try self.require_open()
         try self.require_idle()
         try self.remember_state("Image Size")
@@ -156,4 +156,3 @@ extend Canvas:
                         self.records[index].elements[element].spec.matrix[(usize)at + 1] *= scale_y
                 place_graph(&self.records[index], [scale_x, 0.0, 0.0, scale_y, 0.0, 0.0])
                 try redraw_vector(&self, index)
-

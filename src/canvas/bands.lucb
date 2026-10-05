@@ -44,9 +44,9 @@ struct Bands:
     static func begin(canvas: Canvas*, matte: f64[3]) -> Bands!:
         try canvas.require_open()
         let device = canvas.device else error(invalid, "draw the document once before saving it")
-        let band = try alloc u8[(usize)canvas.extent_x * (usize)tile_size * 4] in memory.heap
+        let band = try new u8[(usize)canvas.extent_x * (usize)tile_size * 4] --- in memory.heap
         errdefer free(band) in memory.heap
-        var bands = Bands(band = band, strips = try alloc gpu.Texture[(usize)((canvas.extent_x + strip_width - 1) // strip_width)] in memory.heap,
+        var bands = Bands(band = band, strips = try new gpu.Texture[(usize)((canvas.extent_x + strip_width - 1) // strip_width)] --- in memory.heap,
                           table = gpu.Texture(), shader = gpu.Shader(), pipeline = gpu.Pipeline(), reads = [gpu.ReadBatch(), gpu.ReadBatch()],
                           strips_per_part = 1, parts = 1, prepared = -1, matte = matte)
         errdefer bands.close()
@@ -69,7 +69,7 @@ struct Bands:
         return bands
 
     ## Row `row` of cells into `band`; how many pixel rows it holds.
-    mutating func fill(canvas: Canvas*, row: u32) -> usize!:
+    func fill(canvas: Canvas*, row: u32) -> usize!:
         let rows = min_u32(tile_size, canvas.extent_y - row * tile_size)
         if self.parts > 1:
             for part in 0..<self.parts:
@@ -90,7 +90,7 @@ struct Bands:
     ## Draw part `part` of band `row` as export bytes into its strips, and send
     ## their read back in batch `turn` (a batch per band at the band's width, or
     ## one per part at the part's).
-    mutating func prepare(canvas: Canvas*, row: u32, part: usize, turn: usize) -> !:
+    func prepare(canvas: Canvas*, row: u32, part: usize, turn: usize) -> !:
         let document = canvas.document else error(invalid, "draw the document once before saving it")
         let composer = canvas.composer else error(invalid, "draw the document once before saving it")
         let rows = min_u32(tile_size, canvas.extent_y - row * tile_size)
@@ -119,14 +119,14 @@ struct Bands:
                 var params: f32[8] = [(f32)x, 0.0, over, document.srgb_flag(), (f32)self.matte[0], (f32)self.matte[1], (f32)self.matte[2], 0.0]
                 try gpu.shade(target.value(), self.pipeline, gpu.Rect((f64)x, 0.0, (f64)columns, (f64)rows), u8[]((u8*)&params[0], 32), [texture, self.table], gpu.Filter.nearest)
                 x += columns
-            discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+            _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
             try batch.copy(self.strips[index], gpu.Region(0, 0, width, rows), base + (usize)(left - part_left) * 4, row_texels = part_width)
         try batch.submit()
         self.prepared = (i64)row
 
     ## Wait for part `part` of band `row` in batch `turn` and copy its rows into
     ## place in `band`.
-    mutating func take(canvas: Canvas*, row: u32, part: usize, turn: usize) -> !:
+    func take(canvas: Canvas*, row: u32, part: usize, turn: usize) -> !:
         let rows = (usize)min_u32(tile_size, canvas.extent_y - row * tile_size)
         let width = (usize)canvas.extent_x
         let part_left = part * self.strips_per_part * (usize)strip_width
@@ -142,7 +142,7 @@ struct Bands:
                 memory.copy(self.band[destination..<destination + part_width * 4], bytes[y * part_width * 4..<(y + 1) * part_width * 4], part_width * 4)
         try batch.reset()
 
-    mutating func close():
+    func close():
         self.reads[0].finish()
         self.reads[1].finish()
         self.pipeline.destroy()

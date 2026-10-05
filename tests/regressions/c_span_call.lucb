@@ -3,7 +3,7 @@
 struct Cursor:
     var calls: usize
 
-    mutating func next() -> const u8[]!:
+    func next() -> const u8[]!:
         self.calls += 1
         return b"AB"
 

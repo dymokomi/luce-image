@@ -42,7 +42,7 @@ extend Canvas:
     ## Take in the bands decoded since the last call, as a draw does: for a
     ## document not on screen, whose picture would otherwise wait for its next
     ## frame. A failed load is reported here, once.
-    pub mutating func continue_opening() -> !:
+    pub func continue_opening() -> !:
         let opening = self.opening else return
         let document = self.document else return
         let composer = self.composer else return
@@ -85,7 +85,7 @@ extend Canvas:
 
     ## Wait for the picture opening, if any, to be in: before another is
     ## placed, for one loads at a time.
-    pub mutating func finish_opening() -> !:
+    pub func finish_opening() -> !:
         while self.opening != none:
             try self.continue_opening()
             if self.opening != none:
@@ -189,8 +189,8 @@ func begin_opening(canvas: Canvas*, layer: u64, picture: interop.Reference[Image
             error(failure.code, failure.message)
     try document.set_tiles(layer, tiles)
     for slot in 0..<opening_slots:
-        opening.slots[slot].band = try alloc u8[packed_band_bytes(width)] in memory.heap
-        opening.slots[slot].painted = try alloc bool[(usize)tile_columns(width)] in memory.heap
+        opening.slots[slot].band = try new u8[packed_band_bytes(width)] --- in memory.heap
+        opening.slots[slot].painted = try new bool[(usize)tile_columns(width)] --- in memory.heap
     for unused in 0..<opening_slots:
         opening.free_slots.release()
     opening.handle = try thread.spawn(opening_worker, (void*)opening, name = "picture open")
@@ -229,8 +229,8 @@ func opening_coded_band(context: void*?, first: usize, count: usize, samples: co
     let slot = try free_slot(opening, first)
     if opening.color.length == 0:
         let codes: usize = 65536 if deep else 256
-        opening.color = try alloc u16[codes] in memory.heap
-        opening.alpha = try alloc u16[codes] in memory.heap
+        opening.color = try new u16[codes] --- in memory.heap
+        opening.alpha = try new u16[codes] --- in memory.heap
         try encoded_tables(deep, opening.color, opening.alpha)
     try pack_band_coded(opening.extent_x, opening.extent_y, slot.row, samples, deep, opening.color, opening.alpha, slot.band, slot.painted)
     band_packed(opening, first + count)
@@ -248,7 +248,7 @@ func free_slot(opening: Opening*, first: usize) -> OpeningSlot*!:
 ## A slot is packed, the picture's rows through `rows` with it.
 func band_packed(opening: Opening*, rows: usize):
     opening.rows.store(rows, .release)
-    discard(opening.packed.add(1))
+    _ = opening.packed.add(1)
     # Frames upload it; the window's loop may be asleep waiting for input.
     wake_frames()
 
@@ -292,7 +292,7 @@ func build_band_levels(canvas: Canvas*, composer: Composer*, tiles: const Tiles*
     while level <= 16 and (last or (row + 1) % (1u32 << level) == 0):
         for column in 0..<level_cells(canvas.extent_x, level):
             pyramid.hold()
-            discard(try pyramid.texture(tiles, column, row >> level, level))
+            _ = try pyramid.texture(tiles, column, row >> level, level)
         if level_cells(canvas.extent_x, level) == 1 and level_cells(canvas.extent_y, level) == 1:
             return
         level += 1

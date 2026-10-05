@@ -14,7 +14,7 @@
 extend Canvas:
     ## Count layer `id`'s visible pixels by their encoded values for
     ## `histogram`: Auto levels and the Levels dialog read it.
-    pub mutating func measure_histogram(id: i64) -> !:
+    pub func measure_histogram(id: i64) -> !:
         try self.require_open()
         let document = self.document else error(invalid, "draw the document once before measuring")
         let layer = document.find((u64)id) else error(invalid, "no such layer")
@@ -25,11 +25,11 @@ extend Canvas:
     ## Count what shows below layer `id` — the whole picture with it and the
     ## layers over it hidden — for `histogram`: what an adjustment layer's
     ## Levels takes in.
-    pub mutating func measure_histogram_below(id: i64) -> !:
+    pub func measure_histogram_below(id: i64) -> !:
         try self.require_open()
         let document = self.document else error(invalid, "draw the document once before measuring")
         let index = try self.index((u64)id)
-        let hidden = try alloc bool[self.count] in memory.heap
+        let hidden = try new bool[self.count] --- in memory.heap
         defer free(hidden) in memory.heap
         for at in 0..<self.count:
             let record = self.records[at]
@@ -55,7 +55,7 @@ extend Canvas:
         return false
 
     ## Put back the visibility `measure_histogram_below` took away.
-    mutating func show_again(hidden: const bool[]):
+    func show_again(hidden: const bool[]):
         let document = self.document else return
         for at in 0..<self.count:
             if hidden[at]:
@@ -64,7 +64,7 @@ extend Canvas:
                     recover ()
 
     ## Empty the histogram's bins before a count.
-    mutating func clear_histogram():
+    func clear_histogram():
         for slot in 0..<(usize)1024:
             self.histogram_counts[slot] = 0
 
@@ -93,9 +93,9 @@ func count_rgba8(counts: u64[], rgba: const u8[], count: usize):
 ## Layer `tiles` counted a cell at a time into `counts`.
 func count_layer(counts: u64[], tiles: const Tiles*) -> !:
     let side = (usize)tile_size
-    let samples = try alloc f32[side * side * 4] in memory.heap
+    let samples = try new f32[side * side * 4] --- in memory.heap
     defer free(samples) in memory.heap
-    let rgba = try alloc u8[side * 4] in memory.heap
+    let rgba = try new u8[side * 4] --- in memory.heap
     defer free(rgba) in memory.heap
     var steps: u8[4097] = ---
     transfer.srgb_byte_table(steps)

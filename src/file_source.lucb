@@ -32,13 +32,13 @@ pub struct FileSource:
     pub func size() -> u64:
         return self.length
 
-    pub mutating func close():
+    pub func close():
         self.file.destroy()
 
 ## `ReadAt` over a `FileSource`.
 pub func read_source(context: void*?, at: u64, into: u8[]) -> usize!:
     let source = (FileSource*)(context else return 0)
-    discard(try source.file.seek((i64)at))
+    _ = try source.file.seek((i64)at)
     return try source.file.read(into)
 
 ## The file at `path` (at most `most` bytes, its size into `size`): the start
@@ -77,8 +77,8 @@ func head_need(data: const u8[], length: usize) -> usize:
 
 ## `count` bytes of `file` from `at`, in heap storage of exactly that size.
 func read_range(file: files.File*, at: u64, count: usize) -> u8[]!:
-    discard(try file.seek((i64)at))
-    let data = try alloc u8[count] in memory.heap
+    _ = try file.seek((i64)at)
+    let data = try new u8[count] --- in memory.heap
     errdefer free(data) in memory.heap
     var used: usize = 0
     while used < count:

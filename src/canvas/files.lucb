@@ -9,7 +9,7 @@ extend Canvas:
     ## pixel (`center_x`, `center_y`): what falls outside the document is cut off
     ## and the rest of the layer is transparent. Dropping a file on a document
     ## does this. The document must have been drawn once.
-    pub mutating func place_layer(id: i64, path: str, center_x: i64, center_y: i64) -> !:
+    pub func place_layer(id: i64, path: str, center_x: i64, center_y: i64) -> !:
         if is_svg(path):
             if let found = try svg_vectors(path):
                 var imported = found
@@ -29,7 +29,7 @@ extend Canvas:
     ## Write the document with all its layers to `path`, one `.l2d` file of
     ## their half-float tiles, a manifest and a preview (docs/FORMATS.md).
     ## Needs the document drawn once.
-    pub mutating func save_package(path: str) -> !:
+    pub func save_package(path: str) -> !:
         try require_loaded(&self)
         try self.wait_idle()
         try save_canvas_package(&self, path)
@@ -37,7 +37,7 @@ extend Canvas:
 
     ## Write the flattened document to `path` as an 8-bit RGBA picture in the
     ## format its extension names. Needs the document drawn at least once.
-    pub mutating func save(path: str, quality: i64 = 90, matte_red: f64 = -1.0, matte_green: f64 = 0.0, matte_blue: f64 = 0.0) -> !:
+    pub func save(path: str, quality: i64 = 90, matte_red: f64 = -1.0, matte_green: f64 = 0.0, matte_blue: f64 = 0.0) -> !:
         try require_loaded(&self)
         try self.wait_idle()
         try save_flattened(&self, path, quality, matte_red, matte_green, matte_blue)
@@ -139,7 +139,7 @@ func flattened_pixels(canvas: Canvas*) -> f32[]!:
     let composer = canvas.composer else error(invalid, "draw the document once before reading it flattened")
     let device = canvas.device else error(invalid, "draw the document once before reading it flattened")
     let count = (usize)canvas.extent_x * (usize)canvas.extent_y * 4
-    let pixels = try alloc f32[count] in memory.heap
+    let pixels = try new f32[count] --- in memory.heap
     errdefer free(pixels) in memory.heap
     var flat = FlatRead(composer = composer, document = document, pixels = pixels, extent_x = canvas.extent_x, extent_y = canvas.extent_y, level = 0,
                         columns = tile_columns(canvas.extent_x), width = (usize)canvas.extent_x)
@@ -285,7 +285,7 @@ struct PictureBands:
     var color: u16[]
     var alpha: u16[]
 
-    mutating func close():
+    func close():
         if self.band.length > 0:
             free(self.band) in memory.heap
         if self.painted.length > 0:
@@ -297,7 +297,7 @@ struct PictureBands:
 ## `linear_rgba_bands`' sink: a band of rows becomes a row of cells.
 func picture_band(context: void*?, first: usize, count: usize, pixels: f32[]) -> !:
     let banding = (PictureBands*)(context else return)
-    discard(count)
+    _ = count
     try banding.tiles.write_band((u32)(first // (usize)tile_size), pixels)
     try settle_job(banding.canvas)
 
@@ -305,13 +305,13 @@ func picture_band(context: void*?, first: usize, count: usize, pixels: f32[]) ->
 ## floats become a row of cells, no floats made on the way.
 func picture_coded_band(context: void*?, first: usize, count: usize, samples: const u8[], deep: bool) -> !:
     let banding = (PictureBands*)(context else return)
-    discard(count)
+    _ = count
     if banding.band.length == 0:
         let codes: usize = 65536 if deep else 256
-        banding.band = try alloc u8[packed_band_bytes(banding.tiles.width())] in memory.heap
-        banding.painted = try alloc bool[(usize)banding.tiles.columns()] in memory.heap
-        banding.color = try alloc u16[codes] in memory.heap
-        banding.alpha = try alloc u16[codes] in memory.heap
+        banding.band = try new u8[packed_band_bytes(banding.tiles.width())] --- in memory.heap
+        banding.painted = try new bool[(usize)banding.tiles.columns()] --- in memory.heap
+        banding.color = try new u16[codes] --- in memory.heap
+        banding.alpha = try new u16[codes] --- in memory.heap
         try encoded_tables(deep, banding.color, banding.alpha)
     let row = (u32)(first // (usize)tile_size)
     try pack_band_coded(banding.tiles.width(), banding.tiles.height(), row, samples, deep, banding.color, banding.alpha, banding.band, banding.painted)
@@ -333,7 +333,7 @@ func place_in_background(canvas: Canvas*, id: i64, picture: interop.Reference[Im
 func prepare_placing(canvas: Canvas*, id: i64, picture: interop.Reference[Image], width: usize*, height: usize*) -> !:
     try canvas.require_open()
     try canvas.finish_opening()
-    discard(try canvas.index((u64)id))
+    _ = try canvas.index((u64)id)
     *width = try picture.value().width()
     *height = try picture.value().height()
 
@@ -342,7 +342,7 @@ func prepare_placing(canvas: Canvas*, id: i64, picture: interop.Reference[Image]
 func place_image_at(canvas: Canvas*, id: i64, picture: interop.Reference[Image], center_x: i64, center_y: i64) -> !:
     try canvas.require_open()
     let document = canvas.document else error(invalid, "draw the document once before placing a picture")
-    discard(try canvas.index((u64)id))
+    _ = try canvas.index((u64)id)
     let width = try picture.value().width()
     let height = try picture.value().height()
     # The picture's tiles a band at a time, moved onto the canvas's grid: what
@@ -454,9 +454,9 @@ func open_psd(path: str) -> interop.Reference[Canvas]!:
     errdefer native.close()
     # Which group holds each record: walking down from the top, a group's own
     # record opens it and the divider below its layers closes it.
-    let parents = try alloc i64[parsed.count if parsed.count > 0 else 1] in memory.heap
+    let parents = try new i64[parsed.count if parsed.count > 0 else 1] --- in memory.heap
     defer free(parents) in memory.heap
-    let open_groups = try alloc i64[parsed.count if parsed.count > 0 else 1] in memory.heap
+    let open_groups = try new i64[parsed.count if parsed.count > 0 else 1] --- in memory.heap
     defer free(open_groups) in memory.heap
     var depth: usize = 0
     var index = parsed.count
@@ -472,10 +472,10 @@ func open_psd(path: str) -> interop.Reference[Canvas]!:
         elif kind == psd.group_end and depth > 0:
             depth -= 1
     # Every record becomes a layer or a group, bottom first; then each goes into its group.
-    let ids = try alloc i64[parsed.count if parsed.count > 0 else 1] in memory.heap
+    let ids = try new i64[parsed.count if parsed.count > 0 else 1] --- in memory.heap
     defer free(ids) in memory.heap
     # One mask's gray pixels at a time, as RGBA for a picture.
-    let gray = try alloc u8[(usize)parsed.width * (usize)parsed.height * 4] in memory.heap
+    let gray = try new u8[(usize)parsed.width * (usize)parsed.height * 4] --- in memory.heap
     defer free(gray) in memory.heap
     for at in 0..<parsed.count:
         let layer = &parsed.layers[at]
@@ -507,5 +507,5 @@ func open_psd(path: str) -> interop.Reference[Canvas]!:
         if ids[at] != 0 and parent >= 0 and ids[(usize)parent] != 0:
             try native.move_into(ids[at], ids[(usize)parent], -1)
     if native.count == 0:
-        discard(try native.add_layer("Background"))
+        _ = try native.add_layer("Background")
     return reservation.publish(native, memory.heap)

@@ -19,7 +19,7 @@ extend Canvas:
     ## (the pixels stay); `preview_selection_transform` or
     ## `preview_selection_distort` show it, `end_selection_transform` keeps it
     ## as one step or puts it back.
-    pub mutating func begin_selection_transform() -> !:
+    pub func begin_selection_transform() -> !:
         try self.require_open()
         if self.selection_warping != none:
             error(invalid, "the selection is already being transformed")
@@ -27,19 +27,19 @@ extend Canvas:
             error(invalid, "nothing is selected to transform")
         let origin = try self.live().copy()
         self.selection_warping = try new SelectionWarping(origin = origin, warp = none, levels = LevelOrigin(selection = none, level = 0),
-                                                            shown = Shown(selection = none, level = 0), shown_box = CellBox(), shown_current = false) in memory.heap
+                                                          shown = Shown(selection = none, level = 0), shown_box = CellBox(), shown_current = false) in memory.heap
 
     pub func transforming_selection() -> bool:
         return self.selection_warping != none
 
     ## The selection as it began, its box's corners moved to `c0`..`c7` (x, y
     ## pairs clockwise from the top left): Distort and Perspective.
-    pub mutating func preview_selection_distort(left: f64, top: f64, width: f64, height: f64, c0: f64, c1: f64, c2: f64, c3: f64, c4: f64, c5: f64, c6: f64, c7: f64) -> !:
+    pub func preview_selection_distort(left: f64, top: f64, width: f64, height: f64, c0: f64, c1: f64, c2: f64, c3: f64, c4: f64, c5: f64, c6: f64, c7: f64) -> !:
         let corners: f64[8] = [c0, c1, c2, c3, c4, c5, c6, c7]
         try show_selection_warp(&self, try quad_warp(left, top, width, height, corners))
 
     ## Keep the reshaped selection as one step, or put back the one it began from.
-    pub mutating func end_selection_transform(keep: bool) -> !:
+    pub func end_selection_transform(keep: bool) -> !:
         let session = self.selection_warping else return
         if keep:
             if let warp = session.warp:

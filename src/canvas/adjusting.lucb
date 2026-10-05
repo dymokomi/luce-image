@@ -11,14 +11,14 @@
 extend Canvas:
     ## Stage parameter `index` (0..22) of the next adjustment, as adjust.frag
     ## lists them for each kind; `clear_adjustments` sets them all to 0.
-    pub mutating func set_adjustment(index: i64, value: f64) -> !:
+    pub func set_adjustment(index: i64, value: f64) -> !:
         if index < 0 or index >= (i64)parameter_count:
             error(invalid, "adjustments take parameters 0..22")
         if not math.is_finite(value):
             error(invalid, "adjustment parameters must be finite")
         self.adjustment[(usize)index] = value
 
-    pub mutating func clear_adjustments():
+    pub func clear_adjustments():
         for index in 0..<parameter_count:
             self.adjustment[index] = 0.0
 
@@ -28,7 +28,7 @@ extend Canvas:
     ## (the curves set with `add_curve_point`), 8 exposure, 9 black & white,
     ## 10 color balance, 11 gradient map, 12 vignette, 13 grain, 14 noise,
     ## 16 camera raw, 17 replace color (adjust.frag lists their parameters). Undoable.
-    pub mutating func adjust_layer(id: i64, kind: i64) -> !:
+    pub func adjust_layer(id: i64, kind: i64) -> !:
         try self.require_open()
         try self.require_idle()
         if kind < 0 or kind >= (i64)adjustment_count:
@@ -36,7 +36,7 @@ extend Canvas:
         # Shown and kept at once: the mask when it is being edited, within the selection.
         try self.begin_preview(id, try self.editing_mask_of(id))
         self.preview_adjust(kind) catch failure:
-            discard(self.end_preview(false) catch: recover ())
+            _ = self.end_preview(false) catch: recover ()
             error(failure.code, failure.message)
         try self.end_preview(true)
 
@@ -46,15 +46,15 @@ extend Canvas:
     ## Add a control point to a curve for the `curves` adjustment (kind 7):
     ## channel 0 is RGB, applied after 1 red, 2 green and 3 blue; x and y in
     ## 0..1; a point at an existing x replaces it; at most 16 per channel.
-    pub mutating func add_curve_point(channel: i64, x: f64, y: f64) -> !:
+    pub func add_curve_point(channel: i64, x: f64, y: f64) -> !:
         try self.curves.add(try curve_channel(channel), x, y)
 
     ## Empty a channel's curve before its points are added one by one.
-    pub mutating func clear_curve(channel: i64) -> !:
+    pub func clear_curve(channel: i64) -> !:
         try self.curves.clear(try curve_channel(channel))
 
     ## Reset a channel's curve to the identity.
-    pub mutating func reset_curve(channel: i64) -> !:
+    pub func reset_curve(channel: i64) -> !:
         let index = try curve_channel(channel)
         try self.curves.clear(index)
         try self.curves.add(index, 0.0, 0.0)
@@ -81,7 +81,7 @@ extend Canvas:
 
     ## The 256×1 table the curves adjustment samples, refreshed from the
     ## curves; none for other kinds.
-    mutating func curve_table(kind: u32) -> gpu.Texture?!:
+    func curve_table(kind: u32) -> gpu.Texture?!:
         if kind != curves:
             return none
         let device = self.device else error(invalid, "draw the document once before adjusting")
@@ -97,7 +97,7 @@ extend Canvas:
     ## pixels from before the preview began, not on the previous preview.
     ## Start showing edits live on layer `id`'s pixels, or on its mask when
     ## `mask` (a gradient there); `end_preview` keeps or drops them.
-    pub mutating func begin_preview(id: i64, mask: bool = false) -> !:
+    pub func begin_preview(id: i64, mask: bool = false) -> !:
         try self.require_open()
         try self.require_idle()
         let document = self.document else error(invalid, "draw the document once before previewing")
@@ -112,7 +112,7 @@ extend Canvas:
         return self.preview != none
 
     ## Show adjustment `kind` (as `adjust_layer`) applied to the layer as it was when the preview began.
-    pub mutating func preview_adjust(kind: i64) -> !:
+    pub func preview_adjust(kind: i64) -> !:
         self.preview_name = adjustment_name(kind)
         if kind < 0 or kind >= (i64)adjustment_count:
             error(invalid, "no such adjustment")
@@ -126,7 +126,7 @@ extend Canvas:
 
     ## Finish the preview: keep what it shows as one undoable edit, or put the
     ## layer's pixels back as they were.
-    pub mutating func end_preview(keep: bool) -> !:
+    pub func end_preview(keep: bool) -> !:
         try self.require_open()
         # A filter or gradient shown at the view's level is made at full size now.
         if keep:
@@ -148,13 +148,13 @@ extend Canvas:
 
     ## Show the previewed layer (or mask) as it was when the preview began, the
     ## edit still under way: a dialog's Preview unchecked.
-    pub mutating func show_preview_original() -> !:
-        discard(try self.restore_preview())
+    pub func show_preview_original() -> !:
+        _ = try self.restore_preview()
 
     ## When the preview is of a mask, fill its missing cells (which count as
     ## white) with white tiles, so an adjustment or filter reaches them too;
     ## whether it is a mask.
-    mutating func whiten_previewed_mask() -> bool!:
+    func whiten_previewed_mask() -> bool!:
         let preview = self.preview else return false
         if not preview.mask:
             return false
@@ -168,12 +168,12 @@ extend Canvas:
                 errdefer white.destroy()
                 let frame = try white.frame()
                 defer frame.release()
-                discard(try frame.value().present(gpu.Color(1.0, 1.0, 1.0, 1.0)))
+                _ = try frame.value().present(gpu.Color(1.0, 1.0, 1.0, 1.0))
                 try mask.set(column, row, white)
         return true
 
     ## Put the previewed layer's original pixels back; the layer's id.
-    mutating func restore_preview() -> u64!:
+    func restore_preview() -> u64!:
         try self.require_open()
         drop_filter_preview(&self)
         drop_gradient_preview(&self)
@@ -185,4 +185,3 @@ extend Canvas:
         else:
             try document.set_tiles(preview.layer, try preview.tiles.clone())
         return preview.layer
-

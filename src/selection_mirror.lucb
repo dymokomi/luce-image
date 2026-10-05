@@ -28,7 +28,7 @@ pub struct Mirror:
         var nothing: u64[]
         return Mirror(tiles = none, shown = nothing, behind = false)
 
-    pub mutating func destroy():
+    pub func destroy():
         if let tiles = self.tiles:
             unbox(tiles)
             self.tiles = none
@@ -41,11 +41,11 @@ pub struct Mirror:
     ## The tiles showing `cells` (settled), their changed cells uploaded;
     ## with `only`, just the cells in it and `extra` more (`behind` says
     ## whether any are left).
-    pub mutating func update(device: gpu.Device, cells: const Cells*, only: CellRange? = none, extra: usize = 0) -> Tiles*!:
+    pub func update(device: gpu.Device, cells: const Cells*, only: CellRange? = none, extra: usize = 0) -> Tiles*!:
         if self.tiles == none:
             var fresh = try Tiles.create(device, cells.extent_x, cells.extent_y)
             errdefer fresh.destroy()
-            let shown = try alloc u64[cells.count()] in memory.heap
+            let shown = try new u64[cells.count()] --- in memory.heap
             errdefer free(shown) in memory.heap
             memory.set(u8[]((u8*)shown.data, shown.length * 8), 0)
             self.tiles = try box(fresh)
@@ -57,7 +57,7 @@ pub struct Mirror:
             if self.shown[index] == 1 and cells.shows(index) == 1:
                 full = index
                 break
-        let pending = try alloc usize[batch] in memory.heap
+        let pending = try new usize[batch] --- in memory.heap
         defer free(pending) in memory.heap
         var waiting: usize = 0
         var spare = extra
@@ -98,7 +98,7 @@ pub struct Mirror:
 ## Convert `items` (cell indices) to half floats on every processor, then
 ## upload them and set them in `tiles`.
 func upload(tiles: Tiles*, cells: const Cells*, items: const usize[]) -> !:
-    let staging = try alloc u8[items.length * tile_bytes] in memory.heap
+    let staging = try new u8[items.length * tile_bytes] --- in memory.heap
     defer free(staging) in memory.heap
     var job = ConvertJob(cells = cells, items = items, staging = staging)
     for value in 0..<(usize)256:

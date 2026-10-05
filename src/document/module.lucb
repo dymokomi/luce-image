@@ -98,7 +98,7 @@ pub struct Document:
         return find_in(self.root, id)
 
     ## Put Quick Mask's layer up with `mask` (taken) as its mask; its id.
-    pub mutating func begin_quick(mask: Tiles) -> u64!:
+    pub func begin_quick(mask: Tiles) -> u64!:
         var owned_mask = mask
         errdefer owned_mask.destroy()
         if self.quick != none:
@@ -119,26 +119,26 @@ pub struct Document:
         return self.quick
 
     ## Take Quick Mask's layer down.
-    pub mutating func end_quick():
+    pub func end_quick():
         self.selection_suspended = false
         let quick = self.quick else return
         self.quick = none
         layer_destroy(quick)
 
     ## Add a transparent raster layer on top of `parent` (the root by default).
-    pub mutating func add_layer(name: str, parent: u64? = none) -> u64!:
+    pub func add_layer(name: str, parent: u64? = none) -> u64!:
         let tiles = try Tiles.create(self.owner, self.extent_x, self.extent_y)
         return try self.add(name, parent, false, tiles)
 
     ## Add an adjustment layer of `kind` with `values` (at most 23) on top of
     ## `parent` (the root by default).
-    pub mutating func add_adjustment(name: str, kind: i64, values: const f64[], parent: u64? = none) -> u64!:
+    pub func add_adjustment(name: str, kind: i64, values: const f64[], parent: u64? = none) -> u64!:
         let id = try self.add(name, parent, false, none)
         try self.set_adjustment(id, kind, values)
         return id
 
     ## Give Curves adjustment layer `id` its curves anew.
-    pub mutating func set_curves(id: u64, curves: Curves) -> !:
+    pub func set_curves(id: u64, curves: Curves) -> !:
         let layer = self.find(id) else error(invalid, "no such layer")
         if layer.adjustment < 0:
             error(invalid, "only an adjustment layer takes curves")
@@ -147,7 +147,7 @@ pub struct Document:
         self.revision += 1
 
     ## Give adjustment layer `id` its kind and parameters anew.
-    pub mutating func set_adjustment(id: u64, kind: i64, values: const f64[]) -> !:
+    pub func set_adjustment(id: u64, kind: i64, values: const f64[]) -> !:
         let layer = self.find(id) else error(invalid, "no such layer")
         if layer.group or layer.pixels != none:
             error(invalid, "only an adjustment layer takes adjustment settings")
@@ -160,11 +160,11 @@ pub struct Document:
         self.revision += 1
 
     ## Add an empty group on top of `parent` (the root by default).
-    pub mutating func add_group(name: str, parent: u64? = none) -> u64!:
+    pub func add_group(name: str, parent: u64? = none) -> u64!:
         return try self.add(name, parent, true, none)
 
     ## Give layer `id` a new name.
-    pub mutating func rename(id: u64, name: str) -> !:
+    pub func rename(id: u64, name: str) -> !:
         let layer = self.find(id) else error(invalid, "no such layer")
         var copied: str = ""
         with memory.heap:
@@ -172,7 +172,7 @@ pub struct Document:
         strings.release(layer.name)
         layer.name = copied
 
-    mutating func add(name: str, parent: u64?, group: bool, tiles: Tiles?) -> u64!:
+    func add(name: str, parent: u64?, group: bool, tiles: Tiles?) -> u64!:
         var holder: Tiles*? = none
         if let owned = tiles:
             holder = try box(owned)
@@ -199,7 +199,7 @@ pub struct Document:
     ## Move a layer — a group with everything in it — into group `parent` (the
     ## top level when none) at `position` among its layers, 0 the bottom; past
     ## the top it goes on top. A group cannot go inside itself.
-    pub mutating func move_to(id: u64, parent: u64?, position: usize) -> !:
+    pub func move_to(id: u64, parent: u64?, position: usize) -> !:
         let moving = self.find(id) else error(invalid, "no such layer")
         var target = self.root
         if let parent_id = parent:
@@ -250,7 +250,7 @@ pub struct Document:
     ## `position`, its pixels and mask moved by (`offset_x`, `offset_y`) onto
     ## this document's canvas. Every layer in it gets a new id, in pre-order
     ## from the one returned.
-    pub mutating func adopt(layer: const Layer*, parent: u64?, position: usize, offset_x: f64, offset_y: f64) -> u64!:
+    pub func adopt(layer: const Layer*, parent: u64?, position: usize, offset_x: f64, offset_y: f64) -> u64!:
         var target = self.root
         if let parent_id = parent:
             target = self.find(parent_id) else error(invalid, "no such parent layer")
@@ -271,7 +271,7 @@ pub struct Document:
 
     ## `layer` copied onto this canvas with new ids: tiles shared when they
     ## land as they are, else drawn anew where they land.
-    mutating func transplant(layer: const Layer*, offset_x: f64, offset_y: f64) -> Layer*!:
+    func transplant(layer: const Layer*, offset_x: f64, offset_y: f64) -> Layer*!:
         var copied: str = ""
         with memory.heap:
             copied = try strings.copy(layer.name)
@@ -295,7 +295,7 @@ pub struct Document:
         if let mask = layer.mask:
             copy.mask = try box(try self.landed(mask, offset_x, offset_y, true))
         if layer.child_count > 0:
-            copy.children = try alloc Layer*[layer.child_count] in memory.heap
+            copy.children = try new Layer*[layer.child_count] --- in memory.heap
             for index in 0..<layer.child_count:
                 copy.children[index] = try self.transplant(layer.children[index], offset_x, offset_y)
                 copy.child_count += 1
@@ -316,14 +316,14 @@ pub struct Document:
         return moved
 
     ## Keep a layer's mask but stop it hiding anything, or bring it back.
-    pub mutating func enable_mask(id: u64, enabled: bool) -> !:
+    pub func enable_mask(id: u64, enabled: bool) -> !:
         let layer = self.find(id) else error(invalid, "no such layer")
         layer.mask_enabled = enabled
         layer.revision += 1
         self.revision += 1
 
     ## Move a layer one step up (`step` 1) or down (-1) among its siblings.
-    pub mutating func reorder(id: u64, step: i64) -> !:
+    pub func reorder(id: u64, step: i64) -> !:
         let parent = parent_of(self.root, id) else error(invalid, "no such layer")
         var index: usize = 0
         while parent.children[index].id != id:
@@ -337,7 +337,7 @@ pub struct Document:
         self.revision += 1
 
     ## Copy a raster layer with its mask and appearance, placed just above it.
-    pub mutating func duplicate(id: u64, name: str) -> u64!:
+    pub func duplicate(id: u64, name: str) -> u64!:
         let source = self.find(id) else error(invalid, "no such layer")
         if source.group:
             error(invalid, "groups cannot be duplicated yet")
@@ -382,13 +382,13 @@ pub struct Document:
         return parent.children[index - 1]
 
     ## Remove a layer or a group with everything in it.
-    pub mutating func remove(id: u64) -> !:
+    pub func remove(id: u64) -> !:
         if not remove_in(self.root, id):
             error(invalid, "no such layer")
         self.revision += 1
 
     ## Replace a raster layer's pixels, taking ownership of `tiles`.
-    pub mutating func set_tiles(id: u64, tiles: Tiles) -> !:
+    pub func set_tiles(id: u64, tiles: Tiles) -> !:
         var holder: Tiles*? = try box(tiles)
         errdefer release_tiles(&holder)
         let layer = self.find(id) else error(invalid, "no such layer")
@@ -401,7 +401,7 @@ pub struct Document:
 
     ## Replace a raster layer's pixels with `tiles` and hand back the pixels it
     ## had, for history.
-    pub mutating func take_tiles(id: u64, tiles: Tiles) -> Tiles!:
+    pub func take_tiles(id: u64, tiles: Tiles) -> Tiles!:
         var holder: Tiles*? = try box(tiles)
         errdefer release_tiles(&holder)
         let layer = self.find(id) else error(invalid, "no such layer")
@@ -441,7 +441,7 @@ pub struct Document:
 
     ## Take `state` as the document and leave what was in its place: undo and
     ## redo swap, never copy.
-    pub mutating func exchange(state: TreeState*):
+    pub func exchange(state: TreeState*):
         let root = self.root
         self.root = state.root
         state.root = root
@@ -474,7 +474,7 @@ pub struct Document:
         self.generation += 1
         restamp(self.root, self.generation)
 
-    pub mutating func set_extent(width: u32, height: u32) -> !:
+    pub func set_extent(width: u32, height: u32) -> !:
         self.extent_x = width
         self.extent_y = height
         var replacement = try Selection.create(width, height)
@@ -483,14 +483,14 @@ pub struct Document:
         self.revision += 1
 
     ## The selection's GPU tiles, or none when nothing is selected.
-    pub mutating func selection_tiles() -> Tiles*?!:
+    pub func selection_tiles() -> Tiles*?!:
         if self.selection_suspended:
             return none
         return try self.selection.gpu_tiles(self.owner)
 
     ## As `selection_tiles`, catching up only the cells in `wanted` and `extra`
     ## more (see `Selection.gpu_tiles_within`): for drawing the ants.
-    pub mutating func selection_tiles_within(wanted: CellRange, extra: usize) -> Tiles*?!:
+    pub func selection_tiles_within(wanted: CellRange, extra: usize) -> Tiles*?!:
         if self.selection_suspended:
             return none
         return try self.selection.gpu_tiles_within(self.owner, wanted, extra)
@@ -500,7 +500,7 @@ pub struct Document:
         return self.selection.gpu_behind()
 
     ## Give a layer or a group an empty mask (revealing everything) or take it away.
-    pub mutating func set_mask(id: u64, present: bool) -> !:
+    pub func set_mask(id: u64, present: bool) -> !:
         let layer = self.find(id) else error(invalid, "no such layer")
         if present and layer.mask == none:
             let tiles = try Tiles.create(self.owner, self.extent_x, self.extent_y)
@@ -513,7 +513,7 @@ pub struct Document:
         self.revision += 1
 
     ## Replace a layer's mask with `tiles` and hand back the mask it had.
-    pub mutating func take_mask(id: u64, tiles: Tiles) -> Tiles!:
+    pub func take_mask(id: u64, tiles: Tiles) -> Tiles!:
         var holder: Tiles*? = try box(tiles)
         errdefer release_tiles(&holder)
         let layer = self.find(id) else error(invalid, "no such layer")
@@ -527,13 +527,13 @@ pub struct Document:
         return taken
 
     ## Clip a layer to the one below, or unclip it.
-    pub mutating func set_clipped(id: u64, clipped: bool) -> !:
+    pub func set_clipped(id: u64, clipped: bool) -> !:
         let layer = self.find(id) else error(invalid, "no such layer")
         layer.clipped = clipped
         self.revision += 1
 
     ## Set a layer's visibility, opacity and blend mode.
-    pub mutating func set_appearance(id: u64, visible: bool, opacity: f64, blend: u32 = 0) -> !:
+    pub func set_appearance(id: u64, visible: bool, opacity: f64, blend: u32 = 0) -> !:
         if not (opacity >= 0.0 and opacity <= 1.0):
             error(invalid, "opacity must be in 0..1")
         if blend > blend_mode_count - 1:
@@ -544,11 +544,10 @@ pub struct Document:
         layer.blend = blend
         self.revision += 1
 
-    pub mutating func destroy():
+    pub func destroy():
         self.end_quick()
         self.selection.destroy()
         layer_destroy(self.root)
-
 
 ## Move a document onto the heap, for holders that keep a pointer.
 pub func box_document(document: Document) -> Document*!:
@@ -561,7 +560,6 @@ pub func box_document(document: Document) -> Document*!:
 pub func unbox_document(document: Document*):
     document.destroy()
     free(document) in memory.heap
-
 
 test "document layers, groups, removal and appearance":
     var device = gpu.Device.open() catch failure:
@@ -580,10 +578,10 @@ test "document layers, groups, removal and appearance":
     try document.set_appearance(background, false, 0.5)
     assert(not (document.find(background) else trap("missing")).visible)
     var rejected = false
-    discard(document.add_layer("Bad", inner) catch failure:
+    _ = document.add_layer("Bad", inner) catch failure:
         assert(failure.code == invalid)
         rejected = true
-        recover 0)
+        recover 0
     assert(rejected)
     let replacement = try Tiles.create(device, 64, 48)
     try document.set_tiles(inner, replacement)

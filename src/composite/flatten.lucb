@@ -12,7 +12,7 @@
 extend Composer:
     ## `layer`'s tile (or its mask's) at the level being made: its stand-in's
     ## while a preview shows one, else its own `tiles`'.
-    mutating func layer_source(layer: const Layer*, tiles: const Tiles*, column: u32, row: u32, mask: bool = false) -> gpu.Texture?!:
+    func layer_source(layer: const Layer*, tiles: const Tiles*, column: u32, row: u32, mask: bool = false) -> gpu.Texture?!:
         for index in 0..<self.stand_in_count:
             let stand_in = self.stand_ins[index]
             if stand_in.layer != layer.id or stand_in.mask != mask:
@@ -44,7 +44,7 @@ extend Composer:
 
     ## A level-0 tile: every contributing layer composited in turn over the
     ## result so far, through the blend shader, each pass into a fresh tile.
-    mutating func flatten(document: const Document*, column: u32, row: u32) -> gpu.Texture!:
+    func flatten(document: const Document*, column: u32, row: u32) -> gpu.Texture!:
         var backdrop = self.blank
         var owned = false
         errdefer drop_owned(&backdrop, owned)
@@ -54,10 +54,10 @@ extend Composer:
             backdrop = try tile_texture(self.owner)
             let frame = try backdrop.frame()
             defer frame.release()
-            discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+            _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
         return backdrop
 
-    mutating func flatten_layers(layers: Layer*[], opacity: f64, column: u32, row: u32, backdrop: gpu.Texture*, owned: bool*) -> !:
+    func flatten_layers(layers: Layer*[], opacity: f64, column: u32, row: u32, backdrop: gpu.Texture*, owned: bool*) -> !:
         # The layer a clipped layer takes its alpha from: the nearest unclipped
         # raster layer below it in this group.
         var base: gpu.Texture? = none
@@ -118,7 +118,7 @@ extend Composer:
 
     ## A group with a mask: its layers flattened on their own, then laid over
     ## the backdrop through the mask at the group's opacity.
-    mutating func masked_group(group: const Layer*, mask_tiles: const Tiles*, opacity: f64, column: u32, row: u32, backdrop: gpu.Texture*, owned: bool*) -> !:
+    func masked_group(group: const Layer*, mask_tiles: const Tiles*, opacity: f64, column: u32, row: u32, backdrop: gpu.Texture*, owned: bool*) -> !:
         var inside = self.blank
         var inside_owned = false
         defer drop_owned(&inside, inside_owned)
@@ -136,7 +136,7 @@ extend Composer:
         try self.pass(backdrop, owned, inside, mask, self.white, self.region_at(column, row), opacity, 0)
 
     ## One layer (or effects) tile composited over the backdrop so far.
-    mutating func pass(backdrop: gpu.Texture*, owned: bool*, texture: gpu.Texture, mask: gpu.Texture, clip: gpu.Texture, area: gpu.Region, opacity: f64, blend: u32) -> !:
+    func pass(backdrop: gpu.Texture*, owned: bool*, texture: gpu.Texture, mask: gpu.Texture, clip: gpu.Texture, area: gpu.Region, opacity: f64, blend: u32) -> !:
         var params: f32[8] = [0.0, 0.0, (f32)area.width, (f32)area.height, (f32)opacity, (f32)blend, self.srgb, 0.0]
         var fresh = try tile_texture(self.owner)
         errdefer fresh.destroy()
@@ -145,7 +145,7 @@ extend Composer:
         let target = try frame.value().target()
         defer target.release()
         try gpu.shade(target.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 32), [*backdrop, texture, mask, clip], gpu.Filter.nearest)
-        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
         if *owned:
             backdrop.destroy()
         *backdrop = fresh
@@ -153,7 +153,7 @@ extend Composer:
 
     ## An adjustment layer applied to the backdrop so far; nothing below,
     ## nothing to adjust — but a blur, whose neighbours may bleed in.
-    mutating func adjust(backdrop: gpu.Texture*, owned: bool*, layer: const Layer*, mask: gpu.Texture, clip: gpu.Texture, opacity: f64, column: u32, row: u32) -> !:
+    func adjust(backdrop: gpu.Texture*, owned: bool*, layer: const Layer*, mask: gpu.Texture, clip: gpu.Texture, opacity: f64, column: u32, row: u32) -> !:
         if not *owned and layer.adjustment != (i64)blur:
             return
         var adjusted = gpu.Texture()
@@ -174,7 +174,7 @@ extend Composer:
         let target = try frame.value().target()
         defer target.release()
         try gpu.shade(target.value(), self.mix, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 8), [*backdrop, adjusted, mask, clip], gpu.Filter.nearest)
-        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
         drop_owned(backdrop, *owned)
         *backdrop = fresh
         *owned = true
@@ -182,7 +182,7 @@ extend Composer:
     ## What is below Blur layer `layer` at the cell, `middle`, blurred with
     ## what is below it in the cells around (flattened up to it), as a fresh
     ## texture.
-    mutating func blurred(middle: gpu.Texture, layer: const Layer*, column: u32, row: u32) -> gpu.Texture!:
+    func blurred(middle: gpu.Texture, layer: const Layer*, column: u32, row: u32) -> gpu.Texture!:
         let document = self.drawing else error(invalid, "a blur layer is drawn within a document")
         var block = try Tiles.create(self.owner, tile_size * 3, tile_size * 3)
         defer block.destroy()
@@ -213,7 +213,7 @@ extend Composer:
 
     ## The level-0 cell as flattened up to layer `stop` (not including it), a
     ## fresh texture; transparent when nothing is below it there.
-    mutating func flatten_until(document: const Document*, column: u32, row: u32, stop: u64) -> gpu.Texture!:
+    func flatten_until(document: const Document*, column: u32, row: u32, stop: u64) -> gpu.Texture!:
         let outer_stop = self.stop_at
         let outer_stopped = self.stopped
         self.stop_at = stop
@@ -233,12 +233,12 @@ extend Composer:
         errdefer clear.destroy()
         let frame = try clear.frame()
         defer frame.release()
-        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
         return clear
 
     ## A Curves layer's lookup table, made once per state of its curves; none
     ## for any other kind.
-    mutating func curve_table_for(layer: const Layer*) -> gpu.Texture?!:
+    func curve_table_for(layer: const Layer*) -> gpu.Texture?!:
         if layer.adjustment != (i64)curves:
             return none
         var key = fnv_start()
@@ -260,7 +260,7 @@ extend Composer:
         return texture
 
     ## The effects tiles for a styled layer, rendered once per pixels-and-style state.
-    mutating func effects_for(layer: const Layer*) -> const Effects*!:
+    func effects_for(layer: const Layer*) -> const Effects*!:
         var key = fnv_start()
         key = fnv_mix(key, layer.id)
         key = fnv_mix(key, layer.revision)
@@ -288,7 +288,7 @@ extend Composer:
     ## Merge `upper` into the layer directly below it: every tile of the lower
     ## layer becomes the two composited with the upper's opacity, blend, mask
     ## and clipping; the upper layer is then removed.
-    pub mutating func merge_down(document: Document*, upper: u64) -> !:
+    pub func merge_down(document: Document*, upper: u64) -> !:
         let top = document.find(upper) else error(invalid, "no such layer")
         let lower = document.below(upper) else error(invalid, "nothing below to merge into")
         if top.group or lower.group:
@@ -313,7 +313,7 @@ extend Composer:
                 let target = try frame.value().target()
                 defer target.release()
                 try gpu.shade(target.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 32), [backdrop, texture, mask, clip], gpu.Filter.nearest)
-                discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+                _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
                 try tiles.set(column, row, fresh)
         lower.revision += 1
         try document.remove(upper)
@@ -338,7 +338,7 @@ func copy_tile(target: gpu.Texture*, source: gpu.Texture) -> !:
     let whole = try frame.value().target()
     defer whole.release()
     try gpu.copy_image(whole.value(), source, gpu.Rect(0.0, 0.0, (f64)tile_size, (f64)tile_size), gpu.Region(0, 0, tile_size, tile_size))
-    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+    _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
 
 ## Fold every layer that contributes to the cells in range into `digest`.
 func hash_layers(seed: u64, layers: Layer*[], opacity: f64, first_column: u32, first_row: u32, span: u32) -> u64:

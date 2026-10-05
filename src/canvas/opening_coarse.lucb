@@ -44,13 +44,13 @@ func opening_coarse(context: void*?, width: usize, height: usize, pixels: const 
     let rows = (usize)tile_columns((u32)height)
     let columns = (usize)tile_columns((u32)width)
     let band_bytes = packed_band_bytes((u32)width)
-    let color = try alloc u16[256] in memory.heap
+    let color = try new u16[256] --- in memory.heap
     defer free(color) in memory.heap
-    let alpha = try alloc u16[256] in memory.heap
+    let alpha = try new u16[256] --- in memory.heap
     defer free(alpha) in memory.heap
     try encoded_tables(false, color, alpha)
-    coarse.bands = try alloc u8[rows * band_bytes] in memory.heap
-    coarse.painted = try alloc bool[rows * columns] in memory.heap
+    coarse.bands = try new u8[rows * band_bytes] --- in memory.heap
+    coarse.painted = try new bool[rows * columns] --- in memory.heap
     coarse.width = (u32)width
     coarse.height = (u32)height
     let line = width * 4
@@ -174,5 +174,5 @@ func coarse_cell(context: void*?, layer_levels: Pyramid*, layer: u64, mask: bool
             let piece = (try coarse.texture(coarse_column, coarse_row)) else continue
             let area = coarse.region(coarse_column, coarse_row)
             try gpu.copy_image(target.value(), piece, gpu.Rect(x, y, (f64)area.width * scale, (f64)area.height * scale), area, gpu.Filter.linear)
-    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+    _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
     return made_texture(texture)

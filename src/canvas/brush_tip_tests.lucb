@@ -11,7 +11,7 @@ func draw_once(canvas: Canvas*, target: gpu.Texture*) -> !:
     let root = try frame.value().target()
     defer root.release()
     try canvas.draw(root, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
-    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0))
 
 test "a sampled tip and the pen's pressure shape a canvas stroke; Define Brush takes the selection":
     var device = gpu.Device.open() catch failure:

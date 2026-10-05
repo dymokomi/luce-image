@@ -27,11 +27,11 @@ pub struct Pieces:
     pub func at(index: usize) -> Piece:
         return self.all[index]
 
-    mutating func add(texture: gpu.Texture, source: gpu.Region, x: i64, y: i64):
+    func add(texture: gpu.Texture, source: gpu.Region, x: i64, y: i64):
         self.all[self.count] = Piece(texture = texture, source = source, x = x, y = y)
         self.count += 1
 
-    pub mutating func destroy():
+    pub func destroy():
         if self.all.length > 0:
             free(self.all) in memory.heap
         var empty: Piece[]
@@ -44,7 +44,7 @@ pub func pieces(tiles: const Tiles*) -> Pieces!:
     var room = (usize)tiles.columns() * (usize)tiles.rows()
     if let range = outside:
         room += (usize)((range.right - range.left) * (range.bottom - range.top)) * 2
-    var list = Pieces(all = try alloc Piece[room + 1] in memory.heap, count = 0)
+    var list = Pieces(all = try new Piece[room + 1] --- in memory.heap, count = 0)
     for row in 0..<tiles.rows():
         for column in 0..<tiles.columns():
             let texture = (try tiles.texture(column, row)) else continue
@@ -91,7 +91,7 @@ pub func relocate(source: const Tiles*, dest: Tiles*, scale_x: f64, scale_y: f64
             free(encoded_pieces) in memory.heap
     if encoded and smooth:
         transfer = try Transfer.create(dest.device())
-        encoded_pieces = try alloc gpu.Texture[parts.count] in memory.heap
+        encoded_pieces = try new gpu.Texture[parts.count] --- in memory.heap
     # Where the pieces land, and so which cells to build.
     var left = 1.0e18
     var top = 1.0e18
@@ -150,7 +150,7 @@ pub func relocate(source: const Tiles*, dest: Tiles*, scale_x: f64, scale_y: f64
                 inside = inside or (x < canvas.width and y < canvas.height)
                 beyond = beyond or reaches_past_part(x, y, w, h, canvas)
             if let frame = holder:
-                discard(try frame.value().present(empty))
+                _ = try frame.value().present(empty)
                 frame.release()
             if opened:
                 if let pass = transfer:
@@ -203,7 +203,7 @@ pub func land_rows(source: const Tiles*, dest: Tiles*, x: i64, y: i64, top: i64,
                     inside = inside or (left < canvas.width and up < canvas.height)
                     beyond = beyond or reaches_past_part(left, up, (f64)area.width, (f64)area.height, canvas)
             if let frame = holder:
-                discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+                _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
                 frame.release()
             if opened:
                 try dest.place(column, row, texture, inside, beyond)
@@ -244,7 +244,7 @@ pub struct Flat:
     pub var left: i64
     pub var top: i64
 
-    pub mutating func destroy():
+    pub func destroy():
         self.texture.destroy()
 
 ## Every piece of `tiles` in one texture over the cells they occupy (the
@@ -264,7 +264,7 @@ pub func flatten_all(device: gpu.Device, tiles: const Tiles*, empty: gpu.Color =
     for index in 0..<parts.count:
         let piece = parts.at(index)
         try gpu.copy_image(whole.value(), piece.texture, gpu.Rect((f64)(piece.x - left), (f64)(piece.y - top), (f64)piece.source.width, (f64)piece.source.height), piece.source)
-    discard(try frame.value().present(empty))
+    _ = try frame.value().present(empty)
     return Flat(texture = flat, left = left, top = top)
 
 ## The smallest box of whole document pixels holding every pixel of `tiles`
@@ -277,7 +277,7 @@ pub func full_bounds(tiles: const Tiles*) -> Bounds?!:
         bounds = inside
         found = true
     let range = tiles.outside_range() else return bounds if found else none
-    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    let bytes = try new u8[(usize)tile_size * (usize)tile_size * 8] --- in memory.heap
     defer free(bytes) in memory.heap
     for row in range.top..<range.bottom:
         for column in range.left..<range.right:
@@ -327,8 +327,8 @@ pub struct Transfer:
         let width = (f64)(try source.width())
         let height = (f64)(try source.height())
         try gpu.shade(area.value(), self.pipeline, gpu.Rect(width = width, height = height), u8[]((u8*)&params[0], 4), [source], gpu.Filter.nearest)
-        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
 
-    pub mutating func destroy():
+    pub func destroy():
         self.pipeline.destroy()
         self.shader.destroy()

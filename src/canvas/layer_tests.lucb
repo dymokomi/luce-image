@@ -34,7 +34,7 @@ test "canvas builds cold, binds on draw, composes layers, saves and reopens":
     let root = try frame.value().target()
     defer root.release()
     try canvas.draw(root, gpu.Rect(2.0, 2.0, 60.0, 60.0), 2.0, 2.0, 2.0)
-    discard(try frame.value().present(gpu.Color(0.0, 0.0, 1.0, 1.0)))
+    _ = try frame.value().present(gpu.Color(0.0, 0.0, 1.0, 1.0))
     var pixel: u8[4]
     try target.read(pixel, gpu.Region(5, 5, 1, 1))
     assert(pixel[0] == 255 and pixel[1] == 0 and pixel[2] == 0 and pixel[3] == 255)
@@ -86,7 +86,7 @@ test "the top layer with pixels is found at a point, and a mask moves with its l
     let upper = try canvas.add_layer("Green")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
     try canvas.select_rectangle(8, 8, 16, 16, 0)
     try canvas.fill(lower, false)
@@ -139,7 +139,7 @@ test "groups hold layers, move and save with them; masks fill, disable and load 
     let green = try canvas.add_layer("Green")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
     try canvas.select_rectangle(8, 8, 16, 16, 0)
     try canvas.fill(red, false)
@@ -203,7 +203,7 @@ test "groups hold layers, move and save with them; masks fill, disable and load 
     let copy = restored.value()
     assert(copy.layer_count() == 4 and (try copy.layer_is_group(3)) and (try copy.layer_depth(1)) == 1 and (try copy.layer_depth(0)) == 0)
     assert((try copy.layer_name(2)) == "Red" and (try copy.layer_masked(2)) and not (try copy.layer_mask_enabled(2)))
-    discard(try shown_at(copy, &target, 0, 0))
+    _ = try shown_at(copy, &target, 0, 0)
     assert((try shown_at(copy, &target, 12, 12))[0] == 255 and (try shown_at(copy, &target, 44, 44))[1] == 255)
     # Removing the group takes what it holds.
     try canvas.remove_layer(folder)
@@ -273,7 +273,7 @@ test "dragging a layer shows what it had past the canvas coming back":
     let layer = try canvas.add_layer("Square")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
     try canvas.select_rectangle(40, 8, 16, 16, 0)
     try canvas.fill(layer, false)
@@ -286,7 +286,7 @@ test "dragging a layer shows what it had past the canvas coming back":
     let root = try frame.value().target()
     defer root.release()
     try canvas.draw_moving(root, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0, layer, -100.0, 0.0)
-    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0))
     var pixel: u8[4]
     try target.read(pixel, gpu.Region(45, 10, 1, 1))
     assert(pixel[0] == 255 and pixel[1] == 0)
@@ -294,7 +294,7 @@ test "dragging a layer shows what it had past the canvas coming back":
 test "guides are added, moved, removed and cleared undoably, and saved with the document":
     var canvas = try Canvas(64, 48)
     defer canvas.close()
-    discard(try canvas.add_layer("Paint"))
+    _ = try canvas.add_layer("Paint")
     canvas.bind_headless() catch failure:
         assert(failure.code == gpu.unavailable)
         return
@@ -380,7 +380,7 @@ test "masks: unlinked they stay when the layer moves, copy to another layer, and
     try canvas.link_mask(first, false)
     try canvas.move_layer(first, 8, 0)
     let mask = (document.find((u64)first) else trap("layer")).mask_tiles() else trap("mask")
-    let pixels = try alloc f32[(usize)64 * 32 * 4] in memory.heap
+    let pixels = try new f32[(usize)64 * 32 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     try mask.read(pixels)
     assert(pixels[(10 * 64 + 31) * 4] > 0.9 and pixels[(10 * 64 + 33) * 4] < 0.1)
@@ -479,7 +479,7 @@ test "whole layers copy and paste: a group with its masked, styled layer, here o
     assert(second.layer_count() == 2 and (try second.layer_id(1)) == landed)
     let document = second.document else trap("bound")
     let child = document.find((u64)(try second.layer_id(0))) else trap("pasted layer")
-    let pixels = try alloc f32[128 * 64 * 4] in memory.heap
+    let pixels = try new f32[128 * 64 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     try (child.tiles() else trap("pixels")).read(pixels)
     assert(pixels[(20 * 128 + 40) * 4 + 3] > 0.99 and pixels[(20 * 128 + 10) * 4 + 3] < 0.01 and pixels[(10 * 128 + 40) * 4 + 3] < 0.01)
@@ -496,7 +496,7 @@ test "shape layers stay shapes: drawn, moved, scaled crisp, saved, and pixels on
         assert(failure.code == gpu.unavailable)
         return
     let document = canvas.document else trap("bound")
-    let pixels = try alloc f32[64 * 48 * 4] in memory.heap
+    let pixels = try new f32[64 * 48 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     # A red square with a blue 2-pixel stroke.
     try canvas.set_shape(layer, 0, 8.0, 8.0, 16.0, 16.0, 5, 0.0, true, 1.0, 0.0, 0.0, true, 0.0, 0.0, 1.0, 2.0)

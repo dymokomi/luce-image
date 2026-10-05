@@ -15,7 +15,7 @@
 func fill_mask_cells(canvas: Canvas*, mask: Tiles*, from_selection: bool) -> !:
     let selection = canvas.current()
     let side = (usize)tile_size
-    let samples = try alloc f32[side * side * 4] in memory.heap
+    let samples = try new f32[side * side * 4] --- in memory.heap
     defer free(samples) in memory.heap
     # The first cell painted black; every other black cell shares its tile.
     var black_column: u32 = 0

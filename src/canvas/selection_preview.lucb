@@ -18,7 +18,7 @@ extend Canvas:
     ## with the same rectangle, zoom and offset; `phase` animates the dashes.
     ## While Quick Mask is on, the masked part is tinted instead (`draw` tints
     ## it itself when it shows the composite).
-    pub mutating func draw_selection(target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, phase: f64) -> !:
+    pub func draw_selection(target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64, phase: f64) -> !:
         if try draw_refine_view(&self, target, rectangle, zoom, offset_x, offset_y, phase):
             return
         if try draw_selection_warp(&self, target, rectangle, zoom, offset_x, offset_y, phase):
@@ -60,7 +60,7 @@ struct LevelOrigin:
     var level: u32
 
     ## `origin` at `level`, made when the level changes.
-    mutating func at(origin: const Selection*, level: u32) -> const Selection*!:
+    func at(origin: const Selection*, level: u32) -> const Selection*!:
         if let kept = self.selection:
             if self.level == level:
                 return kept
@@ -71,7 +71,7 @@ struct LevelOrigin:
         self.level = level
         return made
 
-    mutating func destroy():
+    func destroy():
         let kept = self.selection else return
         self.selection = none
         kept.destroy()
@@ -83,14 +83,14 @@ struct Shown:
     var level: u32
 
     ## Show `made` (a selection at `level`), handed over.
-    mutating func show(made: Selection, level: u32) -> !:
+    func show(made: Selection, level: u32) -> !:
         let kept = try new Selection in memory.heap
         *kept = made
         self.destroy()
         self.selection = kept
         self.level = level
 
-    mutating func destroy():
+    func destroy():
         let kept = self.selection else return
         self.selection = none
         kept.destroy()

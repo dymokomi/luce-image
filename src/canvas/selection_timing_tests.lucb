@@ -17,7 +17,7 @@ func paced_under(started: u64, most: f64, pace: f64) -> bool:
 func select_blobs(canvas: Canvas*) -> !:
     let width: usize = 15000
     let height: usize = 24000
-    let coverage = try alloc u8[width * height] in memory.heap
+    let coverage = try new u8[width * height] --- in memory.heap
     defer free(coverage) in memory.heap
     for y in 0..<height:
         let wave_y = (i64)(y % 1800) - 900
@@ -32,9 +32,9 @@ func select_blobs(canvas: Canvas*) -> !:
 ## One frame of a 64-point view at 100% from the document's corner, and the
 ## selection tiles its ants draw with (a window's frame draws them in its own format).
 func ants_frame(canvas: Canvas*, target: gpu.Texture*) -> !:
-    discard(try shown_at(canvas, target, 0, 0))
+    _ = try shown_at(canvas, target, 0, 0)
     let document = canvas.document else trap("drawn")
-    discard(try document.selection_tiles_within(shown_cells(canvas, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0), ants_extra_cells))
+    _ = try document.selection_tiles_within(shown_cells(canvas, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0), ants_extra_cells)
 
 test "select and mask and transform selection keep up with a 15000 by 24000 selection edged everywhere":
     var device = gpu.Device.open() catch failure:
@@ -46,7 +46,7 @@ test "select and mask and transform selection keep up with a 15000 by 24000 sele
     var canvas = try Canvas(15000, 24000)
     defer canvas.close()
     let layer = try canvas.add_layer("Paint")
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     try canvas.fill_gradient(layer, 0.0, 0.0, 15000.0, 24000.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0)
     try select_blobs(&canvas)
     let pace = build_pace()
@@ -93,7 +93,7 @@ test "select and mask and transform selection keep up with a 15000 by 24000 sele
     assert(paced_under(started, 20000.0, pace) and canvas.undo_name() == "Select and Mask" and not canvas.refining())
     # The kept selection's edge reaches the GPU the cells a view shows first
     # (at 100%, a few), the rest a few a frame while the view keeps drawing.
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     started = time.now()
     try ants_frame(&canvas, &target)
     let ants = since(started)

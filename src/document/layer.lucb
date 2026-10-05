@@ -8,7 +8,6 @@
 #
 #==============================================================================================
 
-
 pub struct Layer:
     pub var id: u64
     pub var name: str
@@ -65,14 +64,14 @@ pub struct Layer:
         return self.children[..<self.child_count]
 
     ## Replace the pixels outright (geometry changes), destroying the old ones.
-    pub mutating func replace_tiles(tiles: Tiles) -> !:
+    pub func replace_tiles(tiles: Tiles) -> !:
         let holder = try box(tiles)
         if let previous = self.pixels:
             unbox(previous)
         self.pixels = holder
         self.revision += 1
 
-    pub mutating func replace_mask(tiles: Tiles) -> !:
+    pub func replace_mask(tiles: Tiles) -> !:
         let holder = try box(tiles)
         if let previous = self.mask:
             unbox(previous)
@@ -111,7 +110,7 @@ pub struct TreeState:
     ## Whether colors mixed in linear light then (`Document.linear_blend`).
     var linear_blend: bool = false
 
-    pub mutating func destroy():
+    pub func destroy():
         layer_destroy(self.root)
         self.selection.destroy()
         if let quick = self.quick:
@@ -146,12 +145,11 @@ func clone_layer(layer: const Layer*) -> Layer*!:
     if let mask = layer.mask:
         copy.mask = try box(try mask.clone())
     if layer.child_count > 0:
-        copy.children = try alloc Layer*[layer.child_count] in memory.heap
+        copy.children = try new Layer*[layer.child_count] --- in memory.heap
         for index in 0..<layer.child_count:
             copy.children[index] = try clone_layer(layer.children[index])
             copy.child_count += 1
     return copy
-
 
 func release_tiles(holder: Tiles*?*):
     if let owned = *holder:
@@ -163,7 +161,7 @@ func make_room(layer: Layer*) -> !:
     if layer.child_count < layer.children.length:
         return
     let capacity = 8 if layer.children.length == 0 else layer.children.length * 2
-    let grown = try alloc Layer*[capacity] in memory.heap
+    let grown = try new Layer*[capacity] --- in memory.heap
     if layer.child_count > 0:
         memory.copy(grown, layer.children, layer.child_count)
     if layer.children.length > 0:

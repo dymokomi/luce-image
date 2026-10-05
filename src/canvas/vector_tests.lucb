@@ -21,7 +21,7 @@ test "a vector layer holds a list of elements: added, stacked, hidden, renamed, 
     canvas.bind_headless() catch failure:
         assert(failure.code == gpu.unavailable)
         return
-    let pixels = try alloc f32[64 * 48 * 4] in memory.heap
+    let pixels = try new f32[64 * 48 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     # A red rectangle, then a blue ellipse over part of it.
     try canvas.set_shape(layer, 0, 8.0, 8.0, 32.0, 24.0, 5, 0.0, true, 1.0, 0.0, 0.0, false, 0.0, 0.0, 0.0, 1.0)
@@ -153,7 +153,7 @@ test "an SVG comes in as vector elements, one an element, a hole kept open":
     try canvas.place_layer(layer, path, 512, 256)
     assert((try canvas.layer_shaped(0)) and (try canvas.element_count(0)) == 2)
     assert((try canvas.element_value(0, 0, 8)) > 0.99 and (try canvas.element_value(0, 1, 10)) > 0.99 and (try canvas.element_value(0, 1, 23)) == 2.0)
-    let pixels = try alloc f32[1024 * 512 * 4] in memory.heap
+    let pixels = try new f32[1024 * 512 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     try layer_pixels(&canvas, layer, pixels)
     # The square, the ring, and the hole in it.
@@ -177,7 +177,7 @@ test "an edit draws again only the cells its element covered or covers, at 15000
     let tiles = (document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")
     let columns = tiles.columns()
     let rows = tiles.rows()
-    let before = try alloc u64[(usize)columns * (usize)rows] in memory.heap
+    let before = try new u64[(usize)columns * (usize)rows] --- in memory.heap
     defer free(before) in memory.heap
     for row in 0..<rows:
         for column in 0..<columns:

@@ -19,7 +19,7 @@
 extend Canvas:
     ## A new vector layer named `name` on top, its graph a Star cloned round a
     ## circle into the Output, drawn; selected nowhere, its id returned. One step.
-    pub mutating func add_vector_layer(name: str) -> i64!:
+    pub func add_vector_layer(name: str) -> i64!:
         try self.require_idle()
         try self.begin_edit("New Vector Layer")
         defer self.end_edit()
@@ -67,44 +67,44 @@ extend Canvas:
         return (i64)entry.source_id if field == 0 else ((i64)entry.to if field == 1 else (i64)entry.port)
 
     ## A node of `kind` at (`x`, `y`) in layer `id`'s graph, with its defaults; its id.
-    pub mutating func add_graph_node(id: i64, kind: i64, x: f64, y: f64) -> i64!:
+    pub func add_graph_node(id: i64, kind: i64, x: f64, y: f64) -> i64!:
         let index = try graph_index(&self, (u64)id)
         var made: u32 = 0
         try commit_graph(&self, index, try graph_with_node(&self.records[index].graph, kind, x, y, &made), "Add Node", false)
         return (i64)made
 
     ## Node `node` of layer `id`'s graph taken away with its wires.
-    pub mutating func delete_graph_node(id: i64, node: i64) -> !:
+    pub func delete_graph_node(id: i64, node: i64) -> !:
         let index = try graph_index(&self, (u64)id)
         let ids: u32[1] = [(u32)node]
         try commit_graph(&self, index, try graph_without_nodes(&self.records[index].graph, ids[..<1]), "Delete Node", false)
 
     ## Node `from`'s output wired into input `port` of node `to`, replacing what
     ## fed it; refused across types or round a loop.
-    pub mutating func link_graph(id: i64, source_id: i64, to: i64, port: i64) -> !:
+    pub func link_graph(id: i64, source_id: i64, to: i64, port: i64) -> !:
         let index = try graph_index(&self, (u64)id)
         try commit_graph(&self, index, try graph_with_link(&self.records[index].graph, (u32)source_id, (u32)to, (u32)port), "Connect", false)
 
     ## The wire into input `port` of node `to` taken away.
-    pub mutating func unlink_graph(id: i64, to: i64, port: i64) -> !:
+    pub func unlink_graph(id: i64, to: i64, port: i64) -> !:
         let index = try graph_index(&self, (u64)id)
         try commit_graph(&self, index, try graph_without_link(&self.records[index].graph, (u32)to, (u32)port), "Disconnect", false)
 
     ## Value `slot` of node `node` set (held to its parameter's range); a drag coalesces.
-    pub mutating func set_graph_value(id: i64, node: i64, slot: i64, value: f64) -> !:
+    pub func set_graph_value(id: i64, node: i64, slot: i64, value: f64) -> !:
         let index = try graph_index(&self, (u64)id)
         if slot < 0:
             error(invalid, "a node has values 0..23")
         try commit_graph(&self, index, try graph_with_value(&self.records[index].graph, (u32)node, (usize)slot, value), "Node Setting", true)
 
     ## Node `node` shown at (`x`, `y`) in the editor; nothing is drawn. A drag coalesces.
-    pub mutating func move_graph_node(id: i64, node: i64, x: f64, y: f64) -> !:
+    pub func move_graph_node(id: i64, node: i64, x: f64, y: f64) -> !:
         let index = try graph_index(&self, (u64)id)
         try commit_graph(&self, index, try graph_with_position(&self.records[index].graph, (u32)node, x, y), "Move Node", true)
 
     ## How many shapes the layer at `index`'s graph puts out, evaluating it if it must.
-    pub mutating func generated_count(index: i64) -> i64!:
-        discard(try self.record(index))
+    pub func generated_count(index: i64) -> i64!:
+        _ = try self.record(index)
         try fresh_output(&self.records[(usize)index])
         return (i64)self.records[(usize)index].generated.count
 

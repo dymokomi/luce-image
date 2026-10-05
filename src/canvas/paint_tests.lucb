@@ -24,7 +24,7 @@ test "canvas strokes paint the selected layer and undo restores it":
     let root = try frame.value().target()
     defer root.release()
     try canvas.draw(root, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
-    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0))
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, false)
     try canvas.begin_stroke(layer, 8.0, 32.0)
     assert(canvas.painting())
@@ -36,7 +36,7 @@ test "canvas strokes paint the selected layer and undo restores it":
     let again = try second.value().target()
     defer again.release()
     try canvas.draw(again, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
-    discard(try second.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    _ = try second.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0))
     var pixel: u8[4]
     try target.read(pixel, gpu.Region(32, 32, 1, 1))
     assert(pixel[1] == 255 and pixel[0] == 0)
@@ -49,7 +49,7 @@ test "canvas strokes paint the selected layer and undo restores it":
     let once_more = try third.value().target()
     defer once_more.release()
     try canvas.draw(once_more, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
-    discard(try third.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    _ = try third.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0))
     try target.read(pixel, gpu.Region(32, 32, 1, 1))
     assert(pixel[1] == 0)
     try canvas.redo()
@@ -61,7 +61,7 @@ test "canvas strokes paint the selected layer and undo restores it":
     let last = try fourth.value().target()
     defer last.release()
     try canvas.draw(last, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
-    discard(try fourth.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    _ = try fourth.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0))
     try target.read(pixel, gpu.Region(32, 32, 1, 1))
     assert(pixel[0] == 255 and pixel[1] == 0 and pixel[2] == 255)
     try canvas.undo()
@@ -80,7 +80,7 @@ test "canvas strokes paint the selected layer and undo restores it":
     let masked = try fifth.value().target()
     defer masked.release()
     try canvas.draw(masked, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
-    discard(try fifth.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    _ = try fifth.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0))
     try target.read(pixel, gpu.Region(32, 32, 1, 1))
     assert(pixel[1] == 0)
     try target.read(pixel, gpu.Region(12, 32, 1, 1))
@@ -91,7 +91,7 @@ test "canvas strokes paint the selected layer and undo restores it":
     let unmasked = try sixth.value().target()
     defer unmasked.release()
     try canvas.draw(unmasked, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
-    discard(try sixth.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    _ = try sixth.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0))
     try target.read(pixel, gpu.Region(32, 32, 1, 1))
     assert(pixel[1] == 255)
     try canvas.set_clipped(layer, true)
@@ -107,7 +107,7 @@ test "canvas strokes paint the selected layer and undo restores it":
     let filled = try seventh.value().target()
     defer filled.release()
     try canvas.draw(filled, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
-    discard(try seventh.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    _ = try seventh.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0))
     try target.read(pixel, gpu.Region(5, 5, 1, 1))
     assert(pixel[0] == 255 and pixel[1] == 0)
     try target.read(pixel, gpu.Region(50, 5, 1, 1))
@@ -121,7 +121,7 @@ test "canvas strokes paint the selected layer and undo restores it":
     let moved = try eighth.value().target()
     defer moved.release()
     try canvas.draw(moved, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
-    discard(try eighth.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    _ = try eighth.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0))
     try target.read(pixel, gpu.Region(5, 5, 1, 1))
     assert(pixel[0] == 0)
     try target.read(pixel, gpu.Region(45, 5, 1, 1))
@@ -153,7 +153,7 @@ test "canvas strokes paint the selected layer and undo restores it":
     let shown = try ninth.value().target()
     defer shown.release()
     try restored.value().draw(shown, gpu.Rect(width = 64.0, height = 64.0), 1.0, 0.0, 0.0)
-    discard(try ninth.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    _ = try ninth.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0))
     # The blurred, moved stroke over the red fill, as it was before saving,
     # mixed as sRGB-encoded values (about 102, 152, 0 in the file; the linear
     # target stores about 34, 80, 0).
@@ -175,7 +175,7 @@ func shown_centre(canvas: Canvas*, target: gpu.Texture*, pixels: u8[]) -> u8!:
     let root = try frame.value().target()
     defer root.release()
     try canvas.draw(root, gpu.Rect(width = 32.0, height = 32.0), 1.0, 0.0, 0.0)
-    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0))
     try target.read(pixels)
     return pixels[(16 * 32 + 16) * 4]
 
@@ -188,9 +188,9 @@ test "painting one cell leaves every other cached tile alone, and redraws its ow
         return
     let document = canvas.document else trap("bound")
     var composer = canvas.composer else trap("bound")
-    discard(try composer.tile(document, 0, 0, 0))
-    discard(try composer.tile(document, 2, 0, 0))
-    discard(try composer.tile(document, 0, 0, 1))
+    _ = try composer.tile(document, 0, 0, 0)
+    _ = try composer.tile(document, 2, 0, 0)
+    _ = try composer.tile(document, 0, 0, 1)
     let rendered = composer.renders
     try canvas.set_brush(20.0, 0.5, 1.0, 1.0, 0.0, 0.0, 1.0, false)
     try canvas.begin_stroke(layer, 50.0, 50.0)
@@ -208,10 +208,10 @@ test "painting one cell leaves every other cached tile alone, and redraws its ow
     assert(again == first and tiles.stamp(0, 0) != stamp)
     try canvas.end_stroke()
     # Cell (2, 0) is still cached; (0, 0) and the coarser tile over it are not.
-    discard(try composer.tile(document, 2, 0, 0))
+    _ = try composer.tile(document, 2, 0, 0)
     assert(composer.renders == rendered)
-    discard(try composer.tile(document, 0, 0, 0))
-    discard(try composer.tile(document, 0, 0, 1))
+    _ = try composer.tile(document, 0, 0, 0)
+    _ = try composer.tile(document, 0, 0, 1)
     assert(composer.renders == rendered + 2)
 
 ## The composited picture's red at (`x`, `y`) in the first cell, as the view draws it.
@@ -219,7 +219,7 @@ func composite_red(canvas: Canvas*, x: usize, y: usize) -> f32!:
     let document = canvas.document else trap("bound")
     let composer = canvas.composer else trap("bound")
     let texture = try composer.tile(document, 0, 0, 0)
-    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    let bytes = try new u8[(usize)tile_size * (usize)tile_size * 8] --- in memory.heap
     defer free(bytes) in memory.heap
     try texture.read(bytes)
     let at = (y * (usize)tile_size + x) * 8
@@ -233,7 +233,7 @@ test "a gradient previews while its ends move, on pixels or on a mask, and keeps
         assert(failure.code == gpu.unavailable)
         return
     let document = canvas.document else trap("bound")
-    let pixels = try alloc f32[(usize)64 * 16 * 4] in memory.heap
+    let pixels = try new f32[(usize)64 * 16 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     let steps = canvas.step_serial()
     # Black to white along x, then the ends swapped: the left edge turns white.
@@ -275,7 +275,7 @@ test "the pencil paints whole pixels, with no soft edge":
     try canvas.extend_stroke(50.7, 21.2)
     try canvas.end_stroke()
     let document = canvas.document else trap("bound")
-    let pixels = try alloc f32[64 * 32 * 4] in memory.heap
+    let pixels = try new f32[64 * 32 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     try ((document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")).read(pixels)
     var painted = 0
@@ -296,7 +296,7 @@ test "an opaque fill shares one tile over every wholly selected cell, and makes 
     let layer = try canvas.add_layer("Paint")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     # 4 by 4 cells; the rectangle holds cells (1..2, 1..2) whole, and edges of the ring round them.
     try canvas.select_rectangle(200, 200, 624, 624)
     let before = tiles_alive()
@@ -334,7 +334,7 @@ test "a fill that fails part way leaves the layer as it was, with nothing in the
     let layer = try canvas.add_layer("Paint")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     try canvas.fill_gradient(layer, 0.0, 0.0, 1024.0, 1024.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0)
     let tiles = layer_tiles(&canvas, layer)
     var stamps: u64[16]

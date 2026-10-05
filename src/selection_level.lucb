@@ -25,7 +25,7 @@ pub func reduce(source: const Cells*, level: u32) -> Cells!:
     var target = try Cells.create(level_extent(source.extent_x, level), level_extent(source.extent_y, level))
     errdefer target.destroy()
     let count = target.count()
-    let values = try alloc i64[count] in memory.heap
+    let values = try new i64[count] --- in memory.heap
     defer free(values) in memory.heap
     var pending: usize = 0
     for index in 0..<count:
@@ -34,7 +34,7 @@ pub func reduce(source: const Cells*, level: u32) -> Cells!:
             target.fill(index, (u8)values[index])
         else:
             pending += 1
-    let items = try alloc usize[pending] in memory.heap
+    let items = try new usize[pending] --- in memory.heap
     defer free(items) in memory.heap
     var at: usize = 0
     for index in 0..<count:
@@ -42,12 +42,12 @@ pub func reduce(source: const Cells*, level: u32) -> Cells!:
             items[at] = index
             at += 1
             # Made here, on this thread: the workers only fill the bytes.
-            discard(target.fresh(index))
+            _ = target.fresh(index)
     var job = ReduceJob(source = source, target = &target, items = items, level = level, failed = false)
     each(pending, (void*)&job, reduce_item)
     if job.failed:
         error(memory.exhausted, "out of memory taking the selection down a level")
-    discard(try target.settle())
+    _ = try target.settle()
     return target
 
 ## The document cells level cell `index` covers: first column and row, and
@@ -95,7 +95,7 @@ func reduce_item(context: void*?, item: usize):
     let index = job.items[item]
     let level = (i64)job.level
     let bytes = (job.target.block(index) else return).bytes
-    let sums = alloc u32[(usize)tile_size * (usize)tile_size] in memory.heap catch failure:
+    let sums = new u32[(usize)tile_size * (usize)tile_size] --- in memory.heap catch failure:
         job.failed = true
         return
     defer free(sums) in memory.heap
@@ -174,7 +174,7 @@ func disc(width: u32, height: u32) -> Cells!:
                 if px > 1100 and py < 90:
                     value = 255.0
                 bytes[(usize)(y * (i64)tile_size + x)] = (u8)value
-    discard(try cells.settle())
+    _ = try cells.settle()
     return cells
 
 test "a selection taken down a level holds each square's mean, reading only the edge":
@@ -203,7 +203,7 @@ test "a 15000 by 24000 selection taken down levels keeps whole squares one value
         for y in 0..<(usize)256:
             for x in 0..<(usize)256:
                 bytes[y * 256 + x] = (u8)x
-    discard(try cells.settle())
+    _ = try cells.settle()
     var reduced = try reduce(&cells, 5)
     defer reduced.destroy()
     assert(reduced.extent_x == 469 and reduced.extent_y == 750)

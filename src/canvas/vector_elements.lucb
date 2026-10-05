@@ -48,14 +48,14 @@ extend Canvas:
 
     ## Make element `element` of layer `id` the one edits act on (-1: none, the
     ## whole layer). Not a step: it is where the Vector panel points.
-    pub mutating func set_active_element(id: i64, element: i64) -> !:
+    pub func set_active_element(id: i64, element: i64) -> !:
         let index = try self.index((u64)id)
         if element < -1 or element >= (i64)self.records[index].elements.length:
             error(invalid, "no such vector element")
         self.records[index].active = element
 
     ## Show or hide element `element` of layer `id`. One step.
-    pub mutating func set_element_visible(id: i64, element: i64, visible: bool) -> !:
+    pub func set_element_visible(id: i64, element: i64, visible: bool) -> !:
         let layer = (u64)id
         let index = try vector_index(&self, layer)
         let slot = try element_slot(&self, index, element)
@@ -69,7 +69,7 @@ extend Canvas:
         try commit_elements(&self, index, list, &dirty, (i64)slot, "Show Vector" if visible else "Hide Vector", self.records[index].active)
 
     ## Element `element` of layer `id` called `name`; one step, nothing drawn.
-    pub mutating func rename_element(id: i64, element: i64, name: str) -> !:
+    pub func rename_element(id: i64, element: i64, name: str) -> !:
         let layer = (u64)id
         let index = try vector_index(&self, layer)
         let slot = try element_slot(&self, index, element)
@@ -84,7 +84,7 @@ extend Canvas:
         self.records[index].elements[slot].name = copied
 
     ## Element `element` of layer `id` moved to place `to` (0 the bottom). One step.
-    pub mutating func move_element(id: i64, element: i64, to: i64) -> !:
+    pub func move_element(id: i64, element: i64, to: i64) -> !:
         let layer = (u64)id
         let index = try vector_index(&self, layer)
         let slot = try element_slot(&self, index, element)
@@ -109,13 +109,13 @@ extend Canvas:
         try commit_elements(&self, index, list, &dirty, (i64)place, name, (i64)place)
 
     ## A copy of element `element` of layer `id` just above it, active; one step.
-    pub mutating func duplicate_element(id: i64, element: i64) -> !:
+    pub func duplicate_element(id: i64, element: i64) -> !:
         let layer = (u64)id
         let index = try vector_index(&self, layer)
         let slot = try element_slot(&self, index, element)
         var copy = try copied_element(self.records[index].elements[slot])
         var text: u8[320]
-        let wanted = format(text, f"{copy.name} copy") catch _:
+        let wanted = strings.format(text, f"{copy.name} copy") catch _:
             recover "Vector copy"
         var named: str = ""
         with memory.heap:
@@ -135,7 +135,7 @@ extend Canvas:
         try commit_elements(&self, index, list, &dirty, (i64)slot + 1, "Duplicate Vector", (i64)slot + 1)
 
     ## Element `element` of layer `id` taken away; one step.
-    pub mutating func delete_element(id: i64, element: i64) -> !:
+    pub func delete_element(id: i64, element: i64) -> !:
         let layer = (u64)id
         let index = try vector_index(&self, layer)
         let slot = try element_slot(&self, index, element)
@@ -150,7 +150,7 @@ extend Canvas:
 
     ## Element `element` of layer `id` scaled, turned by `angle` degrees and
     ## moved about the pivot, as `preview_transform`'s box. One step.
-    pub mutating func transform_element(id: i64, element: i64, scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64, pivot_x: f64, pivot_y: f64) -> !:
+    pub func transform_element(id: i64, element: i64, scale_x: f64, scale_y: f64, angle: f64, dx: f64, dy: f64, pivot_x: f64, pivot_y: f64) -> !:
         let layer = (u64)id
         let warp = try affine_warp(scale_x, scale_y, angle * math.pi / 180.0, dx, dy, pivot_x, pivot_y)
         let name = "Free Transform"

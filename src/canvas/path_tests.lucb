@@ -8,7 +8,7 @@ test "a pen path is a curved shape layer: drawn, undone, moved, restyled and sav
         assert(failure.code == gpu.unavailable)
         return
     let document = canvas.document else trap("bound")
-    let pixels = try alloc f32[64 * 48 * 4] in memory.heap
+    let pixels = try new f32[64 * 48 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     # A "D": a curve from (10, 10) out to x 40 and back to (10, 40), closed by a straight edge.
     try canvas.add_point(10.0, 10.0)

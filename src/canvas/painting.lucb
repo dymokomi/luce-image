@@ -16,14 +16,14 @@ extend Canvas:
         return (i64)quick.id
 
     ## Whether edits to layer `id` (after `paint_target`) go to a mask.
-    mutating func paints_mask(id: i64) -> bool!:
+    func paints_mask(id: i64) -> bool!:
         if self.quick_mask():
             return true
         return self.mask_editing and self.records[try self.index((u64)id)].masked
 
     ## Fill the selection (or the whole layer) on `layer` with the brush color
     ## at its opacity, or clear it when `erase`. Undoable.
-    pub mutating func fill(layer: i64, erase: bool) -> !:
+    pub func fill(layer: i64, erase: bool) -> !:
         try self.require_open()
         try self.require_idle()
         let document = self.document else error(invalid, "draw the document once before filling")
@@ -39,7 +39,7 @@ extend Canvas:
 
     ## Set the brush every following stroke paints with: its size, edge, color
     ## and strength. The tip shape, dynamics and texture set separately stay.
-    pub mutating func set_brush(diameter: f64, hardness: f64, opacity: f64, flow: f64, red: f64, green: f64, blue: f64, erase: bool) -> !:
+    pub func set_brush(diameter: f64, hardness: f64, opacity: f64, flow: f64, red: f64, green: f64, blue: f64, erase: bool) -> !:
         var brush = self.brush
         brush.diameter = diameter
         brush.hardness = hardness
@@ -53,13 +53,13 @@ extend Canvas:
 
     ## Hard whole-pixel dabs without anti-aliasing, as Photoshop's Pencil, or
     ## the brush's soft ones.
-    pub mutating func set_brush_aliased(aliased: bool):
+    pub func set_brush_aliased(aliased: bool):
         self.brush.aliased = aliased
 
     ## The tip's shape: dab spacing as a fraction of the diameter (Photoshop's
     ## 25 % is 0.25), angle in degrees, roundness 0.05..1, and the smoothing
     ## string in document pixels.
-    pub mutating func set_brush_shape(spacing: f64, angle: f64, roundness: f64, smoothing: f64) -> !:
+    pub func set_brush_shape(spacing: f64, angle: f64, roundness: f64, smoothing: f64) -> !:
         var brush = self.brush
         brush.spacing = spacing
         brush.angle = angle
@@ -71,8 +71,8 @@ extend Canvas:
     ## The brush's jitters, each 0..1: size, angle and roundness (shape),
     ## scatter as a fraction of the diameter with the dabs per step, flow
     ## (transfer), hue, saturation and brightness (color).
-    pub mutating func set_brush_dynamics(size_jitter: f64, angle_jitter: f64, roundness_jitter: f64, scatter: f64, scatter_count: i64,
-                                         flow_jitter: f64, hue_jitter: f64, saturation_jitter: f64, brightness_jitter: f64) -> !:
+    pub func set_brush_dynamics(size_jitter: f64, angle_jitter: f64, roundness_jitter: f64, scatter: f64, scatter_count: i64,
+                                flow_jitter: f64, hue_jitter: f64, saturation_jitter: f64, brightness_jitter: f64) -> !:
         var brush = self.brush
         brush.size_jitter = size_jitter
         brush.angle_jitter = angle_jitter
@@ -92,7 +92,7 @@ extend Canvas:
     ## tilt, 3 azimuth, 4 barrel rotation, 5 airbrush wheel, 6 stroke
     ## direction, 7 velocity, 8 fade over `steps` dabs; from `minimum` (0..1)
     ## through `curve` (-1 firm .. 1 soft).
-    pub mutating func set_brush_dynamic(parameter: i64, control: i64, minimum: f64 = 0.0, curve: f64 = 0.0, steps: i64 = 25) -> !:
+    pub func set_brush_dynamic(parameter: i64, control: i64, minimum: f64 = 0.0, curve: f64 = 0.0, steps: i64 = 25) -> !:
         if parameter < 0 or parameter >= (i64)dynamic_count or control < 0 or control > (i64)Control.fade:
             error(invalid, "brush dynamics are parameters 0..9 and controls 0..8")
         let dynamic = Dynamic(control = (Control)(u8)control, minimum = minimum, curve = curve, steps = steps)
@@ -103,7 +103,7 @@ extend Canvas:
     ## image set by `set_brush_texture_image`, at `scale` (0.1..10) and `depth`
     ## 0..1 (how much of it shows), multiplied (mode 0) or subtracted (1),
     ## its values `invert`ed or not.
-    pub mutating func set_brush_texture(kind: i64, scale: f64, depth: f64, mode: i64 = 0, invert: bool = false) -> !:
+    pub func set_brush_texture(kind: i64, scale: f64, depth: f64, mode: i64 = 0, invert: bool = false) -> !:
         var brush = self.brush
         brush.texture = kind
         brush.texture_scale = scale
@@ -115,13 +115,13 @@ extend Canvas:
 
     ## The brush's sampled tip: `width` × `height` grayscale coverage bytes
     ## (255 paints), up to 1024 a side; no bytes paint with the round tip.
-    pub mutating func set_brush_tip(pixels: const u8[], width: i64, height: i64) -> !:
+    pub func set_brush_tip(pixels: const u8[], width: i64, height: i64) -> !:
         if self.stroke != none:
             error(invalid, "finish the stroke first")
         try self.brush_images.set_tip(pixels, (usize)math.max(0.0, (f64)width), (usize)math.max(0.0, (f64)height))
 
     ## The brush's texture image (texture kind 4), as `set_brush_tip`'s bytes.
-    pub mutating func set_brush_texture_image(pixels: const u8[], width: i64, height: i64) -> !:
+    pub func set_brush_texture_image(pixels: const u8[], width: i64, height: i64) -> !:
         if self.stroke != none:
             error(invalid, "finish the stroke first")
         try self.brush_images.set_pattern(pixels, (usize)math.max(0.0, (f64)width), (usize)math.max(0.0, (f64)height))
@@ -132,7 +132,7 @@ extend Canvas:
     ## The pen: `pressure` 0..1 (a mouse's 0 or 1 presses fully), its lean's
     ## `azimuth` and `altitude` in degrees, barrel `rotation`, airbrush wheel
     ## `tangential` and the time `at_ms` in milliseconds, for the brush's dynamics.
-    pub mutating func begin_stroke(layer: i64, x: f64, y: f64, pressure: f64 = 1.0, azimuth: f64 = 0.0, altitude: f64 = 90.0, rotation: f64 = 0.0, tangential: f64 = 0.0, at_ms: f64 = 0.0) -> !:
+    pub func begin_stroke(layer: i64, x: f64, y: f64, pressure: f64 = 1.0, azimuth: f64 = 0.0, altitude: f64 = 90.0, rotation: f64 = 0.0, tangential: f64 = 0.0, at_ms: f64 = 0.0) -> !:
         try self.require_open()
         try require_loaded(&self)
         try self.wait_idle()
@@ -156,7 +156,7 @@ extend Canvas:
         self.stroke_layer = (u64)target
 
     ## Continue the stroke to a document point, with the pen as `begin_stroke` takes it.
-    pub mutating func extend_stroke(x: f64, y: f64, pressure: f64 = 1.0, azimuth: f64 = 0.0, altitude: f64 = 90.0, rotation: f64 = 0.0, tangential: f64 = 0.0, at_ms: f64 = 0.0) -> !:
+    pub func extend_stroke(x: f64, y: f64, pressure: f64 = 1.0, azimuth: f64 = 0.0, altitude: f64 = 90.0, rotation: f64 = 0.0, tangential: f64 = 0.0, at_ms: f64 = 0.0) -> !:
         try self.require_open()
         if self.warp_finishing:
             error(invalid, "no stroke is in progress")
@@ -172,7 +172,7 @@ extend Canvas:
         try stroke.extend(&painter, try stroke_target(document, self.stroke_layer, stroke.paints_mask(), true), x, y, Pen(pressure = pressure, azimuth = azimuth, altitude = altitude, rotation = rotation, tangential = tangential, time = at_ms))
 
     ## End the stroke, keeping what it painted.
-    pub mutating func end_stroke() -> !:
+    pub func end_stroke() -> !:
         try self.require_open()
         if self.warp_finishing:
             error(invalid, "no stroke is in progress")
@@ -207,7 +207,7 @@ extend Canvas:
 
     ## Wait for a smudge still finishing and keep it. Everything that
     ## changes or reads the whole document calls this first.
-    pub mutating func wait_idle() -> !:
+    pub func wait_idle() -> !:
         if not self.warp_finishing:
             return
         let warp = self.warp else return
@@ -215,20 +215,20 @@ extend Canvas:
 
     ## Whether smudge walks on a worker: on by default; off, each move
     ## is walked before `extend_stroke` returns (scripts that time strokes).
-    pub mutating func set_async_warp(on: bool) -> !:
+    pub func set_async_warp(on: bool) -> !:
         try self.wait_idle()
         self.warp_async = on
 
     ## Smudge's dab spacing, a fraction of the diameter (0.15 by default;
     ## from about 0.2 the dabs show as beads along a soft stroke).
-    pub mutating func set_smudge_spacing(spacing: f64) -> !:
+    pub func set_smudge_spacing(spacing: f64) -> !:
         if not (spacing >= 0.01 and spacing <= 5.0):
             error(invalid, "smudge spacing is 0.01..5 of the diameter")
         self.smudge_spacing = spacing
 
     ## Stamp the dabs the stroke queued since the last draw: pointer moves
     ## only queue them, so however many arrive, a frame stamps them once.
-    mutating func settle_stroke() -> !:
+    func settle_stroke() -> !:
         if let warp = self.warp:
             try settle_warp(&self, warp)
             return
@@ -246,7 +246,7 @@ extend Canvas:
     ## Lay a linear gradient over layer `id` from one color at (`x0`, `y0`) to
     ## another at (`x1`, `y1`), straight alpha in linear light, inside the
     ## selection. Undoable.
-    pub mutating func fill_gradient(id: i64, x0: f64, y0: f64, x1: f64, y1: f64, r0: f64, g0: f64, b0: f64, a0: f64, r1: f64, g1: f64, b1: f64, a1: f64, radial: bool = false) -> !:
+    pub func fill_gradient(id: i64, x0: f64, y0: f64, x1: f64, y1: f64, r0: f64, g0: f64, b0: f64, a0: f64, r1: f64, g1: f64, b1: f64, a1: f64, radial: bool = false) -> !:
         try self.require_open()
         try self.require_idle()
         let document = self.document else error(invalid, "draw the document once before filling")
@@ -265,7 +265,7 @@ extend Canvas:
 
     ## The eyedropper: read the flattened document's color at a pixel into
     ## `picked_red` and friends (linear light, straight alpha).
-    pub mutating func pick(x: i64, y: i64) -> !:
+    pub func pick(x: i64, y: i64) -> !:
         try self.require_open()
         if x < 0 or y < 0 or x >= (i64)self.extent_x or y >= (i64)self.extent_y:
             error(invalid, "the picked pixel lies outside the document")
@@ -308,4 +308,3 @@ func stroke_target(document: Document*, layer: u64, on_mask: bool, begun: bool) 
         target.selection = try document.selection_tiles()
         target.mixing = document.mixing(on_mask)
     return target
-

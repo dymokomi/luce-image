@@ -19,7 +19,7 @@ extend Canvas:
     ## the pointer are searched for an edge, edges under `contrast` percent
     ## (1..100) are ignored, and `frequency` (0..100) sets how often anchors
     ## fall on their own.
-    pub mutating func begin_magnetic(x: f64, y: f64, level: i64 = 0, width: f64 = 10.0, contrast: f64 = 10.0, frequency: i64 = 57) -> !:
+    pub func begin_magnetic(x: f64, y: f64, level: i64 = 0, width: f64 = 10.0, contrast: f64 = 10.0, frequency: i64 = 57) -> !:
         try self.require_open()
         if self.document == none or self.composer == none:
             error(invalid, "draw the document once before using the Magnetic Lasso")
@@ -42,11 +42,11 @@ extend Canvas:
         let samples_y = (i64)((self.extent_y + span - 1) >> chosen)
         let columns = (u32)((samples_x + (i64)tile_size - 1) // (i64)tile_size)
         let rows = (u32)((samples_y + (i64)tile_size - 1) // (i64)tile_size)
-        let cells = try alloc LumaCell*?[(usize)columns * (usize)rows] in memory.heap
+        let cells = try new LumaCell*?[(usize)columns * (usize)rows] --- in memory.heap
         errdefer free(cells) in memory.heap
         for index in 0..<cells.length:
             cells[index] = none
-        let anchors = try alloc usize[64] in memory.heap
+        let anchors = try new usize[64] --- in memory.heap
         errdefer free(anchors) in memory.heap
         let scale = (f64)span
         let magnetic = try new Magnetic(level = chosen, scale = scale, samples_x = samples_x, samples_y = samples_y,
@@ -58,7 +58,7 @@ extend Canvas:
         try add_anchor(magnetic)
 
     ## The live wire to the edge nearest the pointer at (`x`, `y`).
-    pub mutating func move_magnetic(x: f64, y: f64) -> !:
+    pub func move_magnetic(x: f64, y: f64) -> !:
         let magnetic = self.magnetic else error(invalid, "no Magnetic Lasso is under way")
         if not math.is_finite(x) or not math.is_finite(y):
             error(invalid, "the pointer must be finite")
@@ -69,7 +69,7 @@ extend Canvas:
                 return
 
     ## A click: the wire fixed to (`x`, `y`) with an anchor there.
-    pub mutating func anchor_magnetic(x: f64, y: f64) -> !:
+    pub func anchor_magnetic(x: f64, y: f64) -> !:
         let magnetic = self.magnetic else error(invalid, "no Magnetic Lasso is under way")
         try self.move_magnetic(x, y)
         var index: usize = 0
@@ -80,7 +80,7 @@ extend Canvas:
         try add_anchor(magnetic)
 
     ## Backspace: the last anchor taken back; false when only the first is left.
-    pub mutating func remove_magnetic_anchor() -> bool:
+    pub func remove_magnetic_anchor() -> bool:
         let magnetic = self.magnetic else return false
         if magnetic.anchor_count <= 1:
             return false
@@ -91,12 +91,12 @@ extend Canvas:
 
     ## Double-click or Enter: the shape closed along the edge back to the
     ## start and selected, combined by `mode`, as one step.
-    pub mutating func close_magnetic(mode: i64 = 0) -> !:
+    pub func close_magnetic(mode: i64 = 0) -> !:
         try self.require_open()
         try close_magnetic(&self, mode)
 
     ## Esc: the Magnetic Lasso let go.
-    pub mutating func cancel_magnetic():
+    pub func cancel_magnetic():
         let magnetic = self.magnetic else return
         self.magnetic = none
         magnetic.destroy()
@@ -132,9 +132,9 @@ struct Points:
     var values: f64[]
     var count: usize
 
-    mutating func push(x: f64, y: f64) -> !:
+    func push(x: f64, y: f64) -> !:
         if self.count + 2 > self.values.length:
-            let grown = try alloc f64[(usize)math.imax(64, (i64)self.values.length * 2)] in memory.heap
+            let grown = try new f64[(usize)math.imax(64, (i64)self.values.length * 2)] --- in memory.heap
             if self.count > 0:
                 memory.copy(grown, self.values, self.count)
             if self.values.length > 0:
@@ -147,7 +147,7 @@ struct Points:
     func points() -> usize:
         return self.count // 2
 
-    mutating func destroy():
+    func destroy():
         if self.values.length > 0:
             free(self.values) in memory.heap
         self.count = 0
@@ -179,7 +179,7 @@ struct Magnetic:
     var anchor_count: usize
     var live: Points
 
-    mutating func destroy():
+    func destroy():
         for index in 0..<self.cells.length:
             if let cell = self.cells[index]:
                 free(cell.values) in memory.heap
@@ -199,7 +199,7 @@ struct Magnetic:
 
 func add_anchor(magnetic: Magnetic*) -> !:
     if magnetic.anchor_count == magnetic.anchors.length:
-        let grown = try alloc usize[magnetic.anchors.length * 2] in memory.heap
+        let grown = try new usize[magnetic.anchors.length * 2] --- in memory.heap
         memory.copy(grown, magnetic.anchors, magnetic.anchor_count)
         free(magnetic.anchors) in memory.heap
         magnetic.anchors = grown
@@ -287,7 +287,7 @@ func settle_anchor(magnetic: Magnetic*) -> bool!:
 ## `height`, from the luma of the cells it (and a sample round it) covers.
 func window_field(canvas: Canvas*, magnetic: Magnetic*, left: i64, top: i64, width: i64, height: i64) -> live_wire.Field!:
     let stride = width + 2
-    let luma = try alloc f32[(usize)(stride * (height + 2))] in memory.heap
+    let luma = try new f32[(usize)(stride * (height + 2))] --- in memory.heap
     defer free(luma) in memory.heap
     for y in 0..<height + 2:
         let sy = math.imax(0, math.imin(magnetic.samples_y - 1, top + y - 1))
@@ -295,7 +295,7 @@ func window_field(canvas: Canvas*, magnetic: Magnetic*, left: i64, top: i64, wid
             let sx = math.imax(0, math.imin(magnetic.samples_x - 1, left + x - 1))
             let cell = try luma_cell(canvas, magnetic, (u32)(sx // (i64)tile_size), (u32)(sy // (i64)tile_size))
             luma[(usize)(y * stride + x)] = cell.values[(usize)((sy % (i64)tile_size) * (i64)tile_size + sx % (i64)tile_size)]
-    let strength = try alloc f32[(usize)(width * height)] in memory.heap
+    let strength = try new f32[(usize)(width * height)] --- in memory.heap
     errdefer free(strength) in memory.heap
     try live_wire.strengths(luma, width, height, strength)
     return live_wire.Field(left = left, top = top, width = width, height = height, strength = strength)
@@ -309,10 +309,10 @@ func luma_cell(canvas: Canvas*, magnetic: Magnetic*, column: u32, row: u32) -> L
     let document = canvas.document else error(invalid, "the document is gone")
     let composer = canvas.composer else error(invalid, "the document is gone")
     let texture = try composer.tile(document, column, row, magnetic.level)
-    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    let bytes = try new u8[(usize)tile_size * (usize)tile_size * 8] --- in memory.heap
     defer free(bytes) in memory.heap
     try texture.read(bytes, gpu.Region(0, 0, tile_size, tile_size))
-    let values = try alloc f32[(usize)tile_size * (usize)tile_size] in memory.heap
+    let values = try new f32[(usize)tile_size * (usize)tile_size] --- in memory.heap
     errdefer free(values) in memory.heap
     for at in 0..<values.length:
         let texel = at * 8

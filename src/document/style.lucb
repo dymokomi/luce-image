@@ -128,7 +128,7 @@ pub struct Style:
 
     ## Set setting `index` from a number, checked: switches take non-zero as
     ## on, colors and opacities 0..1, sizes and blurs 0..250, offsets -1000..1000.
-    pub mutating func set_field(index: i64, value: f64) -> !:
+    pub func set_field(index: i64, value: f64) -> !:
         if not math.is_finite(value):
             error(invalid, "style settings must be finite")
         let kind = field_kind(index)

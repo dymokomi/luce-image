@@ -41,7 +41,7 @@ pub struct Window:
     pub var top: i64
     pub var level: u32
 
-    pub mutating func destroy():
+    pub func destroy():
         self.texture.destroy()
 
 ## What output cell (`column`, `row`) reads through `warp` (a backwards map,
@@ -119,7 +119,7 @@ func gather_level(device: gpu.Device, tiles: const Tiles*, pyramid: Pyramid*, bo
             let width = covered_at(tiles.width(), (u32)column, level)
             let height = covered_at(tiles.height(), (u32)row, level)
             try gpu.copy_image(whole.value(), cell, gpu.Rect((f64)(column * span - left), (f64)(row * span - top), (f64)width, (f64)height), gpu.Region(0, 0, width, height))
-    discard(try frame.value().present(empty))
+    _ = try frame.value().present(empty)
     return Window(texture = texture, left = left, top = top, level = level)
 
 ## `box` of `tiles` on the canvas gathered at full size into a window texture,
@@ -159,7 +159,7 @@ func gather_full(device: gpu.Device, tiles: const Tiles*, box: Footprint, empty:
             for row in max_i64(range.top, floor_div(top, span))..<min_i64(range.bottom, floor_div(bottom + span - 1, span)):
                 for column in max_i64(range.left, floor_div(left, span))..<min_i64(range.right, floor_div(right + span - 1, span)):
                     try copy_outside(whole.value(), tiles, column, row, left, top)
-    discard(try frame.value().present(empty))
+    _ = try frame.value().present(empty)
     return Window(texture = texture, left = left, top = top, level = 0)
 
 ## The part of outside cell (`column`, `row`) of `tiles` past the canvas into

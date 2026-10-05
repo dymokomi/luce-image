@@ -17,21 +17,21 @@ extend Canvas:
     ## The tool strokes use: 0 paint (the brush), 1 clone stamp, 2 spot
     ## healing, 3 blur, 4 smudge, 5 push (Liquify's forward warp). Retouching
     ## takes the brush's diameter, hardness and opacity (strength).
-    pub mutating func set_retouch(kind: i64) -> !:
+    pub func set_retouch(kind: i64) -> !:
         if kind < retouch_paint or kind > retouch_burn:
             error(invalid, "retouching tools are 0 paint, 1 clone, 2 heal, 3 blur, 4 smudge, 5 push, 6 dodge, 7 burn")
         self.retouch = kind
 
     ## Dodge and Burn's range (0 shadows, 1 midtones, 2 highlights) and
     ## exposure (0..1), as their header's.
-    pub mutating func set_tone(range: i64, exposure: f64) -> !:
+    pub func set_tone(range: i64, exposure: f64) -> !:
         if range < 0 or range > 2 or not math.is_finite(exposure):
             error(invalid, "a tone range is 0..2 and its exposure finite")
         self.tone_range = range
         self.tone_exposure = math.clamp(exposure, 0.0, 1.0)
 
     ## Where the clone stamp copies from (Alt-click): a new source starts a new alignment.
-    pub mutating func set_clone_source(x: f64, y: f64):
+    pub func set_clone_source(x: f64, y: f64):
         self.clone_x = x
         self.clone_y = y
         self.clone_set = true
@@ -39,7 +39,7 @@ extend Canvas:
 
     ## Aligned: every stroke keeps the first one's offset; otherwise each
     ## starts at the source again. `all_layers` samples everything shown.
-    pub mutating func set_clone_options(aligned: bool, all_layers: bool):
+    pub func set_clone_options(aligned: bool, all_layers: bool):
         self.clone_aligned = aligned
         self.clone_all = all_layers
 
@@ -52,13 +52,13 @@ extend Canvas:
     ## diameter rounded up — for the preview inside the brush. The source is the
     ## layer's own pixels, or with All Layers the picture; only the cells under
     ## the brush are read back.
-    pub mutating func clone_preview(id: i64, x: f64, y: f64, diameter: f64, opacity: f64 = 1.0) -> const u8[]!:
+    pub func clone_preview(id: i64, x: f64, y: f64, diameter: f64, opacity: f64 = 1.0) -> const u8[]!:
         let document = self.document else error(invalid, "draw the document once before previewing a clone")
         let side = (usize)math.max(1.0, math.min(1024.0, math.ceil(diameter)))
         if self.preview_bytes.length != side * side * 4:
             if self.preview_bytes.length > 0:
                 free(self.preview_bytes) in memory.heap
-            self.preview_bytes = try alloc u8[side * side * 4] in memory.heap
+            self.preview_bytes = try new u8[side * side * 4] --- in memory.heap
         let out = self.preview_bytes
         for index in 0..<out.length:
             out[index] = 0
@@ -134,7 +134,7 @@ func begin_retouch(canvas: Canvas*, id: u64, x: f64, y: f64, pen: Pen) -> !:
         # worker that cannot start leaves the stroke walking here.
         if canvas.warp_async:
             boxed.start_async() catch failure:
-                discard(failure)
+                _ = failure
         return
     var brush = canvas.brush
     brush.erase = false
@@ -231,7 +231,7 @@ func keep_warp(canvas: Canvas*, warp: WarpStroke*) -> !:
         warp.destroy()
         free(warp) in memory.heap
     try warp.wait()
-    discard(try upload_warp(canvas, warp, 0))
+    _ = try upload_warp(canvas, warp, 0)
     if tracing():
         trace_end()
     try canvas.restrict_to_selection(canvas.warped, &canvas.history[canvas.history_count - 1].tiles)
@@ -264,7 +264,6 @@ func copy_cell(out: u8[], side: usize, bytes: const u8[], at_x: i64, at_y: i64):
                 let value = (f64)from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8))
                 let shown = value if channel == 3 else transfer.srgb_encode(math.clamp(value, 0.0, 1.0))
                 out[target + channel] = (u8)math.round(math.clamp(shown, 0.0, 1.0) * 255.0)
-
 
 ## A clone preview's cells being read: from (`first_column`, `first_row`),
 ## `columns` wide, into `out` (`side` square at `left`, `top`).

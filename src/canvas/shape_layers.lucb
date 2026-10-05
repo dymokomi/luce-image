@@ -20,9 +20,9 @@ extend Canvas:
     ## line is its stroke). On a vector layer the shape replaces its target
     ## element (the active one, else the topmost). It stays a shape, crisp
     ## however it is moved, scaled or turned. One step.
-    pub mutating func set_shape(id: i64, kind: i64, x: f64, y: f64, width: f64, height: f64, sides: i64, radius: f64,
-                                filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
-                                stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64) -> !:
+    pub func set_shape(id: i64, kind: i64, x: f64, y: f64, width: f64, height: f64, sides: i64, radius: f64,
+                       filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
+                       stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64) -> !:
         let values: f64[22] = [(f64)kind, x, y, width, height, (f64)sides, radius, 1.0 if filled else 0.0, fill_red, fill_green, fill_blue,
                                1.0 if stroked else 0.0, stroke_red, stroke_green, stroke_blue, stroke_width, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
         try set_layer_shape(&self, (u64)id, try shape_from_values(values))
@@ -30,17 +30,17 @@ extend Canvas:
     ## `set_shape`'s shape added on top of layer `id`'s elements instead, named
     ## after its kind and active: a pixel layer with nothing painted becomes a
     ## vector layer. One step.
-    pub mutating func add_shape(id: i64, kind: i64, x: f64, y: f64, width: f64, height: f64, sides: i64, radius: f64,
-                                filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
-                                stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64) -> !:
+    pub func add_shape(id: i64, kind: i64, x: f64, y: f64, width: f64, height: f64, sides: i64, radius: f64,
+                       filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
+                       stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64) -> !:
         let values: f64[22] = [(f64)kind, x, y, width, height, (f64)sides, radius, 1.0 if filled else 0.0, fill_red, fill_green, fill_blue,
                                1.0 if stroked else 0.0, stroke_red, stroke_green, stroke_blue, stroke_width, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
         try add_vector_element(&self, (u64)id, try shape_from_values(values), "", "Shape")
 
     ## The target element's fill, stroke, corner radius and sides changed, its
     ## geometry and transform kept. One step; a slider dragged coalesces.
-    pub mutating func restyle_shape(id: i64, filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
-                                    stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64, radius: f64, sides: i64) -> !:
+    pub func restyle_shape(id: i64, filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
+                           stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64, radius: f64, sides: i64) -> !:
         let style: f64[11] = [(f64)sides, radius, 1.0 if filled else 0.0, fill_red, fill_green, fill_blue,
                               1.0 if stroked else 0.0, stroke_red, stroke_green, stroke_blue, stroke_width]
         try restyle_target(&self, (u64)id, style[..<11])
@@ -50,28 +50,28 @@ extend Canvas:
     ## three an anchor in document pixels — the point, the handle coming in, the
     ## handle going out — joined by cubic curves, closed back to the first when
     ## `closed`; filled and stroked as `set_shape`. One step.
-    pub mutating func set_path(id: i64, closed: bool, filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
-                               stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64) -> !:
+    pub func set_path(id: i64, closed: bool, filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
+                      stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64) -> !:
         let style: f64[11] = [3.0, 0.0, 1.0 if filled else 0.0, fill_red, fill_green, fill_blue,
                               1.0 if stroked else 0.0, stroke_red, stroke_green, stroke_blue, stroke_width]
         try set_layer_shape(&self, (u64)id, try self.collected_path(closed, style[..<11]))
 
     ## `set_path`'s path added on top of layer `id`'s elements instead, active. One step.
-    pub mutating func add_path(id: i64, closed: bool, filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
-                               stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64) -> !:
+    pub func add_path(id: i64, closed: bool, filled: bool, fill_red: f64, fill_green: f64, fill_blue: f64,
+                      stroked: bool, stroke_red: f64, stroke_green: f64, stroke_blue: f64, stroke_width: f64) -> !:
         let style: f64[11] = [3.0, 0.0, 1.0 if filled else 0.0, fill_red, fill_green, fill_blue,
                               1.0 if stroked else 0.0, stroke_red, stroke_green, stroke_blue, stroke_width]
         try add_vector_element(&self, (u64)id, try self.collected_path(closed, style[..<11]), "", "Path")
 
     ## The Vector panel's new path: an empty path element named `name` on top of
     ## layer `id`, active, for the Pen to draw into. One step.
-    pub mutating func add_empty_path(id: i64, name: str) -> !:
+    pub func add_empty_path(id: i64, name: str) -> !:
         var no_path: f64[]
         try add_vector_element(&self, (u64)id, ShapeSpec(kind = 4, filled = false, stroked = true, stroke_width = 1.0, path = no_path), name, "New Path")
 
     ## The collected points (`add_point`) as a path spec styled by `style`
     ## (`restyle_shape`'s values from sides on), which the caller owns.
-    mutating func collected_path(closed: bool, style: const f64[]) -> ShapeSpec!:
+    func collected_path(closed: bool, style: const f64[]) -> ShapeSpec!:
         let collected = self.polygon[..<self.polygon_count]
         self.polygon_count = 0
         if collected.length < 2 * anchor_values:

@@ -40,7 +40,7 @@ pub func smooth(cells: Cells*, radius: i64) -> !:
 func pass_cells(cells: Cells*, kind: i64, pixels: i64, feather: i64, apron: i64) -> !:
     let count = cells.count()
     # Which cells need working out; the rest keep (or take) one value.
-    let values = try alloc i64[count] in memory.heap
+    let values = try new i64[count] --- in memory.heap
     defer free(values) in memory.heap
     var pending: usize = 0
     for index in 0..<count:
@@ -50,7 +50,7 @@ func pass_cells(cells: Cells*, kind: i64, pixels: i64, feather: i64, apron: i64)
             values[index] = 0
         if values[index] < 0:
             pending += 1
-    let items = try alloc usize[pending] in memory.heap
+    let items = try new usize[pending] --- in memory.heap
     defer free(items) in memory.heap
     # The cells as they were, shared, for the workers to read while each
     # cell worked out gets a block of its own to write.
@@ -61,7 +61,7 @@ func pass_cells(cells: Cells*, kind: i64, pixels: i64, feather: i64, apron: i64)
         if values[index] < 0:
             items[at] = index
             at += 1
-            discard(cells.fresh(index))
+            _ = cells.fresh(index)
         elif cells.uniform(index) != values[index]:
             cells.fill(index, (u8)values[index])
     var job = ModifyJob(source = &before, target = cells, items = items, kind = kind, pixels = pixels, feather = feather, apron = apron, failed = false)
@@ -115,15 +115,15 @@ func modify_item(context: void*?, item: usize):
     var window = Window(left = cells.origin_x(index) - apron, top = cells.origin_y(index) - apron,
                         width = width + 2 * apron, height = height + 2 * apron, extent_x = (i64)cells.extent_x, extent_y = (i64)cells.extent_y)
     let size = (usize)(window.width * window.height)
-    let a = alloc u8[size] in memory.heap catch failure:
+    let a = new u8[size] --- in memory.heap catch failure:
         job.failed = true
         return
     defer free(a) in memory.heap
-    let b = alloc u8[size] in memory.heap catch failure:
+    let b = new u8[size] --- in memory.heap catch failure:
         job.failed = true
         return
     defer free(b) in memory.heap
-    let scratch = alloc u8[(usize)math.imax(window.width, window.height) * 2] in memory.heap catch failure:
+    let scratch = new u8[(usize)math.imax(window.width, window.height) * 2] --- in memory.heap catch failure:
         job.failed = true
         return
     defer free(scratch) in memory.heap
@@ -131,7 +131,7 @@ func modify_item(context: void*?, item: usize):
     var current = a
     var other = b
     if job.kind == kind_border:
-        let c = alloc u8[size] in memory.heap catch failure:
+        let c = new u8[size] --- in memory.heap catch failure:
             job.failed = true
             return
         defer free(c) in memory.heap
@@ -265,7 +265,7 @@ pub func extreme_rows(source: const u8[], target: u8[], window: const Window*, r
 ## As `extreme_rows`, down every good column: the same running extremes,
 ## a whole row of columns at a time so the memory is walked in order.
 pub func extreme_columns(source: const u8[], target: u8[], window: const Window*, radius: i64, grow: bool, margin: i64, scratch: u8[]):
-    discard(scratch)
+    _ = scratch
     let width = (usize)window.width
     let height = window.height
     let first = (usize)margin
@@ -273,16 +273,16 @@ pub func extreme_columns(source: const u8[], target: u8[], window: const Window*
     if last <= first or height <= 0:
         return
     let run = 2 * radius + 1
-    let forward = alloc u8[source.length] in memory.heap catch failure:
+    let forward = new u8[source.length] --- in memory.heap catch failure:
         # No room for the rows at once: a column at a time.
-        let line = alloc u8[(usize)height * 2] in memory.heap catch again:
+        let line = new u8[(usize)height * 2] --- in memory.heap catch again:
             trap("out of memory in a selection pass")
         defer free(line) in memory.heap
         for x in first..<last:
             extreme_line(source, target, x, width, height, radius, grow, line)
         return
     defer free(forward) in memory.heap
-    let backward = alloc u8[source.length] in memory.heap catch failure:
+    let backward = new u8[source.length] --- in memory.heap catch failure:
         trap("out of memory in a selection pass")
     defer free(backward) in memory.heap
     # Extremes from each block of rows' start downwards, and from its end upwards.
@@ -365,7 +365,7 @@ pub func box_columns(source: const u8[], target: u8[], window: const Window*, ra
     if height <= 2 * radius or last <= first:
         return
     let run = 2 * radius + 1
-    let totals = alloc i64[width] in memory.heap catch failure:
+    let totals = new i64[width] --- in memory.heap catch failure:
         for x in first..<last:
             box_line(source, target, x, width, height, radius)
         return

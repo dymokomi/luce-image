@@ -7,7 +7,7 @@ func warp_canvas(target: gpu.Texture*, async: bool) -> Canvas!:
     var canvas = try Canvas(600, 300)
     errdefer canvas.close()
     let layer = try canvas.add_layer("Paint")
-    discard(try shown_at(&canvas, target, 0, 0))
+    _ = try shown_at(&canvas, target, 0, 0)
     try canvas.set_async_warp(async)
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
     try canvas.select_rectangle(200, 80, 120, 120, 0)
@@ -30,7 +30,7 @@ func warp_path(canvas: Canvas*, layer: i64, kind: i64) -> !:
 
 ## Every straight-alpha sample of the canvas's first layer.
 func layer_samples(canvas: Canvas*) -> f32[]!:
-    let pixels = try alloc f32[600 * 300 * 4] in memory.heap
+    let pixels = try new f32[600 * 300 * 4] --- in memory.heap
     errdefer free(pixels) in memory.heap
     try layer_tiles(canvas, try canvas.layer_id(0)).read(pixels)
     return pixels

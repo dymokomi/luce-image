@@ -452,7 +452,7 @@ pub struct Canvas:
     pub func resolution() -> f64:
         return self.dpi
 
-    pub mutating func set_resolution(dpi: f64) -> !:
+    pub func set_resolution(dpi: f64) -> !:
         if not math.is_finite(dpi) or dpi < 1.0 or dpi > 100000.0:
             error(invalid, "a resolution must be 1..100000 pixels per inch")
         self.dpi = dpi
@@ -466,7 +466,7 @@ pub struct Canvas:
         return self.cold_linear_blend
 
     ## Turn linear blending on or off for the whole document, one undo step.
-    pub mutating func set_linear_blend(on: bool) -> !:
+    pub func set_linear_blend(on: bool) -> !:
         if on == self.linear_blend():
             return
         if let document = self.document:
@@ -481,7 +481,7 @@ pub struct Canvas:
     ## in squares of `cell` points of linear greys `light_grey` and `dark_grey`,
     ## aligned to the document's corner: the picture mixes with it as its
     ## colors mix. A `cell` of 0 leaves it to the caller, who draws it first.
-    pub mutating func set_checker(cell: f64, light_grey: f64, dark_grey: f64) -> !:
+    pub func set_checker(cell: f64, light_grey: f64, dark_grey: f64) -> !:
         if not math.is_finite(cell) or cell < 0.0 or not math.is_finite(light_grey) or not math.is_finite(dark_grey):
             error(invalid, "a checkerboard needs a square size of 0 or more and finite greys")
         self.checker_cell = cell
@@ -493,7 +493,7 @@ pub struct Canvas:
     pub func profile() -> interop.Owned[str]!:
         return try interop.copy_text((str)self.profile_name[..<self.profile_length])
 
-    pub mutating func set_profile(name: str):
+    pub func set_profile(name: str):
         let length = name.length if name.length < self.profile_name.length else self.profile_name.length
         for index in 0..<length:
             self.profile_name[index] = name.bytes[index]
@@ -511,7 +511,7 @@ pub struct Canvas:
         return (i64)self.extent_y
 
     ## The selection being edited: the document's once bound, the cold one before.
-    mutating func live() -> Selection*:
+    func live() -> Selection*:
         if let document = self.document:
             return &document.selection
         return &self.selection
@@ -523,7 +523,7 @@ pub struct Canvas:
 
     ## No stroke and no preview may be in progress for edits and history; a
     ## smudge still finishing on its worker is waited for.
-    mutating func require_idle() -> !:
+    func require_idle() -> !:
         try require_loaded(&self)
         try self.wait_idle()
         if self.stroke != none or self.warp != none or self.liquify != none:
@@ -534,7 +534,7 @@ pub struct Canvas:
             error(invalid, "finish the preview first")
 
     ## Create the GPU document on the target's device and move waiting pictures in.
-    mutating func bind(target: const gpu.RenderTarget*) -> !:
+    func bind(target: const gpu.RenderTarget*) -> !:
         if self.document != none:
             return
         let acquired = gpu.device_of(target) catch failure:
@@ -555,7 +555,7 @@ pub struct Canvas:
         return self.selected_layer_index
 
     ## The application's selected layer (stack index), saved with the document.
-    pub mutating func set_selected_layer(index: i64):
+    pub func set_selected_layer(index: i64):
         self.selected_layer_index = index
 
 pub let canvas_type: interop.Type[Canvas] = interop.Type[Canvas]("Canvas", Canvas.close, Canvas.trace, closeable = true, main_thread = true)

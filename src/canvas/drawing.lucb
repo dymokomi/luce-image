@@ -8,12 +8,12 @@ extend Canvas:
     ## Draw the view into textures of `texel_format` rather than a window's surface
     ## (none): what the view's own pipelines (the checkerboard and tints, the
     ## channel view, mattes) are made for. For headless renderers and benchmarks.
-    pub mutating func set_view_format(texel_format: gpu.Format?):
+    pub func set_view_format(texel_format: gpu.Format?):
         self.drop_view_pipelines()
         self.view_format = texel_format
 
     ## Let the view's own pipelines go, to be made again when next drawn.
-    mutating func drop_view_pipelines():
+    func drop_view_pipelines():
         if let pipeline = self.quick_overlay:
             var owned = pipeline
             owned.destroy()
@@ -31,7 +31,7 @@ extend Canvas:
             owned.destroy()
             self.channels_shader = none
 
-    mutating func quick_pipeline() -> gpu.Pipeline!:
+    func quick_pipeline() -> gpu.Pipeline!:
         if let existing = self.quick_overlay:
             return existing
         let device = self.device else error(invalid, "draw the document once first")
@@ -42,7 +42,7 @@ extend Canvas:
         self.quick_overlay = pipeline
         return pipeline
 
-    mutating func channels_pipeline() -> gpu.Pipeline!:
+    func channels_pipeline() -> gpu.Pipeline!:
         if let existing = self.channels_view:
             return existing
         let device = self.device else error(invalid, "draw the document once first")
@@ -53,7 +53,7 @@ extend Canvas:
         self.channels_view = pipeline
         return pipeline
 
-    mutating func ants_pipeline() -> gpu.Pipeline!:
+    func ants_pipeline() -> gpu.Pipeline!:
         if let existing = self.ants:
             return existing
         let device = self.device else error(invalid, "draw the document once first")
@@ -68,7 +68,7 @@ extend Canvas:
     ## points), with its top-left corner at `rectangle`'s origin plus `offset`,
     ## scaled by `zoom` (document pixels to points). Binds the device on first
     ## use. Pixels are crisp at and above 100% and filtered below it.
-    pub mutating func draw(target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64) -> !:
+    pub func draw(target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64) -> !:
         try self.require_open()
         try self.settle_stroke()
         if not math.is_finite(zoom) or zoom <= 0.0 or zoom > 256.0 or not math.is_finite(offset_x) or not math.is_finite(offset_y):
@@ -115,7 +115,7 @@ extend Canvas:
         let last_column = max_u32(first_column, visible_cell(rectangle.x + rectangle.width - origin_x, tile_points, columns - 1) + 1)
         let last_row = max_u32(first_row, visible_cell(rectangle.y + rectangle.height - origin_y, tile_points, rows - 1) + 1)
         # Tiles a background batch brought back since the last frame.
-        discard(try prefetch_collect())
+        _ = try prefetch_collect()
         # A batch that failed to decode something: this frame brings what it lacks
         # back itself, so the failure is reported.
         let waits = not progressive_loading or prefetch_had_failure()
@@ -160,7 +160,7 @@ extend Canvas:
 
     ## Draw one layer's own pixels (or its mask when `mask` is set) scaled into
     ## `rectangle` of `target`, for thumbnails. Needs the document bound.
-    pub mutating func draw_layer(target: interop.View[gpu.RenderTarget], index: i64, rectangle: gpu.Rect, mask: bool = false) -> !:
+    pub func draw_layer(target: interop.View[gpu.RenderTarget], index: i64, rectangle: gpu.Rect, mask: bool = false) -> !:
         try self.require_open()
         try self.settle_stroke()
         let record = try self.record(index)
@@ -191,8 +191,8 @@ extend Canvas:
     ## (`dx`, `dy`) document pixels without touching its pixels: the live
     ## preview of a move. The displaced layer is drawn on top of the rest in
     ## normal blending at its opacity.
-    pub mutating func draw_moving(target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64,
-                                  id: i64, dx: f64, dy: f64) -> !:
+    pub func draw_moving(target: interop.View[gpu.RenderTarget], rectangle: gpu.Rect, zoom: f64, offset_x: f64, offset_y: f64,
+                         id: i64, dx: f64, dy: f64) -> !:
         try self.require_open()
         try self.settle_stroke()
         let index = try self.index((u64)id)

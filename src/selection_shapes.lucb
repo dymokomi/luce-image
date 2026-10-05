@@ -193,7 +193,7 @@ func ellipse_item(context: void*?, item: usize):
     if job.shape.value(x + 0.5, y + 0.5) == 255 and job.shape.value(last_x, y + 0.5) == 255 and job.shape.value(x + 0.5, last_y) == 255 and job.shape.value(last_x, last_y) == 255:
         combine_value(job.cells, index, 255, job.mode)
         return
-    let shape = alloc u8[block_bytes] in memory.heap catch failure:
+    let shape = new u8[block_bytes] --- in memory.heap catch failure:
         trap("out of memory drawing a selection")
     defer free(shape) in memory.heap
     memory.set(shape, 0)
@@ -231,13 +231,13 @@ func polygon_row(context: void*?, item: usize):
     let xb = math.imin((i64)cells.extent_x, (i64)(job.cover.right * (usize)tile_size))
     let span = (usize)(xb - xa)
     let count = job.points.length // 2
-    let strip = alloc u8[across * block_bytes] in memory.heap catch failure:
+    let strip = new u8[across * block_bytes] --- in memory.heap catch failure:
         trap("out of memory drawing a selection")
     defer free(strip) in memory.heap
-    let delta = alloc i32[span + 1] in memory.heap catch failure:
+    let delta = new i32[span + 1] --- in memory.heap catch failure:
         trap("out of memory drawing a selection")
     defer free(delta) in memory.heap
-    let crossings = alloc f64[count] in memory.heap catch failure:
+    let crossings = new f64[count] --- in memory.heap catch failure:
         trap("out of memory drawing a selection")
     defer free(crossings) in memory.heap
     memory.set(strip, 0)
@@ -313,7 +313,7 @@ func source_item(context: void*?, index: usize):
         elif let block = other.block(index):
             combine_cell(job.cells, index, block.bytes, job.mode)
         return
-    let shape = alloc u8[block_bytes] in memory.heap catch failure:
+    let shape = new u8[block_bytes] --- in memory.heap catch failure:
         trap("out of memory reading a selection")
     defer free(shape) in memory.heap
     memory.set(shape, 0)

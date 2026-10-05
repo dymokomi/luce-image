@@ -23,7 +23,7 @@ extend Canvas:
     ## Select › Select and Mask: begin refining the selection's edge;
     ## `preview_refine` shows it, `end_refine` keeps it as one step or puts
     ## the selection back.
-    pub mutating func begin_refine() -> !:
+    pub func begin_refine() -> !:
         try self.require_open()
         try self.require_idle()
         if self.select_mask != none:
@@ -32,8 +32,8 @@ extend Canvas:
             error(invalid, "nothing is selected to refine")
         let origin = try self.live().copy()
         self.select_mask = try new SelectMask(origin = origin, view = refine_ants, setting = Refinement(), asked = false, levels = LevelOrigin(selection = none, level = 0),
-                                                luma = none, lit = none, luma_level = 0, task = none, shown = Shown(selection = none, level = 0),
-                                                shown_setting = Refinement(), shown_box = CellBox(), keeping = false, keep_read = 0) in memory.heap
+                                              luma = none, lit = none, luma_level = 0, task = none, shown = Shown(selection = none, level = 0),
+                                              shown_setting = Refinement(), shown_box = CellBox(), keeping = false, keep_read = 0) in memory.heap
 
     pub func refining() -> bool:
         return self.select_mask != none
@@ -43,22 +43,22 @@ extend Canvas:
     ## and `shift` edge (-100..100%). Only recorded here: the frames that
     ## follow work it out at the view's level, over what it shows, on a
     ## thread of their own (masking.lucb), the latest setting winning.
-    pub mutating func preview_refine(radius: i64, smooth: i64, feather: i64, contrast: f64, shift: f64) -> !:
+    pub func preview_refine(radius: i64, smooth: i64, feather: i64, contrast: f64, shift: f64) -> !:
         try ask_refine(&self, Refinement(radius = radius, smooth = smooth, feather = feather, contrast = contrast, shift = shift))
 
     ## OK (`keep`): the whole selection refined so at full size, one step;
     ## Cancel: as it was. With `background` OK returns at once: the work runs
     ## on the previews' thread, edits are refused (`refine_keeping`) until
     ## a frame or `continue_refine` finds it done and records the step.
-    pub mutating func end_refine(keep: bool, radius: i64 = 0, smooth: i64 = 0, feather: i64 = 0, contrast: f64 = 0.0, shift: f64 = 0.0,
-                                 background: bool = false) -> !:
+    pub func end_refine(keep: bool, radius: i64 = 0, smooth: i64 = 0, feather: i64 = 0, contrast: f64 = 0.0, shift: f64 = 0.0,
+                        background: bool = false) -> !:
         if keep and self.select_mask != none and not self.refine_keeping():
             try ask_refine(&self, Refinement(radius = radius, smooth = smooth, feather = feather, contrast = contrast, shift = shift))
         try end_refine(&self, keep, background)
 
     ## Keep OK's refinement once it is done (at once with `wait`): the
     ## editor calls it each frame; drawing the selection does too.
-    pub mutating func continue_refine(wait: bool = false) -> !:
+    pub func continue_refine(wait: bool = false) -> !:
         let session = self.select_mask else return
         if not session.keeping:
             return
@@ -107,7 +107,7 @@ extend Canvas:
 
     ## How the view shows the selection while refining: 0 marching ants,
     ## 1 a red overlay, 2 on black, 3 on white.
-    pub mutating func set_refine_view(mode: i64) -> !:
+    pub func set_refine_view(mode: i64) -> !:
         if mode < 0 or mode > 3:
             error(invalid, "the view is 0 ants, 1 overlay, 2 on black or 3 on white")
         let session = self.select_mask else error(invalid, "Select and Mask is not open")
@@ -127,7 +127,7 @@ extend Canvas:
 
     ## Wait for a preview working on its own thread and take it in: for
     ## tests and scripts that look at it before the next frame.
-    pub mutating func wait_previews() -> !:
+    pub func wait_previews() -> !:
         let session = self.select_mask else return
         try collect_refine(session, true)
 
@@ -216,7 +216,7 @@ func prepare_refine_preview(canvas: Canvas*, scope: Scope) -> !:
 ## The thread's work: the refinement, cut short by a cancel.
 func run_refine_task(context: void*?):
     let work = (RefineWork*)(context else return)
-    discard(work.run())
+    _ = work.run()
 
 ## Take in the refinement under way if it has finished: shown when it ran to
 ## the end, let go when it was cancelled. With `wait`, wait for it.
@@ -259,9 +259,9 @@ func lightness_at(canvas: Canvas*, session: SelectMask*, source: const Cells*, r
         session.luma_level = level
     let luma = session.luma else trap("made above")
     let lit = session.lit else trap("made above")
-    let values = try alloc i64[source.count()] in memory.heap
+    let values = try new i64[source.count()] --- in memory.heap
     defer free(values) in memory.heap
-    discard(pending_cells(source, refinement, box, values))
+    _ = pending_cells(source, refinement, box, values)
     var needed = try Cells.create(source.extent_x, source.extent_y)
     defer needed.destroy()
     needed_cells(source, values, refinement.apron(), &needed)
@@ -308,7 +308,7 @@ func end_refine(canvas: Canvas*, keep: bool, background: bool) -> !:
     if let task = session.task:
         task.work.cancel()
         collect_refine(session, true) catch failure:
-            discard(failure)
+            _ = failure
     if not keep or not session.asked or not session.setting.changes():
         drop_refine(canvas)
         return
@@ -336,7 +336,7 @@ func read_keep_lightness(canvas: Canvas*, session: SelectMask*, wait: bool) -> b
         let luma = lightness_at(canvas, session, session.origin.coverage(), session.setting, CellBox(), 0, keep_read_cells, &unread) catch failure:
             drop_refine(canvas)
             error(failure.code, failure.message)
-        discard(luma)
+        _ = luma
         if not wait and time.now() - started > keep_read_ns:
             break
     session.keep_read = lit_count(session)

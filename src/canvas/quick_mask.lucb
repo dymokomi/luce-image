@@ -19,7 +19,7 @@
 extend Canvas:
     ## Select › Quick Mask on: the selection becomes a mask the painting tools
     ## edit (white selects, black masks), one undo step.
-    pub mutating func enter_quick_mask() -> !:
+    pub func enter_quick_mask() -> !:
         try self.require_open()
         try self.require_idle()
         let document = self.document else error(invalid, "draw the document once before using Quick Mask")
@@ -27,10 +27,10 @@ extend Canvas:
             return
         try self.remember_state("Quick Mask")
         let tiles = try quick_tiles_from(&self, &document.selection)
-        discard(try document.begin_quick(tiles))
+        _ = try document.begin_quick(tiles)
 
     ## Quick Mask off: the mask painted becomes the selection, one undo step.
-    pub mutating func exit_quick_mask() -> !:
+    pub func exit_quick_mask() -> !:
         try self.require_open()
         try self.require_idle()
         let document = self.document else return
@@ -73,7 +73,7 @@ func quick_tiles_from(canvas: Canvas*, selection: const Selection*) -> Tiles!:
     for value in 0..<(usize)256:
         halves[value] = to_half((f32)value / 255.0)
     let one = to_half(1.0)
-    let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    let bytes = try new u8[(usize)tile_size * (usize)tile_size * 8] --- in memory.heap
     defer free(bytes) in memory.heap
     var black_column: i64 = -1
     var black_row: u32 = 0

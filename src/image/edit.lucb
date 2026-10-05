@@ -10,11 +10,11 @@
 
 extend Image:
     ## A new image with the same channels, pixels and attributes.
-    pub mutating func copy() -> interop.Reference[Image]!:
+    pub func copy() -> interop.Reference[Image]!:
         return try self.crop(0, 0, try self.width(), try self.height())
 
     ## The pixels from (`left`, `top`) up to but not including (`right`, `bottom`).
-    pub mutating func crop(left: usize, top: usize, right: usize, bottom: usize) -> interop.Reference[Image]!:
+    pub func crop(left: usize, top: usize, right: usize, bottom: usize) -> interop.Reference[Image]!:
         try self.load()
         if left >= right or top >= bottom or right > self.raster.width or bottom > self.raster.height:
             error(invalid, "crop rectangle is empty or outside the image")
@@ -33,7 +33,7 @@ extend Image:
         return try Image.own(raster, self.threads)
 
     ## Channel `name` alone, as a one-channel "Y" image.
-    pub mutating func get_channel(name: str) -> interop.Reference[Image]!:
+    pub func get_channel(name: str) -> interop.Reference[Image]!:
         try self.load()
         let channel = try self.raster.find_channel(name)
         var raster = model.Raster(width = self.raster.width, height = self.raster.height, xmin = self.raster.xmin, ymin = self.raster.ymin, max_bytes = self.raster.max_bytes)
@@ -45,7 +45,7 @@ extend Image:
         return try Image.own(raster, self.threads)
 
     ## The image in another Pillow mode; grey comes from Rec. 601 luma.
-    pub mutating func convert(mode: str) -> interop.Reference[Image]!:
+    pub func convert(mode: str) -> interop.Reference[Image]!:
         try self.load()
         let out = try Image.create(mode, self.raster.width, self.raster.height, max_bytes = self.raster.max_bytes)
         errdefer out.release()
@@ -94,7 +94,7 @@ extend Image:
         return out
 
     ## Nearest is appropriate for discrete IDs. Bilinear must never filter IDs.
-    pub mutating func resize(width: usize, height: usize, resample: str = "nearest") -> interop.Reference[Image]!:
+    pub func resize(width: usize, height: usize, resample: str = "nearest") -> interop.Reference[Image]!:
         try self.load()
         if resample != "nearest" and resample != "bilinear":
             error(invalid, "resample must be nearest or bilinear")

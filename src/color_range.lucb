@@ -186,7 +186,7 @@ test "hue and tone ranges: blues, greys in none, shadows and highlights":
 
 test "a large picture is worked out in bands on every processor, the same as one pixel at a time":
     let count: usize = 600 * 500
-    let pixels = try alloc f32[count * 4] in memory.heap
+    let pixels = try new f32[count * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     for index in 0..<count:
         let red = index % 3 == 0
@@ -194,7 +194,7 @@ test "a large picture is worked out in bands on every processor, the same as one
         pixels[index * 4 + 1] = 0.0
         pixels[index * 4 + 2] = 0.0 if red else 1.0
         pixels[index * 4 + 3] = 1.0
-    let coverage = try alloc u8[count] in memory.heap
+    let coverage = try new u8[count] --- in memory.heap
     defer free(coverage) in memory.heap
     let red: RangeSample[1] = [range_sample(1.0, 0.0, 0.0, false)]
     try range_coverage(pixels, red, range_sampled, 40.0, false, coverage)

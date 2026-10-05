@@ -13,7 +13,7 @@ func frame_pixels(canvas: Canvas*, target: gpu.Texture*, zoom: f64, x: f64, y: f
     let root = try frame.value().target()
     defer root.release()
     try canvas.draw(root, gpu.Rect(width = 256.0, height = 192.0), zoom, x, y)
-    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0))
     try target.read(into)
 
 func same_bytes(a: const u8[], b: const u8[]) -> bool:
@@ -86,7 +86,7 @@ func window_frame(canvas: Canvas*, target: gpu.Texture*, into: u8[]) -> !:
     try canvas.draw(root, gpu.Rect(width = 256.0, height = 192.0), 1.0, -600.0, -500.0)
     try canvas.draw(root, gpu.Rect(x = 192.0, width = 64.0, height = 48.0), 64.0 / 1500.0, 0.0, 0.0)
     try canvas.draw(root, gpu.Rect(x = 0.0, y = 128.0, width = 96.0, height = 64.0), 96.0 / 1500.0, 0.0, 0.0)
-    discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0)))
+    _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0))
     try target.read(into)
 
 test "a frame drawn three times under a budget one draw alone exceeds completes, the same, without growing":
@@ -235,9 +235,9 @@ test "previews that last many frames draw from tiles the memory tiers moved off 
     var target = try gpu.Texture.create(device, 256, 256, gpu.Format.rgba8_linear)
     defer target.destroy()
     let size = (usize)256 * 256 * 4
-    let expected = try alloc u8[size * 8] in memory.heap
+    let expected = try new u8[size * 8] --- in memory.heap
     defer free(expected) in memory.heap
-    let seen = try alloc u8[size * 8] in memory.heap
+    let seen = try new u8[size * 8] --- in memory.heap
     defer free(seen) in memory.heap
     try drawn(&canvas, &target, 0.125, 0.0, 0.0, expected[0..<size])
     try canvas.fill_gradient(layer, 0.0, 0.0, 2048.0, 2048.0, 1.0, 0.2, 0.1, 1.0, 0.1, 0.3, 0.9, 1.0)

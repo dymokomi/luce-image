@@ -43,7 +43,7 @@ pub struct Mesher:
         var pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.replace, gpu.Format.rgba16_float)
         return Mesher(owner = device, shader = shader, pipeline = pipeline)
 
-    pub mutating func destroy():
+    pub func destroy():
         self.pipeline.destroy()
         self.shader.destroy()
 
@@ -62,7 +62,7 @@ pub struct Mesher:
     pub func row_of_cells(mesh: const MeshMap*, tiles: const Tiles*, pyramid: Pyramid*, row: u32, first: u32, last: u32, threads: usize,
                           context: void*, each: func(void*, u32, u32, gpu.Texture?) -> unit!) -> !:
         let count = (usize)(last - first + 1)
-        let fields = try alloc CellField[count] in memory.heap
+        let fields = try new CellField[count] --- in memory.heap
         for index in 0..<count:
             fields[index] = CellField(bytes = none, wide = none, reach = nowhere())
         defer:
@@ -113,7 +113,7 @@ pub struct Mesher:
         defer area.release()
         try gpu.shade(area.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&params[0], 64),
                       [window.texture, field, coverage], gpu.Filter.nearest)
-        discard(try frame.value().present(clear))
+        _ = try frame.value().present(clear)
         return fresh
 
 ## A cell's field made on the CPU, for the GPU: each texel's displacement
@@ -130,7 +130,7 @@ struct CellField:
     var spacing: f64 = 1.0
     var n: i64 = 0
 
-    mutating func destroy():
+    func destroy():
         if let bytes = self.bytes:
             free(bytes) in memory.heap
         if let wide = self.wide:
@@ -156,16 +156,16 @@ func prepare(mesh: const MeshMap*, column: u32, row: u32, level: u32, step: i64)
     made.spacing = scale * (f64)step
     made.n = n
     let count = (usize)(n * n)
-    let bytes = try alloc u8[count * 8] in memory.heap
+    let bytes = try new u8[count * 8] --- in memory.heap
     errdefer free(bytes) in memory.heap
-    let cover = try alloc u8[count] in memory.heap
+    let cover = try new u8[count] --- in memory.heap
     defer free(cover) in memory.heap
     made.reach = mesh.field(made.x0, made.y0, made.spacing, n, scale, bytes, cover)
     if not made.reach.moved:
         free(bytes) in memory.heap
         return made
     # As rgba8, coverage in red: rows of whole words, whatever the width.
-    let wide = try alloc u8[count * 4] in memory.heap
+    let wide = try new u8[count * 4] --- in memory.heap
     for index in 0..<count:
         wide[index * 4] = cover[index]
         wide[index * 4 + 1] = 0

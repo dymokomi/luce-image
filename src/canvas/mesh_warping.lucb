@@ -18,12 +18,12 @@ extend Canvas:
     ## Edit › Transform › Warp on layer `id`: a Bézier patch over its painted
     ## box, as found (`warp_point_*`, `set_warp_point`, `set_warp_preset`),
     ## shown live until `end_mesh_warp`.
-    pub mutating func begin_warp(id: i64) -> !:
+    pub func begin_warp(id: i64) -> !:
         try begin_mesh_warp(&self, (u64)id, false, 0)
 
     ## Edit › Puppet Warp on layer `id`: a mesh over its painted box at
     ## `density` (0 fewer, 1 normal, 2 more) with no pins yet.
-    pub mutating func begin_puppet(id: i64, density: i64 = 1) -> !:
+    pub func begin_puppet(id: i64, density: i64 = 1) -> !:
         try begin_mesh_warp(&self, (u64)id, true, density)
 
     ## Whether a warp or puppet warp is under way.
@@ -31,27 +31,27 @@ extend Canvas:
         return self.mesh_warp != none
 
     ## The box the warp's mesh covers: the layer's painted box.
-    pub mutating func mesh_box_left() -> f64!:
+    pub func mesh_box_left() -> f64!:
         return (try mesh_session(&self)).box.left
 
-    pub mutating func mesh_box_top() -> f64!:
+    pub func mesh_box_top() -> f64!:
         return (try mesh_session(&self)).box.top
 
-    pub mutating func mesh_box_right() -> f64!:
+    pub func mesh_box_right() -> f64!:
         return (try mesh_session(&self)).box.right
 
-    pub mutating func mesh_box_bottom() -> f64!:
+    pub func mesh_box_bottom() -> f64!:
         return (try mesh_session(&self)).box.bottom
 
     ## Warp's control point `index` (0..15, row by row across the 4 by 4 grid).
-    pub mutating func warp_point_x(index: i64) -> f64!:
+    pub func warp_point_x(index: i64) -> f64!:
         return (try mesh_session(&self)).points[(usize)(try warp_index(index)) * 2]
 
-    pub mutating func warp_point_y(index: i64) -> f64!:
+    pub func warp_point_y(index: i64) -> f64!:
         return (try mesh_session(&self)).points[(usize)(try warp_index(index)) * 2 + 1]
 
     ## Move Warp's control point `index` to (`x`, `y`); the next frame shows it.
-    pub mutating func set_warp_point(index: i64, x: f64, y: f64) -> !:
+    pub func set_warp_point(index: i64, x: f64, y: f64) -> !:
         let shown = try mesh_session(&self)
         let at = (usize)(try warp_index(index))
         if not math.is_finite(x) or not math.is_finite(y):
@@ -62,7 +62,7 @@ extend Canvas:
 
     ## Warp's header preset `kind` (warp_patch.lucb's `warp_*`) at `bend` (-1..1):
     ## the points as the preset puts them; -1 puts them back as found.
-    pub mutating func set_warp_preset(kind: i64, bend: f64) -> !:
+    pub func set_warp_preset(kind: i64, bend: f64) -> !:
         let shown = try mesh_session(&self)
         if kind < 0:
             try identity_patch(shown.box, shown.points[0..])
@@ -71,52 +71,52 @@ extend Canvas:
         shown.changed = true
 
     ## Put a puppet pin at (`x`, `y`); its index.
-    pub mutating func puppet_add_pin(x: f64, y: f64) -> i64!:
+    pub func puppet_add_pin(x: f64, y: f64) -> i64!:
         let puppet = try puppet_session(&self)
         let index = try puppet.add_pin(x, y)
         (try mesh_session(&self)).changed = true
         return (i64)index
 
     ## Drag puppet pin `index` to (`x`, `y`); the next frame shows it.
-    pub mutating func puppet_move_pin(index: i64, x: f64, y: f64) -> !:
+    pub func puppet_move_pin(index: i64, x: f64, y: f64) -> !:
         let puppet = try puppet_session(&self)
         try puppet.move_pin((usize)math.imax(0, index), x, y)
         (try mesh_session(&self)).changed = true
 
     ## Take puppet pin `index` away.
-    pub mutating func puppet_remove_pin(index: i64) -> !:
+    pub func puppet_remove_pin(index: i64) -> !:
         let puppet = try puppet_session(&self)
         try puppet.remove_pin((usize)math.imax(0, index))
         (try mesh_session(&self)).changed = true
 
-    pub mutating func puppet_pin_count() -> i64!:
+    pub func puppet_pin_count() -> i64!:
         return (i64)(try puppet_session(&self)).pin_count
 
-    pub mutating func puppet_pin_x(index: i64) -> f64!:
+    pub func puppet_pin_x(index: i64) -> f64!:
         return (try puppet_session(&self)).pin_x((usize)math.imax(0, index))
 
-    pub mutating func puppet_pin_y(index: i64) -> f64!:
+    pub func puppet_pin_y(index: i64) -> f64!:
         return (try puppet_session(&self)).pin_y((usize)math.imax(0, index))
 
     ## The pin within `reach` pixels of (`x`, `y`); -1 for none.
-    pub mutating func puppet_hit(x: f64, y: f64, reach: f64) -> i64!:
+    pub func puppet_hit(x: f64, y: f64, reach: f64) -> i64!:
         return (try puppet_session(&self)).hit(x, y, reach)
 
     ## Where the pins take the layer's point (`x`, `y`): for drawing the mesh as it bends.
-    pub mutating func puppet_place_x(x: f64, y: f64) -> f64!:
+    pub func puppet_place_x(x: f64, y: f64) -> f64!:
         var px = 0.0
         var py = 0.0
         (try puppet_session(&self)).deform(x, y, &px, &py)
         return px
 
-    pub mutating func puppet_place_y(x: f64, y: f64) -> f64!:
+    pub func puppet_place_y(x: f64, y: f64) -> f64!:
         var px = 0.0
         var py = 0.0
         (try puppet_session(&self)).deform(x, y, &px, &py)
         return py
 
     ## Keep the warp as one undo step (`keep`), or leave the layer as it was.
-    pub mutating func end_mesh_warp(keep: bool) -> !:
+    pub func end_mesh_warp(keep: bool) -> !:
         let shown = try mesh_session(&self)
         self.mesh_warp = none
         defer drop_mesh_warping(shown)

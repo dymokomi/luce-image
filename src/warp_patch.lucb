@@ -108,7 +108,7 @@ pub func patch_mesh(box: Footprint, points: const f64[]) -> MeshMap!:
     for index in 0..<patch_points:
         reach = math.max(reach, math.max(math.abs(points[index * 2] - points[0]), math.abs(points[index * 2 + 1] - points[1])))
     let side = lattice_for(math.max(reach, math.max(box.right - box.left, box.bottom - box.top)))
-    let landing = try alloc f64[(side + 1) * (side + 1) * 2] in memory.heap
+    let landing = try new f64[(side + 1) * (side + 1) * 2] --- in memory.heap
     defer free(landing) in memory.heap
     for j in 0..<side + 1:
         for i in 0..<side + 1:

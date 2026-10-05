@@ -155,7 +155,7 @@ pub struct Image:
             error(invalid, "invalid threads or encoded byte limit")
         var raster = model.Raster(max_bytes = max_bytes, max_pixels = max_pixels, frame = frame)
         errdefer raster.close()
-        raster.encoded = try alloc u8[data.length] in memory.heap
+        raster.encoded = try new u8[data.length] --- in memory.heap
         memory.copy(raster.encoded, data, data.length)
         try probe(&raster)
         return try Image.own(raster, threads)
@@ -279,7 +279,7 @@ pub struct Image:
         return self.active_workers
 
     ## Decode the pixels now, in parallel for TIFF, EXR, HEIC and camera raws.
-    pub mutating func load() -> !:
+    pub func load() -> !:
         try self.ensure_open()
         if self.is_loaded():
             return
@@ -306,7 +306,7 @@ pub struct Image:
 
     ## A picture opened from its file's start alone gets the file whole, for a
     ## decode that works from it all. The file must not have changed.
-    mutating func read_whole_file() -> !:
+    func read_whole_file() -> !:
         if not self.head_only:
             return
         let whole = try read_whole((c_api.str)self.raster.path, self.raster.max_bytes)
@@ -329,7 +329,7 @@ pub struct Image:
         self.raster.encoded = whole
         self.head_only = false
 
-    mutating func discard_pixels():
+    func discard_pixels():
         if self.raster.pixels.length > 0:
             free(self.raster.pixels) in memory.heap
         var empty: f64[]
@@ -337,7 +337,7 @@ pub struct Image:
         self.active_workers = 0
 
     ## Select frame `frame` of the file, as Pillow's seek; the pixels decode again on use.
-    pub mutating func seek(frame: usize) -> !:
+    pub func seek(frame: usize) -> !:
         try self.ensure_open()
         if frame == self.raster.frame:
             return
@@ -359,20 +359,20 @@ pub struct Image:
         return (y * self.raster.width + x) * self.raster.channels.length + channel
 
     ## One raw sample of one channel, in the channel's own range.
-    pub mutating func get_sample(x: usize, y: usize, channel: usize = 0) -> f64!:
+    pub func get_sample(x: usize, y: usize, channel: usize = 0) -> f64!:
         try self.load()
         return self.raster.pixels[try self.offset(x, y, channel)]
 
     ## Set one raw sample of one channel.
-    pub mutating func put_sample(x: usize, y: usize, channel: usize, value: f64) -> !:
+    pub func put_sample(x: usize, y: usize, channel: usize, value: f64) -> !:
         try self.load()
         self.raster.pixels[try self.offset(x, y, channel)] = value
 
     ## The color at a pixel from its Y or R, G, B and A channels, in the samples'
     ## own range; alpha is the maximum when there is no A channel.
-    pub mutating func getpixel(x: usize, y: usize) -> Pixel!:
+    pub func getpixel(x: usize, y: usize) -> Pixel!:
         try self.load()
-        discard(try self.offset(x, y, 0))
+        _ = try self.offset(x, y, 0)
         var r: f64 = 0.0
         var g: f64 = 0.0
         var b: f64 = 0.0
@@ -395,9 +395,9 @@ pub struct Image:
         return Pixel(r, g, b, a)
 
     ## Set a pixel's color channels; named non-color channels take `put_sample`.
-    pub mutating func putpixel(x: usize, y: usize, pixel: Pixel) -> !:
+    pub func putpixel(x: usize, y: usize, pixel: Pixel) -> !:
         try self.load()
-        discard(try self.offset(x, y, 0))
+        _ = try self.offset(x, y, 0)
         for c in 0..<self.raster.channels.length:
             let name = self.raster.channels[c].name
             if name != "Y" and name != "R" and name != "G" and name != "B" and name != "A":
@@ -443,7 +443,7 @@ pub struct Image:
         return b""
 
     ## Move the data window's top-left, as EXR stores it.
-    pub mutating func set_origin(x: i64, y: i64) -> !:
+    pub func set_origin(x: i64, y: i64) -> !:
         try self.ensure_open()
         if x < -2147483648 or y < -2147483648 or x > 2147483647 - (i64)self.raster.width + 1 or y > 2147483647 - (i64)self.raster.height + 1:
             error(invalid, "image data window exceeds int32")
@@ -455,7 +455,7 @@ pub struct Image:
         try self.ensure_open()
         return self.raster.path
 
-    pub mutating func set_metadata(name: str, value: str) -> !:
+    pub func set_metadata(name: str, value: str) -> !:
         try self.ensure_open()
         if strings.contains(name, "\0"):
             error(invalid, "metadata name contains NUL")
@@ -464,7 +464,7 @@ pub struct Image:
     ## Encode and write atomically to `path`: the format from `file_format` or the
     ## extension; `compression` and `tile` for TIFF and EXR, `quality` (1..100) for
     ## JPEG, `bigtiff` for TIFF.
-    pub mutating func save(path: str, file_format: str = "", compression: str = "zip", quality: i64 = 90, tile: usize = 0, bigtiff: bool = false) -> !:
+    pub func save(path: str, file_format: str = "", compression: str = "zip", quality: i64 = 90, tile: usize = 0, bigtiff: bool = false) -> !:
         try check_path(path)
         # Managed Luce text is a byte view, not necessarily NUL-terminated.
         let destination = try strings.copy(path)
@@ -479,7 +479,7 @@ pub struct Image:
 
     ## The image encoded as `file_format` ("png", "jpg"/"jpeg", "tif"/"tiff" or
     ## "exr"), with the options `save` takes: heap bytes the caller frees.
-    pub mutating func encode(file_format: str, compression: str = "zip", quality: i64 = 90, tile: usize = 0, bigtiff: bool = false) -> u8[]!:
+    pub func encode(file_format: str, compression: str = "zip", quality: i64 = 90, tile: usize = 0, bigtiff: bool = false) -> u8[]!:
         try self.load()
         let lower = try strings.to_lower(file_format)
         defer strings.release(lower)
@@ -502,11 +502,11 @@ pub struct Image:
         else:
             error(unsupported, "unsupported output image format")
         let view = encoded.view()
-        let bytes = try alloc u8[view.length] in memory.heap
+        let bytes = try new u8[view.length] --- in memory.heap
         memory.copy(bytes, view, view.length)
         return bytes
 
-    pub mutating func close():
+    pub func close():
         if self.closed:
             return
         self.raster.close()
@@ -524,10 +524,10 @@ func read_whole(path: c_api.str, most: usize) -> u8[]!:
     var file = try files.File.open(path)
     defer file.destroy()
     let size = try file.seek(0, files.SeekOrigin.end)
-    discard(try file.seek(0))
+    _ = try file.seek(0)
     if size < 0 or (u64)size > (u64)most:
         error(limit, "the file exceeds the read limit")
-    let data = try alloc u8[(usize)size] in memory.heap
+    let data = try new u8[(usize)size] --- in memory.heap
     errdefer free(data) in memory.heap
     var used: usize = 0
     while used < data.length:

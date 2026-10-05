@@ -69,12 +69,12 @@ pub struct Grid:
         let points_y = (i64)math.ceil((f64)height / step) + 2
         let blocks_x = (points_x + block_side - 1) // block_side
         let blocks_y = (points_y + block_side - 1) // block_side
-        let blocks = try alloc Block*?[(usize)(blocks_x * blocks_y)] in memory.heap
+        let blocks = try new Block*?[(usize)(blocks_x * blocks_y)] --- in memory.heap
         for index in 0..<blocks.length:
             blocks[index] = none
         return Grid(step = step, points_x = points_x, points_y = points_y, blocks_x = blocks_x, blocks_y = blocks_y, blocks = blocks, moved = Moved())
 
-    pub mutating func destroy():
+    pub func destroy():
         for index in 0..<self.blocks.length:
             if let block = self.blocks[index]:
                 free(block.values) in memory.heap
@@ -90,12 +90,12 @@ pub struct Grid:
         return Shift(x = (f64)block.values[at], y = (f64)block.values[at + 1])
 
     ## Set point (`gx`, `gy`), making its block the first time.
-    mutating func set(gx: i64, gy: i64, shift: Shift) -> !:
+    func set(gx: i64, gy: i64, shift: Shift) -> !:
         if gx < 0 or gy < 0 or gx >= self.points_x or gy >= self.points_y:
             return
         let index = (usize)((gy // block_side) * self.blocks_x + gx // block_side)
         if self.blocks[index] == none:
-            let values = try alloc f32[(usize)(block_side * block_side * 2)] in memory.heap
+            let values = try new f32[(usize)(block_side * block_side * 2)] --- in memory.heap
             errdefer free(values) in memory.heap
             for at in 0..<values.length:
                 values[at] = 0.0
@@ -127,7 +127,7 @@ pub struct Grid:
     ## rim) at (`x`, `y`), each pixel takes what lay `move` behind it by the
     ## tip's weight there. On the field: D'(g) = D(g - m w(g)) - m w(g), read
     ## from the field as it was before the dab.
-    pub mutating func push(x: f64, y: f64, move_x: f64, move_y: f64, radius: f64, hardness: f64) -> !:
+    pub func push(x: f64, y: f64, move_x: f64, move_y: f64, radius: f64, hardness: f64) -> !:
         let first_x = math.imax(0, (i64)math.ceil((x - radius) / self.step))
         let first_y = math.imax(0, (i64)math.ceil((y - radius) / self.step))
         let last_x = math.imin(self.points_x - 1, (i64)math.floor((x + radius) / self.step))
@@ -137,9 +137,9 @@ pub struct Grid:
         let across = last_x - first_x + 1
         let count = (usize)(across * (last_y - first_y + 1))
         # The new values first, all read from the field before the dab.
-        let fresh = try alloc f32[count * 2] in memory.heap
+        let fresh = try new f32[count * 2] --- in memory.heap
         defer free(fresh) in memory.heap
-        let weights = try alloc f32[count] in memory.heap
+        let weights = try new f32[count] --- in memory.heap
         defer free(weights) in memory.heap
         for gy in first_y..<last_y + 1:
             for gx in first_x..<last_x + 1:
@@ -248,7 +248,7 @@ test "a field's split halves sum back to the displacement":
     var grid = try Grid.create(2000, 2000, 16.0)
     defer grid.destroy()
     try grid.push(1000.0, 1000.0, 700.25, -300.5, 500.0, 0.9)
-    let bytes = try alloc u8[3 * 3 * 8] in memory.heap
+    let bytes = try new u8[3 * 3 * 8] --- in memory.heap
     defer free(bytes) in memory.heap
     let reach = grid.field(992.0, 992.0, 16.0, 3, bytes)
     assert(reach.moved and reach.left < 300.0)

@@ -14,7 +14,7 @@ test "selected pixels move or copy with their selection, and edits keep inside i
     let layer = try canvas.add_layer("Paint")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     # A red square at 8..24.
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
     try canvas.select_rectangle(8, 8, 16, 16, 0)
@@ -61,7 +61,7 @@ test "layer via copy holds the selected pixels, and via cut takes them":
     let layer = try canvas.add_layer("Paint")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
     try canvas.select_rectangle(8, 8, 32, 16, 0)
     try canvas.fill(layer, false)

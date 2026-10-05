@@ -52,19 +52,19 @@ struct PackageWriter:
         let slot = (usize)tile_size * tile_row_bytes
         var writer = PackageWriter(file = file, offset = 0, blob_count = 0, cell_count = 0, stamp_count = 0, staged = 0, home_count = 0)
         writer.failed.store(false, .release)
-        writer.blobs = try alloc PackageBlob[256] in memory.heap
-        writer.cells = try alloc PackageCell[256] in memory.heap
-        writer.stamp_keys = try alloc u64[1024] in memory.heap
-        writer.stamp_blobs = try alloc u32[1024] in memory.heap
+        writer.blobs = try new PackageBlob[256] --- in memory.heap
+        writer.cells = try new PackageCell[256] --- in memory.heap
+        writer.stamp_keys = try new u64[1024] --- in memory.heap
+        writer.stamp_blobs = try new u32[1024] --- in memory.heap
         for index in 0..<writer.stamp_keys.length:
             writer.stamp_keys[index] = 0
-        writer.texels = try alloc u8[package_batch * slot] in memory.heap
-        writer.filtered = try alloc u8[package_batch * slot] in memory.heap
-        writer.packed = try alloc u8[package_batch * flate.deflate_bound(slot)] in memory.heap
-        writer.packed_length = try alloc usize[package_batch] in memory.heap
-        writer.slot_blob = try alloc u32[package_batch] in memory.heap
-        writer.slot_rows = try alloc usize[package_batch] in memory.heap
-        writer.homes = try alloc Home[256] in memory.heap
+        writer.texels = try new u8[package_batch * slot] --- in memory.heap
+        writer.filtered = try new u8[package_batch * slot] --- in memory.heap
+        writer.packed = try new u8[package_batch * flate.deflate_bound(slot)] --- in memory.heap
+        writer.packed_length = try new usize[package_batch] --- in memory.heap
+        writer.slot_blob = try new u32[package_batch] --- in memory.heap
+        writer.slot_rows = try new usize[package_batch] --- in memory.heap
+        writer.homes = try new Home[256] --- in memory.heap
         var header: u8[16]
         memory.copy(u8[](&header[0], 8), package_magic.bytes, 8)
         put_u32(u8[](&header[0], 16), 8, package_version)
@@ -72,14 +72,14 @@ struct PackageWriter:
         try writer.write(u8[](&header[0], 16))
         return writer
 
-    mutating func write(bytes: const u8[]) -> !:
+    func write(bytes: const u8[]) -> !:
         try write_all(&self.file, bytes)
         self.offset += (u64)bytes.length
 
     ## A new blob of `rows` texel rows, its place filled in when it is written.
-    mutating func new_blob(rows: usize) -> u32!:
+    func new_blob(rows: usize) -> u32!:
         if self.blob_count == self.blobs.length:
-            let grown = try alloc PackageBlob[self.blobs.length * 2] in memory.heap
+            let grown = try new PackageBlob[self.blobs.length * 2] --- in memory.heap
             memory.copy(grown, self.blobs, self.blob_count)
             free(self.blobs) in memory.heap
             self.blobs = grown
@@ -87,9 +87,9 @@ struct PackageWriter:
         self.blob_count += 1
         return (u32)(self.blob_count - 1)
 
-    mutating func add_cell(layer: u32, plane: u32, column: i64, row: i64, blob: u32) -> !:
+    func add_cell(layer: u32, plane: u32, column: i64, row: i64, blob: u32) -> !:
         if self.cell_count == self.cells.length:
-            let grown = try alloc PackageCell[self.cells.length * 2] in memory.heap
+            let grown = try new PackageCell[self.cells.length * 2] --- in memory.heap
             memory.copy(grown, self.cells, self.cell_count)
             free(self.cells) in memory.heap
             self.cells = grown
@@ -97,9 +97,9 @@ struct PackageWriter:
         self.cell_count += 1
 
     ## Remember that `blob` holds the tile at cell (`column`, `row`) of `tiles`.
-    mutating func home(tiles: const Tiles*, column: u32, row: u32, blob: u32) -> !:
+    func home(tiles: const Tiles*, column: u32, row: u32, blob: u32) -> !:
         if self.home_count == self.homes.length:
-            let grown = try alloc Home[self.homes.length * 2] in memory.heap
+            let grown = try new Home[self.homes.length * 2] --- in memory.heap
             memory.copy(grown, self.homes, self.home_count)
             free(self.homes) in memory.heap
             self.homes = grown
@@ -117,14 +117,14 @@ struct PackageWriter:
             at = (at + 1) % self.stamp_keys.length
         return none
 
-    mutating func remember(stamp: u64, blob: u32) -> !:
+    func remember(stamp: u64, blob: u32) -> !:
         if stamp == 0:
             return
         if (self.stamp_count + 1) * 2 > self.stamp_keys.length:
             let keys = self.stamp_keys
             let blobs = self.stamp_blobs
-            self.stamp_keys = try alloc u64[keys.length * 2] in memory.heap
-            self.stamp_blobs = try alloc u32[keys.length * 2] in memory.heap
+            self.stamp_keys = try new u64[keys.length * 2] --- in memory.heap
+            self.stamp_blobs = try new u32[keys.length * 2] --- in memory.heap
             for index in 0..<self.stamp_keys.length:
                 self.stamp_keys[index] = 0
             self.stamp_count = 0
@@ -141,7 +141,7 @@ struct PackageWriter:
         self.stamp_count += 1
 
     ## Stage `rows` texel rows of a tile for `blob`; a full batch goes out.
-    mutating func stage(texels: const u8[], rows: usize, blob: u32) -> !:
+    func stage(texels: const u8[], rows: usize, blob: u32) -> !:
         let slot = (usize)tile_size * tile_row_bytes
         let bytes = rows * tile_row_bytes
         memory.copy(self.texels[self.staged * slot..], texels, bytes)
@@ -152,7 +152,7 @@ struct PackageWriter:
             try self.flush()
 
     ## Compress the staged tiles across the processors, then write them in order.
-    mutating func flush() -> !:
+    func flush() -> !:
         if self.staged == 0:
             return
         try spread(self.staged, (void*)&self, compress_slot)
@@ -166,7 +166,7 @@ struct PackageWriter:
             try self.write(self.packed[slot * bound..<slot * bound + self.packed_length[slot]])
         self.staged = 0
 
-    mutating func destroy():
+    func destroy():
         self.file.destroy()
         if self.texels.length > 0:
             free(self.texels) in memory.heap
@@ -195,7 +195,7 @@ func compress_slot(context: void*?, slot: usize):
     filter_tile(writer.texels[slot * size..<slot * size + bytes], writer.slot_rows[slot], filtered)
     let bound = flate.deflate_bound(size)
     let used = flate.deflate_raw(filtered, tile_deflate_level, writer.packed[slot * bound..<(slot + 1) * bound], true) catch failure:
-        discard(failure)
+        _ = failure
         writer.failed.store(true, .release)
         return
     writer.packed_length[slot] = used
@@ -216,7 +216,7 @@ func save_canvas_package(canvas: Canvas*, path: str) -> !:
     defer strings.release(native)
     write_package(canvas, document, manifest, temporary, native) catch failure:
         files.remove_file((c_api.str)temporary) catch removal:
-            discard(removal)
+            _ = removal
         error(failure.code, failure.message)
     # An older document folder of this name gives way; then the new file takes its place.
     try clear_old_package(native)
@@ -271,9 +271,9 @@ func write_package(canvas: Canvas*, document: Document*, manifest: interop.Refer
 ## painted cells, a shared tile once, then any cells past the canvas.
 func write_tiles(canvas: Canvas*, writer: PackageWriter*, layer: u32, tiles: const Tiles*, base: u32) -> !:
     let cap = (usize)tiles.columns() * (usize)tiles.rows()
-    let wanted = try alloc Cell[cap if cap > 0 else 1] in memory.heap
+    let wanted = try new Cell[cap if cap > 0 else 1] --- in memory.heap
     defer free(wanted) in memory.heap
-    let blobs = try alloc u32[cap if cap > 0 else 1] in memory.heap
+    let blobs = try new u32[cap if cap > 0 else 1] --- in memory.heap
     defer free(blobs) in memory.heap
     var count: usize = 0
     for row in 0..<tiles.rows():
@@ -346,7 +346,7 @@ func sink_cell(context: void*?, cell: Cell, bytes: const u8[]) -> !:
 ## The cells past the canvas (`plane`), read one by one: few layers have any.
 func write_beyond(writer: PackageWriter*, layer: u32, tiles: const Tiles*, plane: u32) -> !:
     let range = tiles.outside_range() else return
-    let bytes = try alloc u8[(usize)tile_size * tile_row_bytes] in memory.heap
+    let bytes = try new u8[(usize)tile_size * tile_row_bytes] --- in memory.heap
     defer free(bytes) in memory.heap
     for row in range.top..<range.bottom:
         for column in range.left..<range.right:
@@ -359,7 +359,7 @@ func write_beyond(writer: PackageWriter*, layer: u32, tiles: const Tiles*, plane
 ## The blob and cell tables as the index's bytes (heap, the caller frees).
 func package_index(writer: const PackageWriter*) -> u8[]!:
     let size = 4 + writer.blob_count * package_blob_bytes + 4 + writer.cell_count * package_cell_bytes
-    let index = try alloc u8[size] in memory.heap
+    let index = try new u8[size] --- in memory.heap
     put_u32(index, 0, (u32)writer.blob_count)
     var at: usize = 4
     for blob in writer.blobs[..<writer.blob_count]:
@@ -385,14 +385,14 @@ func package_index(writer: const PackageWriter*) -> u8[]!:
 ## there is left alone.
 func clear_old_package(path: str) -> !:
     let found = files.metadata((c_api.str)path) catch failure:
-        discard(failure)
+        _ = failure
         return
     if found.kind != files.FileKind.directory:
         return
     let manifest = try paths.join(path, "document.prisma")
     defer manifest.release()
-    discard(files.metadata((c_api.str)manifest.value) catch failure:
-        error(invalid, "a folder that is not a document is in the way of the saved file"))
+    _ = files.metadata((c_api.str)manifest.value) catch failure:
+        error(invalid, "a folder that is not a document is in the way of the saved file")
     try files.remove_tree((c_api.str)path)
 
 ## A small flattened PNG of the document into `out`: the composite at the
@@ -406,10 +406,10 @@ func package_preview(canvas: Canvas*, out: Buffer*) -> !:
     let width = level_size(canvas.extent_x, level)
     let height = level_size(canvas.extent_y, level)
     let texture = try composer.tile(document, 0, 0, level)
-    let halves = try alloc u8[(usize)width * (usize)height * 8] in memory.heap
+    let halves = try new u8[(usize)width * (usize)height * 8] --- in memory.heap
     defer free(halves) in memory.heap
     try texture.read(halves, gpu.Region(0, 0, width, height))
-    let pixels = try alloc u8[(usize)width * (usize)height * 4] in memory.heap
+    let pixels = try new u8[(usize)width * (usize)height * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     for at in 0..<(usize)width * (usize)height:
         let alpha = math.clamp((f64)from_half(get_u16(halves, at * 8 + 6)), 0.0, 1.0)

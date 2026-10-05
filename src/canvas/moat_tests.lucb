@@ -23,14 +23,14 @@ test "a mask filled from the selection matches it pixel for pixel; a black mask 
     let layer = try canvas.add_layer("Paint")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     # Wholly selected cells, cells the selection misses, and edges across cells.
     try canvas.select_rectangle(10, 20, 600, 500)
     try canvas.select_ellipse(500, 300, 380, 360, 1)
     try canvas.set_mask(layer, true, 2)
     let document = canvas.document else trap("bound")
     let mask = (document.find((u64)layer) else trap("layer")).mask_tiles() else trap("masked")
-    let samples = try alloc f32[(usize)tile_size * (usize)tile_size * 4] in memory.heap
+    let samples = try new f32[(usize)tile_size * (usize)tile_size * 4] --- in memory.heap
     defer free(samples) in memory.heap
     let selection = canvas.current()
     var y: i64 = 0
@@ -62,18 +62,18 @@ test "copy reads only the selection's box, from the layer or merged, across cell
     let paint = try canvas.add_layer("Paint")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, false)
     try canvas.fill(background, false)
     try canvas.select_rectangle(200, 150, 300, 250)
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, false)
     try canvas.fill(paint, false)
     try canvas.deselect()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     # A box across the square's corner and three cell edges.
     let width: usize = 180
     let height: usize = 140
-    let rgba = try alloc u8[width * height * 4] in memory.heap
+    let rgba = try new u8[width * height * 4] --- in memory.heap
     defer free(rgba) in memory.heap
     let document = canvas.document else trap("bound")
     let tiles = (document.find((u64)paint) else trap("layer")).tiles() else trap("pixels")
@@ -97,14 +97,14 @@ test "trim finds the box across cells from composited bands, on transparency and
     let paint = try canvas.add_layer("Paint")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.2, 0.4, 0.6, false)
     try canvas.select_rectangle(123, 240, 555, 301)
     try canvas.fill(paint, false)
     try canvas.select_rectangle(700, 600, 9, 7)
     try canvas.fill(paint, false)
     try canvas.deselect()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     assert(try canvas.measure_trim(0))
     assert(canvas.content_left() == 123 and canvas.content_top() == 240 and canvas.content_width() == 709 - 123 and canvas.content_height() == 607 - 240)
     # The top-left corner is clear too: the same box.
@@ -121,12 +121,12 @@ test "the histogram counts a layer's cells and the picture's bands, transparency
     let paint = try canvas.add_layer("Paint")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     try canvas.set_brush(10.0, 1.0, 1.0, 1.0, 0.2, 0.4, 0.6, false)
     try canvas.select_rectangle(200, 150, 300, 250)
     try canvas.fill(paint, false)
     try canvas.deselect()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     try canvas.measure_histogram(paint)
     let red = (i64)transfer.srgb_byte(0.2)
     let blue = (i64)transfer.srgb_byte(0.6)
@@ -147,15 +147,15 @@ test "a large document refuses TIFF clearly instead of flattening; a small one s
     defer device.destroy()
     var small = try Canvas(300, 200)
     defer small.close()
-    discard(try small.add_layer("Paint"))
+    _ = try small.add_layer("Paint")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&small, &target, 0, 0))
+    _ = try shown_at(&small, &target, 0, 0)
     try small.save("build/moat-small.tif")
     var large = try Canvas(9000, 8000)
     defer large.close()
-    discard(try large.add_layer("Paint"))
-    discard(try shown_at(&large, &target, 0, 0))
+    _ = try large.add_layer("Paint")
+    _ = try shown_at(&large, &target, 0, 0)
     var refused = false
     large.save("build/moat-large.tif") catch failure:
         refused = failure.code == limit
@@ -171,10 +171,10 @@ test "a placed picture goes in a band at a time and lands exactly where it was p
     let layer = try canvas.add_layer("Placed")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     let width: usize = 700
     let height: usize = 530
-    let pixels = try alloc f32[width * height * 4] in memory.heap
+    let pixels = try new f32[width * height * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     for at in 0..<width * height:
         pixels[at * 4] = (f32)(at % width) / (f32)width
@@ -187,10 +187,10 @@ test "a placed picture goes in a band at a time and lands exactly where it was p
     try place_image_at(&canvas, layer, picture, 400, 300)
     let document = canvas.document else trap("bound")
     let tiles = (document.find((u64)layer) else trap("layer")).tiles() else trap("pixels")
-    let samples = try alloc f32[(usize)tile_size * (usize)tile_size * 4] in memory.heap
+    let samples = try new f32[(usize)tile_size * (usize)tile_size * 4] --- in memory.heap
     defer free(samples) in memory.heap
     # The picture went through 8-bit sRGB: compare what it holds now.
-    let expected = try alloc f32[width * height * 4] in memory.heap
+    let expected = try new f32[width * height * 4] --- in memory.heap
     defer free(expected) in memory.heap
     try picture.value().linear_rgba(expected)
     for (x, y) in [(50, 35), (299, 290), (749, 564), (400, 300), (260, 260)]:
@@ -216,9 +216,9 @@ test "a gradient previewed at the view's level matches the kept one, zoomed out 
     var target = try gpu.Texture.create(device, 512, 384, gpu.Format.rgba8_linear)
     defer target.destroy()
     let size = (usize)512 * 384 * 4
-    let shown = try alloc u8[size] in memory.heap
+    let shown = try new u8[size] --- in memory.heap
     defer free(shown) in memory.heap
-    let kept = try alloc u8[size] in memory.heap
+    let kept = try new u8[size] --- in memory.heap
     defer free(kept) in memory.heap
     for pass in 0..<(usize)2:
         # The second time within a selection, as a fill keeps to it.
@@ -253,14 +253,14 @@ test "a gradient's one-color cells share a tile at each end; the ramp between is
     let layer = try canvas.add_layer("Gradient")
     var target = try gpu.Texture.create(device, 64, 64, gpu.Format.rgba8_linear)
     defer target.destroy()
-    discard(try shown_at(&canvas, &target, 0, 0))
+    _ = try shown_at(&canvas, &target, 0, 0)
     # A short ramp from x 600 to 800: red before, blue after.
     try canvas.fill_gradient(layer, 600.0, 0.0, 800.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0)
     let document = canvas.document else trap("bound")
     let tiles = (document.find((u64)layer) else trap("layer")).tiles() else trap("pixels")
     assert(tiles.stamp(0, 0) == tiles.stamp(1, 3) and tiles.stamp(0, 0) != tiles.stamp(2, 0))
     assert(tiles.stamp(4, 0) == tiles.stamp(5, 2) and tiles.stamp(4, 0) != tiles.stamp(0, 0))
-    let samples = try alloc f32[(usize)tile_size * (usize)tile_size * 4] in memory.heap
+    let samples = try new f32[(usize)tile_size * (usize)tile_size * 4] --- in memory.heap
     defer free(samples) in memory.heap
     try tiles.read_cell(1, 3, samples)
     assert(samples[0] == 1.0 and samples[2] == 0.0 and samples[3] == 1.0)
@@ -294,14 +294,14 @@ func keep_streamed(context: void*?, first: usize, count: usize, pixels: f32[]) -
 func streams_as_whole(path: str, width: usize, height: usize) -> !:
     let streamed = try Image.open(path)
     defer streamed.release()
-    var rows = StreamedRows(pixels = try alloc f32[width * height * 4] in memory.heap, next = 0, width = width, calls = 0)
+    var rows = StreamedRows(pixels = try new f32[width * height * 4] --- in memory.heap, next = 0, width = width, calls = 0)
     defer free(rows.pixels) in memory.heap
     try streamed.value().linear_rgba_bands(256, keep_streamed, (void*)&rows)
     assert(rows.next == height and rows.calls == (height + 255) // 256)
     assert(not streamed.value().is_loaded())
     let whole = try Image.open(path)
     defer whole.release()
-    let expected = try alloc f32[width * height * 4] in memory.heap
+    let expected = try new f32[width * height * 4] --- in memory.heap
     defer free(expected) in memory.heap
     try whole.value().linear_rgba(expected)
     for index in 0..<expected.length:
@@ -310,7 +310,7 @@ func streams_as_whole(path: str, width: usize, height: usize) -> !:
 test "PNG, JPEG and TIFF pictures stream a band at a time exactly as they decode whole":
     let width: usize = 700
     let height: usize = 600
-    let bytes = try alloc u8[width * height * 4] in memory.heap
+    let bytes = try new u8[width * height * 4] --- in memory.heap
     defer free(bytes) in memory.heap
     for y in 0..<height:
         for x in 0..<width:
@@ -335,7 +335,7 @@ test "PNG, JPEG and TIFF pictures stream a band at a time exactly as they decode
 test "a picture opened as a document becomes tiles a band at a time, exactly":
     let width: usize = 600
     let height: usize = 530
-    let bytes = try alloc u8[width * height * 4] in memory.heap
+    let bytes = try new u8[width * height * 4] --- in memory.heap
     defer free(bytes) in memory.heap
     for index in 0..<bytes.length:
         bytes[index] = (u8)((index * 13) % 256) if index % 4 != 3 else 255
@@ -352,9 +352,9 @@ test "a picture opened as a document becomes tiles a band at a time, exactly":
     let document = canvas.document else trap("bound")
     let layer = document.find(record.id) else trap("a layer")
     let tiles = layer.tiles() else trap("pixels")
-    let samples = try alloc f32[256 * 256 * 4] in memory.heap
+    let samples = try new f32[256 * 256 * 4] --- in memory.heap
     defer free(samples) in memory.heap
-    let expected = try alloc f32[width * height * 4] in memory.heap
+    let expected = try new f32[width * height * 4] --- in memory.heap
     defer free(expected) in memory.heap
     let whole = try Image.open("build/stream-open.png")
     defer whole.release()
@@ -372,7 +372,7 @@ test "a picture opened as a document becomes tiles a band at a time, exactly":
 test "a picture that opens but cannot be decoded fails the bind that loads it, as an error":
     let width: usize = 400
     let height: usize = 300
-    let bytes = try alloc u8[width * height * 4] in memory.heap
+    let bytes = try new u8[width * height * 4] --- in memory.heap
     defer free(bytes) in memory.heap
     for index in 0..<bytes.length:
         bytes[index] = (u8)((index * 31) % 256)

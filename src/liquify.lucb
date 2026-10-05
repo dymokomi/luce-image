@@ -44,7 +44,7 @@ pub struct Liquifier:
         var pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.replace, gpu.Format.rgba16_float)
         return Liquifier(owner = device, shader = shader, pipeline = pipeline)
 
-    pub mutating func destroy():
+    pub func destroy():
         self.pipeline.destroy()
         self.shader.destroy()
 
@@ -57,7 +57,7 @@ pub struct Liquifier:
         let area = try frame.value().target()
         defer area.release()
         try gpu.shade(area.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&(*params)[0], 64), [window, field], gpu.Filter.nearest)
-        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
         return fresh
 
     ## Cell (`column`, `row`) of pyramid `level` of the layer `grid` pushes,
@@ -76,7 +76,7 @@ pub struct Liquifier:
         # a point to a sample.
         let spacing = math.max(grid.step, scale)
         let n = (i64)(side / spacing) + 1
-        let bytes = try alloc u8[(usize)(n * n) * 8] in memory.heap
+        let bytes = try new u8[(usize)(n * n) * 8] --- in memory.heap
         defer free(bytes) in memory.heap
         let reach = grid.field(x0, y0, spacing, n, bytes)
         if not reach.moved:
@@ -137,7 +137,7 @@ pub struct LiquifyStroke:
                              last_x = x, last_y = y, debt = 0.0, changed = false)
 
     ## Continue to (`x`, `y`), a dab every step along the way.
-    pub mutating func extend(x: f64, y: f64) -> !:
+    pub func extend(x: f64, y: f64) -> !:
         if not math.is_finite(x) or not math.is_finite(y):
             error(invalid, "stroke coordinates must be finite")
         let dx = x - self.last_x
@@ -160,5 +160,5 @@ pub struct LiquifyStroke:
         self.last_x = x
         self.last_y = y
 
-    pub mutating func destroy():
+    pub func destroy():
         self.grid.destroy()

@@ -49,7 +49,7 @@ pub func brush_mask_png_text(mask: interop.Reference[BrushMask]) -> interop.Owne
     defer image.release()
     let encoded = try image.value().encode("png")
     defer free(encoded) in memory.heap
-    let text = try alloc u8[(encoded.length + 2) // 3 * 4] in memory.heap
+    let text = try new u8[(encoded.length + 2) // 3 * 4] --- in memory.heap
     defer free(text) in memory.heap
     base64_encode(encoded, text)
     return try interop.copy_text((str)text)
@@ -96,7 +96,7 @@ func base64_encode(data: const u8[], text: u8[]):
 
 ## The bytes of base64 `text` (on the heap, the caller's); whitespace is skipped.
 func base64_decode(text: const u8[]) -> u8[]!:
-    let out = try alloc u8[text.length // 4 * 3 + 3] in memory.heap
+    let out = try new u8[text.length // 4 * 3 + 3] --- in memory.heap
     errdefer free(out) in memory.heap
     var bits: u32 = 0
     var held: u32 = 0
@@ -123,7 +123,7 @@ func base64_decode(text: const u8[]) -> u8[]!:
             held -= 8
             out[count] = (u8)((bits >> held) & 255)
             count += 1
-    let kept = try alloc u8[count] in memory.heap
+    let kept = try new u8[count] --- in memory.heap
     memory.copy(kept, out, count)
     free(out) in memory.heap
     return kept

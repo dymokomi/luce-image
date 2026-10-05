@@ -22,14 +22,14 @@ func node_of(canvas: Canvas*, index: i64, kind: i64) -> i64!:
 test "a new vector layer draws its default graph; edits are steps, undone and saved":
     var canvas = try Canvas(800, 600)
     defer canvas.close()
-    discard(try canvas.add_layer("Background"))
+    _ = try canvas.add_layer("Background")
     canvas.bind_headless() catch failure:
         assert(failure.code == gpu.unavailable)
         return
     let layer = try canvas.add_vector_layer("Vector 1")
     assert((try canvas.layer_shaped(1)) and canvas.undo_name() == "New Vector Layer")
     assert((try canvas.graph_node_count(1)) == 4 and (try canvas.graph_link_count(1)) == 3 and (try canvas.generated_count(1)) == 12)
-    let pixels = try alloc f32[800 * 600 * 4] in memory.heap
+    let pixels = try new f32[800 * 600 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     try graph_pixels(&canvas, layer, pixels)
     # The top star of the ring sits above the middle; the middle itself is clear.
@@ -94,7 +94,7 @@ test "a Path node takes a hand-made element and follows it when it changes":
     try canvas.set_graph_value(layer, path, (i64)slot_x, 200.0)
     try canvas.link_graph(layer, path, output, 0)
     assert((try canvas.generated_count(0)) == 1)
-    let pixels = try alloc f32[400 * 300 * 4] in memory.heap
+    let pixels = try new f32[400 * 300 * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     try graph_pixels(&canvas, layer, pixels)
     assert(graph_alpha(pixels, 400, 20, 20) > 0.99 and graph_alpha(pixels, 400, 220, 20) > 0.99)
@@ -112,7 +112,7 @@ test "a graph edit draws again only the cells its changed shapes cover, at 15000
 func many_stars() -> !:
     var canvas = try Canvas(15000, 24000)
     defer canvas.close()
-    discard(try canvas.add_layer("Background"))
+    _ = try canvas.add_layer("Background")
     canvas.bind_headless() catch failure:
         assert(failure.code == gpu.unavailable)
         return
@@ -145,7 +145,7 @@ func many_stars() -> !:
     let tiles = (document.find((u64)layer) else trap("layer")).tiles() else trap("tiles")
     let columns = tiles.columns()
     let rows = tiles.rows()
-    let before = try alloc u64[(usize)columns * (usize)rows] in memory.heap
+    let before = try new u64[(usize)columns * (usize)rows] --- in memory.heap
     defer free(before) in memory.heap
     for row in 0..<rows:
         for column in 0..<columns:

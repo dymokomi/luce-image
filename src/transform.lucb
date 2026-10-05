@@ -64,7 +64,7 @@ pub struct Transformer:
         var clear = try tile_texture(device)
         errdefer clear.destroy()
         let frame = try clear.frame()
-        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
         frame.release()
         return Transformer(owner = device, shader = shader, pipeline = pipeline, float_shader = float_shader, floating = floating, clear = clear)
 
@@ -179,7 +179,7 @@ pub struct Transformer:
         let area = try frame.value().target()
         defer area.release()
         try gpu.shade(area.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&(*params)[0], 80), [source, selection], gpu.Filter.nearest)
-        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
         return texture
 
     ## The device the transformer draws on.
@@ -198,7 +198,7 @@ pub struct Transformer:
         let area = try frame.value().target()
         defer area.release()
         try gpu.shade(area.value(), self.pipeline, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&(*params)[0], 80), [source, selection], gpu.Filter.nearest)
-        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
         return texture
 
     ## `float.frag` with `params` (the map at 0..5 and 11..13, as `shader_params`
@@ -217,14 +217,14 @@ pub struct Transformer:
         defer area.release()
         try gpu.shade(area.value(), self.floating, gpu.Rect(width = (f64)tile_size, height = (f64)tile_size), u8[]((u8*)&packed[0], 64),
                       [source, selection, base else self.clear, base_selection else self.clear], gpu.Filter.nearest)
-        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
         return texture
 
     ## The clear tile.
     pub func clear_tile() -> gpu.Texture:
         return self.clear
 
-    pub mutating func destroy():
+    pub func destroy():
         self.clear.destroy()
         self.floating.destroy()
         self.float_shader.destroy()
@@ -271,7 +271,7 @@ test "a free transform scales, turns and flips a layer about a pivot, and a mask
     defer document.destroy()
     let layer = try document.add_layer("Square")
     let count = (usize)128 * 128 * 4
-    let pixels = try alloc f32[count] in memory.heap
+    let pixels = try new f32[count] --- in memory.heap
     defer free(pixels) in memory.heap
     for index in 0..<count:
         pixels[index] = 0.0
@@ -335,7 +335,7 @@ test "translating a layer moves its pixels across tiles, and what leaves the can
     defer document.destroy()
     let layer = try document.add_layer("Dot")
     let count = (usize)300 * 40 * 4
-    let pixels = try alloc f32[count] in memory.heap
+    let pixels = try new f32[count] --- in memory.heap
     defer free(pixels) in memory.heap
     for index in 0..<count:
         pixels[index] = 0.0
@@ -390,7 +390,7 @@ test "a large shrink reads a coarser level and keeps the picture, with no textur
     defer document.destroy()
     let layer = try document.add_layer("Wide")
     let count = (usize)6000 * 1024 * 4
-    let pixels = try alloc f32[count] in memory.heap
+    let pixels = try new f32[count] --- in memory.heap
     defer free(pixels) in memory.heap
     for y in 0..<(usize)1024:
         for x in 0..<(usize)6000:
@@ -407,7 +407,7 @@ test "a large shrink reads a coarser level and keeps the picture, with no textur
     # A tenth the size about the top-left: 600 by 102, red then blue.
     try transformer.apply(&document, layer, try affine_warp(0.1, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0))
     let result = (document.find(layer) else trap("layer")).tiles() else trap("tiles")
-    let back = try alloc f32[count] in memory.heap
+    let back = try new f32[count] --- in memory.heap
     defer free(back) in memory.heap
     try result.read(back)
     let red = (50 * 6000 + 100) * 4
