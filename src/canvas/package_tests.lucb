@@ -167,7 +167,7 @@ test "a document past its memory budget saves and opens within it, pixels unchan
     let opened = try Canvas.open("build/package-budget.l2d")
     defer opened.release()
     try frame_pixels(opened.value(), &target, 0.25, 0.0, 0.0, seen)
-    assert(same_bytes(seen, reference))
+    assert(seen == reference)
     # The opened tiles are backed by the file: past the budget they leave without
     # being written to the scratch file, and the GPU keeps within the budget (and
     # a batch of slack) once the load settles.
@@ -177,7 +177,7 @@ test "a document past its memory budget saves and opens within it, pixels unchan
     # Panning over tiles that left comes back exact, read from the file.
     try frame_pixels(opened.value(), &target, 1.0, -600.0, -500.0, seen)
     try frame_pixels(&canvas, &target, 1.0, -600.0, -500.0, reference)
-    assert(same_bytes(seen, reference))
+    assert(seen == reference)
 
 test "the selected layer is saved with the document and comes back":
     var device = gpu.Device.open() catch failure:
@@ -231,15 +231,15 @@ test "a document saved over the file it came from keeps every pixel, and undo st
     try document.settle_memory()
     # What the document shows now, read back through the new file.
     try frame_pixels(document, &target, 0.25, 0.0, 0.0, seen)
-    assert(same_bytes(seen, second))
+    assert(seen == second)
     let again = try Canvas.open("build/package-over.l2d")
     defer again.release()
     try frame_pixels(again.value(), &target, 0.25, 0.0, 0.0, seen)
-    assert(same_bytes(seen, second))
+    assert(seen == second)
     # Undo (deselect, fill, select) reaches the pixels from before, which only
     # history held: they left the old file before it was replaced.
     try document.undo()
     try document.undo()
     try document.undo()
     try frame_pixels(document, &target, 0.25, 0.0, 0.0, seen)
-    assert(same_bytes(seen, first))
+    assert(seen == first)

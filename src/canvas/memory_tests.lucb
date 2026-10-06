@@ -16,12 +16,6 @@ func frame_pixels(canvas: Canvas*, target: gpu.Texture*, zoom: f64, x: f64, y: f
     _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 1.0))
     try target.read(into)
 
-func same_bytes(a: const u8[], b: const u8[]) -> bool:
-    for index in 0..<a.length:
-        if a[index] != b[index]:
-            return false
-    return true
-
 test "under a tiny memory budget the document draws, strokes, undoes and exports exactly as without one":
     var device = gpu.Device.open() catch failure:
         assert(failure.code == gpu.unavailable)
@@ -48,9 +42,9 @@ test "under a tiny memory budget the document draws, strokes, undoes and exports
     try canvas.set_memory_budgets(1048576, 0)
     for round in 0..<(usize)3:
         try frame_pixels(&canvas, &target, fit, 0.0, 0.0, seen)
-        assert(same_bytes(seen, reference_fit))
+        assert(seen == reference_fit)
         try frame_pixels(&canvas, &target, 1.0, -600.0 + (f64)round * 10.0 - 10.0 * (f64)round, -500.0, seen)
-        assert(same_bytes(seen, reference_near))
+        assert(seen == reference_near)
     try canvas.settle_memory()
     assert(canvas.memory_gpu_bytes() <= 4194304 and canvas.memory_ram_bytes() > 0)
     # A stroke, undone, leaves the picture as it was; redone, as it was drawn.
@@ -59,10 +53,10 @@ test "under a tiny memory budget the document draws, strokes, undoes and exports
     try canvas.extend_stroke(900.0, 700.0)
     try canvas.end_stroke()
     try frame_pixels(&canvas, &target, 1.0, -600.0, -500.0, seen)
-    assert(not same_bytes(seen, reference_near))
+    assert(seen != reference_near)
     try canvas.undo()
     try frame_pixels(&canvas, &target, 1.0, -600.0, -500.0, seen)
-    assert(same_bytes(seen, reference_near))
+    assert(seen == reference_near)
     # The export reads the tiles wherever they are: the same file's pixels.
     try canvas.save("build/memory-budgeted.png")
     let expected = try Image.open("build/memory-reference.png")
@@ -111,13 +105,13 @@ test "a frame drawn three times under a budget one draw alone exceeds completes,
     # One tile of GPU: every frame's first draw pins more than that.
     try canvas.set_memory_budgets(524288, 0)
     try window_frame(&canvas, &target, seen)
-    assert(same_bytes(seen, reference))
+    assert(seen == reference)
     try window_frame(&canvas, &target, seen)
     let derived = canvas.memory_derived_bytes()
     let uploads = canvas.memory_transient_uploads()
     for round in 0..<(usize)10:
         try window_frame(&canvas, &target, seen)
-        assert(same_bytes(seen, reference))
+        assert(seen == reference)
     # The same frames again cost the same: nothing grows, nothing is made twice over.
     assert(canvas.memory_derived_bytes() <= derived + 1048576)
     assert(canvas.memory_transient_uploads() - uploads <= 10 * 4 * 30)
@@ -166,7 +160,7 @@ test "past the RAM budget six layers move to the scratch file, and undo and expo
     try canvas.settle_memory()
     try canvas.undo()
     try frame_pixels(&canvas, &target, 1.0, -600.0, -500.0, seen)
-    assert(same_bytes(seen, reference))
+    assert(seen == reference)
     try canvas.settle_memory()
     assert(canvas.memory_ram_bytes() <= 8 * 524288)
     try canvas.save("build/memory-disk.png")
@@ -249,4 +243,4 @@ test "previews that last many frames draw from tiles the memory tiers moved off 
     try previews_under(&canvas, layer, &target, 1048576, seen, size)
     assert(canvas.memory_demotions() > demoted)
     for at in 0..<(usize)8:
-        assert(same_bytes(seen[at * size..<(at + 1) * size], expected[at * size..<(at + 1) * size]))
+        assert(seen[at * size..<(at + 1) * size] == expected[at * size..<(at + 1) * size])
