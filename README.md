@@ -93,8 +93,8 @@ build/test-env/bin/python -m pip install -r tests/requirements.txt
 ./test.sh
 ```
 
-Bootstrap verifies the sibling compiler revisions against `bootstrap/BASE` and
-`bootstrap/LUCE`, then writes compilers only inside this repo's ignored `build/`.
+Bootstrap builds the sibling compilers (`../luce-base`, `../luce`, as checked out; main
+in CI) and writes them only inside this repo's ignored `build/`.
 It does not build into, modify, or update the language repositories. Supply
 `--base /path/to/luce-base --luce /path/to/luce` to the test runner to test other
 compiler versions instead. See [testing](docs/TESTING.md) for dependencies and CI.
