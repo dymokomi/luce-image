@@ -87,17 +87,13 @@ Luce-facing `Canvas` object:
 ## Build and test
 
 ```sh
-python3 tools/bootstrap.py
-python3 -m venv build/test-env
+python3 -m venv build/test-env                  # the oracles: Pillow, tifffile, imagecodecs, OpenEXR
 build/test-env/bin/python -m pip install -r tests/requirements.txt
-./test.sh
+luc test
 ```
 
-Bootstrap builds the sibling compilers (`../luce-base`, `../luce`, as checked out; main
-in CI) and writes them only inside this repo's ignored `build/`.
-It does not build into, modify, or update the language repositories. Supply
-`--base /path/to/luce-base --luce /path/to/luce` to the test runner to test other
-compiler versions instead. See [testing](docs/TESTING.md) for dependencies and CI.
+`luc test` runs the module tests and `tests/oracles`, which skips when the oracles are not
+installed. See [testing](docs/TESTING.md) for dependencies and CI.
 
 The GPU shaders are GLSL under `src/shaders/`; after changing one, regenerate
 `src/shaders.lucb` with luce-gpu's generator (needs `glslangValidator` and `spirv-cross`):

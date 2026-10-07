@@ -1,4 +1,4 @@
-## The codec regression driver tests/run.py builds in every compiler mode: it
+## The codec regression driver tests/oracles/gate.py builds: it
 ## decodes one picture (PNG, JPEG, EXR or TIFF) to raw samples and re-encodes it
 ## in a chosen format, for the Python checks in tests/ to compare against their
 ## reference readers.

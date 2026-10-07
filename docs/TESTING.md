@@ -1,25 +1,18 @@
 # Tests and toolchains
 
-Prerequisites: sibling `luce-base` and `luce` checkouts at the revisions in
-`bootstrap/`, a host C compiler, Python with venv/pip, and the test-only packages
-in `tests/requirements.txt`. Bootstrap supports Apple Silicon macOS and x86_64
-Linux. Other hosts can supply prebuilt compilers.
+Prerequisites: the development toolchain (`luc`, `luce`, `luce-base` from luce-base's
+`tools/toolchain.py`), Python with venv/pip, and the test-only packages in
+`tests/requirements.txt`.
 
 ```sh
-python3 tools/bootstrap.py
 python3 -m venv build/test-env
 build/test-env/bin/python -m pip install -r tests/requirements.txt
-./test.sh                 # native opt 0/1/2/3, C, C release
-./test.sh --opt 0         # quicker one-mode local pass
-./test.sh --backend c     # C backend comparison
-./test.sh --base /path/to/luce-base --luce /path/to/luce --opt 3
+luc test
 ```
 
-`LUCE_BASE_COMPILER` and `LUCE_COMPILER` also override test compiler paths. The
-runner sets `LUCE_BASE` for the high-level compiler. Bootstrap reads siblings but
-places stage0, Base and Luce binaries only under `build/toolchain/`. Source pins
-are checked, never automatically updated. C-backend tests compile the same Base
-sources; they do not link native image libraries.
+`luc test` runs every module's test blocks and the program `tests/oracles`, which runs
+`gate.py` with the Python of `build/test-env` (or `python3`): it builds the drivers once,
+natively, and compares them with the oracles. Without the oracle packages it skips.
 
 ## Gates
 

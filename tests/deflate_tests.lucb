@@ -1,4 +1,4 @@
-## The deflate regression driver tests/run.py builds in every compiler mode: it
+## The deflate regression driver tests/oracles/gate.py builds: it
 ## inflates a packed file and checks it against the raw one.
 from luce_std import files
 import memory
