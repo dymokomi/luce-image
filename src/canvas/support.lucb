@@ -103,6 +103,8 @@ extend Canvas:
     ## report (a draw's bind is where a picture opened as a document loads).
     func load_pictures() -> !:
         var failed: ErrorCode? = none
+        # the first failure's message, copied: its handler gives the original back (base.md §11.3)
+        var room: u8[512]
         var message: str = ""
         for index in 0..<self.count:
             if let picture = self.records[index].picture:
@@ -114,13 +116,13 @@ extend Canvas:
                 self.load_picture(index, picture, self.records[index].picture_x, self.records[index].picture_y, false) catch failure:
                     if failed == none:
                         failed = failure.code
-                        message = failure.message
+                        message = strings.copy_into(room, failure.message)
             if let picture = self.records[index].mask_picture:
                 self.records[index].mask_picture = none
                 self.load_picture(index, picture, self.records[index].mask_x, self.records[index].mask_y, true) catch failure:
                     if failed == none:
                         failed = failure.code
-                        message = failure.message
+                        message = strings.copy_into(room, failure.message)
         if let code = failed:
             error(code, message)
 
